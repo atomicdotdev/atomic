@@ -30,6 +30,39 @@ pub fn deserialize_conflicts(bytes: &[u8]) -> PristineResult<Vec<StoredConflict>
     })
 }
 
+/// Wire form of a view's pending-untrack list: explicitly versioned so a
+/// future layout can be migrated rather than guessed at.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingUntracksV1 {
+    version: u32,
+    paths: Vec<String>,
+}
+
+/// Serialize a view's pending-untrack path list (versioned).
+pub fn serialize_pending_untracks(paths: &[String]) -> PristineResult<Vec<u8>> {
+    let payload = PendingUntracksV1 {
+        version: 1,
+        paths: paths.to_vec(),
+    };
+    serde_json::to_vec(&payload).map_err(|e| PristineError::Serialization {
+        message: format!("failed to serialize pending untracks: {e}"),
+    })
+}
+
+/// Deserialize a view's pending-untrack path list, rejecting unknown versions.
+pub fn deserialize_pending_untracks(bytes: &[u8]) -> PristineResult<Vec<String>> {
+    let payload: PendingUntracksV1 =
+        serde_json::from_slice(bytes).map_err(|e| PristineError::Serialization {
+            message: format!("failed to deserialize pending untracks: {e}"),
+        })?;
+    if payload.version != 1 {
+        return Err(PristineError::Inconsistent {
+            message: format!("unsupported pending-untracks version {}", payload.version),
+        });
+    }
+    Ok(payload.paths)
+}
+
 // Edge Serialization
 
 /// Serialize a SerializedGraphEdge to bytes (24 bytes)

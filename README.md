@@ -2,11 +2,11 @@
 
 A Semantic Change Graph (SCG) to track memory, intent, provenance, and change as a single unit of work.  This is the evolution of source code management in the era of agents and agentic coding.
 
-The Git causal bridge is temporarily supported on **Unix only (Linux and macOS)**.
-Windows bridge support is deferred while its platform contract is defined; native
+The Git causal shim is temporarily supported on **Unix only (Linux and macOS)**.
+Windows shim support is deferred while its platform contract is defined; native
 Atomic functionality continues to be tested on Windows. See the
 [temporary platform policy](docs/RFC-ATOMIC-GIT-CAUSAL-BRIDGE.md#temporary-platform-support-pr-207)
-for the CI scope and requirements for re-enabling Windows bridge tests.
+for the CI scope and requirements for re-enabling Windows shim tests.
 
 ## Why Atomic?
 
@@ -282,59 +282,191 @@ The vault stores five kinds of content:
 
 Everything is content-addressed and version-controlled. When an agent starts a session, it reads the vault for context. When it finishes, its learnings go back into the vault for the next session — human or machine.
 
+**Colocated repositories that track `.vault/` in Git:** `atomic git import` preserves
+your tracked vault files byte-for-byte (it hydrates the vault database from them;
+default templates are only created for a repository that has no `.vault/` at all).
+The first import records the vault's shim policy — `[git.shim] vault = "tracked"`
+in `.atomic/config.toml` — so the vault participates in Git equivalence and
+publication checks exactly like any other tracked path. A repository whose Git tree
+does not track `.vault/` keeps the vault private and ignored by Git.
+
+**Rolling Git import (default for fresh repositories):** in a fresh, checked-out
+Git repository, `atomic git import` imports first-parent history with a live dashboard
+when running in a terminal. The responsive Ratatui dashboard shows progress,
+staging throughput/ETA, CPU and memory history, and the rolling window separately.
+The ETA excludes final verification. Use `--stream-window-mib 128` to raise the default
+32 MiB limit on queued Git blob reservations and prepared batches (1–256 MiB).
+This is **not** a limit on total process memory. Read-ahead is capped at 500 commits;
+publication batches are capped at 100 commits and the byte budget. The stream
+imports **graph-only changes with zero FileOps** and verifies the final Git tree,
+not every historical graph state. Git does not capture Atomic CRDT history, so
+streaming does not synthesize historical identities. Native/incremental handoff
+from graph-only imports remains a separate limitation; use the ordinary importer
+when you need its semantic lifecycle support.
+Unsupported history is refused rather than silently falling back: use
+`--no-stream` for the ordinary importer where supported. Streaming shares the
+ordinary parser's raw-name, symlink and gitlink support; these are not rejected
+merely for using the streaming route.
+`--all`, `--incremental`, `--with-crdt` and existing-repository imports retain
+their ordinary path. Explicit `--stream` remains available for requiring the
+restricted fresh-import route.
+
 ### Knowledge Graph — Code Intelligence at Scale
 
-Atomic builds a **knowledge graph** from your entire codebase — source code content, file structure, tree-sitter entities (functions, classes, types), module hierarchy, change history, and their relationships. Search it, traverse it, visualize it, or let an LLM explore it with tools.
+Atomic's **workflow knowledge graph** connects intents, sessions, turns, provenance,
+attestations, changes, files, and views, alongside goals and memories. It is a
+deterministic, rebuildable read model: recorded changes, session ledgers, provenance
+sidecars, attestations, and vault objects remain authoritative.
+
+Workflow relationships use the canonical `atomic:` namespace
+(`https://atomic.dev/ns/workflow#`). For example:
+
+```text
+Session     ──atomic:hasTurn───────────▶ Turn
+Turn        ──atomic:hasPlan───────────▶ Intent
+Turn        ──atomic:generatedChange───▶ Change
+Turn        ──atomic:turnExplainedBy───▶ ProvenanceGraph
+Change      ──atomic:implements───────▶ Intent
+Change      ──atomic:changeExplainedBy─▶ ProvenanceGraph
+Change      ──atomic:attestedBy────────▶ Attestation
+Attestation ──atomic:coversChange──────▶ Change
+Change      ──atomic:modifiesFile──────▶ File
+Change      ──atomic:directlyOnView────▶ View
+```
+
+These links reflect captured facts, not guessed historical associations. Missing
+facts produce explicit gap findings. `atomic:directlyOnView` means a view's own
+change membership, not visibility inherited from ancestors or dependencies.
+
+Resources have canonical IRIs: local workflow resources are qualified by the
+repository's stable ProjectId, while changes, provenance graphs, and session
+attestations use full, algorithm-qualified content hashes. JSON nodes carry
+asserted class IRIs in `types`, and edge `kind` values are absolute predicate IRIs.
+Copy resource IDs from search or graph JSON rather than constructing legacy
+`file:…`, `entity:…`, or abbreviated `change:…` IDs.
 
 ```bash
-# Search the knowledge graph — unified structural + content search
+# Refresh workflow facts from recorded changes, files, and views
+atomic query enrich
+
+# Search workflow resources, with indexed source-content matches
 atomic query search "replication"
 
-# Search source code content (powered by syntext trigram index)
-atomic query code "replication" -t cpp -g src/mongo/db/repl/
+# Explore a resource's asserted relationships (1–2 hops)
+atomic query neighbors "<resource-iri-from-search>" --json
 
-# List tree-sitter entities in a file (functions, classes, types)
-atomic query entities src/mongo/db/repl/replication_coordinator_impl.cpp
-
-# Explore relationships around a node (1-2 hops)
-atomic query neighbors "module:src/mongo/db/repl"
-
-# Visualize the graph — opens interactive D3 force-directed layout
+# Visualize a search neighborhood in an interactive HTML graph
 atomic query graph "replication" -k 20 --depth 2
+
+# Inspect an intent's lineage and dependency closure, not a generic neighborhood
+atomic intent graph ATOM::alice::1 --html
 ```
 
-The KG contains seven node types connected by typed edges:
+Intent graphs distinguish captured and explicitly declared implementation from
+changes that merely record the intent artifact, and report truncation and missing
+resources. Change, intent, and view nodes also expose recorded AI usage summaries,
+with cost/token coverage and model attribution; missing usage is not assumed to be
+free. See [Intent semantic change graphs](docs/intent-graph.md) for scope and
+accounting details.
 
-```
-module:src/mongo/db/repl          ← directory-level grouping
-  ├─ PART_OF ← file:replication_coordinator.h    ← tracked files
-  │              ├─ DEFINES → entity:ReplicationCoordinator (class, L42-890)
-  │              └─ INCLUDES → file:replication_process.h
-  ├─ PART_OF ← file:bgsync.cpp
-  │              └─ MODIFIES ← change:R4YQUAS2 ("fix replication lag")
-  │                              ├─ AUTHORED_BY → identity:alice
-  │                              └─ DEPENDS_ON → change:XMJZ3IPF
-  └─ PART_OF → module:src/mongo/db  (parent module)
-```
-
-Search is powered by two indexes that work together:
-- **KG FTS** — searches node labels, summaries, and metadata (structural search)
-- **syntext** — trigram-indexed content search across all source files, ~20x faster than grep
-
-Results are ranked: `src/` files above tests, modules above flat files, content match counts as a signal. A bounded min-heap ensures the top N results surface from thousands of matches without sorting the full set.
-
-For agents (Claude Code, Gemini, etc.), the CLI commands ARE the tools. An agent calls `atomic query search`, `atomic query neighbors`, `atomic query entities`, and its own `read_file` — the same path a human follows. No grep, no find, no LLM-calling-LLM overhead.
-
-For humans on the terminal, `ask` provides an agentic loop with tool use:
+**Code structure is queried live, not persisted in the workflow KG.** Tree-sitter
+provides entities and caller relationships on demand; module, call, definition,
+and import edges are not stored as a parallel code graph.
 
 ```bash
-# LLM explores the KG with tools and answers your question
+# Build/update the separate syntext source-content index
+atomic query index
+
+# Search recorded source in the current view; -t filters language and -g paths
+atomic query code "replication" -t rs -g atomic-core/src/
+
+# Parse a file's functions, classes, and types with line ranges
+atomic query entities atomic-core/src/kg/iri.rs
+
+# Find callers by path-qualified symbol or bare name in the recorded view
+atomic query callers "atomic-core/src/kg/iri.rs#mint_change" --json
+```
+
+`query search`, `query callers`, and `query code` use the **current view's effective
+graph filter**: the view's changes, all ancestor views, and transitive dependencies.
+They read recorded source bytes, not unrecorded working-copy edits or stale content
+from another view. Deletions and renames follow the canonical view projection.
+Vault-only results, such as memories and intents, remain shared.
+
+Search combines **KG full-text search** over resource IDs, labels, and summaries
+with source-content matches verified against the recorded view. Filtering precedes
+ranking and limits; no working-copy content index or checkout is required. Callers
+use request-scoped tree-sitter parsing, not persisted KG code edges. This
+correctness-first path renders/scans the selected view per query. RPC clients can
+select a view explicitly; omitting it uses the working copy's registered desired
+view. Other query verbs retain their existing scope semantics. The agent tool
+loop's `code_search` and `kg_search` read the same recorded view. The separate
+working-copy content index remains only for its maintenance consumers — Git
+import refresh and post-record index updates — and no search path consults it.
+Existing ambient ignore rules still suppress ignored paths, including recorded
+files; that policy is intentional and unchanged.
+
+Recorded code search applies path/type filters **before reading file contents**,
+then scans eligible files one at a time. It keeps at most the requested number of
+best matches while still counting every match and directory facet—even with a
+zero display limit. Facet-count ties sort by directory path. Rendered files over
+10 MiB are skipped, not searched as truncated files. Closure, path-claim, and inode
+attribute validation still precede request filtering: invalid global metadata
+fails closed, while content-only errors in excluded files are deliberately unread.
+Selected-file content errors still propagate. No persistent cache or reindex is
+required. See [query resource diagnostics](docs/query-view-performance.md) for
+memory bounds, costs excluded from those bounds, and a reproducible benchmark.
+
+For `query search`, `--kind` matches an exact, case-sensitive absolute class IRI
+against **any asserted type**, before candidate-pool truncation. An omitted or
+empty kind means no filter; an unknown class matches nothing. `--pool` defaults
+to 5000 and is a retention budget, normalized to at least the result limit—not a
+cap on which eligible candidates are examined. Without a kind filter, a larger
+pool enables cross-type diversity. With a kind filter, results are the highest-
+ranked matching nodes without cross-type diversity, so even `--pool 1` cannot hide
+their top result. CLI/service search defaults to 10 results; a service request
+limit of zero (including CLI `--limit 0`) uses that default. Direct repository
+search APIs instead interpret a zero limit literally and return no nodes.
+
+**SHACL validation** runs locally in the CLI using PurRDF. Builtin profiles and
+enterprise-authored `.atomic/shapes/*.ttl` files use the same engine:
+
+```bash
+# Validate the asserted workflow snapshot (default projection profile)
+atomic query validate --format json
+
+# Apply the stricter managed-plan, provenance, and verified-attestation checks
+atomic query validate --profile publication --format json
+
+# Explicitly rebuild the complete derived workflow graph, including vault entries
+atomic query reindex --full
+```
+
+The projection profile permits a missing shortcut only with its matching gap
+finding. Reports include snapshot/profile identity, target coverage, and standard
+validation results. Conformance with no applicable targets is vacuous, not proof of
+complete history. Exit codes are **0** for conformance, **1** for violations, and
+**3** for shape or engine errors. Imports resolve only among explicitly loaded
+shape bundles, without implicit network fetching.
+
+Phase 1 does **not** enable OWL inference or mandatory validation hooks on sync or
+publication. Signature verification remains separate from SHACL. See the
+[KG upgrade guide](docs/knowledge-graph-phase1-upgrade.md) for the breaking API
+changes and migration behavior.
+
+Agents can use the same CLI queries directly. For interactive natural-language
+questions, `ask` provides an LLM tool-use loop:
+
+```bash
 atomic query ask "who fixed the auth bug?"
 ```
 
-The `ask` command gives the LLM six tools (`kg_search`, `kg_neighbors`, `read_file`, `list_entities`, `code_search`, `vault_read`) and lets it decide what to look up. Provider-agnostic — works with Anthropic or OpenAI. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to enable.
+The model can search workflow facts, inspect source files, parse entities, and read
+vault entries. Set `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` to enable it. Answers are
+model-generated interpretations, not machine-validated historical audit evidence.
 
-No API key required for `search`, `code`, `entities`, `neighbors`, `graph`, or `enrich`.
+No LLM API key is required for `search`, `code`, `entities`, `callers`, `neighbors`,
+`graph`, `enrich`, `index`, `reindex`, or `validate`.
 
 ## Quick Start
 
@@ -385,7 +517,7 @@ Every change stores two parallel representations:
 |---------|-------------|
 | `atomic init` | Initialize a new repository |
 | `atomic add <paths>` | Add files to tracking |
-| `atomic remove <paths>` | Remove files from tracking |
+| `atomic remove <paths>` | Stop tracking files (`git rm` semantics: untracking recorded content needs a recorded delete) |
 | `atomic move <src> <dst>` | Move or rename tracked files |
 | `atomic status` | Show working copy status |
 | `atomic diff` | Show differences in working copy |
@@ -399,14 +531,16 @@ Every change stores two parallel representations:
 | Command | Description |
 |---------|-------------|
 | `atomic query search <query>` | Search the knowledge graph (structural + content) |
-| `atomic query code <pattern>` | Search source code content (trigram-indexed, `-t` for file type, `-g` for path filter) |
+| `atomic query code <pattern>` | Search recorded source in the current view (`-t` for file type, `-g` for path filter) |
 | `atomic query entities <path>` | List tree-sitter entities in a file (functions, classes, types with line ranges) |
-| `atomic query neighbors <id>` | Explore the graph around a node (DEFINES, MODIFIES, PART_OF, INCLUDES edges) |
-| `atomic query graph <query>` | Visualize the knowledge graph as interactive HTML (D3 force-directed, `-k` seeds, `--depth`, `--kinds`) |
+| `atomic query callers <path#name\|name>` | Find callers using live source parsing, without stored KG code edges |
+| `atomic query neighbors <resource-iri>` | Explore asserted workflow relationships around a canonical resource |
+| `atomic query graph <query>` | Visualize the workflow graph as interactive HTML (`-k` seeds, `--depth`, `--kinds` with class IRIs) |
 | `atomic query ask <question>` | Natural-language Q&A with agentic tool loop (requires API key) |
-| `atomic query enrich` | Build/rebuild KG from VCS data + content index (modules, entities, includes) |
+| `atomic query enrich` | Refresh VCS workflow facts (changes, files, views) |
 | `atomic query index` | Build/update the content search index (`--rebuild` for full, `--stats` for info) |
-| `atomic query reindex` | Rebuild the KG index from vault entries |
+| `atomic query reindex [--full]` | Reproject vault entries; `--full` rebuilds the complete derived workflow graph |
+| `atomic query validate` | Run builtin and local enterprise SHACL shapes (`--profile projection\|publication`, `--format json`) |
 
 ### View Commands
 
@@ -460,6 +594,7 @@ Every change stores two parallel representations:
 | `atomic agent status` | Show sessions, hook liveness, and failures (`--json` for tooling) |
 | `atomic agent explain <id>` | Generate AI reasoning summary for a session |
 | `atomic agent attest` | List and inspect attestations |
+| `atomic diagnostics` | Read-only support report: version, integrations, skills, hooks, Git shim, repository counts and selected redb table statistics (`--json`) |
 
 Hook health is computed from session-scoped logs, so concurrent agents retain
 their own outcomes and a child's success cannot hide a parent's failure. See
@@ -505,6 +640,32 @@ Full documentation at **[docs.atomic.dev](https://docs.atomic.dev/)**.
 ## Building
 
 If replacing an older binary, first follow [the legacy upgrade steps](#upgrading-from-legacy-database-owners-0191-and-earlier).
+
+Source builds require **Rust 1.98 or newer** (including the SHACL dependencies).
+`rust-toolchain.toml` pins the supported development toolchain. Use rustup's
+`cargo`/`rustc` shims, not an older standalone Homebrew Rust installation:
+
+```sh
+rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup show active-toolchain
+rustc --version
+cargo build -r
+```
+
+If Cargo still reports `rustc 1.97.1`, inspect `type -a cargo rustc`: a direct
+`/opt/homebrew/bin/cargo` or `rustc` ahead of `~/.cargo/bin` bypasses rustup and
+the repository pin. Put the export above **after** Homebrew's PATH setup in your
+shell configuration. Do not lower `rust-version` or use `--ignore-rust-version`:
+the dependency itself requires the newer compiler. For a one-command build
+without changing the shell configuration:
+
+```sh
+PATH="$HOME/.cargo/bin:$PATH" cargo build -r
+```
+
+Also check for explicit `RUSTC`, `RUSTDOC`, `RUSTUP_TOOLCHAIN`, or Cargo config
+overrides if the shims still select the wrong compiler.
 
 ```bash
 # Build all crates

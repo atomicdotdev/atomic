@@ -75,6 +75,7 @@ use commands::{
     Compact,
     Completions,
     Conflicts,
+    Diagnostics,
     Diff,
     Doctor,
     Git,
@@ -94,6 +95,7 @@ use commands::{
     Record,
     Remote,
     Remove,
+    Repo,
     Restore,
     Revise,
     Sandbox,
@@ -264,19 +266,24 @@ enum Commands {
 
     /// Remove files from tracking.
     ///
-    /// Stops tracking files in the repository. Files can either be deleted
-    /// from disk or kept as untracked files using the `--keep` flag.
+    /// Stops tracking files, mirroring `git rm`. A never-recorded path is
+    /// untracked outright and stays on disk; a recorded path is removed from the
+    /// working copy, and recording that deletion is what completes the untrack.
     ///
     /// # Examples
     ///
     /// ```text
-    /// # Remove and delete file
-    /// atomic remove old_file.txt
+    /// # Untrack an added-but-never-recorded file (kept on disk)
+    /// atomic remove draft_notes.txt
     ///
-    /// # Stop tracking but keep file
-    /// atomic remove --keep secrets.txt
+    /// # Stop tracking a recorded file: deletes it, then record the deletion
+    /// atomic remove Cargo.lock
+    /// atomic record -m "Stop tracking Cargo.lock"
     ///
-    /// # Remove directory
+    /// # Also delete never-recorded files from disk
+    /// atomic remove --delete secrets.txt
+    ///
+    /// # Remove a directory recursively
     /// atomic remove old_code/
     /// ```
     #[command(visible_alias = "rm")]
@@ -487,6 +494,21 @@ enum Commands {
     /// such as backfilling the dependency index for legacy repositories.
     Doctor(Doctor),
 
+    /// Print a read-only support report.
+    ///
+    /// Reports the Atomic version, installed agent integrations and skills
+    /// with their versions, which agents have Atomic hooks enabled, and
+    /// whether the Git shim is enabled. Changes nothing, needs no network,
+    /// and works outside a workspace.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic diagnostics
+    /// atomic diagnostics --json
+    /// ```
+    Diagnostics(Diagnostics),
+
     /// Reclaim unused space in the repository database.
     Compact(Compact),
 
@@ -658,6 +680,9 @@ enum Commands {
     /// atomic project create my-app --workspace other-ws
     /// ```
     Project(ProjectCmd),
+
+    /// Inspect local repository identity and metadata.
+    Repo(Repo),
 
     /// Manage organizations and members.
     ///
@@ -1036,6 +1061,7 @@ fn main() {
         Commands::Blame(blame) => blame.run(),
 
         Commands::Doctor(doctor) => doctor.run(),
+        Commands::Diagnostics(diagnostics) => diagnostics.run(),
         Commands::Compact(compact) => compact.run(),
 
         Commands::Git(git) => git.run(),
@@ -1061,6 +1087,7 @@ fn main() {
         Commands::Workspace(workspace) => workspace.run(),
 
         Commands::Project(project) => project.run(),
+        Commands::Repo(repo) => repo.run(),
 
         #[cfg(feature = "teams")]
         Commands::Org(org) => org.run(),

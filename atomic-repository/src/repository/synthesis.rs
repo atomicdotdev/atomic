@@ -454,7 +454,7 @@ pub fn git_classification_metadata(
     classification.unhashed_git_facts(&mut git);
     git.insert(
         "sequencing".to_string(),
-        serde_json::Value::String("bridge".to_string()),
+        serde_json::Value::String("shim".to_string()),
     );
     if !boundaries.is_empty() {
         git.insert(
@@ -545,6 +545,14 @@ pub struct StagedTreeExpectation {
     /// the last commit and merges verify the whole tree. `None` checks every
     /// path.
     pub verify_paths: Option<std::collections::BTreeSet<String>>,
+    /// When set, only these paths replay their semantic closure (review F4
+    /// text replay); every entry still gets the graph-layer byte, mode and
+    /// kind checks. The importer sets it for a single-parent commit of an
+    /// incremental import with no exclusions: the closure of every other
+    /// trunk is exactly what the previous import verified, so replaying all
+    /// of them again only costs time (seconds per commit on a few hundred
+    /// files). `None` replays every present text path.
+    pub semantic_verify_paths: Option<std::collections::BTreeSet<String>>,
 }
 
 impl StagedExpectation {
@@ -961,116 +969,107 @@ fn global_alive_set(
     Ok(set)
 }
 
+/// FileOps paths describe the name at recording time. Stable trunk identity
+/// determines ownership after rename or path reuse; branch/vertex/token IDs
+/// are checked separately by each attribution predicate below.
+fn file_ops_target_trunk(
+    ops: &atomic_core::change::FileOps,
+    owner: atomic_core::types::NodeId,
+    trunk: atomic_core::crdt::TrunkId,
+) -> bool {
+    let raw = ops.trunk_id();
+    let resolved = if raw.change_id().is_root() {
+        atomic_core::crdt::TrunkId::new(owner, raw.file_idx())
+    } else {
+        raw
+    };
+    resolved == trunk
+}
+
 /// Whether any applied change OUTSIDE the interpreted closure recorded the
 /// semantic op that deleted `branch` (review C1/C3: tombstones are attributed
 /// by actual operations — a registered writer's Delete/Modify for the branch
 /// — not merely by graph liveness, because a whole-file replace tombstones
 /// semantic branches without graph-deleting the replaced vertices).
+#[cfg(test)]
 pub(crate) fn out_of_closure_writer_deleted_branch(
     repo_change_loader: &dyn Fn(&Hash) -> Result<Change, String>,
     txn: &atomic_core::pristine::WriteTxn<'_>,
-    path: &str,
+    trunk: atomic_core::crdt::TrunkId,
     branch: atomic_core::crdt::BranchId,
     visibility: &atomic_core::pristine::GraphVisibilityClosure,
 ) -> Result<bool, String> {
-    use atomic_core::pristine::GraphTxnT;
-    for (change_id, hash) in txn.list_registered_changes().map_err(|e| e.to_string())? {
-        if visibility.contains(change_id) {
-            continue;
-        }
-        // Review F1: a registered change is NOT an applied writer. The
-        // scanner may attribute a tombstone only to a change whose operations
-        // actually ran in the graph; a merely registered (e.g. fetched or
-        // staged) change's FileOps are not execution proof. Mirrors
-        // `applied_writer_deleted_branch` (review D2).
-        if !txn
-            .has_change_in_graph(change_id)
-            .map_err(|e| e.to_string())?
-        {
-            continue;
-        }
-        let Ok(change) = repo_change_loader(&hash) else {
-            continue;
-        };
-        for ops in change.file_ops() {
-            if ops.path() != path {
-                continue;
-            }
-            for line_op in ops.line_ops() {
-                let raw_branch = line_op.branch_id();
-                let resolved = if raw_branch.change_id().is_root() {
-                    atomic_core::crdt::BranchId::new(change_id, raw_branch.branch_idx())
-                } else {
-                    raw_branch
-                };
-                if resolved != branch {
-                    continue;
-                }
-                match line_op.operation() {
-                    // A Delete tomstones the branch; a Modify tombstones and
-                    // re-inserts the same id (either writer legitimately
-                    // produced the row's tombstone at some point).
-                    atomic_core::crdt::BranchOp::Delete { .. }
-                    | atomic_core::crdt::BranchOp::Modify { .. } => return Ok(true),
-                    _ => {}
-                }
-            }
-        }
-    }
-    Ok(false)
+    Ok(
+        SemanticDeletionEvidence::load(repo_change_loader, txn, trunk, visibility)?
+            .outside
+            .contains(&branch),
+    )
 }
 
-/// Whether ANY applied change recorded the semantic op that deleted
-/// `branch` for `path`, regardless of which closure the writer belongs to
-/// (review D2, unexpected-chain-branch attribution): a forced whole-file
-/// replace inside the interpreted closure tombstones every bound branch —
-/// including branches created by out-of-closure concurrent writers — so a
-/// genuine tombstone's writer may live on either side of the closure
-/// boundary. The loaded change must be a real applied change (a registered
-/// id alone is not a writer, review D2).
-fn applied_writer_deleted_branch(
-    repo_change_loader: &dyn Fn(&Hash) -> Result<Change, String>,
-    txn: &atomic_core::pristine::WriteTxn<'_>,
-    path: &str,
-    branch: atomic_core::crdt::BranchId,
-) -> Result<bool, String> {
-    use atomic_core::pristine::GraphTxnT;
-    for (change_id, hash) in txn.list_registered_changes().map_err(|e| e.to_string())? {
-        if !txn
-            .has_change_in_graph(change_id)
-            .map_err(|e| e.to_string())?
-        {
-            continue;
-        }
-        let Ok(change) = repo_change_loader(&hash) else {
-            continue;
-        };
-        for ops in change.file_ops() {
-            if ops.path() != path {
+/// Transaction-local deletion proofs for one exact trunk and visibility.
+/// Scan canonical applied FileOps once, rather than cloning every historical
+/// change again for every dead branch in the staged file-order chain.
+#[derive(Default)]
+pub(super) struct SemanticDeletionEvidence {
+    pub(super) applied: std::collections::HashSet<atomic_core::crdt::BranchId>,
+    pub(super) outside: std::collections::HashSet<atomic_core::crdt::BranchId>,
+}
+
+type SemanticDeletionCache = std::cell::OnceCell<Result<SemanticDeletionEvidence, String>>;
+
+/// Evidence shared by branch checks within one staged file verification.
+struct SemanticBranchContext<'a> {
+    visibility: &'a atomic_core::pristine::GraphVisibilityClosure,
+    global_alive:
+        &'a std::collections::HashSet<atomic_core::types::GraphNode<atomic_core::types::NodeId>>,
+    deletion_evidence: &'a SemanticDeletionCache,
+}
+
+impl SemanticDeletionEvidence {
+    pub(super) fn load(
+        loader: &dyn Fn(&Hash) -> Result<Change, String>,
+        txn: &atomic_core::pristine::WriteTxn<'_>,
+        trunk: atomic_core::crdt::TrunkId,
+        visibility: &atomic_core::pristine::GraphVisibilityClosure,
+    ) -> Result<Self, String> {
+        use atomic_core::pristine::GraphTxnT;
+        let mut evidence = Self::default();
+        for (change_id, hash) in txn.list_registered_changes().map_err(|e| e.to_string())? {
+            // Registration alone is never proof that FileOps executed.
+            if !txn
+                .was_change_applied(change_id)
+                .map_err(|e| e.to_string())?
+            {
                 continue;
             }
-            for line_op in ops.line_ops() {
-                let raw_branch = line_op.branch_id();
-                let resolved = if raw_branch.change_id().is_root() {
-                    atomic_core::crdt::BranchId::new(change_id, raw_branch.branch_idx())
-                } else {
-                    raw_branch
-                };
-                if resolved != branch {
+            let Ok(change) = loader(&hash) else { continue };
+            for ops in change.file_ops() {
+                if !file_ops_target_trunk(ops, change_id, trunk) {
                     continue;
                 }
-                match line_op.operation() {
-                    // A Delete tomstones the branch; a Modify tombstones and
-                    // re-inserts the same id (either writer legitimately
-                    // produced the row's tombstone at some point).
-                    atomic_core::crdt::BranchOp::Delete { .. }
-                    | atomic_core::crdt::BranchOp::Modify { .. } => return Ok(true),
-                    _ => {}
+                for line in ops.line_ops() {
+                    if !matches!(
+                        line.operation(),
+                        atomic_core::crdt::BranchOp::Delete { .. }
+                            | atomic_core::crdt::BranchOp::Modify { .. }
+                    ) {
+                        continue;
+                    }
+                    let raw = line.branch_id();
+                    let branch = if raw.change_id().is_root() {
+                        atomic_core::crdt::BranchId::new(change_id, raw.branch_idx())
+                    } else {
+                        raw
+                    };
+                    evidence.applied.insert(branch);
+                    if !visibility.contains(change_id) {
+                        evidence.outside.insert(branch);
+                    }
                 }
             }
         }
+        Ok(evidence)
     }
-    Ok(false)
 }
 
 /// Review E1: whether the GLOBAL graph genuinely proves `branch`'s bound
@@ -1086,7 +1085,7 @@ fn applied_writer_deleted_branch(
 fn graph_proves_dead_with_ownership(
     repo: &Repository,
     txn: &atomic_core::pristine::WriteTxn<'_>,
-    path: &str,
+    trunk: atomic_core::crdt::TrunkId,
     branch: atomic_core::crdt::BranchId,
     node: &atomic_core::types::GraphNode<atomic_core::types::NodeId>,
     global_alive: &std::collections::HashSet<
@@ -1118,7 +1117,7 @@ fn graph_proves_dead_with_ownership(
         .load_change(&hash)
         .map_err(|e| format!("cannot load branch vertex writer: {e}"))?;
     Ok(change_wrote_branch_vertex_for_branch(
-        &writer, path, branch, *node,
+        &writer, trunk, branch, *node,
     ))
 }
 
@@ -1165,7 +1164,7 @@ fn vertex_content_bytes(
 pub(crate) fn out_of_closure_writer_deleted_trunk(
     repo_change_loader: &dyn Fn(&Hash) -> Result<Change, String>,
     txn: &atomic_core::pristine::WriteTxn<'_>,
-    path: &str,
+    trunk: atomic_core::crdt::TrunkId,
     visibility: &atomic_core::pristine::GraphVisibilityClosure,
 ) -> Result<bool, String> {
     use atomic_core::pristine::GraphTxnT;
@@ -1176,7 +1175,7 @@ pub(crate) fn out_of_closure_writer_deleted_trunk(
         // Review F1: same application proof as the branch scanner — a
         // registered-but-unapplied change never attributes a trunk tombstone.
         if !txn
-            .has_change_in_graph(change_id)
+            .was_change_applied(change_id)
             .map_err(|e| e.to_string())?
         {
             continue;
@@ -1185,7 +1184,7 @@ pub(crate) fn out_of_closure_writer_deleted_trunk(
             continue;
         };
         for ops in change.file_ops() {
-            if ops.path() != path {
+            if !file_ops_target_trunk(ops, change_id, trunk) {
                 continue;
             }
             if matches!(
@@ -1199,21 +1198,21 @@ pub(crate) fn out_of_closure_writer_deleted_trunk(
     Ok(false)
 }
 
-/// Whether `change`'s own FileOps for `path` recorded the line op that bound
+/// Whether `change`'s own FileOps for the stable trunk recorded the line op that bound
 /// branch `branch` to `vertex` (review C1: concurrency attribution by actual
 /// operations, not bare registered ids; review E1: EXACT branch→vertex file
 /// ownership). The op must resolve to THIS branch id AND carry exactly the
-/// vertex's content range for THIS path — a different file's real vertex
+/// vertex's content range for THIS trunk — a different file's real vertex
 /// (the same change's other-file line op at that range) never proves a
 /// binding for this file's branch.
 fn change_wrote_branch_vertex_for_branch(
     change: &Change,
-    path: &str,
+    trunk: atomic_core::crdt::TrunkId,
     branch: atomic_core::crdt::BranchId,
     vertex: atomic_core::types::GraphNode<atomic_core::types::NodeId>,
 ) -> bool {
     for ops in change.file_ops() {
-        if ops.path() != path {
+        if !file_ops_target_trunk(ops, vertex.change, trunk) {
             continue;
         }
         for line_op in ops.line_ops() {
@@ -1244,19 +1243,19 @@ fn change_wrote_branch_vertex_for_branch(
 /// Whether `change`'s own FileOps key `leaf`'s id when applied (review D2:
 /// a registered NodeId is not proof of a writer — the leaf must come from
 /// the writer's own per-apply counter over the Insert/Modify content it
-/// recorded for this path and branch). The replay mirrors the apply's
+/// recorded for this trunk and branch). The replay mirrors the apply's
 /// leaf-id contract exactly: one counter per change spanning every file
 /// entry in order, advanced by every recorded leaf op.
 fn change_wrote_leaf(
     change: &Change,
-    path: &str,
+    trunk: atomic_core::crdt::TrunkId,
     branch: atomic_core::crdt::BranchId,
     leaf: atomic_core::crdt::LeafId,
 ) -> bool {
     let owner = leaf.change_id();
     let mut counter = 0u32;
     for ops in change.file_ops() {
-        let is_target = ops.path() == path;
+        let is_target = file_ops_target_trunk(ops, owner, trunk);
         for line_op in ops.line_ops() {
             let raw_branch = line_op.branch_id();
             let resolved = if raw_branch.change_id().is_root() {
@@ -1517,7 +1516,7 @@ impl Repository {
     /// Returns the capture digest. The bytes are stored in the pristine
     /// database, which only the Atomic library writes; a JSONL journal line
     /// is operation-linkage evidence only when this capture exists.
-    pub fn capture_bridge_event(&self, event_bytes: &[u8]) -> Result<[u8; 32], RepositoryError> {
+    pub fn capture_shim_event(&self, event_bytes: &[u8]) -> Result<[u8; 32], RepositoryError> {
         use atomic_core::pristine::BridgeEventCaptureMutTxnT;
         let mut txn = self
             .pristine
@@ -1532,7 +1531,7 @@ impl Repository {
     }
 
     /// Whether the exact event bytes have an immutable capture (CB-9B R4).
-    pub fn bridge_event_captured(&self, event_bytes: &[u8]) -> Result<bool, RepositoryError> {
+    pub fn shim_event_captured(&self, event_bytes: &[u8]) -> Result<bool, RepositoryError> {
         use atomic_core::pristine::BridgeEventCaptureTxnT;
         let digest: [u8; 32] = blake3::hash(event_bytes).into();
         let txn = self
@@ -1553,9 +1552,9 @@ impl Repository {
     /// holds the active head of its scope, so an anchored capture is proof
     /// it was written while that operation was the live head. The advisory
     /// hook path (direct stdin, no active operation) must use
-    /// [`Repository::capture_bridge_event`] instead: its captures carry no
+    /// [`Repository::capture_shim_event`] instead: its captures carry no
     /// anchor and read as unauthenticated evidence downstream.
-    pub fn capture_bridge_event_anchored(
+    pub fn capture_shim_event_anchored(
         &self,
         event_bytes: &[u8],
         operation: atomic_core::types::OperationId,
@@ -1582,7 +1581,7 @@ impl Repository {
     /// without the operation's capture token fail here, so the
     /// authentication tier never trusts a bare anchor row and can never
     /// authenticate an advisory capture that predates the operation.
-    pub fn bridge_anchor_binds_operation(
+    pub fn shim_anchor_binds_operation(
         &self,
         event_bytes: &[u8],
         operation: atomic_core::types::OperationId,
@@ -1667,7 +1666,7 @@ impl Repository {
 
     /// The capture token minted for `operation`'s capture context, if any
     /// (review E2). An executor driving Git hooks inside the operation's
-    /// capture context exports this token as `ATOMIC_BRIDGE_CAPTURE_TOKEN`;
+    /// capture context exports this token as `ATOMIC_SHIM_CAPTURE_TOKEN`;
     /// only captured events carrying it can anchor to the operation.
     pub fn bridge_ref_capture_token(
         &self,
@@ -1839,6 +1838,15 @@ impl Repository {
     /// against the staged graph projection before the transaction commits.
     /// `hashed_metadata` is hash-covered caller metadata (CB-9B raw foreign
     /// facts); empty when none.
+    ///
+    /// `supersede` names the genuinely replaced history to remove from the
+    /// target view in the same transaction: view members whose Git origin is
+    /// outside the import's full target closure. Assembly exclusions that are
+    /// sibling legs of that same closure (invisible while this commit
+    /// assembles, but part of the import target) must not appear here — the
+    /// later merge resolution re-references them through
+    /// `ensure_union_state`, and a mid-walk eviction would leave descendant
+    /// commits assembling against a missing baseline.
     #[allow(clippy::too_many_arguments)]
     pub fn synthesize_git_change(
         &self,
@@ -1855,7 +1863,7 @@ impl Repository {
         expectation: &StagedExpectation,
         git_commit_sha: Option<&str>,
         parent_interpretation_closure: &[Hash],
-        supersede_excluded: bool,
+        supersede: &[Hash],
     ) -> Result<SynthesisOutcome, RepositoryError> {
         let working_copy = self.require_working_copy_id()?;
         // Reentrant under an outer workspace transaction on the same thread;
@@ -1876,7 +1884,7 @@ impl Repository {
             expectation,
             git_commit_sha,
             parent_interpretation_closure,
-            supersede_excluded,
+            supersede,
         )
     }
 
@@ -1934,7 +1942,7 @@ impl Repository {
             // R1): its assembly exclusions are sibling lineages that the union
             // legitimately contains, so they are never superseded from the
             // view — `ensure_union_state` re-references them first.
-            false,
+            &[],
         )
     }
 
@@ -1959,7 +1967,7 @@ impl Repository {
         parent_interpretation_closure: &[Hash],
         expectation: &StagedExpectation,
         assembly_excluded: &[Hash],
-        supersede_excluded: bool,
+        supersede: &[Hash],
     ) -> Result<SynthesisOutcome, RepositoryError> {
         let working_copy = self.require_working_copy_id()?;
         let operation_lock = self.try_lock_operation(working_copy)?;
@@ -1978,7 +1986,7 @@ impl Repository {
             expectation,
             git_commit_sha,
             parent_interpretation_closure,
-            supersede_excluded,
+            supersede,
         )
     }
 
@@ -2000,7 +2008,7 @@ impl Repository {
         parent_interpretation_closure: &[Hash],
         expectation: &StagedExpectation,
         assembly_excluded: &[Hash],
-        supersede_excluded: bool,
+        supersede: &[Hash],
     ) -> Result<SynthesisOutcome, RepositoryError> {
         self.synthesize_git_change_locked(
             workspace.operation_lock(),
@@ -2017,8 +2025,58 @@ impl Repository {
             expectation,
             git_commit_sha,
             parent_interpretation_closure,
-            supersede_excluded,
+            supersede,
         )
+    }
+
+    /// Ancestor-directory identity bindings for one assembly: every parent
+    /// directory of the records being assembled (record paths, move old
+    /// paths, and deleted paths), resolved through the assembly view's graph
+    /// closure. Globalization seeds these bindings so structural parent
+    /// anchoring never depends on the ambient TREE (preserved imports hold
+    /// TREE updates in the deferred lifecycle journal; the ambient binding
+    /// may also belong to another view's inode). Directories absent from
+    /// the closure stay unseeded — globalization emits their DirAdd anchors
+    /// inside the change being assembled, exactly as before.
+    fn assembly_projected_paths<T>(
+        &self,
+        txn: &T,
+        visibility: &atomic_core::pristine::GraphVisibilityClosure,
+        recorded_files: &[atomic_core::record::workflow::RecordedFile],
+        deleted_paths: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, atomic_core::record::workflow::ProjectedPathBinding>,
+        RepositoryError,
+    >
+    where
+        T: atomic_core::pristine::GraphTxnT
+            + atomic_core::pristine::TreeTxnT
+            + atomic_core::pristine::PathClaimTxnT
+            + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
+    {
+        use atomic_core::record::workflow::ancestor_directories;
+        use std::collections::{BTreeSet, HashMap};
+
+        let mut wanted: BTreeSet<String> = BTreeSet::new();
+        for file in recorded_files {
+            wanted.extend(ancestor_directories(file.path()));
+            if let Some(old_path) = file.old_path() {
+                wanted.extend(ancestor_directories(old_path));
+            }
+        }
+        for path in deleted_paths {
+            wanted.extend(ancestor_directories(path));
+        }
+
+        let mut bindings = HashMap::with_capacity(wanted.len());
+        for directory in wanted {
+            if let Some(binding) =
+                self.projected_path_binding_for_visibility(txn, visibility, &directory)?
+            {
+                bindings.insert(directory, binding);
+            }
+        }
+        Ok(bindings)
     }
 
     /// Git directories are implicit: deleting their last descendant also
@@ -2121,7 +2179,7 @@ impl Repository {
         expectation: &StagedExpectation,
         git_commit_sha: Option<&str>,
         parent_interpretation_closure: &[Hash],
-        supersede_excluded: bool,
+        supersede: &[Hash],
     ) -> Result<SynthesisOutcome, RepositoryError> {
         use atomic_core::pristine::ViewTxnT;
         use atomic_core::record::workflow::assemble_change;
@@ -2163,6 +2221,21 @@ impl Repository {
                     recorded_files,
                     deleted_paths,
                 )?;
+                // Parent-directory anchors resolved through the assembly
+                // closure: under a preserved incremental import the ambient
+                // TREE/DIRECTORIES hold the bindings only in the deferred
+                // lifecycle journal (or bind them to another view's inode),
+                // so globalization's `ensure_directory_anchor` /
+                // `resolve_path_to_inode` must consult these projected
+                // bindings before the ambient indexes — otherwise nested
+                // adds emit duplicate DirAdd claims and directory deletions
+                // fail to resolve their parents.
+                let projected_paths = self.assembly_projected_paths(
+                    &txn,
+                    &visibility,
+                    &recorded_files,
+                    deleted_paths,
+                )?;
                 let view_graph = atomic_core::pristine::ViewGraph::new(&txn, visibility);
                 // CB-9C: imported trees legitimately contain empty tracked
                 // files (`.gitkeep`, lockfile placeholders). Their FileAdd
@@ -2187,7 +2260,8 @@ impl Repository {
                     header.clone(),
                     &AssemblyOptions::new()
                         .max_content_size(content_budget)
-                        .include_empty_files(true),
+                        .include_empty_files(true)
+                        .projected_paths(projected_paths),
                 ) {
                     Ok(result) => {
                         let change = result.into_change();
@@ -2286,25 +2360,25 @@ impl Repository {
                     .map_err(|e| RepositoryError::Database(e.to_string()))?
                     .is_some();
                 let applied = txn
-                    .has_change_in_graph(change_id)
+                    .was_change_applied(change_id)
                     .map_err(|e| RepositoryError::Database(e.to_string()))?;
                 (in_view, applied)
             };
             if in_view {
                 // Review C4: an already-known hash cannot bypass the
-                // supersede alignment. When this synthesis would supersede
-                // assembly exclusions, the published effective view must not
-                // still contain them — including through ancestors. A
+                // supersede alignment. When this synthesis supersedes
+                // genuinely replaced history, the published effective view
+                // must not still contain it — including through ancestors. A
                 // survivor means the boundary cannot be aligned without
                 // touching ancestor/unrelated work: refuse instead of
-                // reporting a clean already-in-view outcome.
-                if supersede_excluded && !assembly_excluded.is_empty() {
+                // reporting a clean already-in-view outcome. Same-closure
+                // sibling legs are never superseded and legitimately survive.
+                if !supersede.is_empty() {
                     let txn = self
                         .pristine
                         .read_txn()
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
-                    let survivors =
-                        self.surviving_exclusions(&txn, view_name, assembly_excluded)?;
+                    let survivors = self.surviving_exclusions(&txn, view_name, supersede)?;
                     if !survivors.is_empty() {
                         let named = survivors
                             .iter()
@@ -2337,6 +2411,15 @@ impl Repository {
                         .load_change(&hash)
                         .map_err(|e| RepositoryError::Database(e.to_string()))?;
                     let txn = operation_lock.begin_write_immediate()?;
+                    // Verification mode (review C4): prove the effective
+                    // boundary only when every assembly exclusion left the
+                    // effective membership (genuinely replaced history);
+                    // retained same-closure sibling legs keep the isolated
+                    // assembly filter, which is this commit's own
+                    // interpretation.
+                    let verify_effective = self
+                        .surviving_exclusions(&*txn, view_name, assembly_excluded)?
+                        .is_empty();
                     let verification = self.verify_staged_projection(
                         &txn,
                         view_name,
@@ -2344,7 +2427,7 @@ impl Repository {
                         assembly_excluded,
                         expectation,
                         &hash,
-                        supersede_excluded,
+                        verify_effective,
                     );
                     // The transaction is dropped uncommitted: this is a
                     // read-side proof, not a mutation stage.
@@ -2381,21 +2464,24 @@ impl Repository {
                     timings,
                     assembly_excluded,
                     expectation,
-                    supersede_excluded,
+                    supersede,
                 );
             }
         }
 
         // 3. Journal the SynthesizeGit intent before any visible effect.
         //
-        // CB-9B review B4: when the caller supersedes its assembly
-        // exclusions (single-parent rewrite synthesis), the excluded
+        // CB-9B review B4: when the caller supersedes genuinely replaced
+        // history (single-parent rewrite synthesis), the replaced
         // Git-origin members that live in THIS view leave the view in the
         // same journal operation that adds the new change, so the published
         // boundary equals the commit's exact interpreted closure. Members
         // living in ancestor views are never removed: ancestor views are
         // shared perspectives whose membership other work depends on
-        // (review B4: preserve other views/history).
+        // (review B4: preserve other views/history). Same-closure sibling
+        // legs are assembly-excluded but never superseded: the import target
+        // still reaches them, and the merge resolution re-references them
+        // through `ensure_union_state`.
         let working_copy = operation_lock.working_copy();
         let (before_state, after_state, sequence, removal_transitions) = {
             let txn = self
@@ -2410,19 +2496,17 @@ impl Repository {
                 })?;
             let mut excluded_ids: std::collections::HashSet<atomic_core::types::NodeId> =
                 std::collections::HashSet::new();
-            if supersede_excluded {
-                for excluded in assembly_excluded {
-                    let id = txn
-                        .get_internal(excluded)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?
-                        .ok_or_else(|| RepositoryError::InvalidOperation {
-                            message: format!(
-                                "superseded assembly exclusion names change {} which is not registered locally",
-                                excluded.to_base32()
-                            ),
-                        })?;
-                    excluded_ids.insert(id);
-                }
+            for excluded in supersede {
+                let id = txn
+                    .get_internal(excluded)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::InvalidOperation {
+                        message: format!(
+                            "superseded assembly exclusion names change {} which is not registered locally",
+                            excluded.to_base32()
+                        ),
+                    })?;
+                excluded_ids.insert(id);
             }
             let mut removal_transitions: Vec<MetadataTransition> = Vec::new();
             let mut after_view_state = Merkle::ZERO;
@@ -2526,7 +2610,7 @@ impl Repository {
             expectation,
             git_commit_sha,
             parent_interpretation_closure,
-            supersede_excluded,
+            supersede,
         );
 
         match apply_result {
@@ -2555,10 +2639,12 @@ impl Repository {
     /// apply.
     ///
     /// Review C4: the reference path carries the same supersede alignment and
-    /// pre-publication verification duties as the apply path — excluded
-    /// target-local members leave the view inside the same transaction,
-    /// ancestor survivors refuse before commit, and the staged proof runs
-    /// against the actual post-alignment effective view closure.
+    /// pre-publication verification duties as the apply path — genuinely
+    /// replaced target-local members leave the view inside the same
+    /// transaction, ancestor survivors refuse before commit, and the staged
+    /// proof runs against the actual post-alignment effective view closure
+    /// whenever every assembly exclusion left the effective membership
+    /// (retained same-closure sibling legs keep the isolated filter).
     ///
     /// Review D1: the prepared operation carries the exact lease set the
     /// fresh-apply path prepares — every target-local exclusion becomes a
@@ -2578,7 +2664,7 @@ impl Repository {
         mut timings: super::ImportWriteTimings,
         assembly_excluded: &[Hash],
         expectation: &StagedExpectation,
-        supersede_excluded: bool,
+        supersede: &[Hash],
     ) -> Result<SynthesisOutcome, RepositoryError> {
         use atomic_core::apply::compute_new_state;
 
@@ -2593,7 +2679,9 @@ impl Repository {
         // FINAL position after the compaction — never the pre-removal count.
         // Preparing stale leases here committed membership that the lease
         // verification then rejected outside the transaction, leaving a
-        // Prepared head that blocked ordinary reopen (review D1).
+        // Prepared head that blocked ordinary reopen (review D1). Only the
+        // genuinely replaced history in `supersede` becomes removal leases;
+        // same-closure sibling legs stay members of the union.
         let (before_state, after_state, final_sequence, removal_transitions) = {
             let txn = self
                 .pristine
@@ -2607,19 +2695,17 @@ impl Repository {
                 })?;
             let mut excluded_ids: std::collections::HashSet<atomic_core::types::NodeId> =
                 std::collections::HashSet::new();
-            if supersede_excluded {
-                for excluded in assembly_excluded {
-                    let id = txn
-                        .get_internal(excluded)
-                        .map_err(|e| RepositoryError::Database(e.to_string()))?
-                        .ok_or_else(|| RepositoryError::InvalidOperation {
-                            message: format!(
-                                "superseded assembly exclusion names change {} which is not registered locally",
-                                excluded.to_base32()
-                            ),
-                        })?;
-                    excluded_ids.insert(id);
-                }
+            for excluded in supersede {
+                let id = txn
+                    .get_internal(excluded)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::InvalidOperation {
+                        message: format!(
+                            "superseded assembly exclusion names change {} which is not registered locally",
+                            excluded.to_base32()
+                        ),
+                    })?;
+                excluded_ids.insert(id);
             }
             let mut removal_transitions: Vec<MetadataTransition> = Vec::new();
             let mut after_view_state = Merkle::ZERO;
@@ -2708,12 +2794,13 @@ impl Repository {
         let apply_start = std::time::Instant::now();
         let apply_result = (|| -> Result<ImportWriteOutcome, RepositoryError> {
             let mut txn = operation_lock.begin_write_immediate()?;
-            // Review C4: supersede target-local exclusions and refuse
+            // Review C4: supersede target-local replaced history and refuse
             // ancestor survivors BEFORE the reference is published, mirroring
-            // the apply path's alignment contract.
-            if supersede_excluded {
-                self.supersede_excluded_members_locked(&mut txn, view_name, assembly_excluded)?;
-                let survivors = self.surviving_exclusions(&*txn, view_name, assembly_excluded)?;
+            // the apply path's alignment contract. Same-closure sibling legs
+            // are never superseded and stay members of the union.
+            if !supersede.is_empty() {
+                self.supersede_excluded_members_locked(&mut txn, view_name, supersede)?;
+                let survivors = self.surviving_exclusions(&*txn, view_name, supersede)?;
                 if !survivors.is_empty() {
                     let named = survivors
                         .iter()
@@ -2745,6 +2832,12 @@ impl Repository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             // Review C4: the referenced change must render its commit tree
             // through the post-alignment view before the transaction commits.
+            // The effective boundary is proven when every assembly exclusion
+            // left the effective membership; retained sibling legs keep the
+            // isolated assembly filter (this commit's own interpretation).
+            let verify_effective = self
+                .surviving_exclusions(&*txn, view_name, assembly_excluded)?
+                .is_empty();
             self.verify_staged_projection(
                 &txn,
                 view_name,
@@ -2754,7 +2847,7 @@ impl Repository {
                 assembly_excluded,
                 expectation,
                 hash,
-                supersede_excluded,
+                verify_effective,
             )?;
             let outcome = ImportWriteOutcome {
                 hash: *hash,
@@ -2808,11 +2901,60 @@ impl Repository {
         expectation: &StagedExpectation,
         git_commit_sha: Option<&str>,
         parent_interpretation_closure: &[Hash],
-        supersede_excluded: bool,
+        supersede: &[Hash],
+    ) -> Result<ImportWriteOutcome, RepositoryError> {
+        let mut write = self.apply_synthesized_change_in_txn(
+            &mut txn,
+            view_name,
+            hash,
+            v3_bytes,
+            final_change,
+            deleted_paths,
+            preserve_existing_tree_paths,
+            options,
+            assembly_excluded,
+            expectation,
+            git_commit_sha,
+            parent_interpretation_closure,
+            supersede,
+        )?;
+        let commit_start = std::time::Instant::now();
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let commit_disk_ms = commit_start.elapsed().as_millis();
+        write.timings.commit_ms += commit_disk_ms;
+        if std::env::var_os("ATOMIC_TRACE_GIT_IMPORT").is_some() {
+            eprintln!(
+                "[git-import] commit {}: commit_disk={}ms",
+                hash.to_base32(),
+                commit_disk_ms,
+            );
+        }
+        Ok(write)
+    }
+
+    /// Stage and verify one interpretation without committing. The caller owns
+    /// the ordered operation lock, prepared journal operation and transaction.
+    /// This is the same mutation path used by ordinary single-change synthesis.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn apply_synthesized_change_in_txn(
+        &self,
+        txn: &mut atomic_core::pristine::WriteTxn<'_>,
+        view_name: &str,
+        hash: &Hash,
+        v3_bytes: &[u8],
+        final_change: &Change,
+        deleted_paths: &[String],
+        preserve_existing_tree_paths: bool,
+        options: &crate::InsertOptions,
+        assembly_excluded: &[Hash],
+        expectation: &StagedExpectation,
+        git_commit_sha: Option<&str>,
+        parent_interpretation_closure: &[Hash],
+        supersede: &[Hash],
     ) -> Result<ImportWriteOutcome, RepositoryError> {
         use crate::apply::write_change_to_graph;
         use atomic_core::apply::compute_new_state;
-        use atomic_core::pristine::GraphTxnT;
 
         // Deterministic test fault: fails the mutation stage after the
         // SynthesizeGit intent was journaled, exercising the recovery path.
@@ -2862,16 +3004,16 @@ impl Repository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
 
-        // The change's hunks are applied only when its vertices are not yet
-        // in the global graph. A registered-but-unapplied change (interrupted
+        // The change's hunks are applied only when ingestion has not completed.
+        // A registered-but-unapplied change (interrupted
         // import, draft reference) is applied normally; anything already in
         // the graph is reference-only and was routed before this stage.
         let already_applied = txn
-            .has_change_in_graph(change_id)
+            .was_change_applied(change_id)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let tree_projection = self.plan_tree_projection(
-            &mut txn,
+            txn,
             change_id,
             *hash,
             final_change,
@@ -2906,7 +3048,7 @@ impl Repository {
             )
         } else {
             write_change_to_graph(
-                &mut txn,
+                txn,
                 view_name,
                 change_id,
                 hash,
@@ -2957,7 +3099,7 @@ impl Repository {
             failpoints::semantic_corrupt_trunk_deleted(&mut *txn, &untouched_paths)?;
         }
         self.apply_tree_projection(
-            &mut txn,
+            txn,
             &tree_projection,
             view_name,
             preserve_existing_tree_paths,
@@ -2965,21 +3107,23 @@ impl Repository {
         let projection_done = commit_start.elapsed();
 
         // CB-9B review B4 + C4: align the published target to the exact
-        // intended closure BEFORE verification. Every superseded assembly
-        // exclusion leaves this view inside the same transaction, so the
-        // staged full-tree check below proves the post-publication view
-        // state — not just the isolated interpretation — and a failing check
-        // aborts before commit, so no misaligned boundary or failing
-        // successor is ever published.
-        if supersede_excluded {
-            self.supersede_excluded_members_locked(&mut txn, view_name, assembly_excluded)?;
+        // intended closure BEFORE verification. Genuinely replaced history
+        // in `supersede` leaves this view inside the same transaction, so
+        // the staged full-tree check below can prove the post-publication
+        // view state — not just the isolated interpretation — and a failing
+        // check aborts before commit, so no misaligned boundary or failing
+        // successor is ever published. Same-closure sibling legs are
+        // assembly-excluded but never superseded; the isolated filter
+        // remains their proof, and the merge resolution re-references them.
+        if !supersede.is_empty() {
+            self.supersede_excluded_members_locked(txn, view_name, supersede)?;
             // Review C4: the alignment removes target-local members only.
             // An exclusion that also lives in an ANCESTOR view survives the
             // removal and would remain visible in the published effective
             // view while a filtered check hid it. Refuse before commit:
             // ancestor views are shared perspectives and are never
             // flattened or deleted to make alignment pass.
-            let survivors = self.surviving_exclusions(&*txn, view_name, assembly_excluded)?;
+            let survivors = self.surviving_exclusions(&*txn, view_name, supersede)?;
             if !survivors.is_empty() {
                 let named = survivors
                     .iter()
@@ -3000,17 +3144,25 @@ impl Repository {
         // Fail-closed verification of the staged state, still inside the
         // same pristine write transaction: an error aborts before commit, so
         // no failing state or successor can become visible or verified.
-        // The supersede path verifies the ACTUAL post-alignment effective
-        // view closure — no exclusion subtraction — so the proof covers
-        // exactly what publication will show (review C4).
+        // Verification mode (review C4): when every assembly exclusion left
+        // the effective membership (genuinely replaced history was evicted,
+        // or there were no exclusions), the check proves the ACTUAL
+        // post-alignment effective view closure — no exclusion subtraction —
+        // covering exactly what publication will show. Retained sibling
+        // legs keep the isolated assembly filter: the proof is this commit's
+        // own interpreted closure, and the union boundary is the merge
+        // resolution's staged check.
+        let verify_effective = self
+            .surviving_exclusions(&*txn, view_name, assembly_excluded)?
+            .is_empty();
         self.verify_staged_projection(
-            &txn,
+            txn,
             view_name,
             final_change,
             assembly_excluded,
             expectation,
             hash,
-            supersede_excluded,
+            verify_effective,
         )
         .map_err(|error| RepositoryError::InvalidOperation {
             message: format!(
@@ -3020,16 +3172,13 @@ impl Repository {
         })?;
         let verify_done = commit_start.elapsed();
 
-        txn.commit()
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
         timings.commit_ms = commit_start.elapsed().as_millis();
         if std::env::var_os("ATOMIC_TRACE_GIT_IMPORT").is_some() {
             eprintln!(
-                "[git-import] write phases {}: projection={}ms verify={}ms commit_disk={}ms",
+                "[git-import] staged write phases {}: projection={}ms verify={}ms",
                 hash.to_base32(),
                 projection_done.as_millis(),
                 (verify_done - projection_done).as_millis(),
-                (commit_start.elapsed() - verify_done).as_millis(),
             );
         }
 
@@ -3184,7 +3333,7 @@ impl Repository {
     /// side of the comparison is the expectation captured from the commit's
     /// tree, the Atomic side is the freshly applied graph state.
     #[allow(clippy::too_many_arguments)]
-    fn verify_staged_projection(
+    pub(super) fn verify_staged_projection(
         &self,
         txn: &atomic_core::pristine::WriteTxn<'_>,
         view_name: &str,
@@ -3345,6 +3494,14 @@ impl Repository {
         let verify_start = std::time::Instant::now();
         let projection = self.project_tree_for_visibility(txn, visibility)?;
         let _projection_ms = verify_start.elapsed().as_millis();
+        // The projection keys paths by the graph's own spelling (raw for
+        // native tracking and current imports, escaped for earlier imports);
+        // the expectation keys are canonical identities.
+        let present_by_identity: std::collections::HashMap<String, _> = projection
+            .present
+            .iter()
+            .map(|(path, item)| (crate::canonical_path_identity(path), item))
+            .collect();
         if !projection.name_conflicts.is_empty() {
             let mut conflicted_paths: Vec<&str> = projection
                 .name_conflicts
@@ -3363,7 +3520,7 @@ impl Repository {
 
         for (path, expected) in &expected_tree.entries {
             let path_start = std::time::Instant::now();
-            let Some(item) = projection.present.get(path) else {
+            let Some(item) = present_by_identity.get(path) else {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
                         "staged tree is missing '{path}' but the commit's Git tree requires it"
@@ -3389,6 +3546,39 @@ impl Repository {
                 message: format!("staged retrieval failed for '{path}': {error}"),
             })?;
             if rendered.as_slice() != expected.bytes.as_slice() {
+                if std::env::var_os("ATOMIC_DEBUG_DELETION").is_some() {
+                    let first_diff = rendered
+                        .iter()
+                        .zip(expected.bytes.iter())
+                        .position(|(a, b)| a != b)
+                        .unwrap_or_else(|| rendered.len().min(expected.bytes.len()));
+                    eprintln!(
+                        "[debug-deletion] graph MISMATCH path={path} commit={} rendered={} expected={} first_diff_at={first_diff}",
+                        final_change.hashed.header.message.lines().next().unwrap_or(""),
+                        rendered.len(),
+                        expected.bytes.len()
+                    );
+                    eprintln!(
+                        "[debug-deletion] rendered[..first_diff+72]={:?}",
+                        String::from_utf8_lossy(
+                            &rendered[first_diff..(first_diff + 72).min(rendered.len())]
+                        )
+                    );
+                    eprintln!(
+                        "[debug-deletion] expected[..first_diff+72]={:?}",
+                        String::from_utf8_lossy(
+                            &expected.bytes
+                                [first_diff..(first_diff + 72).min(expected.bytes.len())]
+                        )
+                    );
+                    eprintln!(
+                        "[debug-deletion] rendered tail={:?} expected tail={:?}",
+                        String::from_utf8_lossy(&rendered[rendered.len().saturating_sub(48)..]),
+                        String::from_utf8_lossy(
+                            &expected.bytes[expected.bytes.len().saturating_sub(48)..]
+                        )
+                    );
+                }
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
                         "staged path '{path}' renders {} byte(s) but the commit tree expects {} byte(s)",
@@ -3517,13 +3707,14 @@ impl Repository {
             {
                 continue;
             }
-            if expected_tree.entries.contains_key(path)
+            let identity = crate::canonical_path_identity(path);
+            if expected_tree.entries.contains_key(&identity)
                 || crate::repository::project_tree::atomic_private_path(path.as_bytes())
-                || crate::repository::project_tree::bridge_private_path(path.as_bytes())
+                || crate::repository::project_tree::shim_private_path(path.as_bytes())
                 || expected_tree
                     .verify_paths
                     .as_ref()
-                    .is_some_and(|paths| !paths.contains(path))
+                    .is_some_and(|paths| !paths.contains(&identity))
             {
                 continue;
             }
@@ -3536,7 +3727,7 @@ impl Repository {
         // Every required structural directory must project present and as an
         // actual directory (not a file collision at an interior path).
         for directory in &required_directories {
-            match projection.present.get(*directory) {
+            match present_by_identity.get(*directory) {
                 Some(item) if item.is_directory => {}
                 Some(_) => {
                     return Err(RepositoryError::InvalidOperation {
@@ -3578,11 +3769,13 @@ impl Repository {
         //    or a pre-semantic legacy change) is content-checked by the
         //    graph layer above, not waived here — its semantic state simply
         //    does not exist to compare.
-        let staged_file_ops: std::collections::HashMap<&str, &atomic_core::change::FileOps> =
+        // File ops carry the repository's raw spelling of a path; the
+        // expectation keys carry the canonical escaped identity.
+        let staged_file_ops: std::collections::HashMap<String, &atomic_core::change::FileOps> =
             final_change
                 .file_ops()
                 .iter()
-                .map(|ops| (ops.path(), ops))
+                .map(|ops| (crate::canonical_path_identity(ops.path()), ops))
                 .collect();
         // Preload the interpreted closure ONCE for every path's semantic
         // verification (review ::15 scaling fix, 2026-09-16): the historical
@@ -3646,10 +3839,22 @@ impl Repository {
             // domain; opaque content is guarded by the same trunk
             // existence/identity/lifecycle checks plus the graph-layer byte
             // equality above.
-            let Some(item) = projection.present.get(path) else {
+            let Some(item) = present_by_identity.get(path) else {
                 // Already refused above; nothing further to reconstruct.
                 continue;
             };
+            if expected_tree
+                .semantic_verify_paths
+                .as_ref()
+                .is_some_and(|scope| !scope.contains(path))
+            {
+                // An untouched trunk of a plain child commit: its closure is
+                // exactly what the previous verification replayed. The raw
+                // consumer walker is not a substitute here: a WIP evidence
+                // snapshot legitimately leaves out-of-closure rows on the
+                // trunk that only the closure-aware replay can attribute.
+                continue;
+            }
             let semantic_start = std::time::Instant::now();
             self.verify_staged_semantic_closure(
                 txn,
@@ -3671,7 +3876,7 @@ impl Repository {
             }
         }
         for path in &expected_tree.semantic_paths {
-            if !staged_file_ops.contains_key(path.as_str()) {
+            if !staged_file_ops.contains_key(&crate::canonical_path_identity(path)) {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
                         "staged change carries no semantic FileOps for '{path}'; the semantic layer must reconstruct it"
@@ -3770,6 +3975,53 @@ impl Repository {
         let mut closure_created: std::collections::HashSet<atomic_core::crdt::BranchId> =
             std::collections::HashSet::new();
 
+        // The caller has already resolved this path through the canonical
+        // graph filtered by the effective closure and rejected name conflicts.
+        // Its stable inode position, not the ambient path index, identifies
+        // the file whose semantic history we must replay. Bind that identity
+        // to its creating FileOps through the same change's canonical FileAdd.
+        // A deleted predecessor with the same path belongs to another trunk.
+        let mut canonical_trunks = std::collections::HashSet::new();
+        for (change_id, change, _) in staged_closure {
+            if *change_id != file_position.change {
+                continue;
+            }
+            for hunk in change.hunks() {
+                if let atomic_core::change::GraphOp::FileAdd {
+                    add_inode,
+                    path: created_path,
+                    ..
+                } = hunk
+                {
+                    if add_inode.start != file_position.pos {
+                        continue;
+                    }
+                    for ops in change.file_ops() {
+                        if ops.path() == created_path
+                            && matches!(
+                                ops.trunk_op(),
+                                Some(atomic_core::crdt::TrunkOp::Create { .. })
+                            )
+                        {
+                            let raw = ops.trunk_id();
+                            let resolved = if raw.change_id().is_root() {
+                                atomic_core::crdt::TrunkId::new(*change_id, raw.file_idx())
+                            } else {
+                                raw
+                            };
+                            canonical_trunks.insert(resolved);
+                        }
+                    }
+                }
+            }
+        }
+        if canonical_trunks.len() > 1 {
+            return Err(format!(
+                "multiple semantic trunks claim the canonical inode for '{path}'"
+            ));
+        }
+        let canonical_trunk = canonical_trunks.into_iter().next();
+
         // ── 1a. Trunk-identity discovery across Move ops (review CB-9C R2). ─
         //
         // A pure imported rename is a real semantic move: the closure's move
@@ -3811,15 +4063,15 @@ impl Repository {
         }
         let identity_trunks: std::collections::HashSet<atomic_core::crdt::TrunkId> = last_move
             .iter()
-            .filter(|(_, target)| target.as_str() == path)
+            .filter(|(_, target)| crate::canonical_path_identity(target) == path)
             .map(|(trunk, _)| *trunk)
             .collect();
         let moved_away: std::collections::HashSet<atomic_core::crdt::TrunkId> = last_move
             .iter()
-            .filter(|(_, target)| target.as_str() != path)
+            .filter(|(_, target)| crate::canonical_path_identity(target) != path)
             .map(|(trunk, _)| *trunk)
             .collect();
-        if identity_trunks.len() > 1 {
+        if canonical_trunk.is_none() && identity_trunks.len() > 1 {
             return Err(format!(
                 "{} distinct trunks' final moves retarget path '{path}' inside one \
                  interpreted closure; the semantic move chain is contradictory",
@@ -3839,7 +4091,7 @@ impl Repository {
         let mut pending_delete: Option<atomic_core::crdt::TrunkId> = None;
         for (change_id, change, _offsets) in staged_closure {
             for ops in change.file_ops() {
-                if ops.path() != path {
+                if crate::canonical_path_identity(ops.path()) != path {
                     continue;
                 }
                 match ops.trunk_op() {
@@ -3887,9 +4139,28 @@ impl Repository {
                 };
                 let trunk_followed = identity_trunks.contains(&resolved_trunk)
                     && !moved_away.contains(&resolved_trunk);
-                let is_target = ((ops.path() == path && !moved_away.contains(&resolved_trunk))
-                    || trunk_followed)
-                    && !superseded.contains(&resolved_trunk);
+                if std::env::var_os("ATOMIC_DEBUG_DELETION").is_some() {
+                    eprintln!(
+                        "[debug-deletion] replay {path}: change {change_id:?} entry {entry_index} ops.path={:?} resolved_trunk={resolved_trunk:?} canonical={canonical_trunk:?} trunk_op={:?} line_ops={}",
+                        ops.path(),
+                        ops.trunk_op(),
+                        ops.line_ops().len()
+                    );
+                    for line_op in ops.line_ops() {
+                        eprintln!("[debug-deletion]     line_op {line_op:?}");
+                    }
+                }
+                let is_target = match canonical_trunk {
+                    Some(identity) => resolved_trunk == identity,
+                    // Retain compatibility with semantic-only legacy creates
+                    // which have no canonical FileAdd binding.
+                    None => {
+                        ((crate::canonical_path_identity(ops.path()) == path
+                            && !moved_away.contains(&resolved_trunk))
+                            || trunk_followed)
+                            && !superseded.contains(&resolved_trunk)
+                    }
+                };
                 if is_target {
                     match ops.trunk_op() {
                         Some(atomic_core::crdt::TrunkOp::Create { encoding, .. }) => {
@@ -4061,16 +4332,99 @@ impl Repository {
         // another view may have moved its ambient path index. Accept that
         // derived location only when an applied out-of-closure Move proves it;
         // a missing/corrupt index without such history remains an error.
-        let indexed_trunk = txn.get_trunk_by_path(path).map_err(|e| e.to_string())?;
-        let expected_identity = identity_trunks.iter().next().copied().or(created_trunk);
+        // The CRDT path index is keyed by the file ops' own spelling of the
+        // path (raw since the path-boundary fix, escaped in earlier imports);
+        // `path` is the canonical escaped identity, so try the raw spelling
+        // first and fall back to the identity itself.
+        let indexed_trunk = {
+            let raw = crate::unescape_repo_path(path)
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                // Literal-percent paths use their stored escaped spelling;
+                // a decoded lookup could select a distinct lookalike's trunk.
+                .filter(|raw| raw != path && !raw.contains('%'));
+            let by_raw = match raw.as_deref() {
+                Some(raw) => txn.get_trunk_by_path(raw).map_err(|e| e.to_string())?,
+                None => None,
+            };
+            match by_raw {
+                Some(trunk) => Some(trunk),
+                None => txn.get_trunk_by_path(path).map_err(|e| e.to_string())?,
+            }
+        };
+        let expected_identity = canonical_trunk
+            .or_else(|| identity_trunks.iter().next().copied())
+            .or(created_trunk);
         let mut concurrent_path = false;
         let mut resolved_trunk = indexed_trunk;
         if let Some(expected) = expected_identity {
+            // Concurrent same-name creates share the ambient path index.
+            // An explicit graph resolution may retain either inode, while
+            // PATH_TRUNK still points at the other historical claimant.
+            // Authenticate that claimant by its actual applied Create;
+            // never let the last index write choose the closure's identity.
+            if let Some(indexed) = indexed_trunk.filter(|id| *id != expected) {
+                if txn
+                    .was_change_applied(indexed.change_id())
+                    .map_err(|e| e.to_string())?
+                {
+                    if let Some(hash) = txn
+                        .get_external(indexed.change_id())
+                        .map_err(|e| e.to_string())?
+                    {
+                        let creator = self.load_change(&hash).map_err(|e| e.to_string())?;
+                        let mut real_claimant = creator.file_ops().iter().any(|ops| {
+                            crate::canonical_path_identity(ops.path()) == path
+                                && file_ops_target_trunk(ops, indexed.change_id(), indexed)
+                                && matches!(
+                                    ops.trunk_op(),
+                                    Some(atomic_core::crdt::TrunkOp::Create { .. })
+                                )
+                        });
+                        // A competing identity can arrive by rename as well
+                        // as creation at this path. Authenticate both its
+                        // creation and an applied Move to this exact path.
+                        if !real_claimant
+                            && creator.file_ops().iter().any(|ops| {
+                                file_ops_target_trunk(ops, indexed.change_id(), indexed)
+                                    && matches!(
+                                        ops.trunk_op(),
+                                        Some(atomic_core::crdt::TrunkOp::Create { .. })
+                                    )
+                            })
+                        {
+                            for (owner, hash) in
+                                txn.list_registered_changes().map_err(|e| e.to_string())?
+                            {
+                                if !txn.was_change_applied(owner).map_err(|e| e.to_string())? {
+                                    continue;
+                                }
+                                let writer = self.load_change(&hash).map_err(|e| e.to_string())?;
+                                if writer.file_ops().iter().any(|ops| {
+                                    file_ops_target_trunk(ops, owner, indexed)
+                                        && matches!(ops.trunk_op(), Some(atomic_core::crdt::TrunkOp::Move { trunk, new_path })
+                                            if *trunk == indexed && crate::canonical_path_identity(new_path) == path)
+                                }) {
+                                    real_claimant = true;
+                                    break;
+                                }
+                            }
+                        }
+                        let row_agrees = txn
+                            .get_crdt_trunk(&encode_trunk_id(&indexed))
+                            .map_err(|e| e.to_string())?
+                            .is_some_and(|row| crate::canonical_path_identity(&row.path) == path);
+                        if real_claimant && row_agrees {
+                            resolved_trunk = Some(expected);
+                        }
+                    }
+                }
+            }
             if let Some(row) = txn
                 .get_crdt_trunk(&encode_trunk_id(&expected))
                 .map_err(|e| e.to_string())?
             {
-                if row.path != path
+                if crate::canonical_path_identity(&row.path) != path
                     && txn
                         .get_trunk_by_path(&row.path)
                         .map_err(|e| e.to_string())?
@@ -4081,7 +4435,7 @@ impl Repository {
                     {
                         if visibility.contains(writer_id)
                             || !txn
-                                .has_change_in_graph(writer_id)
+                                .was_change_applied(writer_id)
                                 .map_err(|e| e.to_string())?
                         {
                             continue;
@@ -4140,7 +4494,7 @@ impl Repository {
             .ok_or_else(|| {
                 "the path→trunk mapping resolves but the trunk row is missing".to_string()
             })?;
-        if trunk_row.path != path && !concurrent_path {
+        if crate::canonical_path_identity(&trunk_row.path) != path && !concurrent_path {
             return Err(format!(
                 "the path→trunk mapping resolves to a trunk row claiming path {:?}; the \
                  semantic index is corrupt",
@@ -4183,7 +4537,7 @@ impl Repository {
             let loader = |hash: &Hash| -> Result<Change, String> {
                 self.load_change(hash).map_err(|e| e.to_string())
             };
-            if out_of_closure_writer_deleted_trunk(&loader, txn, path, visibility)? {
+            if out_of_closure_writer_deleted_trunk(&loader, txn, trunk_key, visibility)? {
                 // A validated out-of-closure writer recorded the semantic
                 // delete: genuine concurrent state (review D2).
                 concurrent_state = true;
@@ -4203,6 +4557,8 @@ impl Repository {
             // text tokens). Lifecycle was verified above (review D2).
             return Ok(());
         }
+
+        let deletion_evidence = SemanticDeletionCache::new();
 
         // ── 3. Row agreement for the closure's own branch domain. ──────────
         //
@@ -4331,6 +4687,23 @@ impl Repository {
             ConsumerLine,
         > = std::collections::HashMap::new();
 
+        // A tombstoned historical chain that anchors no live line has no
+        // ordering effect on this closure. Audit every live line and all of
+        // its recorded ancestors, including deleted anchors it still uses.
+        let mut ordering_domain = std::collections::HashSet::new();
+        for (id, branch) in &branches {
+            if !branch.state.is_alive() {
+                continue;
+            }
+            let mut next = Some(*id);
+            while let Some(id) = next {
+                if !ordering_domain.insert(id) {
+                    break;
+                }
+                next = branches.get(&id).and_then(|branch| branch.after);
+            }
+        }
+        let mut concurrent_after = None;
         let mut replay_alive_ids: Vec<atomic_core::crdt::BranchId> = Vec::new();
         for (branch_id, expected) in &branches {
             let branch_key = encode_branch_id(branch_id);
@@ -4350,6 +4723,71 @@ impl Repository {
                     "branch {branch_id:?} claims a different trunk than the closure \
                      replayed for '{path}'; branch ownership must match the closure"
                 ));
+            }
+            if closure_created.contains(branch_id) && ordering_domain.contains(branch_id) {
+                let stored = txn
+                    .get_crdt_branch_after(&branch_key)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| {
+                        format!("branch {branch_id:?} has no recorded after-reference")
+                    })?;
+                let actual_after = if stored == [0u8; 12] {
+                    None
+                } else {
+                    Some(atomic_core::crdt::tables::decode_branch_id(&stored))
+                };
+                if actual_after != expected.after {
+                    if concurrent_after.is_none() {
+                        let mut bindings = std::collections::HashSet::new();
+                        for (owner, hash) in
+                            txn.list_registered_changes().map_err(|e| e.to_string())?
+                        {
+                            // Ambient AFTER can reflect another valid leg
+                            // inside this merge closure too. Authenticate the
+                            // exact binding against an applied canonical op;
+                            // closure-local order still supplies expected bytes.
+                            if !txn.was_change_applied(owner).map_err(|e| e.to_string())? {
+                                continue;
+                            }
+                            let writer = self.load_change(&hash).map_err(|e| e.to_string())?;
+                            let resolve = |id: atomic_core::crdt::BranchId| {
+                                if id.change_id().is_root() {
+                                    atomic_core::crdt::BranchId::new(owner, id.branch_idx())
+                                } else {
+                                    id
+                                }
+                            };
+                            for ops in writer
+                                .file_ops()
+                                .iter()
+                                .filter(|ops| file_ops_target_trunk(ops, owner, trunk_key))
+                            {
+                                for line in ops.line_ops() {
+                                    let predecessor = match line.operation() {
+                                        atomic_core::crdt::BranchOp::Insert { after, .. } => after,
+                                        atomic_core::crdt::BranchOp::Reparent {
+                                            new_after, ..
+                                        } => new_after,
+                                        _ => continue,
+                                    };
+                                    bindings.insert((
+                                        resolve(line.branch_id()),
+                                        predecessor.map(resolve),
+                                    ));
+                                }
+                            }
+                        }
+                        concurrent_after = Some(bindings);
+                    }
+                    if !concurrent_after
+                        .as_ref()
+                        .unwrap()
+                        .contains(&(*branch_id, actual_after))
+                    {
+                        return Err(format!("branch {branch_id:?} has an after-reference that no applied canonical writer recorded"));
+                    }
+                    concurrent_state = true;
+                }
             }
             let row_vertex = txn
                 .get_crdt_branch_vertex(&branch_key)
@@ -4388,7 +4826,7 @@ impl Repository {
                         Some(node) => graph_proves_dead_with_ownership(
                             self,
                             txn,
-                            path,
+                            trunk_key,
                             *branch_id,
                             node,
                             &global_alive,
@@ -4399,9 +4837,14 @@ impl Repository {
                         let loader = |hash: &Hash| -> Result<Change, String> {
                             self.load_change(hash).map_err(|e| e.to_string())
                         };
-                        out_of_closure_writer_deleted_branch(
-                            &loader, txn, path, *branch_id, visibility,
-                        )?
+                        deletion_evidence
+                            .get_or_init(|| {
+                                SemanticDeletionEvidence::load(&loader, txn, trunk_key, visibility)
+                            })
+                            .as_ref()
+                            .map_err(Clone::clone)?
+                            .outside
+                            .contains(branch_id)
                     };
                     if !attributed {
                         return Err(
@@ -4479,7 +4922,7 @@ impl Repository {
                             .load_change(&writer_hash)
                             .map_err(|e| format!("cannot load concurrent writer: {e}"))?;
                         if !change_wrote_branch_vertex_for_branch(
-                            &writer, path, *branch_id, *row_node,
+                            &writer, trunk_key, *branch_id, *row_node,
                         ) {
                             return Err(format!(
                                 "branch {branch_id:?} is bound to {row_node:?} but the \
@@ -4557,8 +5000,9 @@ impl Repository {
                     let writer = self
                         .load_change(&writer_hash)
                         .map_err(|e| format!("cannot load concurrent writer: {e}"))?;
-                    if !change_wrote_branch_vertex_for_branch(&writer, path, *branch_id, *row_node)
-                    {
+                    if !change_wrote_branch_vertex_for_branch(
+                        &writer, trunk_key, *branch_id, *row_node,
+                    ) {
                         return Err(format!(
                             "branch {branch_id:?} was deleted by the closure but the staged \
                              row is alive bound to {row_node:?}; no applied out-of-closure \
@@ -4654,7 +5098,7 @@ impl Repository {
                             let writer = self
                                 .load_change(&writer_hash)
                                 .map_err(|e| format!("cannot load leaf writer: {e}"))?;
-                            change_wrote_leaf(&writer, path, *branch_id, leaf_id)
+                            change_wrote_leaf(&writer, trunk_key, *branch_id, leaf_id)
                         };
                     if !attributed {
                         return Err(format!(
@@ -4686,20 +5130,50 @@ impl Repository {
             }
         }
 
-        // The closure's semantic replay must regenerate the commit tree:
-        // its alive lines aggregate - joined in the staged after-chain's
-        // file order - to exactly the expected bytes. The CONTENT comes
-        // from the closure replay (each line's own writer blob slice); the
-        // ORDER comes from the staged chain, so a corrupted after-chain
-        // reorders or drops lines and fails closed here (review B2).
+        // Reconstruct the selected closure with its own recorded order.
+        // Ambient AFTER rows are audited above, including exact attribution
+        // for genuine out-of-closure reparenting; they cannot order this view.
+        let closure_chain = super::record::semantic_branch_order(
+            &branches
+                .iter()
+                .map(|(id, branch)| (*id, branch.after))
+                .collect(),
+        )?;
+        let replay_alive_bytes: Vec<u8> = closure_chain
+            .iter()
+            .filter_map(|id| branches.get(id))
+            .filter(|branch| branch.state.is_alive())
+            .flat_map(|branch| branch.bytes.iter().copied())
+            .collect();
         let actual_chain =
             iter_trunk_branches_in_file_order(txn, trunk_key).map_err(|e| e.to_string())?;
-        let mut replay_alive_bytes: Vec<u8> = Vec::new();
+        if std::env::var_os("ATOMIC_DEBUG_DELETION").is_some() {
+            let ids: Vec<_> = staged_closure.iter().map(|(id, _, _)| *id).collect();
+            let expected: Vec<_> = branches
+                .iter()
+                .map(|(id, branch)| {
+                    format!(
+                        "{id:?}:{:?}:{:?}",
+                        branch.state,
+                        String::from_utf8_lossy(&branch.bytes)
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[debug-deletion] summary {path}: closure={ids:?} trunk_key={trunk_key:?} expected={expected:?} actual_chain={actual_chain:?}"
+            );
+        }
         let mut visited: std::collections::HashSet<atomic_core::crdt::BranchId> =
             std::collections::HashSet::new();
+        let debug_semantic = std::env::var_os("ATOMIC_DEBUG_DELETION").is_some();
         for branch_id in &actual_chain {
             visited.insert(*branch_id);
-            let Some(expected) = branches.get(branch_id) else {
+            let Some(_expected) = branches.get(branch_id) else {
+                if debug_semantic {
+                    eprintln!(
+                        "[debug-deletion] chain branch {branch_id:?} UNEXPECTED (no closure entry)"
+                    );
+                }
                 // Review D2: a staged after-chain branch the closure never
                 // wrote is NOT silently skipped. The historical skip let an
                 // unexpected live branch with no vertex into the chain (the
@@ -4717,19 +5191,36 @@ impl Repository {
                     path,
                     trunk_key,
                     *branch_id,
-                    visibility,
-                    &global_alive,
+                    SemanticBranchContext {
+                        visibility,
+                        global_alive: &global_alive,
+                        deletion_evidence: &deletion_evidence,
+                    },
                 )? {
                     consumer_domain.insert(*branch_id, ConsumerLine::Writer(writer_vertex));
                     concurrent_state = true;
                 }
                 continue;
             };
-            if expected.state.is_alive() {
-                replay_alive_bytes.extend_from_slice(&expected.bytes);
-            }
         }
         if replay_alive_bytes.as_slice() != expected_bytes {
+            if std::env::var_os("ATOMIC_DEBUG_DELETION").is_some() {
+                let first_diff = replay_alive_bytes
+                    .iter()
+                    .zip(expected_bytes)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(replay_alive_bytes.len().min(expected_bytes.len()));
+                let window = |bytes: &[u8]| {
+                    let start = first_diff.saturating_sub(40);
+                    let end = (first_diff + 80).min(bytes.len());
+                    String::from_utf8_lossy(&bytes[start.min(bytes.len())..end]).into_owned()
+                };
+                eprintln!(
+                    "[debug-deletion] semantic MISMATCH path={path} first_diff_at={first_diff} replay={:?} expected={:?}",
+                    window(&replay_alive_bytes),
+                    window(expected_bytes)
+                );
+            }
             return Err(format!(
                 "the closure's semantic operations render {} byte(s) for the alive lines but \
                      the commit tree expects {} byte(s); the semantic closure must regenerate \
@@ -4819,13 +5310,15 @@ impl Repository {
         path: &str,
         trunk_key: atomic_core::crdt::TrunkId,
         branch: atomic_core::crdt::BranchId,
-        visibility: &atomic_core::pristine::GraphVisibilityClosure,
-        global_alive: &std::collections::HashSet<
-            atomic_core::types::GraphNode<atomic_core::types::NodeId>,
-        >,
+        context: SemanticBranchContext<'_>,
     ) -> Result<Option<atomic_core::types::GraphNode<atomic_core::types::NodeId>>, String> {
         use atomic_core::crdt::tables::encode_branch_id;
         use atomic_core::pristine::{CrdtTxnT, GraphTxnT};
+        let SemanticBranchContext {
+            visibility,
+            global_alive,
+            deletion_evidence,
+        } = context;
         let branch_key = encode_branch_id(&branch);
         let row = txn
             .get_crdt_branch(&branch_key)
@@ -4859,13 +5352,21 @@ impl Repository {
                 .map_err(|e| e.to_string())?
                 .as_ref()
             {
-                Some(node) => {
-                    graph_proves_dead_with_ownership(self, txn, path, branch, node, global_alive)?
-                }
+                Some(node) => graph_proves_dead_with_ownership(
+                    self,
+                    txn,
+                    trunk_key,
+                    branch,
+                    node,
+                    global_alive,
+                )?,
                 None => false,
-            } || out_of_closure_writer_deleted_branch(
-                &loader, txn, path, branch, visibility,
-            )? || applied_writer_deleted_branch(&loader, txn, path, branch)?;
+            } || deletion_evidence
+                .get_or_init(|| SemanticDeletionEvidence::load(&loader, txn, trunk_key, visibility))
+                .as_ref()
+                .map_err(Clone::clone)?
+                .applied
+                .contains(&branch);
             if !attributed {
                 return Err(
                     "the staged file-order chain contains a branch the closure never wrote \
@@ -4912,7 +5413,7 @@ impl Repository {
         // FileOps must record THIS branch id bound to THIS vertex for this
         // path; a different file's vertex at a matching range is not this
         // branch's content.
-        if !change_wrote_branch_vertex_for_branch(&writer, path, branch, row_node) {
+        if !change_wrote_branch_vertex_for_branch(&writer, trunk_key, branch, row_node) {
             return Err(format!(
                 "branch {branch:?} is bound to {row_node:?} but no applied out-of-closure \
                  change recorded that binding for '{path}'; the binding is corruption"
@@ -4921,3 +5422,6 @@ impl Repository {
         Ok(Some(row_node))
     }
 }
+
+#[cfg(test)]
+mod streaming_sample;

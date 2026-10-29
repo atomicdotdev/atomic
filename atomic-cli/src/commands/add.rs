@@ -508,20 +508,18 @@ impl Command for Add {
             }
         }
 
-        // CB-11A: in a colocated bridge workspace, `atomic add` records
+        // CB-11A: in a colocated shim workspace, `atomic add` records
         // durable tracking intent AND creates an intent-to-add Git index
         // entry (RFC §3.4, §9.3). The index entry records intent only — no
         // content is staged, and `status --git` reports the path as
         // unstaged-new, never as staged content. Durable `TREE` is written by
         // the tracking call above, never by this index entry. A working copy
-        // that never enrolled in the bridge keeps native `add` semantics and
+        // that never enrolled in the shim keeps native `add` semantics and
         // the user's Git index is left alone (RFC §2).
         if !self.dry_run
             && total_stats.total_added() > 0
             && repo_root.join(".git").exists()
-            && repo
-                .bridge_workspace_active()
-                .map_err(CliError::Repository)?
+            && repo.shim_workspace_active().map_err(CliError::Repository)?
         {
             if let Err(error) = create_intent_to_add_entries(&repo_root, &files_to_add) {
                 print_warning(&format!(
@@ -565,10 +563,7 @@ pub(crate) fn finish_service_add(repo_root: &Path, requested: &[PathBuf]) -> Cli
     }
     let repo = Repository::open_readonly_wait(repo_root, atomic_repository::database_lock_wait())
         .map_err(CliError::Repository)?;
-    if repo
-        .bridge_workspace_active()
-        .map_err(CliError::Repository)?
-    {
+    if repo.shim_workspace_active().map_err(CliError::Repository)? {
         create_intent_to_add_entries(repo_root, requested)?;
     }
     Ok(())
@@ -708,7 +703,7 @@ fn format_count(count: usize, singular: &str, plural: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+    use serial_test::file_serial;
     use std::path::{Path, PathBuf};
 
     // Add Command Construction Tests
@@ -918,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_outside_repository() {
         let _guard = DirGuard::new();
 
@@ -933,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_file_not_found() {
         let _guard = DirGuard::new();
 
@@ -955,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_single_file() {
         let _guard = DirGuard::new();
 
@@ -979,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_multiple_files() {
         let _guard = DirGuard::new();
 
@@ -1004,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_directory() {
         let _guard = DirGuard::new();
 
@@ -1031,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_dry_run() {
         let _guard = DirGuard::new();
 
@@ -1061,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_already_tracked() {
         let _guard = DirGuard::new();
 
@@ -1090,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_with_force() {
         let _guard = DirGuard::new();
 
@@ -1114,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_non_recursive() {
         let _guard = DirGuard::new();
 
@@ -1144,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_all_untracked() {
         let _guard = DirGuard::new();
 
@@ -1169,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_all_no_untracked() {
         let _guard = DirGuard::new();
 
@@ -1195,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_nested_directory() {
         let _guard = DirGuard::new();
 
@@ -1226,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_cannot_add_atomic_dir() {
         let _guard = DirGuard::new();
 
@@ -1304,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_with_path_containing_spaces() {
         let _guard = DirGuard::new();
 
@@ -1332,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_with_unicode_filename() {
         let _guard = DirGuard::new();
 
@@ -1360,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_verify_tracking_after_add() {
         let _guard = DirGuard::new();
 
@@ -1389,7 +1384,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_dry_run_does_not_track() {
         let _guard = DirGuard::new();
 

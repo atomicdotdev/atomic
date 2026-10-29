@@ -10,6 +10,8 @@ impl ProvenanceAccumulator {
 
     /// Append a goal node (human prompt).
     ///
+    /// `timestamp` is Unix epoch milliseconds, as on every accumulator node.
+    ///
     /// Returns the new node's ID.
     pub fn append_goal(&mut self, prompt: &str, timestamp: i64) -> String {
         let summary = truncate_prompt(prompt, MAX_GOAL_PROMPT_LEN);

@@ -11,6 +11,7 @@
 #   7. Git import → KG enrichment → queries
 #   8. Memory and materialize
 #   9. Vault behavior in a repo initialized without --vault
+#  10. View-filtered search, code and callers (including stale indexes)
 #
 # Every assertion checks both the exit code and the expected output shape.
 # A branch that would pass regardless of the command's outcome is a bug in
@@ -50,6 +51,57 @@ assert_ran() {
         _fail "$desc" "output missing /$pattern/: $(echo "$OUT" | head -2 | tr '\n' ' ')"
     else
         _pass "$desc"
+    fi
+}
+
+# Discover the registered current view and its canonical IRI, then require a real
+# incoming membership edge. Import may select a different view than init created.
+# An empty neighbors response is not a passing graph.
+assert_view_membership() {
+    local desc="$1"
+    local view_name view_id
+    run_cmd atomic view list --json
+    if [[ $RC -ne 0 ]]; then
+        _fail "$desc" "view list exited $RC: $OUT"
+        return
+    fi
+    if ! view_name="$(echo "$OUT" | python3 -c '
+import json, sys
+name = json.load(sys.stdin)["current_view"]
+assert isinstance(name, str) and name
+print(name)
+')"; then
+        _fail "$desc" "registered current view missing: $OUT"
+        return
+    fi
+    run_cmd atomic vault query search "$view_name" --kind 'https://atomic.dev/ns/workflow#View' --json
+    if [[ $RC -ne 0 ]]; then
+        _fail "$desc" "view search exited $RC: $OUT"
+        return
+    fi
+    if ! view_id="$(echo "$OUT" | python3 -c '
+import json, sys
+nodes = json.load(sys.stdin)
+print(next(node["id"] for node in nodes if node["label"] == sys.argv[1] and "https://atomic.dev/ns/workflow#View" in node["types"]))
+' "$view_name")"; then
+        _fail "$desc" "canonical $view_name view missing: $OUT"
+        return
+    fi
+    run_cmd atomic vault query neighbors "$view_id" --json
+    if [[ $RC -ne 0 ]]; then
+        _fail "$desc" "neighbors exited $RC: $OUT"
+    elif echo "$OUT" | python3 -c '
+import json, sys
+graph = json.load(sys.stdin)
+view_id = sys.argv[1]
+ns = "https://atomic.dev/ns/workflow#"
+nodes = {node["id"]: node for node in graph["nodes"]}
+assert ns + "View" in nodes[view_id]["types"]
+assert any(edge["to_id"] == view_id and edge["kind"] == ns + "directlyOnView" and ns + "Change" in nodes[edge["from_id"]]["types"] for edge in graph["edges"])
+' "$view_id"; then
+        _pass "$desc"
+    else
+        _fail "$desc" "canonical view/change membership missing: $OUT"
     fi
 }
 
@@ -197,25 +249,24 @@ assert_ran "KG search finds recorded content" "change:|file:src/main\.rs"
 begin_section "Vault: KG Enrichment"
 
 make_temp_repo "vault-kg"
-init_repo --vault
+init_repo --vault --view main
 
 # Create some tracked files
 create_file "src/auth.rs" "pub fn authenticate() { }\npub fn verify() { }"
 create_file "src/main.rs" "fn main() { authenticate(); }"
 add_files "src/auth.rs" "src/main.rs"
-record_change "Add auth module" >/dev/null 2>&1 || true
+record_change "Add auth module" >/dev/null 2>&1
 
-# Run explicit KG enrichment — reports what was enriched
+# The service reports the processed total; keep this strict about successful
+# execution and a positive count rather than expecting the old local renderer.
 run_cmd atomic vault query enrich
-assert_ran "KG enrich from VCS data" "Enriched: .*views.*files.*changes"
+assert_ran "KG enrich from VCS data" '^Enriched knowledge graph: [1-9][0-9]* item\(s\) processed\.$'
 
-# Search for entities
+# Search for workflow file resources (AST entities are not stored in the KG).
 run_cmd atomic vault query search "auth" --json
 assert_ran "KG search finds 'auth' content" "auth"
 
-# Query neighbors of a view node — returns a node/edge graph
-run_cmd atomic vault query neighbors "view:dev" --json
-assert_ran "KG neighbors query for view node" '"nodes"'
+assert_view_membership "KG neighbors contain canonical view membership"
 
 # Reindex
 run_cmd atomic vault query reindex
@@ -271,7 +322,7 @@ else
     else
         cd "$GIT_KG_DIR"
 
-        run_cmd atomic init --vault
+        run_cmd atomic init --vault --view main
         if [[ $RC -eq 0 ]]; then
             _pass "init --vault in git checkout"
         else
@@ -287,15 +338,13 @@ else
 
         # Enrich KG from imported data
         run_cmd atomic vault query enrich
-        assert_ran "KG enrichment after git import" "Enriched: .*views.*files.*changes"
+        assert_ran "KG enrichment after git import" '^Enriched knowledge graph: [1-9][0-9]* item\(s\) processed\.$'
 
         # Search should find content from the imported repo
         run_cmd atomic vault query search "uuid" --json
         assert_ran "KG search finds imported content" "uuid"
 
-        # Neighbors query for the imported default view
-        run_cmd atomic vault query neighbors "view:main" --json
-        assert_ran "KG neighbors query after import" '"nodes"'
+        assert_view_membership "KG neighbors contain imported view membership"
 
         # Reindex vault entries
         run_cmd atomic vault query reindex
@@ -352,6 +401,62 @@ assert_ran "vault list works after plain init" "memory/MEMORY\.md"
 # No goals were created, so the list is an empty JSON array
 run_cmd atomic vault goal list --json
 assert_ran "goal list is empty after plain init" '^\[\]$'
+
+# ════════════════════════════════════════════════════════════════════════════
+# Section 10: View-Filtered Queries
+# ════════════════════════════════════════════════════════════════════════════
+
+begin_section "Queries: View Isolation"
+
+make_temp_repo "query-view-scope"
+init_repo
+create_file "src/lib.rs" $'pub fn target() {}\npub fn caller() { target(); }\n'
+add_files "src/lib.rs"
+assert_success "record base query source" atomic record -m "base query source"
+assert_success "create inheriting query view" atomic view create query-feature --draft --parent dev
+assert_success "switch to query feature" atomic view switch query-feature --force
+
+# Same paths/symbols, different signatures and call bodies: filtering paths alone
+# would still expose the wrong view's source or caller relationships.
+create_file "src/lib.rs" $'pub fn target(secret: SiblingSecret) {}\npub fn caller() {}\n'
+create_file "src/sibling.rs" $'pub fn sibling_only() { target(); }\n// sibling_marker\n'
+add_files "src/sibling.rs"
+assert_success "record sibling query source" atomic record -m "sibling query source"
+assert_success "enrich feature query data" atomic query enrich
+assert_success "build working-copy index on feature" atomic query index --rebuild
+
+run_cmd atomic query code "SiblingSecret" --json
+assert_ran "feature code includes its own signature" 'SiblingSecret'
+run_cmd atomic query callers "src/lib.rs#target" --json
+assert_ran "feature caller comes from sibling source" '"path": "src/sibling.rs"'
+if [[ $RC -eq 0 ]] && ! echo "$OUT" | grep -qF '"name": "caller"'; then
+    _pass "feature does not retain base caller's removed call"
+else
+    _fail "feature does not retain base caller's removed call" "exit $RC: $OUT"
+fi
+
+assert_success "switch back to base query view" atomic view switch dev --force
+create_file "src/lib.rs" $'pub fn disk_only() {}\n'
+
+run_cmd atomic query search "SiblingSecret" --json
+assert_ran "base structural search excludes sibling signature" '^\[\]$'
+run_cmd atomic query code 'SiblingSecret|sibling_marker|disk_only' --json
+assert_ran "base code excludes sibling and unrecorded bytes" '"total_matches": 0'
+run_cmd atomic query code 'TARGET' -i -g 'src/' -t rs -n 1 --json
+assert_ran "code options preserve the recorded view's match count" '"total_matches": 2'
+run_cmd atomic query callers "src/lib.rs#target" --json
+assert_ran "base caller is recovered from recorded source" '"name": "caller"'
+if [[ $RC -eq 0 ]] && ! echo "$OUT" | grep -qF '"path": "src/sibling.rs"'; then
+    _pass "base callers exclude sibling-only files"
+else
+    _fail "base callers exclude sibling-only files" "exit $RC: $OUT"
+fi
+
+# WORKING_COPIES, not this derived compatibility marker, selects the default.
+printf '%s\n' 'query-feature' > .atomic/current_view
+run_cmd atomic query code "SiblingSecret" --json
+assert_ran "queries use registered view rather than compatibility marker" '"total_matches": 0'
+assert_file_content "queries preserve unrecorded working-copy bytes" "src/lib.rs" 'pub fn disk_only() {}'
 
 # ════════════════════════════════════════════════════════════════════════════
 # Summary

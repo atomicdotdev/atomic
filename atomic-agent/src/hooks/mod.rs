@@ -31,6 +31,24 @@
 //!               TurnOrchestrator
 //! ```
 //!
+//! # Source Timestamps
+//!
+//! Every built-in adapter reads the optional top-level `timestamp` before
+//! agent-specific normalization, preserves its source time in [`TurnEvent`],
+//! and leaves its raw representation intact. The provenance journal stores
+//! milliseconds; RFC-3339 inputs retain finer precision in the event itself.
+//!
+//! - Copilot accepts integer epoch milliseconds (camelCase hooks) or RFC-3339
+//!   strings (VS Code-compatible hooks).
+//! - Cline accepts decimal epoch-millisecond strings.
+//! - Other adapters accept RFC-3339 strings when supplied. Hosts without a
+//!   timestamp use receipt time; Atomic cannot reconstruct their source time.
+//!
+//! Only missing/null timestamps fall back to receipt time. Malformed supplied
+//! values return [`AgentError::HookParseFailed`], including overflow or unsupported
+//! representations. New events never infer seconds versus milliseconds from
+//! magnitude; legacy stored-payload compatibility remains a separate concern.
+//!
 //! # Hook Installation
 //!
 //! When `atomic agent enable --agent claude-code` is run, the adapter's
@@ -68,10 +86,12 @@ pub mod grok;
 pub mod hermes;
 pub mod kilo;
 pub mod kiro;
+pub mod live;
 pub mod manifest;
 pub mod opencode;
 pub mod pi;
 pub mod sherpa;
+mod timestamp;
 
 use std::fmt;
 use std::path::Path;
@@ -148,6 +168,9 @@ pub trait AgentHook: Send + Sync + fmt::Debug {
     ///
     /// The `input` parameter is the raw bytes read from stdin when the agent
     /// invokes the hook. Each agent sends a different JSON format.
+    /// Preserve supplied source time using the adapter's explicit wire encoding;
+    /// use receipt time only when the timestamp is missing/null. Do not derive
+    /// event time from tool arguments, transcripts, or timestamp magnitude.
     ///
     /// # Arguments
     ///

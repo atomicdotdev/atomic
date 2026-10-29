@@ -112,7 +112,8 @@ pub struct Provenance {
     #[serde(default)]
     pub temperature: Option<u32>,
 
-    /// Request timestamp (Unix epoch seconds)
+    /// Request timestamp (Unix epoch milliseconds). Historical records may
+    /// contain seconds; interpret with [`crate::types::timestamp::epoch_datetime`].
     #[serde(default)]
     pub timestamp: Option<i64>,
 
@@ -508,7 +509,9 @@ impl Provenance {
         if let Some(session_id) = &parts.session_id {
             builder = builder.session_id(session_id.clone());
         }
-        builder.timestamp(chrono::Utc::now().timestamp()).build()
+        builder
+            .timestamp(chrono::Utc::now().timestamp_millis())
+            .build()
     }
 
     /// Set the prompt from text (hashed for privacy).

@@ -263,9 +263,9 @@ fn project_tag_to_git_if_colocated(
     view: &str,
     name: &str,
 ) {
-    // RFC §2/§8.4: tag projection is bridge behavior; a working copy that
+    // RFC §2/§8.4: tag projection is shim behavior; a working copy that
     // never enrolled keeps its tags Atomic-only.
-    match repo.bridge_workspace_active() {
+    match repo.shim_workspace_active() {
         Ok(true) => {}
         Ok(false) => return,
         Err(error) => {
@@ -310,7 +310,7 @@ fn project_tag_to_git_if_colocated(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     // -------------------------------------------------------------------------
     // Author Parsing Tests
@@ -436,7 +436,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_create_lightweight_tag() {
         use tempfile::tempdir;
 
@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_create_annotated_tag() {
         use tempfile::tempdir;
 
@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_create_duplicate_tag_fails() {
         use tempfile::tempdir;
 
@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_create_with_force_overwrites() {
         use tempfile::tempdir;
 

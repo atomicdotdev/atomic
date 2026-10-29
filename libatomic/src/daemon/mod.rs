@@ -38,6 +38,7 @@
 // handlers for no gain (per-request handling makes the size a non-issue).
 #![allow(clippy::result_large_err)]
 
+mod change_impact;
 pub mod convert;
 pub mod journal_sink;
 pub mod provenance_core;

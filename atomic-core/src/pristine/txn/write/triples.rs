@@ -155,6 +155,7 @@ impl WriteTxn<'_> {
 
 impl<'a> KgTxnT for WriteTxn<'a> {
     fn get_kg_node(&self, id: &str) -> PristineResult<Option<KgNode>> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -163,10 +164,9 @@ impl<'a> KgTxnT for WriteTxn<'a> {
         let result = match table.get(id)? {
             Some(value) => {
                 let bytes: &[u8] = value.value();
-                let node: KgNode =
-                    serde_json::from_slice(bytes).map_err(|e| PristineError::Serialization {
-                        message: e.to_string(),
-                    })?;
+                let node = KgNode::from_json(bytes).map_err(|e| PristineError::Serialization {
+                    message: e.to_string(),
+                })?;
                 Some(node)
             }
             None => None,
@@ -176,6 +176,7 @@ impl<'a> KgTxnT for WriteTxn<'a> {
     }
 
     fn get_kg_edges_from(&self, node_id: &str) -> PristineResult<Vec<KgEdge>> {
+        self.require_current_kg()?;
         let from_table = match self.txn.open_multimap_table(KG_EDGES_FROM) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -205,6 +206,7 @@ impl<'a> KgTxnT for WriteTxn<'a> {
     }
 
     fn get_kg_edges_to(&self, node_id: &str) -> PristineResult<Vec<KgEdge>> {
+        self.require_current_kg()?;
         let to_table = match self.txn.open_multimap_table(KG_EDGES_TO) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -234,6 +236,7 @@ impl<'a> KgTxnT for WriteTxn<'a> {
     }
 
     fn kg_fts_search(&self, query: &str, limit: usize) -> PristineResult<Vec<KgNode>> {
+        self.require_current_kg()?;
         let fts_table = match self.txn.open_multimap_table(KG_FTS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -260,40 +263,11 @@ impl<'a> KgTxnT for WriteTxn<'a> {
             }
         }
 
-        // Sort by relevance: boost entity nodes (3x) and file nodes (2x)
-        // over change nodes (1x). Entities and files are more useful for
-        // code exploration than individual change records.
-        let mut ranked: Vec<(String, usize)> = hit_counts.into_iter().collect();
-        ranked.sort_by(|a, b| {
-            let boost_a = if a.0.starts_with("entity:") {
-                a.1 * 3
-            } else if a.0.starts_with("file:") {
-                a.1 * 2
-            } else {
-                a.1
-            };
-            let boost_b = if b.0.starts_with("entity:") {
-                b.1 * 3
-            } else if b.0.starts_with("file:") {
-                b.1 * 2
-            } else {
-                b.1
-            };
-            boost_b.cmp(&boost_a)
-        });
-        ranked.truncate(limit);
-
-        // Fetch full nodes
-        let mut nodes = Vec::new();
-        for (id, _) in &ranked {
-            if let Some(node) = self.get_kg_node(id)? {
-                nodes.push(node);
-            }
-        }
-        Ok(nodes)
+        crate::pristine::vault::rank_kg_hits(self, hit_counts, limit)
     }
 
     fn kg_fts_match_ids(&self, query: &str) -> PristineResult<Vec<(String, usize)>> {
+        self.require_current_kg()?;
         let fts_table = match self.txn.open_multimap_table(KG_FTS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -323,6 +297,7 @@ impl<'a> KgTxnT for WriteTxn<'a> {
     }
 
     fn count_kg_nodes(&self) -> PristineResult<usize> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
@@ -332,6 +307,7 @@ impl<'a> KgTxnT for WriteTxn<'a> {
     }
 
     fn kg_node_ids_by_source(&self, sources: &[&str]) -> PristineResult<Vec<String>> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -350,6 +326,7 @@ impl<'a> KgTxnT for WriteTxn<'a> {
     }
 
     fn count_kg_edges(&self) -> PristineResult<usize> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_EDGES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
@@ -361,6 +338,38 @@ impl<'a> KgTxnT for WriteTxn<'a> {
 
 impl<'a> KgMutTxnT for WriteTxn<'a> {
     fn upsert_kg_node(&mut self, node: &KgNode) -> PristineResult<()> {
+        if !self.kg_writes_enabled()? {
+            return Ok(());
+        }
+        if node.types.is_empty()
+            || node
+                .types
+                .iter()
+                .any(|iri| crate::kg::ontology::Class::from_iri(iri).is_none())
+        {
+            return Err(PristineError::Serialization {
+                message: "node must have canonical asserted classes".into(),
+            });
+        }
+        let old_types: Vec<String> = self
+            .txn
+            .open_multimap_table(KG_TYPES)?
+            .remove_all(node.id.as_str())?
+            .map(|row| row.map(|row| row.value().to_owned()))
+            .collect::<Result<_, _>>()?;
+        for class in old_types {
+            self.txn
+                .open_multimap_table(KG_TYPES_REV)?
+                .remove(class.as_str(), node.id.as_str())?;
+        }
+        for class in &node.types {
+            self.txn
+                .open_multimap_table(KG_TYPES)?
+                .insert(node.id.as_str(), class.as_str())?;
+            self.txn
+                .open_multimap_table(KG_TYPES_REV)?
+                .insert(class.as_str(), node.id.as_str())?;
+        }
         // Replacement semantics are important: old ID/label/summary tokens
         // must disappear before the same node ID is re-indexed.
         self.remove_kg_fts_entries(&node.id)?;
@@ -378,6 +387,9 @@ impl<'a> KgMutTxnT for WriteTxn<'a> {
     }
 
     fn upsert_kg_edge(&mut self, edge: &KgEdge) -> PristineResult<()> {
+        if !self.kg_writes_enabled()? {
+            return Ok(());
+        }
         let edge_key = encode_edge_key(&edge.from_id, &edge.to_id, &edge.kind);
 
         let mut edges_table = self.txn.open_table(KG_EDGES)?;
@@ -399,6 +411,20 @@ impl<'a> KgMutTxnT for WriteTxn<'a> {
     }
 
     fn del_kg_node(&mut self, id: &str) -> PristineResult<bool> {
+        if !self.kg_writes_enabled()? {
+            return Ok(false);
+        }
+        let classes: Vec<String> = self
+            .txn
+            .open_multimap_table(KG_TYPES)?
+            .remove_all(id)?
+            .map(|row| row.map(|row| row.value().to_owned()))
+            .collect::<Result<_, _>>()?;
+        for class in classes {
+            self.txn
+                .open_multimap_table(KG_TYPES_REV)?
+                .remove(class.as_str(), id)?;
+        }
         // First delete all edges for this node
         self.del_kg_edges_for_node(id)?;
 
@@ -419,6 +445,9 @@ impl<'a> KgMutTxnT for WriteTxn<'a> {
     }
 
     fn del_kg_edge(&mut self, from_id: &str, to_id: &str, kind: &str) -> PristineResult<bool> {
+        if !self.kg_writes_enabled()? {
+            return Ok(false);
+        }
         let edge_key = encode_edge_key(from_id, to_id, kind);
 
         let mut edges_table = match self.txn.open_table(KG_EDGES) {
@@ -444,6 +473,9 @@ impl<'a> KgMutTxnT for WriteTxn<'a> {
     }
 
     fn del_kg_edges_for_node(&mut self, node_id: &str) -> PristineResult<usize> {
+        if !self.kg_writes_enabled()? {
+            return Ok(0);
+        }
         // Collect all edge keys for this node (both directions)
         let outgoing = self.get_kg_edges_from(node_id)?;
         let incoming = self.get_kg_edges_to(node_id)?;
@@ -458,6 +490,11 @@ impl<'a> KgMutTxnT for WriteTxn<'a> {
     }
 
     fn init_kg(&mut self) -> PristineResult<()> {
+        if !self.kg_writes_enabled()? {
+            return Ok(());
+        }
+        self.txn.open_multimap_table(KG_TYPES)?;
+        self.txn.open_multimap_table(KG_TYPES_REV)?;
         self.txn.open_table(KG_NODES)?;
         self.txn.open_table(KG_EDGES)?;
         self.txn.open_multimap_table(KG_EDGES_FROM)?;
@@ -470,6 +507,7 @@ impl<'a> KgMutTxnT for WriteTxn<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kg::ontology::{Class as C, Predicate as P};
     use crate::pristine::traits::MutTxnT;
     use crate::pristine::Pristine;
     use tempfile::tempdir;
@@ -481,13 +519,13 @@ mod tests {
         let mut txn = pristine.write_txn().unwrap();
         txn.init_kg().unwrap();
 
-        let node = KgNode::new("change:abc123", "change", "abc123", "change_graph")
+        let node = KgNode::new("change:abc123", C::Change, "abc123", "change_graph")
             .with_summary("Fix auth bug");
         txn.upsert_kg_node(&node).unwrap();
 
         let retrieved = txn.get_kg_node("change:abc123").unwrap().unwrap();
         assert_eq!(retrieved.id, "change:abc123");
-        assert_eq!(retrieved.kind, "change");
+        assert!(retrieved.has_type(C::Change));
         assert_eq!(retrieved.summary, Some("Fix auth bug".to_string()));
 
         assert!(txn.get_kg_node("nonexistent").unwrap().is_none());
@@ -506,17 +544,17 @@ mod tests {
         txn.init_kg().unwrap();
 
         // Create nodes
-        txn.upsert_kg_node(&KgNode::new("change:abc", "change", "abc", "graph"))
+        txn.upsert_kg_node(&KgNode::new("change:abc", C::Change, "abc", "graph"))
             .unwrap();
-        txn.upsert_kg_node(&KgNode::new("file:auth.rs", "file", "auth.rs", "graph"))
+        txn.upsert_kg_node(&KgNode::new("file:auth.rs", C::File, "auth.rs", "graph"))
             .unwrap();
-        txn.upsert_kg_node(&KgNode::new("file:main.rs", "file", "main.rs", "graph"))
+        txn.upsert_kg_node(&KgNode::new("file:main.rs", C::File, "main.rs", "graph"))
             .unwrap();
 
         // Create edges
-        txn.upsert_kg_edge(&KgEdge::new("change:abc", "file:auth.rs", "MODIFIES"))
+        txn.upsert_kg_edge(&KgEdge::new("change:abc", "file:auth.rs", P::ModifiesFile))
             .unwrap();
-        txn.upsert_kg_edge(&KgEdge::new("change:abc", "file:main.rs", "MODIFIES"))
+        txn.upsert_kg_edge(&KgEdge::new("change:abc", "file:main.rs", P::ModifiesFile))
             .unwrap();
 
         // Query outgoing
@@ -530,7 +568,7 @@ mod tests {
 
         // Delete edge
         assert!(txn
-            .del_kg_edge("change:abc", "file:auth.rs", "MODIFIES")
+            .del_kg_edge("change:abc", "file:auth.rs", P::ModifiesFile.iri())
             .unwrap());
         assert_eq!(txn.get_kg_edges_from("change:abc").unwrap().len(), 1);
 
@@ -548,14 +586,16 @@ mod tests {
         let mut txn = pristine.write_txn().unwrap();
         txn.init_kg().unwrap();
 
-        txn.upsert_kg_node(&KgNode::new("a", "x", "A", "test"))
+        txn.upsert_kg_node(&KgNode::new("a", C::Memory, "A", "test"))
             .unwrap();
-        txn.upsert_kg_node(&KgNode::new("b", "x", "B", "test"))
+        txn.upsert_kg_node(&KgNode::new("b", C::Memory, "B", "test"))
             .unwrap();
-        txn.upsert_kg_node(&KgNode::new("c", "x", "C", "test"))
+        txn.upsert_kg_node(&KgNode::new("c", C::Memory, "C", "test"))
             .unwrap();
-        txn.upsert_kg_edge(&KgEdge::new("a", "b", "LINK")).unwrap();
-        txn.upsert_kg_edge(&KgEdge::new("b", "c", "LINK")).unwrap();
+        txn.upsert_kg_edge(&KgEdge::new("a", "b", P::References))
+            .unwrap();
+        txn.upsert_kg_edge(&KgEdge::new("b", "c", P::References))
+            .unwrap();
 
         // Depth 1 from "a"
         let sg = txn.kg_neighbors("a", 1).unwrap();
@@ -578,12 +618,12 @@ mod tests {
         txn.init_kg().unwrap();
 
         txn.upsert_kg_node(
-            &KgNode::new("change:abc", "change", "abc123", "graph")
+            &KgNode::new("change:abc", C::Change, "abc123", "graph")
                 .with_summary("Fix authentication bug"),
         )
         .unwrap();
         txn.upsert_kg_node(
-            &KgNode::new("change:def", "change", "def456", "graph").with_summary("Add logging"),
+            &KgNode::new("change:def", C::Change, "def456", "graph").with_summary("Add logging"),
         )
         .unwrap();
 
@@ -612,12 +652,12 @@ mod tests {
         let mut txn = pristine.write_txn().unwrap();
         txn.init_kg().unwrap();
 
-        let old = KgNode::new("memory:build", "memory", "Build", "vault")
+        let old = KgNode::new("memory:build", C::Memory, "Build", "vault")
             .with_summary("obsoletecapybara summary");
         txn.upsert_kg_node(&old).unwrap();
         assert_eq!(txn.kg_fts_match_ids("obsoletecapybara").unwrap().len(), 1);
 
-        let updated = KgNode::new("memory:build", "memory", "Build", "vault")
+        let updated = KgNode::new("memory:build", C::Memory, "Build", "vault")
             .with_summary("currentwombat summary");
         txn.upsert_kg_node(&updated).unwrap();
 
@@ -634,12 +674,12 @@ mod tests {
         let mut txn = pristine.write_txn().unwrap();
         txn.init_kg().unwrap();
 
-        let node = KgNode::new("memory:reused", "memory", "Original", "vault")
+        let node = KgNode::new("memory:reused", C::Memory, "Original", "vault")
             .with_summary("ghostplatypus");
         txn.upsert_kg_node(&node).unwrap();
         assert!(txn.del_kg_node(&node.id).unwrap());
 
-        let replacement = KgNode::new("memory:reused", "memory", "Replacement", "vault");
+        let replacement = KgNode::new("memory:reused", C::Memory, "Replacement", "vault");
         txn.upsert_kg_node(&replacement).unwrap();
         assert!(txn.kg_fts_match_ids("ghostplatypus").unwrap().is_empty());
 
@@ -655,7 +695,7 @@ mod tests {
         // Simulate an index written before replacement-safe indexing existed,
         // including obsolete metadata and a deleted node's orphan posting.
         {
-            let node = KgNode::new("memory:legacy", "memory", "Legacy", "vault")
+            let node = KgNode::new("memory:legacy", C::Memory, "Legacy", "vault")
                 .with_summary("legacyechidna");
             let bytes = serde_json::to_vec(&node).unwrap();
             let mut nodes = txn.txn.open_table(KG_NODES).unwrap();
@@ -689,12 +729,14 @@ mod tests {
         let mut txn = pristine.write_txn().unwrap();
         txn.init_kg().unwrap();
 
-        txn.upsert_kg_node(&KgNode::new("a", "x", "A", "t"))
+        txn.upsert_kg_node(&KgNode::new("a", C::Memory, "A", "t"))
             .unwrap();
-        txn.upsert_kg_node(&KgNode::new("b", "x", "B", "t"))
+        txn.upsert_kg_node(&KgNode::new("b", C::Memory, "B", "t"))
             .unwrap();
-        txn.upsert_kg_edge(&KgEdge::new("a", "b", "LINK")).unwrap();
-        txn.upsert_kg_edge(&KgEdge::new("b", "a", "BACK")).unwrap();
+        txn.upsert_kg_edge(&KgEdge::new("a", "b", P::References))
+            .unwrap();
+        txn.upsert_kg_edge(&KgEdge::new("b", "a", P::References))
+            .unwrap();
 
         txn.del_kg_node("a").unwrap();
 
@@ -711,9 +753,10 @@ mod tests {
         {
             let mut txn = pristine.write_txn().unwrap();
             txn.init_kg().unwrap();
-            txn.upsert_kg_node(&KgNode::new("x", "t", "X", "s"))
+            txn.upsert_kg_node(&KgNode::new("x", C::Memory, "X", "s"))
                 .unwrap();
-            txn.upsert_kg_edge(&KgEdge::new("x", "y", "LINK")).unwrap();
+            txn.upsert_kg_edge(&KgEdge::new("x", "y", P::References))
+                .unwrap();
             txn.commit().unwrap();
         }
         {

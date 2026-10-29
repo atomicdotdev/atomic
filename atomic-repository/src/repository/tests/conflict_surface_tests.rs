@@ -195,6 +195,21 @@ fn test_name_conflict_same_path_creates_are_surfaced() {
             .any(|path| path == "new.txt"),
         "status must surface PATH_CLAIMS conflict before materialization"
     );
+    let error = repo
+        .search_content_paths_on_view(
+            "dev",
+            "seed",
+            crate::ContentSearchOptions {
+                max_results: Some(0),
+                ..Default::default()
+            },
+            &["seed.txt".into()],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("unresolved path claims"),
+        "{error}"
+    );
 
     // Synthesized marker files are evidence, not repository objects. They must
     // bypass both ident expansion and external smudge drivers.

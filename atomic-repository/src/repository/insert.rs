@@ -1758,6 +1758,7 @@ impl Repository {
         hash: &Hash,
         options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
         let t0 = std::time::Instant::now();
 
@@ -1788,7 +1789,13 @@ impl Repository {
                 let closure =
                     super::provenance_gate::reachable_closure(self, std::slice::from_ref(hash))?;
                 let provider = super::provenance_gate::local_session_mac_key_provider(self);
-                self.enforce_publication_gate("shared-view insertion", &closure, Some(&provider))?;
+                let did_provider = super::provenance_gate::local_did_key_provider(self);
+                self.enforce_publication_gate(
+                    "shared-view insertion",
+                    &closure,
+                    Some(&provider),
+                    Some(&did_provider),
+                )?;
             }
         }
 
@@ -1907,28 +1914,16 @@ impl Repository {
         let before_visibility = graph_visibility_closure(&txn, &before_view)?;
         let before_projection = self.project_tree_for_visibility(&txn, &before_visibility)?;
 
-        // Check if the change's edges are already in the global GRAPH.
-        //
-        // A change is "already in the global graph" when it is registered
-        // (has a NodeId) AND at least one of its vertices exists in the
-        // GRAPH B-tree.  `has_change_in_graph` performs a single O(log N)
-        // range scan — far cheaper and more reliable than the previous
-        // approach of loading the Change file and probing individual hunks.
-        //
-        // This correctly handles:
-        //   - Changes recorded on a Draft view (edges in GRAPH only)
-        //     → returns false, so hunks are re-applied to the global GRAPH
-        //   - Changes already inserted into a Shared view (edges in GRAPH)
-        //     → returns true, so redundant hunk application is skipped
-        //   - Changes with only EdgeUpdate hunks (no FileAdd/DirAdd)
-        //     → correctly detected via the range scan
+        // Ingestion is independent of the selected view and of whether this
+        // change created vertices. Edge-only deletes and attribute changes
+        // already in the ambient graph must also be reference-only inserts.
         let t_check = std::time::Instant::now();
         let already_in_graph = if let Some(node_id) = txn
             .get_internal(hash)
             .map_err(|e| RepositoryError::Database(e.to_string()))?
         {
             let in_graph = txn
-                .has_change_in_graph(node_id)
+                .was_change_applied(node_id)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             log::debug!(
                 "insert_change: hash={} node_id={:?} already_in_graph={}",
@@ -2077,6 +2072,9 @@ impl Repository {
 
         // Commit the transaction
         log::debug!("insert_change: committing transaction...");
+        if txn.kg_writes_enabled()? {
+            self.project_view_kg(&mut txn)?;
+        }
         let commit_start = std::time::Instant::now();
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -2177,40 +2175,41 @@ impl Repository {
                 name: view_name.to_string(),
             })?;
 
-        // Collect all needed changes (including the target)
+        // Collect every missing change (the target included) in dependency
+        // order: a depth-first post-order over the dependency graph lists
+        // each change after all of its dependencies. The previous
+        // breadth-first list reversed was not topological (a dependency
+        // listed after a sibling that needs it came out after that sibling),
+        // so a closure referenced into a new view could apply a change
+        // before the change its edges anchor to; the misanchored lines then
+        // rendered twice (a branch seeded after merges rendered a merged
+        // line both at the top and at the end of the file).
         let mut to_insert = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(*hash);
-
-        while let Some(current_hash) = queue.pop_front() {
-            if visited.contains(&current_hash) {
+        let mut stack: Vec<(Hash, bool)> = vec![(*hash, false)];
+        while let Some((current_hash, expanded)) = stack.pop() {
+            if expanded {
+                to_insert.push(current_hash);
                 continue;
             }
-            visited.insert(current_hash);
-
-            // Check if already inserted
+            if !visited.insert(current_hash) {
+                continue;
+            }
+            // Already inserted: its own dependencies are present by invariant.
             if let Ok(Some(id)) = read_txn.get_internal(&current_hash) {
                 if read_txn.get_change_seq(&view, id).ok().flatten().is_some() {
-                    continue; // Already inserted
+                    continue;
                 }
             }
-
-            // Load and queue dependencies
             let dep_change = self.load_change(&current_hash)?;
+            stack.push((current_hash, true));
             for dep in dep_change.dependencies() {
                 if !visited.contains(dep) {
-                    queue.push_back(*dep);
+                    stack.push((*dep, false));
                 }
             }
-
-            to_insert.push(current_hash);
         }
-
         drop(read_txn);
-
-        // Reverse to get topological order (dependencies first)
-        to_insert.reverse();
 
         // CB-12B: gate the complete reachable closure ONCE before any
         // mutation when the target is Shared. The per-change gate inside
@@ -2222,7 +2221,13 @@ impl Repository {
             if shared_target {
                 let closure = super::provenance_gate::reachable_closure(self, &to_insert)?;
                 let provider = super::provenance_gate::local_session_mac_key_provider(self);
-                self.enforce_publication_gate("shared-view insertion", &closure, Some(&provider))?;
+                let did_provider = super::provenance_gate::local_did_key_provider(self);
+                self.enforce_publication_gate(
+                    "shared-view insertion",
+                    &closure,
+                    Some(&provider),
+                    Some(&did_provider),
+                )?;
                 options.skip_publication_gate = true;
             }
         }
@@ -2405,7 +2410,14 @@ impl Repository {
                 })?;
             txn.update_view(&removal_view)
                 .map_err(|error| RepositoryError::Database(error.to_string()))?;
-            self.realign_tree_projection_in_txn(&mut txn, removal_view_name)?;
+            // A private snapshot's membership changed, not the selected
+            // working-copy closure. Projecting its namespace here would hide
+            // pending deletions (or rename paths) from the next durable
+            // record. Preserve the same selected-view boundary as the write
+            // above, including separately staged working-copy paths.
+            if removal_view_name == self.current_view {
+                self.realign_tree_projection_in_txn(&mut txn, removal_view_name)?;
+            }
             if removal_view_name == view_name {
                 let final_view = txn
                     .get_view(view_name)
@@ -2766,7 +2778,13 @@ impl Repository {
         if target_is_shared {
             let closure = super::provenance_gate::reachable_closure(self, &source_changes)?;
             let provider = super::provenance_gate::local_session_mac_key_provider(self);
-            self.enforce_publication_gate("triage promotion", &closure, Some(&provider))?;
+            let did_provider = super::provenance_gate::local_did_key_provider(self);
+            self.enforce_publication_gate(
+                "triage promotion",
+                &closure,
+                Some(&provider),
+                Some(&did_provider),
+            )?;
         }
 
         // When the source view is Draft, its changes were recorded against

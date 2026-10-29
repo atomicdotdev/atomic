@@ -919,6 +919,10 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn pending_untracks(&self, _view_id: u64) -> Result<Vec<String>, PristineError> {
+            Ok(Vec::new())
+        }
+
         fn get_change_seq(
             &self,
             _view: &ViewState,

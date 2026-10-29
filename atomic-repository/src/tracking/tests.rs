@@ -14,7 +14,10 @@ fn test_normalize_path_trailing_slash() {
 
 #[test]
 fn test_normalize_path_backslashes() {
+    #[cfg(windows)]
     assert_eq!(normalize_path(Path::new("src\\main.rs")), "src/main.rs");
+    #[cfg(unix)]
+    assert_eq!(normalize_path(Path::new("src\\main.rs")), "src\\main.rs");
 }
 
 #[test]
@@ -703,5 +706,100 @@ fn test_move_nonexistent_fails() {
             result.unwrap_err(),
             TrackingError::NotTracked { .. }
         ));
+    }
+}
+
+/// A graph-bound inode belongs to the change that bound it, so untracking it by
+/// editing the derived tables must be refused rather than wipe the binding.
+#[test]
+fn untrack_refuses_a_graph_bound_inode() {
+    use atomic_core::pristine::{Pristine, TreeTxnT};
+    use atomic_core::types::{ChangePosition, NodeId, Position};
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("pristine.redb");
+    let pristine = Pristine::open(&db_path).unwrap();
+
+    let inode = {
+        let mut txn = pristine.write_txn().unwrap();
+        let inode = add_to_tree(&mut txn, "Cargo.lock", false).unwrap();
+        // Mimic what `record` does after `add`: bind the inode to its graph
+        // position. That binding is what the untrack must not delete.
+        let position = Position::new(NodeId::new(3), ChangePosition::new(10));
+        txn.put_inode(inode, position).unwrap();
+        txn.commit().unwrap();
+        inode
+    };
+
+    {
+        let txn = pristine.read_txn().unwrap();
+        assert_eq!(
+            tracked_path_state(&txn, inode).unwrap(),
+            TrackedPathState::Recorded,
+            "a bound inode is change-owned"
+        );
+    }
+
+    {
+        let mut txn = pristine.write_txn().unwrap();
+        let error = untrack_staged_path(&mut txn, "Cargo.lock")
+            .expect_err("untracking a recorded binding must be refused");
+        assert!(
+            matches!(error, TrackingError::RecordedPathNotUntrackable { .. }),
+            "unexpected error: {error:?}"
+        );
+        let _ = txn.abort();
+    }
+
+    // Refusing leaves the binding and the name intact.
+    {
+        let txn = pristine.read_txn().unwrap();
+        assert!(is_tracked(&txn, "Cargo.lock").unwrap());
+        assert!(
+            txn.inode_position(inode).unwrap().is_some(),
+            "the refusal must not retire the binding"
+        );
+    }
+}
+
+/// The same inode unbound is staged, and staged is exactly what tracking may undo.
+#[test]
+fn untrack_accepts_an_unbound_inode() {
+    use atomic_core::pristine::Pristine;
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("pristine.redb");
+    let pristine = Pristine::open(&db_path).unwrap();
+
+    let inode = {
+        let mut txn = pristine.write_txn().unwrap();
+        let inode = add_to_tree(&mut txn, "draft.txt", false).unwrap();
+        txn.commit().unwrap();
+        inode
+    };
+
+    {
+        let txn = pristine.read_txn().unwrap();
+        assert_eq!(
+            tracked_path_state(&txn, inode).unwrap(),
+            TrackedPathState::Staged,
+            "an unbound inode is tracking-owned"
+        );
+    }
+
+    {
+        let mut txn = pristine.write_txn().unwrap();
+        assert_eq!(
+            untrack_staged_path(&mut txn, "draft.txt").unwrap(),
+            Some(inode)
+        );
+        txn.commit().unwrap();
+    }
+
+    {
+        let txn = pristine.read_txn().unwrap();
+        assert!(!is_tracked(&txn, "draft.txt").unwrap());
     }
 }

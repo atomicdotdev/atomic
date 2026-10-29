@@ -365,6 +365,22 @@ impl IdentityStore {
     /// (uppercase) renderings of a 32-byte id.
     const DELEGATIONS_DIR: &'static str = "delegations";
 
+    /// Open the default identity store without creating files or directories.
+    pub fn open_default_existing() -> Result<Self, IdentityError> {
+        Self::open_existing(&Self::default_store_path()?)
+    }
+
+    /// Load an existing store's configuration without initializing it.
+    /// This does not load any private keys; callers may load public identities.
+    pub fn open_existing(root: &Path) -> Result<Self, IdentityError> {
+        let content = fs::read_to_string(root.join(Self::CONFIG_FILE))?;
+        let config = toml::from_str(&content)?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            config,
+        })
+    }
+
     /// Open or create the default identity store.
     ///
     /// The default location is `~/.atomic/identities/` in the user's home directory.

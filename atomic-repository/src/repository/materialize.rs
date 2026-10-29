@@ -143,7 +143,7 @@ impl Repository {
         &self,
     ) -> Result<Option<RepositoryCommonLockGuard>, RepositoryError> {
         // CB-13B: once the `git-bridge-cutover` requirement is durable, the
-        // colocated bridge owns writes. The legacy shadow writer refuses
+        // colocated shim owns writes. The legacy shadow writer refuses
         // before taking its lock or touching any state (fast path).
         self.require_legacy_shadow_write_allowed()?;
         #[cfg(test)]
@@ -209,6 +209,20 @@ impl Repository {
         &self,
         working_copy: WorkingCopyId,
     ) -> Result<Option<(String, u32)>, RepositoryError> {
+        self.first_view_conflict_marker_where(working_copy, &|_, _| true)
+    }
+
+    /// [`Self::first_view_conflict_marker`] restricted to the files for
+    /// which `counts(path, content)` holds. A boundary that projects into a
+    /// Git history whose committed tree already carries marker bytes (a
+    /// lockfile merged by hand upstream) must not refuse every later record
+    /// over content Git itself holds; it passes a predicate that discounts
+    /// files whose bytes are already Git's own.
+    pub fn first_view_conflict_marker_where(
+        &self,
+        working_copy: WorkingCopyId,
+        counts: &dyn Fn(&str, &[u8]) -> bool,
+    ) -> Result<Option<(String, u32)>, RepositoryError> {
         self.validate_working_copy(working_copy)?;
         for tracked in self.list_tracked_files()? {
             if tracked.is_directory {
@@ -218,7 +232,9 @@ impl Repository {
             let full_path = self.root.join(&tracked.path);
             if let Ok(content) = std::fs::read(&full_path) {
                 if let Some(line) = first_conflict_marker_line(&content) {
-                    return Ok(Some((path, line)));
+                    if counts(&path, &content) {
+                        return Ok(Some((path, line)));
+                    }
                 }
             }
         }
@@ -283,12 +299,40 @@ pub(crate) fn live_names_for_path<T: GraphTxnT, C: atomic_core::change::ChangeSt
     path: &str,
     filter: &HashSet<NodeId>,
 ) -> Result<Vec<atomic_core::types::GraphNode<NodeId>>, RepositoryError> {
+    live_names_for_path_with_claims(txn, store, position, path, filter, &[])
+}
+
+pub(super) fn live_names_for_path_with_claims<T: GraphTxnT, C: atomic_core::change::ChangeStore>(
+    txn: &T,
+    store: &C,
+    position: Position<NodeId>,
+    path: &str,
+    filter: &HashSet<NodeId>,
+    claims: &[(String, atomic_core::pristine::PathClaimId)],
+) -> Result<Vec<atomic_core::types::GraphNode<NodeId>>, RepositoryError> {
     let options = atomic_core::output::RetrieveOptions::new().with_change_filter(filter.clone());
-    let names = atomic_core::output::repo::live_inode_names(txn, position, &options)
-        .map_err(|e| RepositoryError::Database(format!("{path}: {e}")))?;
+    let structural: Vec<_> = claims.iter().map(|(_, claim)| *claim).collect();
+    let names = atomic_core::output::repo::live_inode_names_with_claims(
+        txn,
+        position,
+        &options,
+        &structural,
+    )
+    .map_err(|e| RepositoryError::Database(format!("{path}: {e}")))?;
     let filename = path.rsplit('/').next().unwrap_or(path).as_bytes();
     let mut matching = Vec::new();
     for name in names {
+        // PATH_CLAIMS is the canonical namespace authority: it already binds
+        // this exact immutable name span to this path. Do not deserialize an
+        // entire change (including provenance) merely to re-read its basename.
+        // Undescribed legacy/other names retain the byte-comparison fallback.
+        if claims
+            .iter()
+            .any(|(known_path, claim)| known_path == path && claim.name == name)
+        {
+            matching.push(name);
+            continue;
+        }
         let mut bytes = vec![0; (name.end.get() - name.start.get()) as usize];
         store
             .get_contents(|id| txn.get_external(id).ok().flatten(), name, &mut bytes)

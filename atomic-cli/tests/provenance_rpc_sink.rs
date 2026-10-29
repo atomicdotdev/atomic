@@ -1,14 +1,14 @@
 //! Integration tests for the RPC-based provenance journal sink
-//! (`ProvenanceRpcSink`): the real daemon binary from the Reactor
-//! checkout, the real `atomic` binary driving the real sink through the
-//! full ProvenanceJournalSink trait flow over the real socket.
+//! (`ProvenanceRpcSink`): the real `atomic` binary driving the real sink
+//! and shared service handlers over a socket. The trait-flow test owns its
+//! server in-process and requires no sibling checkout or external binary.
 //!
 //! The sink itself lives inside the (binary-only) CLI crate, so the suite
 //! drives it through the hidden `agent journal-rpc-selftest` harness
 //! command, which exercises exactly the trait surface the orchestrator
 //! uses: reserve → append (chunked under the wire budget) → prepare →
 //! load_frozen_envelopes (paged reassembly) → bind → acknowledge, plus
-//! stop_turn/turn_status. A second test proves `agent hooks` journals over
+//! stop_turn/turn_status. Optional Reactor tests prove `agent hooks` journals over
 //! the daemon's ProvenanceService when the daemon is already reachable
 //! (the daemon's RPC log must show the journal calls), and a third proves
 //! the D4 cutover: with NO daemon pre-started, a hook flow auto-starts
@@ -19,7 +19,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use atomic_repository::Repository;
-use serial_test::serial;
+use serial_test::file_serial;
 use tempfile::TempDir;
 
 /// Kills the spawned daemon when dropped — a panic in the test must not
@@ -50,17 +50,73 @@ fn reactor_root() -> Option<PathBuf> {
         .filter(|root| root.join("Cargo.toml").exists())
 }
 
-/// `None` when the Reactor checkout (and thus the daemon binary) is
-/// unavailable; every test in this suite skips in that case.
+/// Discover an actual daemon target for the optional external transport tests.
+/// The mandatory trait-flow test serves the same handlers in this process.
 fn daemon_binary() -> Option<PathBuf> {
-    Some(reactor_root()?.join("target/debug/atomicd"))
+    let root = reactor_root()?;
+    // A sibling directory named reactor is not proof it contains atomicd.
+    // Cargo also owns the target directory (including CARGO_TARGET_DIR).
+    let output = Command::new("cargo")
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--locked",
+            "--offline",
+            "--manifest-path",
+        ])
+        .arg(root.join("Cargo.toml"))
+        .output()
+        .expect("inspect Reactor targets");
+    assert!(
+        output.status.success(),
+        "cannot inspect Reactor targets: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("Cargo metadata JSON");
+    let has_daemon = metadata["packages"]
+        .as_array()
+        .expect("Cargo packages")
+        .iter()
+        .any(|package| {
+            package["targets"]
+                .as_array()
+                .expect("Cargo targets")
+                .iter()
+                .any(|target| {
+                    target["name"] == "atomicd"
+                        && target["kind"]
+                            .as_array()
+                            .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"))
+                })
+        });
+    if !has_daemon {
+        assert!(
+            std::env::var_os("ATOMIC_REACTOR_ROOT").is_none(),
+            "ATOMIC_REACTOR_ROOT explicitly names a workspace without an atomicd binary target"
+        );
+        return None;
+    }
+    Some(
+        PathBuf::from(
+            metadata["target_directory"]
+                .as_str()
+                .expect("Cargo target directory"),
+        )
+        .join("debug")
+        .join(format!("atomicd{}", std::env::consts::EXE_SUFFIX)),
+    )
 }
 
 /// Skip-label for tests that require the Reactor checkout.
 fn skip_without_reactor(what: &str) {
     // cargo prints skipped-test output on stderr; keep the skip visible
     // in the run log without failing the suite.
-    eprintln!("skipping {what}: no Reactor checkout (set ATOMIC_REACTOR_ROOT to enable)");
+    eprintln!(
+        "skipping {what}: no built Reactor atomicd target (set ATOMIC_REACTOR_ROOT to enable)"
+    );
 }
 
 /// Guard that restores the socket override when dropped.
@@ -179,39 +235,42 @@ fn run_atomic(args: &[&str], current_dir: &Path, stdin: Option<&[u8]>) -> std::p
     output
 }
 
-#[test]
-#[serial]
-fn rpc_sink_drives_the_full_trait_flow_over_the_socket() {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[file_serial]
+async fn rpc_sink_drives_the_full_trait_flow_over_the_socket() {
+    use libatomic::atomic::{
+        daemon_service_server::DaemonServiceServer,
+        provenance_service_server::ProvenanceServiceServer,
+    };
+    use libatomic::daemon::{
+        services::DaemonImpl, services_agent::ProvenanceImpl, state::DaemonState,
+    };
+    use std::sync::Arc;
     // The selftest is the REACTOR transport's exercise — opt in explicitly
     // (local mode is the CLI default and would refuse the command).
     let _service = VarEnv::set("ATOMIC_SERVICE", "reactor");
-    // Build the daemon from the Reactor checkout when it is missing (the
-    // normal verification flow builds it first).
-    let (Some(reactor), Some(daemon)) = (reactor_root(), daemon_binary()) else {
-        skip_without_reactor("rpc_sink_drives_the_full_trait_flow_over_the_socket");
-        return;
-    };
-    if !daemon.exists() {
-        let output = Command::new("cargo")
-            .arg("build")
-            .arg("--manifest-path")
-            .arg(reactor.join("Cargo.toml"))
-            .output()
-            .expect("cargo build reactor");
-        assert!(
-            output.status.success(),
-            "building atomicd failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     let temp = TempDir::new().unwrap();
     let repo = temp.path().join("repo");
     drop(Repository::init(&repo).unwrap());
     let socket = temp.path().join("atomicd.sock");
     let _env = SocketEnv::set(&socket);
-    let mut daemon = KillOnDrop(spawn_daemon(&socket, &[]));
-    wait_for_daemon(&socket, &mut daemon.0);
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let state = Arc::new(DaemonState::new());
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(DaemonServiceServer::new(DaemonImpl {
+                state: state.clone(),
+            }))
+            .add_service(ProvenanceServiceServer::new(ProvenanceImpl { state }))
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::UnixListenerStream::new(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            ),
+    );
 
     // Six ~450 KiB wire envelopes (payload plus JSON framing) against
     // the sink's 1 MiB wire chunk budget: the batch must split into
@@ -269,7 +328,8 @@ fn rpc_sink_drives_the_full_trait_flow_over_the_socket() {
 
     // The daemon really owns the journal: inspect the store the daemon
     // wrote (its per-request handles are closed between RPCs).
-    drop(daemon);
+    stop.send(()).unwrap();
+    server.await.unwrap().unwrap();
     let store = atomic_repository::redb_change_store::RedbChangeStore::open_existing(
         Repository::canonical_database_path(&repo).unwrap(),
     )
@@ -300,7 +360,7 @@ fn rpc_sink_drives_the_full_trait_flow_over_the_socket() {
 }
 
 #[test]
-#[serial]
+#[file_serial]
 fn hooks_prefer_the_rpc_journal_sink_when_the_daemon_is_reachable() {
     if !daemon_binary().is_some_and(|daemon| daemon.exists()) {
         skip_without_reactor("hooks_prefer_the_rpc_journal_sink_when_the_daemon_is_reachable");
@@ -362,7 +422,7 @@ fn hooks_prefer_the_rpc_journal_sink_when_the_daemon_is_reachable() {
 }
 
 #[test]
-#[serial]
+#[file_serial]
 fn hooks_start_the_daemon_when_none_is_running() {
     if !daemon_binary().is_some_and(|daemon| daemon.exists()) {
         skip_without_reactor("hooks_start_the_daemon_when_none_is_running");

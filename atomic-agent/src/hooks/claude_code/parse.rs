@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
-use crate::hooks::AgentHook;
+use crate::hooks::{timestamp::TimestampFormat, AgentHook};
 
 // ============================================================================
 // CLAUDE CODE JSON INPUT TYPES
@@ -115,6 +115,8 @@ pub(super) fn parse_hook_event(
             reason: e.to_string(),
         })?;
 
+    let timestamp = TimestampFormat::Rfc3339.parse(agent_name, hook_type, &raw_json)?;
+
     match hook_type {
         HookType::SessionStart => parse_session_start(agent_name, hook_type, raw_json),
         HookType::SessionEnd | HookType::TurnEnd => {
@@ -124,6 +126,7 @@ pub(super) fn parse_hook_event(
         HookType::PreToolUse => parse_pre_tool(agent_name, hook_type, raw_json),
         HookType::PostToolUse => parse_post_tool(agent_name, hook_type, raw_json),
     }
+    .map(|event| event.with_timestamp(timestamp))
 }
 
 /// Extract the session_id from parsed input, returning a default if missing.

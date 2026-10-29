@@ -71,9 +71,9 @@ use crate::status::{
 
 use crate::tracking::{
     add_to_tree, collect_files_for_tracking_with_rules, get_inode, is_tracked, list_tracked,
-    move_tracked, normalize_path, normalize_path_with_root, remove_from_tree,
-    should_ignore_with_rules, tracked_under_prefix, TrackedFile, TrackingError, TrackingOptions,
-    TrackingStats,
+    move_tracked, normalize_path, normalize_path_with_root, should_ignore_with_rules,
+    tracked_path_state, tracked_under_prefix, untrack_staged_path, TrackedFile, TrackedPathState,
+    TrackingError, TrackingOptions, TrackingStats,
 };
 use crate::unrecord::{UnrecordOptions, UnrecordOutcome};
 use crate::RepositoryError;
@@ -84,15 +84,24 @@ mod adoption;
 mod anchor;
 mod binding_fetch;
 mod binding_store;
+mod change_intents;
+pub use change_intents::{
+    ChangeIntentAssociation, ChangeIntentContext, ChangeIntentIdentity, ChangePlanBinding,
+};
 mod conflict_object;
 mod conflict_reconcile;
 mod cutover;
 pub mod database;
 mod deferred_tree;
+mod dependency_closure;
 mod equivalence;
 mod file_index_v2;
 mod filter;
 mod git_observation;
+mod git_stream;
+pub use git_stream::{
+    GitGraphImportSession, GitStreamLimits, GitStreamOutcome, PreparedGitGraphChange,
+};
 mod ignore_mirror;
 mod locks;
 mod materialize;
@@ -105,6 +114,7 @@ mod project_tree;
 mod projection;
 mod projection_commit;
 mod projection_effects;
+mod query;
 pub mod ref_mapping;
 mod remote_cache;
 mod repair;
@@ -116,6 +126,7 @@ pub use remote_cache::{
 };
 mod revise;
 mod sandbox;
+mod semantic_closure;
 mod semantic_materialize;
 mod set_id;
 mod snapshot;
@@ -124,7 +135,9 @@ mod split;
 mod staging;
 mod stash;
 mod switch;
+mod syntax_index;
 mod synthesis;
+pub use syntax_index::{Caller, SyntaxIndex};
 mod tag_projection;
 mod views;
 mod working_copy;
@@ -138,19 +151,20 @@ pub use conflict_reconcile::{
     ConflictReconcileOutcome, StaleConflictDisposition, StaleConflictPath, StaleConflictReport,
 };
 pub use cutover::{
-    BridgeCutoverAudit, BridgeCutoverOutcome, BridgeCutoverPlan, CutoverAuditDisposition,
-    CutoverSchemaAudit,
+    CutoverAuditDisposition, CutoverSchemaAudit, ShimCutoverAudit, ShimCutoverOutcome,
+    ShimCutoverPlan,
 };
 pub use database::{
     database_lock_wait, ensure_database, has_database, DATABASE_FILE, LEGACY_CHANGE_STORE_FILE,
     LEGACY_DIR, LEGACY_PRISTINE_FILE,
 };
 pub use equivalence::{
-    compare_project_state, compare_project_to_index, compare_project_to_worktree,
+    compare_project_state, compare_project_state_tolerating_untracked, compare_project_to_index,
+    compare_project_to_worktree, compare_project_to_worktree_with_index,
     verify_prospective_equivalence, EquivalenceClaims, EquivalenceLayer, EquivalenceMismatch,
     EquivalenceReport, MismatchKind, VerifiedProspectiveEquivalence,
 };
-pub use file_index_v2::FileIndexV2BackfillOutcome;
+pub use file_index_v2::{FileIndexV2BackfillOutcome, FileIndexV2SeedOutcome};
 pub use filter::{
     collect_view_change_ids, collect_visible_change_ids, collect_visible_change_ids_with_deps,
     graph_visibility_closure, graph_visibility_from_membership, view_membership,
@@ -170,16 +184,16 @@ pub use ignore_mirror::{
 pub use locks::RepositoryCommonLockGuard;
 pub use operation::{
     OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,
-    OperationVerificationState, PreparedBridgeGitWrite, PreparedRemoteOperation,
+    OperationVerificationState, PreparedRemoteOperation, PreparedShimGitWrite,
 };
 pub use project_tree::{
-    escape_repo_path, unescape_repo_path, ConversionPolicy, ExclusionPolicy, ExclusionReason,
-    GitIndexEntry, GitIndexState, GitObject, GitObjectDatabase, GitObjectKind, GitTree,
-    GitTreeEntry, LossPolicy, ManifestDisposition, ManifestRoot, PhysicalKind,
-    PlatformCapabilities, ProjectTree, ProjectTreeError, RepoPath, RepositoryEntry,
-    RepositoryManifest, WorktreeEntry, WorktreeObservation, CONVERSION_POLICY_VERSION,
-    GIT_INDEX_STATE_VERSION, REPOSITORY_MANIFEST_VERSION, REPO_PATH_VERSION,
-    WORKTREE_OBSERVATION_VERSION,
+    atomic_private_path, canonical_path_identity, escape_repo_path, unescape_repo_path,
+    ConversionPolicy, ExclusionPolicy, ExclusionReason, GitIndexEntry, GitIndexState, GitObject,
+    GitObjectDatabase, GitObjectKind, GitTree, GitTreeEntry, LossPolicy, ManifestDisposition,
+    ManifestRoot, PhysicalKind, PlatformCapabilities, ProjectTree, ProjectTreeError, RepoPath,
+    RepositoryEntry, RepositoryManifest, WorktreeEntry, WorktreeObservation,
+    CONVERSION_POLICY_VERSION, GIT_INDEX_STATE_VERSION, REPOSITORY_MANIFEST_VERSION,
+    REPO_PATH_VERSION, WORKTREE_OBSERVATION_VERSION,
 };
 pub use projection::effective_projection_closure;
 pub use projection_commit::{
@@ -216,6 +230,7 @@ pub use tag_projection::TagProjectionOutcome;
 pub use views::{ManifestApplyOutcome, ViewInfo};
 pub use working_copy::canonical_dot_dir_for;
 pub use working_copy::detect_repository_root;
+pub use working_copy::REPOSITORY_POINTER;
 pub use working_copy_reconcile::{WorkingCopyReconcileOutcome, WorkingCopyRegistrationDiagnosis};
 pub use workspace_txn::{
     git_locks_present, git_state_quiescent, GitQuiescence, ReconcileEffectBudget,
@@ -239,8 +254,14 @@ mod changes;
 mod content;
 mod history;
 mod insert;
+mod kg_attestation;
+mod kg_rebuild;
+mod project_identity;
 pub mod provenance_gate;
 mod provenance_summary;
+pub use project_identity::{
+    build_project_identity, project_identity_hash, verify_project_identity, IdentityAdoption,
+};
 mod record;
 mod remotes;
 mod status;
@@ -249,6 +270,8 @@ mod tracking;
 mod triage;
 mod vault;
 mod vault_defaults;
+mod vault_projection;
+pub use vault_triples::WorkflowSnapshot;
 mod vault_embeddings;
 mod vault_goal;
 mod vault_identity;
@@ -258,8 +281,8 @@ mod vault_names;
 mod vault_triples;
 mod verify;
 pub use anchor::{
-    conversion_policy_for_git, format_equivalence_report, read_head_map, BridgeAnchorError,
-    BridgeAnchorOutcome, BridgeAnchorRefusal, HeadMapEntry,
+    conversion_policy_for_git, format_equivalence_report, read_head_map, HeadMapEntry,
+    ShimAnchorError, ShimAnchorOutcome, ShimAnchorRefusal,
 };
 pub use binding_fetch::{
     BindingChangeSource, ClosureAcquisition, ClosureReadiness, IncompletenessReason,
@@ -374,6 +397,9 @@ pub struct Repository {
     /// holds the sandbox's view (from its pointer file); it must not repoint
     /// the canonical `current_view` on disk.
     is_sandbox: bool,
+    /// Per-process memo of the CRDT branch state folded per trunk over the
+    /// current assembly closure; see [`semantic_closure::SemanticClosureMemo`].
+    semantic_closure_memo: std::sync::Mutex<semantic_closure::SemanticClosureMemo>,
 }
 
 impl std::fmt::Debug for Repository {
@@ -502,6 +528,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
 
         Ok(repository)
@@ -605,8 +632,13 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         repository.fence_recovery_for_budget(working_copy_id, budget)?;
+        if !budget.is_metadata_only() {
+            repository.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
+            repository.rebuild_kg(false)?;
+        }
 
         // Deferred TREE or operation recovery may rewrite the compatibility
         // pointer. Reassert the persistent record as the sole authority.
@@ -701,6 +733,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;
@@ -759,6 +792,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         })
     }
 
@@ -797,7 +831,7 @@ default = "{}"
     /// format upgrade; afterwards the database is reopened read-only.
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
         Self::wait_for_database(DEFAULT_DATABASE_WAIT, || {
-            Self::open_readonly_mode(path.as_ref(), false)
+            Self::open_readonly_mode(path.as_ref(), false, false)
         })
     }
 
@@ -809,14 +843,30 @@ default = "{}"
     pub fn open_readonly_for_operation_inspection<P: AsRef<Path>>(
         path: P,
     ) -> Result<Self, RepositoryError> {
-        Self::open_readonly_mode(path.as_ref(), true)
+        Self::open_readonly_mode(path.as_ref(), true, false)
+    }
+
+    /// Open an existing current-layout repository without migration or repair.
+    ///
+    /// This narrow inspection mode rejects legacy layouts and sandboxes rather
+    /// than invoking their migration or provisioning paths.
+    pub fn open_readonly_without_migration<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, RepositoryError> {
+        Self::open_readonly_mode(path.as_ref(), false, true)
     }
 
     fn open_readonly_mode(
         path: &Path,
         operation_inspection: bool,
+        no_migration: bool,
     ) -> Result<Self, RepositoryError> {
         if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path) {
+            if no_migration {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "non-migrating sandbox inspection is unavailable".to_string(),
+                });
+            }
             return Self::open_sandbox_readonly(working_root, canonical, &view);
         }
         let layout = working_copy::discover_layout(path)?;
@@ -825,9 +875,17 @@ default = "{}"
 
         // Open the pristine database in read-only mode. Identity validation below
         // performs no repair and reports a typed migration-required error.
-        let pristine = Arc::new(
-            Pristine::open_readonly(ensure_database(&dot_dir)?).map_err(RepositoryError::from)?,
-        );
+        let database = if no_migration {
+            database::require_current_database(&dot_dir)?
+        } else {
+            ensure_database(&dot_dir)?
+        };
+        let pristine = if no_migration {
+            Pristine::open_readonly_without_recovery(database)
+        } else {
+            Pristine::open_readonly(database)
+        };
+        let pristine = Arc::new(pristine.map_err(RepositoryError::from)?);
         let (working_copy_id, current_view) =
             working_copy::load_registered_identity(&pristine, &layout)?;
 
@@ -843,6 +901,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         if !operation_inspection
             && (repository.has_pending_deferred_tree_alignment()
@@ -900,6 +959,7 @@ default = "{}"
             pristine: Arc::new(pristine),
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         if repository.has_pending_deferred_tree_alignment() {
             return Err(RepositoryError::InvalidOperation {
@@ -925,7 +985,9 @@ default = "{}"
         path: P,
         timeout: std::time::Duration,
     ) -> Result<Self, RepositoryError> {
-        Self::wait_for_database(timeout, || Self::open_readonly_mode(path.as_ref(), false))
+        Self::wait_for_database(timeout, || {
+            Self::open_readonly_mode(path.as_ref(), false, false)
+        })
     }
 
     fn wait_for_database(
@@ -1004,6 +1066,7 @@ default = "{}"
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         };
         let operation_lock = repository.try_lock_operation(working_copy_id)?;
         repository.recover_pending_deferred_tree_alignment_locked(&operation_lock)?;

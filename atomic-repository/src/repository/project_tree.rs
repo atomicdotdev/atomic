@@ -9,6 +9,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use atomic_core::change::InodeKind;
 use atomic_core::operation::{GitHashAlgorithm, GitObjectId};
@@ -140,6 +141,18 @@ pub fn escape_repo_path(bytes: &[u8]) -> String {
     output
 }
 
+/// The canonical String identity of a graph name, whichever spelling the
+/// graph stored: the raw bytes (native tracking, and imports since the
+/// path-boundary fix) or the already-escaped identity (earlier imports).
+/// Idempotent on an escaped name; a raw name whose literal `%` does not
+/// decode keeps its bytes.
+pub fn canonical_path_identity(path: &str) -> String {
+    match unescape_repo_path(path) {
+        Ok(bytes) => escape_repo_path(&bytes),
+        Err(_) => escape_repo_path(path.as_bytes()),
+    }
+}
+
 /// The exact inverse of [`escape_repo_path`]: decode every `%XX` escape back
 /// to its byte. Errors on a malformed escape (`%` not followed by two hex
 /// digits), never silently rewriting identity.
@@ -229,7 +242,7 @@ pub enum ExclusionReason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExclusionPolicy {
-    BridgePrivate,
+    ShimPrivate,
     IncludeVault,
 }
 
@@ -238,16 +251,93 @@ impl ExclusionPolicy {
         if atomic_private_path(path.as_bytes()) {
             Some(ExclusionReason::AtomicPrivate)
         } else if path.components().next().unwrap_or_default() == b".vault"
-            && self == Self::BridgePrivate
+            && self == Self::ShimPrivate
         {
             Some(ExclusionReason::VaultPrivate)
         } else {
             None
         }
     }
+
+    /// Resolve the vault half of the policy for one live colocated Git
+    /// repository (RFC §6.2: "`.vault/` is private by default but may be
+    /// tracked under explicit policy").
+    ///
+    /// An explicit `[git.shim] vault` record in the repository
+    /// configuration wins in both directions — the first import records
+    /// the detected value, and a user override is honored. A configuration
+    /// that predates the field omits it: that is "undecided", and the Git
+    /// HEAD tree decides (a repository whose HEAD tree tracks a `.vault`
+    /// entry runs [`Self::IncludeVault`]).
+    ///
+    /// A repository whose Git tree tracks `.vault/` must run with the
+    /// vault included in the manifest projection: the alternative — a
+    /// projection that silently lacks a Git-tracked `.vault/` — can never
+    /// verify against the raw Git tree, and a publication built from it
+    /// would delete the vault from Git.
+    ///
+    /// Fail-closed: an unreadable or corrupt repository configuration, or
+    /// an unresolvable Atomic layout in a checkout that has one, is a real
+    /// fault — it propagates instead of silently changing the resolved
+    /// policy.
+    pub fn resolve_for_git(git: &git2::Repository) -> Result<Self, ProjectTreeError> {
+        if let Some(workdir) = git.workdir() {
+            let repository_present = workdir.join(".atomic").exists();
+            let dot_dir = if repository_present {
+                Repository::canonical_dot_dir(workdir).map_err(|error| {
+                    ProjectTreeError::Repository(format!(
+                        "cannot resolve the Atomic directory for the checkout at {}: {error}",
+                        workdir.display()
+                    ))
+                })?
+            } else {
+                // No local `.atomic`: nothing is recorded yet (a fresh
+                // checkout before its first import, or a plain Git
+                // repository) — the HEAD tree decides.
+                match Repository::canonical_dot_dir(workdir) {
+                    Ok(dot_dir) => dot_dir,
+                    Err(_) => return Ok(Self::from_git_head(git)),
+                }
+            };
+            let config_path = dot_dir.join("config.toml");
+            if config_path.exists() {
+                let (config, _) = atomic_config::RepoConfig::load_with_vault_recorded(&config_path)
+                    .map_err(|error| {
+                        ProjectTreeError::Repository(format!(
+                            "cannot load the repository configuration at {}: {error}",
+                            config_path.display()
+                        ))
+                    })?;
+                if let Some(vault) = config.git.shim.vault {
+                    return Ok(match vault {
+                        atomic_config::ShimVaultPolicy::Tracked => Self::IncludeVault,
+                        atomic_config::ShimVaultPolicy::Private => Self::ShimPrivate,
+                    });
+                }
+            }
+        }
+        Ok(Self::from_git_head(git))
+    }
+
+    /// Auto-detect from the Git HEAD tree: does the tracked root tree hold
+    /// a `.vault` entry? An unborn or detached-without-commit HEAD reads
+    /// as untracked.
+    fn from_git_head(git: &git2::Repository) -> Self {
+        let tracks_vault = git
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_commit().ok())
+            .and_then(|commit| commit.tree().ok())
+            .is_some_and(|tree| tree.get_name(".vault").is_some());
+        if tracks_vault {
+            Self::IncludeVault
+        } else {
+            Self::ShimPrivate
+        }
+    }
 }
 
-/// Whether `path` is Atomic-private bridge state (`.atomic*`): tracked alive
+/// Whether `path` is Atomic-private shim state (`.atomic*`): tracked alive
 /// in the worktree's Atomic view but deliberately absent from project
 /// manifests and from Git. Staged whole-tree verification (review R3) exempts
 /// these paths from the extra-path refusal exactly as the conversion policy
@@ -260,16 +350,16 @@ pub fn atomic_private_path(path_bytes: &[u8]) -> bool {
     first == b".atomic" || path_bytes == b".atomicignore"
 }
 
-/// Whether `path` is bridge-private state under
-/// [`ExclusionPolicy::BridgePrivate`] — deliberately absent from project
+/// Whether `path` is shim-private state under
+/// [`ExclusionPolicy::ShimPrivate`] — deliberately absent from project
 /// manifests while tracked alive in the Atomic view. This is exactly the
-/// path set [`ExclusionPolicy::BridgePrivate::exclusion`] rejects: Atomic
+/// path set [`ExclusionPolicy::ShimPrivate::exclusion`] rejects: Atomic
 /// private state (`.atomic*`) plus the vault (`.vault/`), whose files a
 /// colocated repository legitimately tracks in both Git and the graph.
 /// Staged verification must exempt the whole set, not only the `.atomic*`
 /// half, or importing a repository that tracks `.vault/` files refuses with
 /// "staged path ... is present but the commit tree does not hold it".
-pub fn bridge_private_path(path_bytes: &[u8]) -> bool {
+pub fn shim_private_path(path_bytes: &[u8]) -> bool {
     let first = path_bytes
         .split(|byte| *byte == b'/')
         .next()
@@ -290,10 +380,16 @@ pub enum ManifestDisposition {
 }
 
 /// One canonical repository entry. `repository_bytes` are already-clean bytes.
+///
+/// The bytes are reference-counted: a project tree is cloned once per
+/// imported commit (the prospective fold keeps every commit's tree), so an
+/// owned buffer per entry per commit cost commits × tree bytes — a 285 MB
+/// tree over 427 commits reached a 70 GB footprint and was killed. Cloning
+/// an entry now shares its bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepositoryEntry {
     pub path: RepoPath,
-    pub repository_bytes: Vec<u8>,
+    pub repository_bytes: Arc<[u8]>,
     pub content_identity: ObjectKey,
     pub mode: u16,
     pub kind: InodeKind,
@@ -329,7 +425,7 @@ impl RepositoryEntry {
         Ok(Self {
             path,
             content_identity: content_key(&repository_bytes),
-            repository_bytes,
+            repository_bytes: Arc::from(repository_bytes),
             mode,
             kind,
             gitlink,
@@ -462,7 +558,7 @@ impl ConversionPolicy {
                 unicode_normalizing: false,
             },
             object_format,
-            exclusions: ExclusionPolicy::BridgePrivate,
+            exclusions: ExclusionPolicy::ShimPrivate,
             losses: LossPolicy::Refuse,
         }
     }
@@ -486,7 +582,7 @@ impl ConversionPolicy {
         encoder.u8(self.platform.unicode_normalizing as u8);
         encoder.u8(algorithm_tag(self.object_format));
         encoder.u8(match self.exclusions {
-            ExclusionPolicy::BridgePrivate => 0,
+            ExclusionPolicy::ShimPrivate => 0,
             ExclusionPolicy::IncludeVault => 1,
         });
         encoder.u8(match self.losses {
@@ -679,10 +775,14 @@ pub enum GitObjectKind {
     Tree,
 }
 
+/// One Git object. The bytes are reference-counted for the same reason as
+/// [`RepositoryEntry::repository_bytes`]: every per-commit project tree of
+/// an import carries its own object database, and the blobs must not be
+/// copied per commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitObject {
     pub kind: GitObjectKind,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -734,6 +834,17 @@ impl GitObjectDatabase {
         algorithm: GitHashAlgorithm,
         kind: GitObjectKind,
         bytes: Vec<u8>,
+    ) -> Result<GitObjectId, ProjectTreeError> {
+        self.insert_shared(algorithm, kind, Arc::from(bytes))
+    }
+
+    /// [`Self::insert`] for bytes another holder already shares (a
+    /// repository entry's bytes): no copy is made.
+    pub fn insert_shared(
+        &mut self,
+        algorithm: GitHashAlgorithm,
+        kind: GitObjectKind,
+        bytes: Arc<[u8]>,
     ) -> Result<GitObjectId, ProjectTreeError> {
         let oid = git_object_id(algorithm, kind, &bytes)?;
         self.objects.insert(oid.clone(), GitObject { kind, bytes });
@@ -854,7 +965,7 @@ impl GitObjectDatabase {
                 "blob object identity or kind mismatch".into(),
             ));
         }
-        Ok(object.bytes.clone())
+        Ok(object.bytes.to_vec())
     }
 }
 
@@ -949,7 +1060,7 @@ fn write_directory(
                 .gitlink
                 .clone()
                 .ok_or_else(|| ProjectTreeError::InvalidGitlink("missing object ID".into()))?,
-            InodeKind::Regular | InodeKind::Symlink => objects.insert(
+            InodeKind::Regular | InodeKind::Symlink => objects.insert_shared(
                 algorithm,
                 GitObjectKind::Blob,
                 entry.repository_bytes.clone(),
@@ -1123,7 +1234,10 @@ impl Repository {
             .values()
             .filter(|item| !item.is_directory)
         {
-            let path = RepoPath::from_bytes(item.path.as_bytes())?;
+            // Manifest fold keys are canonical identities: the graph stores a
+            // name raw (native tracking, current imports) or already escaped
+            // (earlier imports); the Git side always folds the escaped form.
+            let path = RepoPath::from_bytes(canonical_path_identity(&item.path).as_bytes())?;
             let disposition = policy
                 .exclusions
                 .exclusion(&path)
@@ -1322,7 +1436,7 @@ impl Repository {
             .values()
             .filter(|item| !item.is_directory)
         {
-            let path = RepoPath::from_bytes(item.path.as_bytes())?;
+            let path = RepoPath::from_bytes(canonical_path_identity(&item.path).as_bytes())?;
             let disposition = policy
                 .exclusions
                 .exclusion(&path)
@@ -1371,7 +1485,7 @@ impl Repository {
             if projected_paths.contains(path.as_str()) {
                 continue;
             }
-            let repo_path = RepoPath::from_bytes(path.as_bytes())?;
+            let repo_path = RepoPath::from_bytes(canonical_path_identity(path).as_bytes())?;
             let disposition = policy
                 .exclusions
                 .exclusion(&repo_path)
@@ -1622,6 +1736,13 @@ mod tests {
         assert!(RepoPath::from_bytes(b"a/../b").is_err());
         assert!(RepoPath::from_bytes(b"a\0b").is_err());
         assert_eq!(path.escaped(), "src/%FFname");
+        // A raw and an escaped spelling share one canonical identity.
+        assert_eq!(canonical_path_identity("caf\u{e9}.txt"), "caf%C3%A9.txt");
+        assert_eq!(canonical_path_identity("caf%C3%A9.txt"), "caf%C3%A9.txt");
+        assert_eq!(canonical_path_identity("has space.txt"), "has%20space.txt");
+        assert_eq!(canonical_path_identity("plain/name.rs"), "plain/name.rs");
+        assert_eq!(canonical_path_identity("100%.txt"), "100%25.txt");
+        assert_eq!(canonical_path_identity("100%25.txt"), "100%25.txt");
     }
 
     #[test]
@@ -1639,6 +1760,123 @@ mod tests {
         let mut changed = policy.clone();
         changed.object_format = GitHashAlgorithm::Sha256;
         assert_ne!(policy.root(), changed.root());
+    }
+
+    /// RFC §6.2: the vault exclusion policy follows an explicit config
+    /// record; an omitted field (a pre-policy config) and no config at all
+    /// fall back to the tracked HEAD tree; corrupt config fails closed.
+    #[test]
+    fn resolve_for_git_follows_config_then_head_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let git = git2::Repository::init(root.path()).unwrap();
+        let signature = git2::Signature::now("policy", "policy@example.com").unwrap();
+
+        fn commit_tree(
+            git: &git2::Repository,
+            signature: &git2::Signature,
+            paths: &[(&str, &[u8])],
+        ) {
+            fn build(git: &git2::Repository, files: &[(&str, &[u8])]) -> git2::Oid {
+                let mut builder = git.treebuilder(None).unwrap();
+                let mut directories = std::collections::BTreeMap::<&str, Vec<(&str, &[u8])>>::new();
+                for &(path, bytes) in files {
+                    if let Some((directory, rest)) = path.split_once('/') {
+                        directories
+                            .entry(directory)
+                            .or_default()
+                            .push((rest, bytes));
+                    } else {
+                        builder
+                            .insert(path, git.blob(bytes).unwrap(), 0o100644)
+                            .unwrap();
+                    }
+                }
+                for (directory, children) in directories {
+                    builder
+                        .insert(directory, build(git, &children), 0o040000)
+                        .unwrap();
+                }
+                builder.write().unwrap()
+            }
+            let tree = git.find_tree(build(git, paths)).unwrap();
+            let parents: Vec<_> = git
+                .find_reference("refs/heads/main")
+                .ok()
+                .and_then(|reference| reference.peel_to_commit().ok())
+                .into_iter()
+                .collect();
+            git.commit(
+                Some("refs/heads/main"),
+                signature,
+                signature,
+                "fixture",
+                &tree,
+                &parents.iter().collect::<Vec<_>>(),
+            )
+            .unwrap();
+            git.set_head("refs/heads/main").unwrap();
+        }
+
+        fn write_config(root: &Path, text: &str) {
+            std::fs::create_dir_all(root.join(".atomic")).unwrap();
+            std::fs::write(root.join(".atomic/config.toml"), text).unwrap();
+        }
+
+        let resolve = |git: &git2::Repository| {
+            ExclusionPolicy::resolve_for_git(git).expect("resolution must not fail")
+        };
+
+        // No commits and no config: untracked, so the vault stays private.
+        assert_eq!(resolve(&git), ExclusionPolicy::ShimPrivate);
+
+        // A tree WITHOUT .vault: still private.
+        commit_tree(&git, &signature, &[("README.md", b"readme\n")]);
+        assert_eq!(resolve(&git), ExclusionPolicy::ShimPrivate);
+
+        // A tree WITH a tracked .vault/: the vault joins the projection.
+        commit_tree(
+            &git,
+            &signature,
+            &[
+                ("README.md", b"readme\n"),
+                (".vault/memory/MEMORY.md", b"# user work\n"),
+            ],
+        );
+        assert_eq!(resolve(&git), ExclusionPolicy::IncludeVault);
+
+        // An omitted field (pre-policy config) is undecided: HEAD decides.
+        write_config(root.path(), "[git.shim]\nenabled = true\n");
+        assert_eq!(
+            resolve(&git),
+            ExclusionPolicy::IncludeVault,
+            "an omitted vault field must not read as an explicit private record"
+        );
+
+        let config_path = root.path().join(".atomic/config.toml");
+        let mut config = atomic_config::RepoConfig::load(&config_path).unwrap();
+        config.git.shim.watch.enabled = true;
+        config.save(&config_path).unwrap();
+        assert_eq!(
+            resolve(&git),
+            ExclusionPolicy::IncludeVault,
+            "saving unrelated shim settings must preserve tracked-tree detection"
+        );
+
+        // An explicit private record wins over the tracked HEAD tree.
+        write_config(root.path(), "[git.shim]\nvault = \"private\"\n");
+        assert_eq!(resolve(&git), ExclusionPolicy::ShimPrivate);
+
+        // An explicit tracked record wins over an untracked HEAD tree.
+        commit_tree(&git, &signature, &[("README.md", b"readme\n")]);
+        write_config(root.path(), "[git.shim]\nvault = \"tracked\"\n");
+        assert_eq!(resolve(&git), ExclusionPolicy::IncludeVault);
+
+        // A corrupt configuration fails closed instead of defaulting.
+        write_config(root.path(), "not [ valid toml");
+        assert!(
+            ExclusionPolicy::resolve_for_git(&git).is_err(),
+            "a corrupt config must propagate, not silently pick a policy"
+        );
     }
 
     #[test]
@@ -1752,7 +1990,7 @@ mod tests {
                         .get(&projected.git.root)
                         .unwrap()
                         .bytes
-                        .as_slice()
+                        .as_ref()
                 )
                 .unwrap(),
                 projected.git.root
@@ -1775,5 +2013,30 @@ mod tests {
                 .parse_manifest(&projected.git.root, &other),
             Err(ProjectTreeError::ObjectAlgorithmMismatch)
         ));
+    }
+}
+
+#[cfg(test)]
+mod shared_bytes_tests {
+    use super::*;
+    use atomic_core::change::InodeKind;
+
+    #[test]
+    fn cloning_an_entry_shares_its_bytes() {
+        let entry = RepositoryEntry::new(
+            RepoPath::from_bytes(b"big.bin").unwrap(),
+            vec![7u8; 4096],
+            0o644,
+            InodeKind::Regular,
+            None,
+            ManifestDisposition::Included,
+        )
+        .unwrap();
+        let copy = entry.clone();
+        assert!(
+            Arc::ptr_eq(&entry.repository_bytes, &copy.repository_bytes),
+            "a cloned entry must not own a second copy of its bytes"
+        );
+        assert_eq!(copy, entry);
     }
 }

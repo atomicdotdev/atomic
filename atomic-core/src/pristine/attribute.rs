@@ -244,6 +244,12 @@ pub fn attr_event_dependency_frontier<T: GraphTxnT + ?Sized>(
     txn: &T,
     events: Vec<InodeAttrEvent>,
 ) -> PristineResult<Vec<InodeAttrEvent>> {
+    // No pair of distinct writers exists to compare in the common case. In
+    // particular, a file's lone initial mode/kind writer does not require a
+    // walk through the entire imported history to establish its frontier.
+    if events.len() < 2 {
+        return Ok(events);
+    }
     let mut ancestry = HashMap::<NodeId, BTreeSet<NodeId>>::new();
     for event in &events {
         ancestry.insert(
@@ -366,6 +372,25 @@ mod tests {
         .unwrap();
         bytes[10] = 1;
         assert!(decode_inode_attr_event(&bytes).is_err());
+    }
+
+    #[test]
+    fn empty_and_single_writer_frontiers_need_no_pairwise_reduction() {
+        let temp = tempfile::tempdir().unwrap();
+        let pristine = Pristine::open(temp.path().join("single.redb")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        let writer = txn.register_change(&Hash::of(b"single writer")).unwrap();
+        txn.put_change_deps(writer, &[]).unwrap();
+        txn.commit().unwrap();
+        let txn = pristine.read_txn().unwrap();
+        assert!(attr_event_dependency_frontier(&txn, Vec::new())
+            .unwrap()
+            .is_empty());
+        let event = InodeAttrEvent::new(writer, InodeAttr::Mode(0o755)).unwrap();
+        assert_eq!(
+            attr_event_dependency_frontier(&txn, vec![event]).unwrap(),
+            vec![event]
+        );
     }
 
     /// Review CB-9C R1: the dependency frontier keeps only causally maximal

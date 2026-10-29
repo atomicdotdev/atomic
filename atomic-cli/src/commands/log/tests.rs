@@ -656,7 +656,7 @@ mod tests {
 
     // Integration Tests (Repository)
 
-    use serial_test::serial;
+    use serial_test::file_serial;
     use std::env;
     use std::fs;
     use tempfile::TempDir;
@@ -686,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_outside_repository() {
         let _guard = TestGuard::new();
 
@@ -703,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_empty_repository() {
         let _guard = TestGuard::new();
 
@@ -718,7 +718,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_with_nonexistent_view() {
         let _guard = TestGuard::new();
 
@@ -738,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_json_empty() {
         let _guard = TestGuard::new();
 
@@ -752,7 +752,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_short_format_empty() {
         let _guard = TestGuard::new();
 
@@ -766,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_oneline_format_empty() {
         let _guard = TestGuard::new();
 
@@ -780,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_with_count() {
         let _guard = TestGuard::new();
 
@@ -794,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_with_reverse() {
         let _guard = TestGuard::new();
 
@@ -808,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_with_from_sequence() {
         let _guard = TestGuard::new();
 
@@ -824,7 +824,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_with_tags_only() {
         let _guard = TestGuard::new();
 
@@ -838,7 +838,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_with_full_hash() {
         let _guard = TestGuard::new();
 
@@ -852,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_combined_options() {
         let _guard = TestGuard::new();
 
@@ -870,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_log_run_in_subdirectory() {
         let _guard = TestGuard::new();
 

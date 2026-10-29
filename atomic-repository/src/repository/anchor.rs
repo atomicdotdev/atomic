@@ -1,4 +1,4 @@
-//! CB-7A: bridge anchoring and bound Git HEAD adoption.
+//! CB-7A: shim anchoring and bound Git HEAD adoption.
 //!
 //! Normative source: RFC-ATOMIC-GIT-CAUSAL-BRIDGE §5.1–5.2, §7.1–7.5, §8.1,
 //! §12.1–12.7 and tracker unit CB-7A.
@@ -81,7 +81,7 @@ use super::workspace_txn::{
 };
 use super::{observe_git_index, Repository};
 
-/// The workspace-local commit → view map, under the bridge-private directory.
+/// The workspace-local commit → view map, under the shim-private directory.
 pub const HEAD_MAP_RELATIVE: &str = ".atomic/bridge/head-map.json";
 
 /// The shortest Git short-OID used in ephemeral view names (RFC §7.5).
@@ -92,20 +92,20 @@ const EPHEMERAL_MIN_PREFIX: usize = 7;
 /// Typed anchor refusals. Nothing is mutated before a refusal is produced and
 /// every variant names its remediation (RFC §7, Phase 7 task 1).
 #[derive(Debug, thiserror::Error)]
-pub enum BridgeAnchorRefusal {
+pub enum ShimAnchorRefusal {
     #[error(
         "cannot anchor an unborn Git HEAD ('{symref}' has no commit); create at least one \
-         commit before enabling the bridge"
+         commit before enabling the shim"
     )]
     UnbornHead { symref: String },
     #[error(
         "cannot anchor Git HEAD pointing at missing target '{symref}'; restore the branch in \
-         Git before enabling the bridge"
+         Git before enabling the shim"
     )]
     MissingHeadTarget { symref: String },
     #[error(
         "cannot anchor a detached Git HEAD at {oid}; checkout a branch or bind this commit \
-         explicitly with 'atomic git bridge binding publish --key-file …'"
+         explicitly with 'atomic git shim binding publish --key-file …'"
     )]
     DetachedHead { oid: String },
     #[error(
@@ -114,24 +114,24 @@ pub enum BridgeAnchorRefusal {
     )]
     DirtyState { detail: String },
     #[error(
-        "bridge anchor refused: Git and Atomic states diverge; run \
-         'atomic git bridge enable --adopt-atomic' to project the Atomic state onto Git, or \
+        "shim anchor refused: Git and Atomic states diverge; run \
+         'atomic git shim enable --adopt-atomic' to project the Atomic state onto Git, or \
          reconcile manually — Atomic never silently merges the two. Mismatches: {report}"
     )]
     Mismatch { report: String },
     #[error(
         "--adopt-git is unavailable: unbound Git adoption ships with Phase 9 foreign \
          synthesis (CB-9B/9C); bind this commit first with \
-         'atomic git bridge binding publish --key-file …'"
+         'atomic git shim binding publish --key-file …'"
     )]
     AdoptGitUnavailable,
 }
 
 /// Anchor failures that are not refusals: infrastructure or verification.
 #[derive(Debug, thiserror::Error)]
-pub enum BridgeAnchorError {
+pub enum ShimAnchorError {
     #[error(transparent)]
-    Refusal(#[from] BridgeAnchorRefusal),
+    Refusal(#[from] ShimAnchorRefusal),
     #[error(transparent)]
     Repository(#[from] RepositoryError),
     #[error(transparent)]
@@ -142,7 +142,7 @@ pub enum BridgeAnchorError {
 
 /// Successful anchor: the signed immutable binding plus the verified checkpoint.
 #[derive(Debug)]
-pub struct BridgeAnchorOutcome {
+pub struct ShimAnchorOutcome {
     /// The signed Anchor binding (immutable, create-only publication).
     pub binding: GitStateBinding,
     /// Whether the binding ref was created (fresh) or replayed an identical
@@ -216,7 +216,7 @@ struct HeadMapWire {
     mappings: BTreeMap<String, HeadMapEntry>,
 }
 
-/// Read the workspace-local head map. It lives under the bridge-private
+/// Read the workspace-local head map. It lives under the shim-private
 /// directory, is never projected into Git, and a missing file reads as an
 /// empty map; malformed or future-versioned maps fail closed.
 pub fn read_head_map(root: &Path) -> Result<BTreeMap<String, HeadMapEntry>, RepositoryError> {
@@ -226,17 +226,17 @@ pub fn read_head_map(root: &Path) -> Result<BTreeMap<String, HeadMapEntry>, Repo
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(error) => {
             return Err(RepositoryError::InvalidRepository {
-                reason: format!("cannot read bridge head map '{}': {error}", path.display()),
+                reason: format!("cannot read shim head map '{}': {error}", path.display()),
             })
         }
     };
     let wire: HeadMapWire =
         serde_json::from_slice(&bytes).map_err(|error| RepositoryError::InvalidRepository {
-            reason: format!("bridge head map '{}' is malformed: {error}", path.display()),
+            reason: format!("shim head map '{}' is malformed: {error}", path.display()),
         })?;
     if wire.version != 1 {
         return Err(RepositoryError::InvalidRepository {
-            reason: format!("unsupported bridge head map version {}", wire.version),
+            reason: format!("unsupported shim head map version {}", wire.version),
         });
     }
     Ok(wire.mappings)
@@ -354,7 +354,7 @@ fn write_head_map(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| RepositoryError::InvalidRepository {
             reason: format!(
-                "cannot create bridge directory '{}': {error}",
+                "cannot create shim directory '{}': {error}",
                 parent.display()
             ),
         })?;
@@ -407,23 +407,21 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), RepositoryError> {
 
 /// The deterministic conversion policy for one live Git repository
 /// (RFC §6.1–6.2): object format, platform capabilities, exclusion rules.
-pub fn conversion_policy_for_git(
-    git: &GitRepository,
-) -> Result<ConversionPolicy, BridgeAnchorError> {
-    let config = git.config().map_err(|error| {
-        BridgeAnchorError::Git(format!("cannot read Git configuration: {error}"))
-    })?;
+pub fn conversion_policy_for_git(git: &GitRepository) -> Result<ConversionPolicy, ShimAnchorError> {
+    let config = git
+        .config()
+        .map_err(|error| ShimAnchorError::Git(format!("cannot read Git configuration: {error}")))?;
     let object_format = match config.get_string("extensions.objectFormat") {
         Ok(value) if value.eq_ignore_ascii_case("sha1") => GitHashAlgorithm::Sha1,
         Ok(value) if value.eq_ignore_ascii_case("sha256") => GitHashAlgorithm::Sha256,
         Ok(value) => {
-            return Err(BridgeAnchorError::Git(format!(
+            return Err(ShimAnchorError::Git(format!(
                 "unsupported Git object algorithm '{value}'"
             )))
         }
         Err(error) if error.code() == git2::ErrorCode::NotFound => GitHashAlgorithm::Sha1,
         Err(error) => {
-            return Err(BridgeAnchorError::Git(format!(
+            return Err(ShimAnchorError::Git(format!(
                 "cannot read Git object algorithm: {error}"
             )))
         }
@@ -436,25 +434,33 @@ pub fn conversion_policy_for_git(
         case_sensitive: !config.get_bool("core.ignorecase").unwrap_or(false),
         unicode_normalizing: config.get_bool("core.precomposeunicode").unwrap_or(false),
     };
+    // RFC §6.2: `.vault/` is private by default but may be tracked under
+    // explicit policy. Anchoring must prove equivalence under the same
+    // policy the import and the verifier resolved, so a colocated
+    // repository that tracks `.vault/` anchors with the vault included in
+    // the manifest projection. Fails closed on a corrupt configuration.
+    policy.exclusions = crate::ExclusionPolicy::resolve_for_git(git).map_err(|error| {
+        ShimAnchorError::Git(format!("cannot resolve the shim vault policy: {error}"))
+    })?;
     Ok(policy)
 }
 
-fn object_format_for(oid: &git2::Oid) -> Result<GitObjectFormat, BridgeAnchorError> {
+fn object_format_for(oid: &git2::Oid) -> Result<GitObjectFormat, ShimAnchorError> {
     match oid.as_bytes().len() {
         20 => Ok(GitObjectFormat::Sha1),
         32 => Ok(GitObjectFormat::Sha256),
-        other => Err(BridgeAnchorError::Git(format!(
+        other => Err(ShimAnchorError::Git(format!(
             "unexpected Git OID width {other}"
         ))),
     }
 }
 
-fn tagged_oid(oid: &git2::Oid) -> Result<GitOid, BridgeAnchorError> {
+fn tagged_oid(oid: &git2::Oid) -> Result<GitOid, ShimAnchorError> {
     let bytes = oid.as_bytes();
     match bytes.len() {
         20 => Ok(GitOid::Sha1(bytes.try_into().expect("sha1 width"))),
         32 => Ok(GitOid::Sha256(bytes.try_into().expect("sha256 width"))),
-        other => Err(BridgeAnchorError::Git(format!(
+        other => Err(ShimAnchorError::Git(format!(
             "unexpected Git OID width {other}"
         ))),
     }
@@ -486,14 +492,14 @@ impl Repository {
     /// CB-7A AC-1: prove complete repository/index/worktree equivalence for
     /// `view` against Git HEAD under one conversion policy (RFC §6.1–6.2,
     /// §12.5). An empty mismatch list is the proof.
-    pub fn bridge_anchor_equivalence(
+    pub fn shim_anchor_equivalence(
         &self,
         git: &GitRepository,
         view: &str,
         policy: &ConversionPolicy,
-    ) -> Result<crate::EquivalenceReport, BridgeAnchorError> {
+    ) -> Result<crate::EquivalenceReport, ShimAnchorError> {
         let project = self.project_tree(view, policy).map_err(|error| {
-            BridgeAnchorError::Git(format!("cannot project view '{view}': {error}"))
+            ShimAnchorError::Git(format!("cannot project view '{view}': {error}"))
         })?;
         let index = observe_git_index(&self.root, policy)?;
         let filter = crate::GitAttributesFilter::for_repository(&self.root);
@@ -508,7 +514,7 @@ impl Repository {
                 .map(|commit| commit.tree_id())
                 .map(|oid| {
                     GitObjectId::new(policy.object_format, oid.as_bytes().to_vec())
-                        .map_err(|error| BridgeAnchorError::Git(error.to_string()))
+                        .map_err(|error| ShimAnchorError::Git(error.to_string()))
                 })
                 .transpose()?,
             ..EquivalenceClaims::default()
@@ -525,9 +531,9 @@ impl Repository {
         &self,
         git: &GitRepository,
         view: &str,
-    ) -> Result<(), BridgeAnchorError> {
+    ) -> Result<(), ShimAnchorError> {
         let policy = conversion_policy_for_git(git)?;
-        let report = self.bridge_anchor_equivalence(git, view, &policy)?;
+        let report = self.shim_anchor_equivalence(git, view, &policy)?;
         if report.is_equivalent() {
             return Ok(());
         }
@@ -539,13 +545,13 @@ impl Repository {
         });
         let detail = format_equivalence_report(&report);
         if pending_only {
-            Err(BridgeAnchorRefusal::DirtyState { detail }.into())
+            Err(ShimAnchorRefusal::DirtyState { detail }.into())
         } else {
-            Err(BridgeAnchorRefusal::Mismatch { report: detail }.into())
+            Err(ShimAnchorRefusal::Mismatch { report: detail }.into())
         }
     }
 
-    /// CB-7A AC-1: anchor the bridge by proving complete equivalence and
+    /// CB-7A AC-1: anchor the shim by proving complete equivalence and
     /// creating the signed Anchor binding plus the verified working-copy
     /// checkpoint.
     ///
@@ -560,44 +566,44 @@ impl Repository {
     /// receiver without an Atomic remote can still verify the closure. The
     /// pack must be the output of [`crate::git_binding::assemble_changes_pack`];
     /// the publisher revalidates it and refuses private material closed.
-    pub fn enable_bridge_anchor(
+    pub fn enable_shim_anchor(
         &mut self,
         git: &GitRepository,
         signer: &atomic_identity::keypair::KeyPair,
-    ) -> Result<BridgeAnchorOutcome, BridgeAnchorError> {
-        self.enable_bridge_anchor_inner(git, signer, None)
+    ) -> Result<ShimAnchorOutcome, ShimAnchorError> {
+        self.enable_shim_anchor_inner(git, signer, None)
     }
 
-    /// [`Self::enable_bridge_anchor`] with a bounded `changes.pack` fallback
+    /// [`Self::enable_shim_anchor`] with a bounded `changes.pack` fallback
     /// attached to the Anchor's binding tree (CB-10B, RFC §8.6).
-    pub fn enable_bridge_anchor_with_changes_pack(
+    pub fn enable_shim_anchor_with_changes_pack(
         &mut self,
         git: &GitRepository,
         signer: &atomic_identity::keypair::KeyPair,
         changes_pack: &[u8],
-    ) -> Result<BridgeAnchorOutcome, BridgeAnchorError> {
+    ) -> Result<ShimAnchorOutcome, ShimAnchorError> {
         if changes_pack.is_empty() {
-            return Err(BridgeAnchorError::Repository(
+            return Err(ShimAnchorError::Repository(
                 RepositoryError::InvalidOperation {
                     message: "an empty changes.pack cannot be published; omit it instead"
                         .to_string(),
                 },
             ));
         }
-        self.enable_bridge_anchor_inner(git, signer, Some(changes_pack))
+        self.enable_shim_anchor_inner(git, signer, Some(changes_pack))
     }
 
-    fn enable_bridge_anchor_inner(
+    fn enable_shim_anchor_inner(
         &mut self,
         git: &GitRepository,
         signer: &atomic_identity::keypair::KeyPair,
         changes_pack: Option<&[u8]>,
-    ) -> Result<BridgeAnchorOutcome, BridgeAnchorError> {
+    ) -> Result<ShimAnchorOutcome, ShimAnchorError> {
         // Typed HEAD classification first: unborn and detached HEADs refuse
         // before any equivalence work (RFC §7.1 step 4, Phase 7 tests).
         let observation = crate::observe_git_metadata(&self.root)?;
         let crate::WorkspaceGitObservation::Repository(observed) = &observation else {
-            return Err(BridgeAnchorRefusal::UnbornHead {
+            return Err(ShimAnchorRefusal::UnbornHead {
                 symref: "<no-git>".to_string(),
             }
             .into());
@@ -607,16 +613,16 @@ impl Repository {
                 self.desired_view_name(self.require_working_copy_id()?)?
             }
             GitHeadObservation::Detached { oid } => {
-                return Err(BridgeAnchorRefusal::DetachedHead { oid: oid.clone() }.into())
+                return Err(ShimAnchorRefusal::DetachedHead { oid: oid.clone() }.into())
             }
             GitHeadObservation::Unborn { symref } => {
-                return Err(BridgeAnchorRefusal::UnbornHead {
+                return Err(ShimAnchorRefusal::UnbornHead {
                     symref: symref.clone(),
                 }
                 .into())
             }
             GitHeadObservation::MissingTarget { symref } => {
-                return Err(BridgeAnchorRefusal::MissingHeadTarget {
+                return Err(ShimAnchorRefusal::MissingHeadTarget {
                     symref: symref.clone(),
                 }
                 .into())
@@ -637,7 +643,7 @@ impl Repository {
         // The verified checkpoint is written only after HEAD/index
         // re-observation (RFC §7.1 step 8, §7.2 step 6).
         self.write_verified_checkpoint(git, &view, &state)?;
-        Ok(BridgeAnchorOutcome {
+        Ok(ShimAnchorOutcome {
             binding,
             publication,
             view,
@@ -654,24 +660,22 @@ impl Repository {
         git: &GitRepository,
         view: &str,
         signer: &atomic_identity::keypair::KeyPair,
-    ) -> Result<GitStateBinding, BridgeAnchorError> {
+    ) -> Result<GitStateBinding, ShimAnchorError> {
         let head = git
             .head()
             .ok()
             .and_then(|head| head.target())
             .ok_or_else(|| {
-                BridgeAnchorError::Git("Git HEAD is not a direct commit reference".to_string())
+                ShimAnchorError::Git("Git HEAD is not a direct commit reference".to_string())
             })?;
         let commit = git.find_commit(head).map_err(|error| {
-            BridgeAnchorError::Git(format!("cannot read Git HEAD commit: {error}"))
+            ShimAnchorError::Git(format!("cannot read Git HEAD commit: {error}"))
         })?;
         let raw_commit = git
             .odb()
-            .map_err(|error| BridgeAnchorError::Git(format!("cannot open Git odb: {error}")))?
+            .map_err(|error| ShimAnchorError::Git(format!("cannot open Git odb: {error}")))?
             .read(head)
-            .map_err(|error| {
-                BridgeAnchorError::Git(format!("cannot read raw HEAD commit: {error}"))
-            })?
+            .map_err(|error| ShimAnchorError::Git(format!("cannot read raw HEAD commit: {error}")))?
             .data()
             .to_vec();
 
@@ -712,7 +716,7 @@ impl Repository {
             return Ok(existing);
         }
         GitStateBinding::sign(payload, signer).map_err(|error| {
-            BridgeAnchorError::Repository(RepositoryError::InvalidOperation {
+            ShimAnchorError::Repository(RepositoryError::InvalidOperation {
                 message: format!("cannot sign the Anchor binding: {error}"),
             })
         })
@@ -987,7 +991,7 @@ impl Repository {
                     head: head_hex.clone(),
                     reason: "no verified binding covers this commit; unbound Git adoption \
                              stays disabled until Phase 9 (CB-9B/9C) — bind it explicitly \
-                             with 'atomic git bridge binding publish --key-file …'"
+                             with 'atomic git shim binding publish --key-file …'"
                         .to_string(),
                 })
             }
@@ -1034,7 +1038,7 @@ impl Repository {
             }
         })?;
         let report = self
-            .bridge_anchor_equivalence(&git, &target.view, &policy)
+            .shim_anchor_equivalence(&git, &target.view, &policy)
             .map_err(|error| RepositoryError::HeadAdoptionRefused {
                 head: head_hex.clone(),
                 reason: error.to_string(),

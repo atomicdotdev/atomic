@@ -31,6 +31,14 @@ impl Repository {
     /// `.vault/` directory structure on disk. This is idempotent —
     /// calling it on an already-initialized vault is a no-op.
     ///
+    /// When a `.vault/` working copy already exists on disk (a colocated
+    /// repository that tracks `.vault/` in Git, or a `.vault/` restored
+    /// from elsewhere), its bytes are user work and authoritative: the
+    /// tables are hydrated from disk before any default content is
+    /// considered, and `vault_install_defaults` never overwrites an
+    /// existing file. Re-initializing an existing vault therefore never
+    /// resets templates or memories.
+    ///
     /// # Directory structure created:
     /// ```text
     /// .vault/
@@ -77,7 +85,24 @@ impl Repository {
         // Initialize embeddings table
         self.init_embeddings()?;
 
-        // Install default vault content (skills, memory index, system prompt)
+        // Hydrate the tables from an existing on-disk working copy BEFORE
+        // installing defaults: a `.vault/` that arrived with a colocated
+        // Git checkout (or any other source) is user work, and its bytes
+        // are authoritative. The pull/clone path has
+        // `bootstrap_vault_from_working_copy` for this; init on a
+        // pre-existing directory has the same shape.
+        if vault_dir.exists() {
+            let updated = self.vault_record_working_copy()?;
+            if !updated.is_empty() {
+                log::info!(
+                    "Hydrated {} vault entries from the existing .vault/ working copy",
+                    updated.len()
+                );
+            }
+        }
+
+        // Install default vault content (skills, memory index, system
+        // prompt) — only for paths absent from both the database and disk.
         self.vault_install_defaults()?;
 
         // NOTE: The vault files are NOT added+recorded here. The CLI init
@@ -160,6 +185,7 @@ impl Repository {
         content: Vec<u8>,
         frontmatter_json: String,
     ) -> Result<Hash, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let now = chrono::Utc::now().to_rfc3339();
         let entry = VaultEntry::new(entry_type, content, frontmatter_json, now.clone());
         let content_hash = Hash::from_bytes(entry.content_hash);
@@ -179,18 +205,14 @@ impl Repository {
             }
             _ => Vec::new(),
         };
-        if let Some(previous_entry_type) = previous_entry
+        if let Some(_previous_entry_type) = previous_entry
             .as_ref()
             .map(|previous| previous.entry_type)
             .filter(|previous| *previous != entry_type)
         {
             txn.init_kg()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            txn.del_kg_node(&super::vault_triples::entry_subject(
-                path,
-                previous_entry_type,
-            ))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            super::vault_triples::delete_vault_projection(&mut txn, path)?;
         }
 
         txn.put_vault_entry(path, &entry)
@@ -233,6 +255,7 @@ impl Repository {
         path: &str,
         entry: &VaultEntry,
     ) -> Result<Hash, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let content_hash = Hash::from_bytes(entry.content_hash);
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -251,18 +274,14 @@ impl Repository {
             }
             _ => Vec::new(),
         };
-        if let Some(previous_entry_type) = previous_entry
+        if let Some(_previous_entry_type) = previous_entry
             .as_ref()
             .map(|previous| previous.entry_type)
             .filter(|previous| *previous != entry.entry_type)
         {
             txn.init_kg()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            txn.del_kg_node(&super::vault_triples::entry_subject(
-                path,
-                previous_entry_type,
-            ))
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            super::vault_triples::delete_vault_projection(&mut txn, path)?;
         }
 
         txn.put_vault_entry(path, entry)
@@ -299,17 +318,16 @@ impl Repository {
     /// Called as a side effect of `vault_store` and `vault_store_entry`.
     /// Best-effort — logs on failure but never fails the parent operation.
     fn vault_auto_index(&self, path: &str) {
-        // Signed attestation blobs must not pollute semantic search, and they
-        // contribute no KG triples (vault_extract_kg early-returns empty for
-        // Attestation). Skip embedding entirely for them.
+        // Signed documents contribute typed workflow links, but their serialized
+        // JSON/proof bytes do not belong in semantic content embeddings.
         let is_attestation = matches!(
             self.vault_retrieve(path),
             Ok(Some(e)) if e.entry_type == VaultEntryType::Attestation
         );
 
-        // KG indexing — safe: extract_kg returns empty for Attestation, so
-        // vault_store_kg deletes any stale rows and stores nothing.
-        if let Err(e) = self.vault_index_kg(path) {
+        // Re-resolve references as a set: adding/removing a target can repair
+        // another entry's historical gap without changing that source entry.
+        if let Err(e) = self.vault_reindex_kg() {
             log::debug!("Auto KG index for {}: {}", path, e);
         }
 
@@ -366,6 +384,7 @@ impl Repository {
 
     /// Delete a vault entry by path. Also updates the manifest.
     pub fn vault_delete(&self, path: &str) -> Result<bool, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut txn = self
             .pristine
             .write_txn()
@@ -381,10 +400,6 @@ impl Repository {
         } else {
             Vec::new()
         };
-        let entry_type = previous_entry
-            .as_ref()
-            .map(|entry| entry.entry_type)
-            .unwrap_or_else(|| infer_entry_type(path));
 
         txn.init_kg()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -395,13 +410,10 @@ impl Repository {
 
         // KG and embeddings are derived from the Vault entry. Clean both even
         // if the source entry is already missing so a retry repairs stale data.
-        let node_id = super::vault_triples::entry_subject(path, entry_type);
         // Remove projected child nodes (tasks, acceptance criteria, scope,
         // constraints) before the subject so an intent deletion does not orphan
         // them or their SATISFIES/TOUCHES edges. No-op for non-intent subjects.
-        super::vault_triples::delete_intent_child_nodes(&mut txn, &node_id)?;
-        txn.del_kg_node(&node_id)
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        super::vault_triples::delete_vault_projection(&mut txn, path)?;
         txn.del_embeddings(path)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -417,6 +429,7 @@ impl Repository {
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        self.vault_reindex_kg()?;
         for update in cascade_updates {
             self.vault_auto_index(&update.path);
             if let Err(error) = self.vault_materialize(&update.path) {
@@ -1244,7 +1257,7 @@ fn remove_manifest_summary_for_entry(manifest: &mut VaultManifest, path: &str, e
 ///
 /// The system fields are always included to enable round-trip (deflation
 /// can reconstruct the VaultEntry from the file).
-fn render_entry_to_markdown(entry: &VaultEntry) -> String {
+pub(crate) fn render_entry_to_markdown(entry: &VaultEntry) -> String {
     let mut output = String::new();
     output.push_str("---\n");
 
@@ -1292,15 +1305,10 @@ fn render_entry_to_markdown(entry: &VaultEntry) -> String {
 
     output.push_str("---\n");
 
-    // Content body
+    // Preserve the stored text exactly. Adding a newline changes its hash and
+    // makes an unchanged materialize/record cycle look like a content edit.
     let content = String::from_utf8_lossy(&entry.content_bytes);
-    if !content.is_empty() {
-        output.push_str(&content);
-        // Ensure file ends with a newline
-        if !content.ends_with('\n') {
-            output.push('\n');
-        }
-    }
+    output.push_str(&content);
 
     output
 }
@@ -2174,6 +2182,49 @@ mod tests {
 
         let result = repo.vault_materialize("nonexistent.md");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn vault_materialize_and_rebuild_preserve_body_bytes() {
+        let source_dir = tempdir().unwrap();
+        let receiver_dir = tempdir().unwrap();
+        let source = Repository::init(source_dir.path()).unwrap();
+        let receiver = Repository::init(receiver_dir.path()).unwrap();
+        source.init_vault().unwrap();
+        receiver.init_vault().unwrap();
+        for (index, body) in [
+            "",
+            "no final newline",
+            "one newline\n",
+            "two\n\n",
+            "中文\r\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let path = format!("memories/roundtrip-{index}.md");
+            source
+                .vault_store(
+                    &path,
+                    VaultEntryType::Memory,
+                    body.as_bytes().to_vec(),
+                    "{}".into(),
+                )
+                .unwrap();
+            let before = source.vault_retrieve(&path).unwrap().unwrap();
+            source.vault_materialize(&path).unwrap();
+            let file = std::fs::read_to_string(source.vault_dir().join(&path)).unwrap();
+            assert!(source
+                .vault_record_files(&[(path.clone(), Some(file.clone()))])
+                .unwrap()
+                .is_empty());
+            receiver
+                .vault_record_files(&[(path.clone(), Some(file))])
+                .unwrap();
+            let after = receiver.vault_retrieve(&path).unwrap().unwrap();
+            assert_eq!(after.content_bytes, before.content_bytes, "{path}");
+            assert_eq!(after.content_hash, before.content_hash, "{path}");
+        }
     }
 
     #[test]

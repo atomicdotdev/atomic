@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use atomic_canonical::node::CanonicalNode;
 use atomic_canonical::{intent_substance_hash, triage_reference, validate_intent, TriagePins};
 use atomic_core::change::{Change, GraphOp, ProvenanceGraph};
-use atomic_core::pristine::ontology::edge_kind;
+use atomic_core::kg::{iri, ontology::Predicate as P};
 use atomic_core::types::{Base32, Hash};
 
 use crate::diff_engine::{change_file_diffs, DiffFormat, DiffOutputConfig, FileChangeStatus};
@@ -32,11 +32,10 @@ use crate::Repository;
 use super::model::*;
 
 /// Case-insensitive edge-kind comparison, mirroring `QueryCallers`.
-fn kind_is(kind: &str, expected: &str) -> bool {
-    kind.eq_ignore_ascii_case(expected)
+fn kind_is(kind: &P, expected: P) -> bool {
+    *kind == expected
 }
 
-/// First 12 base32 chars — the short id used for `change:<short>` KG nodes.
 /// True for paths the vault owns — intent files, attestations, audit
 /// entries. Changes confined to these are lifecycle bookkeeping, not work
 /// a task is expected to have declared.
@@ -47,18 +46,6 @@ fn is_vault_path(path: &str) -> bool {
 
 fn short12(hash_b32: &str) -> String {
     hash_b32.chars().take(12).collect()
-}
-
-/// Map a canonical `urn:atomic:<kind>:<local>` id to its KG child id
-/// (`<kind>:<LOCAL>`), matching `vault_triples::child_kg_id`.
-fn child_kg_id(urn: &str) -> String {
-    match urn.strip_prefix("urn:atomic:") {
-        Some(rest) => match rest.split_once(':') {
-            Some((kind, local)) => format!("{kind}:{}", local.to_uppercase()),
-            None => rest.to_uppercase(),
-        },
-        None => urn.to_string(),
-    }
 }
 
 /// If any acceptance criterion on `node` carries a view-scoped verification
@@ -89,6 +76,8 @@ pub fn build_report(
 ) -> Result<TriageReport, RepositoryError> {
     // 1. The candidate set (T0): only-in-feature, closure additions, baggage.
     let set = repo.triage_candidate_set(feature, target)?;
+    let project = repo.project_id()?;
+    let syntax = repo.syntax_index(Some(feature))?;
 
     // 2. The pinned view Merkle (the materialized state the report is about).
     let view_merkle = repo.get_view_info(feature)?.state_base32();
@@ -121,8 +110,8 @@ pub fn build_report(
     // Walkthrough facts, collected in the same KG passes (no extra queries):
     // path → module (PART_OF) and file → file dependency edges (IMPORTS/
     // INCLUDES). Best-effort — empty on an unenriched KG.
-    let mut file_module: BTreeMap<String, String> = BTreeMap::new();
-    let mut file_deps: BTreeSet<(String, String)> = BTreeSet::new();
+    let file_module = syntax.file_modules.clone();
+    let file_deps = syntax.file_deps.clone();
     // Task facts from reached intents (id, text, touches, satisfies), in
     // intent-id order — the walkthrough's narrative inputs.
     let mut task_facts: Vec<TaskFact> = Vec::new();
@@ -161,7 +150,7 @@ pub fn build_report(
 
         // The shared `file:<path>` node ids that MODIFIES/TOUCHES/DEFINES/
         // SCOPE_OUT_FILE all meet on.
-        let mut modifies: Vec<String> = paths.iter().map(|p| format!("file:{p}")).collect();
+        let mut modifies: Vec<String> = paths.iter().map(|p| iri::mint_file(&project, p)).collect();
         modifies.sort();
         modifies.dedup();
         for f in &modifies {
@@ -173,36 +162,21 @@ pub fn build_report(
         // entities) seeds the blast walk. Both sit at depth 1 from the file
         // node. Absent enrichment these are simply empty (best-effort).
         let mut touching_tasks: BTreeSet<String> = BTreeSet::new();
-        let mut entities: Vec<String> = Vec::new();
+        let mut entities: Vec<String> = syntax
+            .entities
+            .iter()
+            .filter(|entity| paths.contains(&entity.file))
+            .map(|entity| format!("{}#{}", entity.file, entity.name))
+            .collect();
         let mut covered = false;
         for file_id in &modifies {
             let Ok(fsub) = repo.vault_kg_neighbors(file_id, 1) else {
                 continue;
             };
-            let path = file_id.strip_prefix("file:").unwrap_or(file_id);
             for e in &fsub.edges {
-                if e.to_id == *file_id && kind_is(&e.kind, edge_kind::TOUCHES) {
+                if e.to_id == *file_id && kind_is(&e.kind, P::Touches) {
                     covered = true;
                     touching_tasks.insert(e.from_id.clone());
-                }
-                if e.from_id == *file_id && kind_is(&e.kind, edge_kind::DEFINES) {
-                    entities.push(e.to_id.clone());
-                }
-                // Walkthrough facts on the same depth-1 neighborhood: the
-                // file's module (PART_OF) and its outgoing file dependencies
-                // (IMPORTS / INCLUDES) — the layer-ordering signal.
-                if e.from_id == *file_id && kind_is(&e.kind, edge_kind::PART_OF) {
-                    if let Some(module) = e.to_id.strip_prefix("module:") {
-                        file_module.insert(path.to_string(), module.to_string());
-                    }
-                }
-                if e.from_id == *file_id
-                    && (kind_is(&e.kind, edge_kind::IMPORTS)
-                        || kind_is(&e.kind, edge_kind::INCLUDES))
-                {
-                    if let Some(target) = e.to_id.strip_prefix("file:") {
-                        file_deps.insert((path.to_string(), target.to_string()));
-                    }
                 }
             }
         }
@@ -222,14 +196,14 @@ pub fn build_report(
         for task in &touching_tasks {
             let tsub = repo.vault_kg_neighbors(task, 1)?;
             for e in &tsub.edges {
-                if e.to_id == *task && kind_is(&e.kind, edge_kind::HAS_TASK) {
+                if e.to_id == *task && kind_is(&e.kind, P::HasTask) {
                     reached = true;
                     intent_to_changes
                         .entry(e.from_id.clone())
                         .or_default()
                         .insert(full.clone());
                 }
-                if e.from_id == *task && kind_is(&e.kind, edge_kind::SATISFIES) {
+                if e.from_id == *task && kind_is(&e.kind, P::Satisfies) {
                     ac_to_changes
                         .entry(e.to_id.clone())
                         .or_default()
@@ -262,8 +236,11 @@ pub fn build_report(
     let mut intent_substance_hashes: BTreeMap<String, String> = BTreeMap::new();
 
     for intent_kg_id in intent_to_changes.keys() {
-        let bare = intent_kg_id.strip_prefix("intent:").unwrap_or(intent_kg_id);
-        match load_intent_node(repo, bare) {
+        let (_, bare) =
+            iri::parse_intent(intent_kg_id).map_err(|e| RepositoryError::InvalidOperation {
+                message: e.to_string(),
+            })?;
+        match load_intent_node(repo, &bare) {
             Ok(node) => {
                 let report = validate_intent(&node);
                 let current_substance = intent_substance_hash(&node);
@@ -276,7 +253,7 @@ pub fn build_report(
                 // The pin lives in the intent's frontmatter (not the lifted
                 // node), so read it via the bridge.
                 if node.status == "done" {
-                    if let Some(pin) = load_intent_done_pin(repo, bare) {
+                    if let Some(pin) = load_intent_done_pin(repo, &bare) {
                         if pin != current_substance {
                             findings.push(
                                 Finding::new(
@@ -307,15 +284,17 @@ pub fn build_report(
                 // never blocking.
                 if let Ok(sub) = repo.vault_kg_neighbors(intent_kg_id, 1) {
                     for e in &sub.edges {
-                        if e.to_id != *intent_kg_id || !kind_is(&e.kind, edge_kind::REMEDIATES) {
+                        if e.to_id != *intent_kg_id || !kind_is(&e.kind, P::Remediates) {
                             continue;
                         }
                         let b_id = &e.from_id;
-                        let b_bare = b_id.strip_prefix("intent:").unwrap_or(b_id);
+                        let b_bare = iri::parse_intent(b_id)
+                            .map(|(_, uid)| uid)
+                            .unwrap_or_default();
                         // In flight = B is not `done`. If B loads and is done,
                         // the remediation is resolved → skip. If B fails to load
                         // (or is any non-done status), treat it as in flight.
-                        let b_done = load_intent_node(repo, b_bare)
+                        let b_done = load_intent_node(repo, &b_bare)
                             .map(|n| n.status == "done")
                             .unwrap_or(false);
                         if b_done {
@@ -352,12 +331,14 @@ pub fn build_report(
                     if let Ok(sub) = repo.vault_kg_neighbors(intent_kg_id, 1) {
                         for e in &sub.edges {
                             // review --REVIEWS--> work (incoming to the work intent).
-                            if e.to_id != *intent_kg_id || !kind_is(&e.kind, edge_kind::REVIEWS) {
+                            if e.to_id != *intent_kg_id || !kind_is(&e.kind, P::Reviews) {
                                 continue;
                             }
                             review_exists = true;
-                            let r_bare = e.from_id.strip_prefix("intent:").unwrap_or(&e.from_id);
-                            if let Ok(rnode) = load_intent_node(repo, r_bare) {
+                            let r_bare = iri::parse_intent(&e.from_id)
+                                .map(|(_, uid)| uid)
+                                .unwrap_or_default();
+                            if let Ok(rnode) = load_intent_node(repo, &r_bare) {
                                 let review_author = rnode.attributed_to.clone().unwrap_or_default();
                                 let independent = !work_author.is_empty()
                                     && !review_author.is_empty()
@@ -425,7 +406,15 @@ pub fn build_report(
 
                 let mut criteria = Vec::new();
                 for ac in &node.has_acceptance_criterion {
-                    let ac_kg = child_kg_id(&ac.id);
+                    let ac_kg = iri::mint_child(
+                        &project,
+                        &bare,
+                        iri::ChildKind::AcceptanceCriterion,
+                        ac.id.rsplit(':').next().unwrap_or(&ac.id),
+                    )
+                    .map_err(|e| RepositoryError::InvalidOperation {
+                        message: e.to_string(),
+                    })?;
                     let satisfied_by: Vec<String> = ac_to_changes
                         .get(&ac_kg)
                         .map(|s| s.iter().cloned().collect())
@@ -638,7 +627,7 @@ pub fn build_report(
         let scope_out: HashSet<String> = isub
             .edges
             .iter()
-            .filter(|e| e.from_id == *intent_kg_id && kind_is(&e.kind, edge_kind::SCOPE_OUT_FILE))
+            .filter(|e| e.from_id == *intent_kg_id && kind_is(&e.kind, P::ScopeOutFile))
             .map(|e| e.to_id.clone())
             .collect();
         if scope_out.is_empty() {
@@ -676,29 +665,9 @@ pub fn build_report(
     for (i, entities) in change_entities.iter().enumerate() {
         let mut callers: BTreeSet<String> = BTreeSet::new();
         for entity in entities {
-            let Ok(esub) = repo.vault_kg_neighbors(entity, 2) else {
-                continue;
-            };
-            for e in &esub.edges {
-                if e.to_id != *entity || !kind_is(&e.kind, edge_kind::CALLS) {
-                    continue;
-                }
-                let caller = &e.from_id;
-                // The caller's defining file(s): incoming DEFINES to the caller.
-                let caller_files: Vec<&String> = esub
-                    .edges
-                    .iter()
-                    .filter(|d| d.to_id == *caller && kind_is(&d.kind, edge_kind::DEFINES))
-                    .map(|d| &d.from_id)
-                    .collect();
-                // Only flag when we can see a defining file and none of them are
-                // in the change-set (avoids noise on partially-enriched graphs).
-                if caller_files.is_empty() {
-                    continue;
-                }
-                let in_change_set = caller_files.iter().any(|f| all_modified_files.contains(*f));
-                if !in_change_set {
-                    callers.insert(caller.clone());
+            for caller in syntax.callers(entity) {
+                if !all_modified_files.contains(&iri::mint_file(&project, &caller.path)) {
+                    callers.insert(format!("{}#{}", caller.path, caller.name));
                 }
             }
         }
@@ -737,6 +706,7 @@ pub fn build_report(
         candidate_hashes.dedup();
         if !candidate_hashes.is_empty() {
             let provider = crate::repository::provenance_gate::local_session_mac_key_provider(repo);
+            let did_provider = crate::repository::provenance_gate::local_did_key_provider(repo);
             match repo.evaluate_publication_gate(
                 &candidate_hashes,
                 &crate::repository::provenance_gate::PublicationGateConfig::from_repo(repo)
@@ -745,6 +715,7 @@ pub fn build_report(
                         repository_identity: None,
                     }),
                 Some(&provider),
+                Some(&did_provider),
             ) {
                 Ok(verdict) => {
                     for blocker in &verdict.blocks {
@@ -842,7 +813,14 @@ pub fn build_report(
             )
         })
         .collect();
-    let walkthrough = build_walkthrough(&change_paths, &file_module, &file_deps, &task_facts);
+    let mut walkthrough = build_walkthrough(&change_paths, &file_module, &file_deps, &task_facts);
+    for layer in &mut walkthrough {
+        layer.files = layer
+            .files
+            .iter()
+            .map(|file| iri::mint_file(&project, file.strip_prefix("file:").unwrap_or(file)))
+            .collect();
+    }
 
     Ok(TriageReport {
         reference,
@@ -1167,6 +1145,39 @@ fn load_provenance_compact(repo: &Repository, hash_b32: &str) -> Option<serde_js
 // ── The change-view hunk summaries (moved from the CLI's `atomic change`)
 // ──────────────────────────────────────────────────────────────────────────
 
+/// The `atomic change` graph summary: added vertex spans and changed edge maps.
+/// These are the CLI's operation-level counts, not graph traversal statistics or
+/// counts of individual edges within each map. Root operations retain the CLI's
+/// single-operation convention; attributes contribute no graph atoms.
+pub fn count_hunk_atoms<H>(hunks: &[GraphOp<H>]) -> (usize, usize) {
+    let mut vertices = 0;
+    let mut edges = 0;
+    for graph_op in hunks {
+        match graph_op {
+            GraphOp::FileAdd { contents, .. } => vertices += 2 + usize::from(contents.is_some()),
+            GraphOp::FileDel { contents, .. } | GraphOp::FileUndel { contents, .. } => {
+                edges += 1 + usize::from(contents.is_some());
+            }
+            GraphOp::FileMove { .. } | GraphOp::Replacement { .. } => {
+                vertices += 1;
+                edges += 1;
+            }
+            GraphOp::DirAdd { .. } => vertices += 2,
+            GraphOp::Edit { .. } | GraphOp::AddRoot { .. } => vertices += 1,
+            GraphOp::DirDel { .. }
+            | GraphOp::DirUndel { .. }
+            | GraphOp::SolveNameConflict { .. }
+            | GraphOp::UnsolveNameConflict { .. }
+            | GraphOp::SolveOrderConflict { .. }
+            | GraphOp::UnsolveOrderConflict { .. }
+            | GraphOp::ResurrectZombies { .. }
+            | GraphOp::DelRoot { .. } => edges += 1,
+            GraphOp::SetAttr { .. } => {}
+        }
+    }
+    (vertices, edges)
+}
+
 /// One changed file's summary in a change: a change-type symbol (`+`/`-`/
 /// `~`/`±`), the path, and a per-file hunk summary — the same view
 /// `atomic change` prints, embedded in the report's `changes[].files`.
@@ -1327,7 +1338,9 @@ pub(crate) fn load_graphs(
     }
     // Most-recent first (a change explained by >1 graph shows all; the newest
     // leads). Both loaders sort/return unspecified order, so sort here.
-    graphs.sort_by_key(|(_, g)| std::cmp::Reverse(g.timestamp));
+    graphs.sort_by_key(|(_, g)| {
+        std::cmp::Reverse(atomic_core::types::timestamp::epoch_millis(g.timestamp))
+    });
     Ok(graphs)
 }
 
@@ -1516,7 +1529,7 @@ Edit a.txt.
 ::file-ref{path=a.txt}
 :::";
         install_intent_body(&repo, &a.intent_file, body_a, None);
-        let a_node_id = format!("intent:{}", a.uid.to_uppercase());
+        let a_node_id = iri::mint_intent(&repo.project_id().unwrap(), &a.uid).unwrap();
 
         // Intent B: remediates A (B --REMEDIATES--> A), status governed by b_done.
         let b = repo.vault_intent_create(intent_opts("Intent B")).unwrap();
@@ -1657,7 +1670,7 @@ Fix the flaw in A.
 
         let a = repo.vault_intent_create(intent_opts("Intent A")).unwrap();
         install_intent_body(&repo, &a.intent_file, body_a, None);
-        let a_node_id = format!("intent:{}", a.uid.to_uppercase());
+        let a_node_id = iri::mint_intent(&repo.project_id().unwrap(), &a.uid).unwrap();
 
         repo.create_view_from("feature", &base_view).unwrap();
         repo.switch_view(working_copy, "feature").unwrap();
@@ -1817,7 +1830,9 @@ Edit foo.
             .find(|c| c.id == change_id)
             .expect("change report present");
         assert!(
-            cr.modifies.iter().any(|m| m == "file:src/foo.rs"),
+            cr.modifies
+                .iter()
+                .any(|m| iri::parse_file(m).is_ok_and(|(_, path)| path == "src/foo.rs")),
             "modifies should include file:src/foo.rs from change_modified_paths: {:?}",
             cr.modifies
         );
@@ -1968,7 +1983,10 @@ Edit bar.
         assert_eq!(report.walkthrough.len(), 1, "one modified dir → one layer");
         let layer = &report.walkthrough[0];
         assert_eq!(layer.id, "layer:src");
-        assert_eq!(layer.files, vec!["file:src/foo.rs"]);
+        assert_eq!(
+            layer.files,
+            vec![iri::mint_file(&repo.project_id().unwrap(), "src/foo.rs")]
+        );
         assert_eq!(layer.changes, vec![hash.clone()]);
         assert!(layer.depends_on.is_empty());
     }
@@ -2012,7 +2030,7 @@ Edit a.txt.
             body_a,
             &[("attributedTo", WORK_AUTHOR), ("status", "in-progress")],
         );
-        let a_node_id = format!("intent:{}", a.uid.to_uppercase());
+        let a_node_id = iri::mint_intent(&repo.project_id().unwrap(), &a.uid).unwrap();
 
         // Optional review intent R: kind=review, `reviews` A.
         if let Some((review_author, done)) = review {

@@ -10,7 +10,7 @@ use atomic_core::pristine::directory_flags;
 use atomic_core::pristine::{MutTxnT, PathClaimTxnT, TreeTxnT};
 use atomic_core::types::{Inode, NodeId, Position};
 
-use super::{TrackedFile, TrackingError, TrackingResult};
+use super::{TrackedFile, TrackedPathState, TrackingError, TrackingResult};
 
 /// Stable node kind projected into the derived tree indexes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,9 +119,9 @@ impl TreeProjectionPlan {
 
         let mut affected_parents = HashSet::<String>::new();
         for (inode, entry) in &self.entries {
-            let Some(desired) = &entry.path else {
+            if entry.path.is_none() {
                 continue;
-            };
+            }
             if let Some(current) = txn
                 .get_path(*inode)
                 .map_err(|error| TreeProjectionError::Database(error.to_string()))?
@@ -133,6 +133,13 @@ impl TreeProjectionPlan {
                     final_paths.remove(&current);
                 }
             }
+        }
+        // Remove every previous binding before installing destinations. This
+        // must not depend on HashMap iteration order for overlapping moves.
+        for (inode, entry) in &self.entries {
+            let Some(desired) = &entry.path else {
+                continue;
+            };
             if let Some(path) = desired {
                 if let Some(parent) = direct_parent(path) {
                     affected_parents.insert(parent.to_string());
@@ -150,15 +157,19 @@ impl TreeProjectionPlan {
                 || txn
                     .is_directory(inode)
                     .map_err(|error| TreeProjectionError::Database(error.to_string()))?;
+            let empty = !final_paths
+                .keys()
+                .any(|path| direct_parent(path) == Some(parent.as_str()));
+            if !is_directory && empty {
+                // An old parent can become a regular file after its last child moves.
+                continue;
+            }
             if !is_directory {
                 return Err(TreeProjectionError::IncompleteMetadata(format!(
                     "projected parent '{}' is not a directory",
                     parent
                 )));
             }
-            let empty = !final_paths
-                .keys()
-                .any(|path| direct_parent(path) == Some(parent.as_str()));
             let entry = self.entries.entry(inode).or_default();
             entry.kind = Some(TreeProjectionKind::Directory);
             entry.directory_flags = Some(if empty {
@@ -736,25 +747,50 @@ pub fn mark_directory_empty<T: MutTxnT + TreeTxnT>(
     Ok(())
 }
 
-/// Remove a single file from tracking.
+/// Classify a tracked inode by the state that tracking itself owns for it.
 ///
-/// This is the low-level function that actually modifies the database.
+/// `add` creates a staged binding (`TREE`/`REV_TREE` only). `record` additionally
+/// binds the inode to its graph position (`INODES`/`REV_INODES`) and appends the
+/// `PATH_CLAIMS` events that make the name durable. A bound inode is therefore
+/// change-derived: rebuilding it belongs to `atomic doctor repair-native-indexes`,
+/// and a tracking edit cannot durably undo it. See [`TrackedPathState`].
+pub fn tracked_path_state<T: TreeTxnT>(txn: &T, inode: Inode) -> TrackingResult<TrackedPathState> {
+    let position = txn
+        .inode_position(inode)
+        .map_err(|e| TrackingError::Database(e.to_string()))?;
+    Ok(if position.is_some() {
+        TrackedPathState::Recorded
+    } else {
+        TrackedPathState::Staged
+    })
+}
+
+/// Remove a *staged* path from tracking: the inverse of `add_to_tree`.
 ///
-/// # Arguments
+/// Deletes `TREE`/`REV_TREE` plus any `DIRECTORIES` row, which is all `add` ever
+/// created. Returns `Ok(None)` when the path is not tracked.
 ///
-/// * `txn` - A mutable transaction
-/// * `path` - The normalized path string
+/// # Errors
 ///
-/// # Returns
-///
-/// The inode that was removed, if any.
-pub fn remove_from_tree<T: MutTxnT>(txn: &mut T, path: &str) -> TrackingResult<Option<Inode>> {
+/// Returns [`TrackingError::RecordedPathNotUntrackable`] when the path's inode is
+/// bound to a graph position, i.e. `record` owns that binding. Retiring it while
+/// the recorded change's `PATH_CLAIMS` event stays visible leaves every later
+/// name projection unable to resolve the claim, which fails `status`, `record`,
+/// `switch`, and materialize with `path claim '<path>' has no inode for graph
+/// position <pos>` until a repair rebuilds the wiped rows. Untracking recorded
+/// content has to be a recorded delete instead.
+pub fn untrack_staged_path<T: MutTxnT>(txn: &mut T, path: &str) -> TrackingResult<Option<Inode>> {
     let Some(inode) = txn
         .get_inode(path)
         .map_err(|e| TrackingError::Database(e.to_string()))?
     else {
         return Ok(None);
     };
+    if tracked_path_state(txn, inode)? == TrackedPathState::Recorded {
+        return Err(TrackingError::RecordedPathNotUntrackable {
+            path: path.to_string(),
+        });
+    }
     TreeProjectionPlan::plan(
         txn,
         [TreeProjectionOperation::Delete {
@@ -764,6 +800,19 @@ pub fn remove_from_tree<T: MutTxnT>(txn: &mut T, path: &str) -> TrackingResult<O
     )?
     .apply(txn)?;
     Ok(Some(inode))
+}
+
+/// Remove a single file from tracking.
+///
+/// This is [`untrack_staged_path`]: it untracks a staged (never recorded) path
+/// and refuses a recorded one, because a recorded path's binding is owned by its
+/// change and must be untracked by recording a delete.
+///
+/// # Errors
+///
+/// See [`untrack_staged_path`].
+pub fn remove_from_tree<T: MutTxnT>(txn: &mut T, path: &str) -> TrackingResult<Option<Inode>> {
+    untrack_staged_path(txn, path)
 }
 
 /// Remove a directory from tracking.
@@ -818,6 +867,14 @@ pub fn remove_directory_from_tree<T: MutTxnT + TreeTxnT>(
 
     if has_children {
         return Err(TrackingError::DirectoryNotEmpty {
+            path: path.to_string(),
+        });
+    }
+
+    // A recorded directory's binding and claim belong to their change, exactly
+    // as for a file; retiring the rows here would wedge name projection.
+    if tracked_path_state(txn, inode)? == TrackedPathState::Recorded {
+        return Err(TrackingError::RecordedPathNotUntrackable {
             path: path.to_string(),
         });
     }

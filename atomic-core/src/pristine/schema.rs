@@ -77,6 +77,7 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
     visitor.table(REV_VIEW_CHANGES)?;
     visitor.table(VIEW_SET_ID_INDEX)?;
     visitor.table(CONFLICTS)?;
+    visitor.table(PENDING_UNTRACKS)?;
 
     // File tree
     visitor.table(PRISTINE_META)?;
@@ -95,6 +96,7 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
     visitor.multimap(CHANGE_DEPS)?;
     visitor.multimap(REV_CHANGE_DEPS)?;
     visitor.table(CHANGE_DEPS_INDEXED)?;
+    visitor.table(APPLIED_CHANGES)?;
 
     // State and tags
     visitor.table(STATES)?;
@@ -150,6 +152,10 @@ pub(crate) fn visit_tables(visitor: &mut impl TableVisitor) -> PristineResult<()
     visitor.multimap(KG_FTS)?;
     visitor.multimap(KG_FTS_BY_NODE)?;
     visitor.table(KG_INDEX_META)?;
+    visitor.table(PROJECT_IDENTITY)?;
+    visitor.table(SIGNER_KEYS)?;
+    visitor.multimap(KG_TYPES)?;
+    visitor.multimap(KG_TYPES_REV)?;
     visitor.table(EMBEDDINGS)?;
 
     // Semantic CRDT

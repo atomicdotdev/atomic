@@ -49,6 +49,7 @@ pub(super) struct ReducedPathClaims {
     pub(super) present: Vec<ProjectedPathClaim>,
     pub(super) absent: Vec<super::deferred_tree::ProjectedAbsent>,
     pub(super) conflicts: HashMap<String, ProjectedNameConflict>,
+    pub(super) name_claims: HashMap<Position<NodeId>, Vec<(String, PathClaimId)>>,
 }
 
 pub(super) fn path_claim_events_for_change<T>(
@@ -276,8 +277,16 @@ where
     T: GraphTxnT + TreeTxnT,
 {
     let mut by_logical_claim = BTreeMap::<(String, Position<NodeId>), Vec<PathClaimEvent>>::new();
+    let mut name_claims = HashMap::<Position<NodeId>, Vec<(String, PathClaimId)>>::new();
     for entry in entries.iter().cloned() {
         if visibility.contains(entry.event.event_change) {
+            let claims = name_claims.entry(entry.event.claim.claimant).or_default();
+            if !claims
+                .iter()
+                .any(|(path, claim)| path == &entry.path && claim == &entry.event.claim)
+            {
+                claims.push((entry.path.clone(), entry.event.claim));
+            }
             by_logical_claim
                 .entry((entry.path, entry.event.claim.claimant))
                 .or_default()
@@ -285,7 +294,7 @@ where
         }
     }
 
-    let mut dependency_memo = HashMap::new();
+    let mut dependency_memo = super::dependency_closure::DependencyClosures::default();
     let mut alive = Vec::new();
     let mut absent = Vec::new();
     let mut ambiguous = HashSet::<(String, Inode)>::new();
@@ -537,6 +546,7 @@ where
         present,
         absent: unambiguous_absent,
         conflicts,
+        name_claims,
     })
 }
 
@@ -929,50 +939,35 @@ fn change_depends_on<T: GraphTxnT>(
     txn: &T,
     descendant: NodeId,
     ancestor: NodeId,
-    memo: &mut HashMap<(NodeId, NodeId), bool>,
+    memo: &mut super::dependency_closure::DependencyClosures<NodeId>,
 ) -> Result<bool, RepositoryError> {
-    if descendant == ancestor {
-        return Ok(true);
-    }
-    if let Some(result) = memo.get(&(descendant, ancestor)) {
-        return Ok(*result);
-    }
-    let ancestor_hash = txn
-        .get_external(ancestor)
+    memo.depends_on(descendant, ancestor, &mut |change| {
+        raw_dependencies(txn, change)
+    })
+}
+
+/// The RAW dependency rows of `change`, as internal ids. Not the indexed
+/// accessor: legacy repositories predate the dependency index, and the
+/// indexed read fails closed on them (dev #196/#206 parity, exercised by
+/// the unrecord-safety legacy fixtures). Raw rows return empty for
+/// unindexed changes, matching dev's fallback semantics for this
+/// supersession probe.
+fn raw_dependencies<T: GraphTxnT>(txn: &T, change: NodeId) -> Result<Vec<NodeId>, RepositoryError> {
+    txn.get_change_deps(change)
         .map_err(|error| RepositoryError::Database(error.to_string()))?
-        .ok_or_else(|| {
-            RepositoryError::Database(format!(
-                "path-claim dependency {} has no external hash",
-                ancestor.get()
-            ))
-        })?;
-    // Use the RAW dependency rows, not the indexed accessor: legacy
-    // repositories predate the dependency index, and the indexed read
-    // fails closed on them (dev #196/#206 parity, exercised by the
-    // unrecord-safety legacy fixtures). Raw rows return empty for
-    // unindexed changes, matching dev's fallback semantics for this
-    // supersession probe.
-    for dependency in txn
-        .get_change_deps(descendant)
-        .map_err(|error| RepositoryError::Database(error.to_string()))?
-    {
-        let dependency_id = txn
-            .get_internal(&dependency)
-            .map_err(|error| RepositoryError::Database(error.to_string()))?
-            .ok_or_else(|| {
-                RepositoryError::Database(format!(
-                    "change {} has unregistered dependency {}",
-                    descendant.get(),
-                    dependency
-                ))
-            })?;
-        if dependency == ancestor_hash || change_depends_on(txn, dependency_id, ancestor, memo)? {
-            memo.insert((descendant, ancestor), true);
-            return Ok(true);
-        }
-    }
-    memo.insert((descendant, ancestor), false);
-    Ok(false)
+        .into_iter()
+        .map(|dependency| {
+            txn.get_internal(&dependency)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Database(format!(
+                        "change {} has unregistered dependency {}",
+                        change.get(),
+                        dependency
+                    ))
+                })
+        })
+        .collect()
 }
 
 #[cfg(test)]

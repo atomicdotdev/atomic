@@ -60,6 +60,22 @@ pub struct GlobalizeContext<'txn, T> {
     /// many hunks in a single recorded file. Cache that traversal once.
     pub(super) content_vertices_cache: std::collections::HashMap<Inode, Vec<GraphNode<NodeId>>>,
 
+    /// Bindings removed by the same change, before destination parents resolve.
+    pub(super) vacated_bindings:
+        std::collections::HashMap<String, std::collections::HashSet<Inode>>,
+
+    /// Closure-projected path identity bindings, keyed by path.
+    ///
+    /// Seeded from [`super::GlobalizeOptions::projected_paths`] by the
+    /// assembly: the ambient TREE/INODES/DIRECTORIES may be preserved
+    /// (deferred lifecycle journal) or foreign (another view's binding), so
+    /// these bindings are the identity authority for parent-directory
+    /// anchoring. The inode and position caches are primed from the same
+    /// seed so every existing path/inode resolution consults the closure
+    /// before the ambient indexes.
+    pub(super) projected_paths:
+        std::collections::HashMap<String, super::options::ProjectedPathBinding>,
+
     /// Directory inode anchors available to additions in the change being built.
     ///
     /// Persisted anchors carry an external hash; directories introduced by this
@@ -93,6 +109,8 @@ where
             position_cache: std::collections::HashMap::new(),
             content_vertices_cache: std::collections::HashMap::new(),
             directory_anchors: std::collections::HashMap::new(),
+            vacated_bindings: std::collections::HashMap::new(),
+            projected_paths: std::collections::HashMap::new(),
         }
     }
 
@@ -118,6 +136,40 @@ where
             position_cache: std::collections::HashMap::new(),
             content_vertices_cache: std::collections::HashMap::new(),
             directory_anchors: std::collections::HashMap::new(),
+            vacated_bindings: std::collections::HashMap::new(),
+            projected_paths: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Register a binding removed by the same atomic change. A new parent
+    /// directory at that path must receive a distinct graph identity.
+    pub fn vacate_binding(&mut self, path: &str, inode: Inode) {
+        self.vacated_bindings
+            .entry(path.to_owned())
+            .or_default()
+            .insert(inode);
+    }
+
+    /// Seed closure-projected path identity bindings (see
+    /// [`super::ProjectedPathBinding`]).
+    ///
+    /// Existing cache entries are left in place: a caller that already
+    /// resolved an identity this assembly trusts keeps it. The inode and
+    /// position caches are primed from the same bindings so
+    /// `resolve_path_to_inode` / `resolve_inode_to_position` consult the
+    /// closure before the ambient TREE/INODES.
+    pub fn seed_projected_paths(
+        &mut self,
+        paths: std::collections::HashMap<String, super::options::ProjectedPathBinding>,
+    ) {
+        for (path, binding) in paths {
+            self.inode_cache
+                .entry(path.clone())
+                .or_insert(binding.inode);
+            self.position_cache
+                .entry(binding.inode)
+                .or_insert(binding.position);
+            self.projected_paths.entry(path).or_insert(binding);
         }
     }
 

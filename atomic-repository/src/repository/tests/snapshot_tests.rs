@@ -899,7 +899,7 @@ fn snapshot_retention_preserves_an_object_rooted_by_an_incomplete_session_record
 #[test]
 #[cfg_attr(
     not(unix),
-    ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+    ignore = "temporary Unix-only Git shim (PR #207); see RFC temporary platform policy"
 )]
 fn snapshot_retention_respects_git_keep_refs_and_audit_wall() {
     let (directory, repo) = create_temp_repo();
@@ -1166,4 +1166,227 @@ fn snapshot_retention_refuses_when_enumeration_fails() {
     drop(repo);
     let repo = Repository::open(directory.path()).unwrap();
     assert_eq!(persisted_change_bytes(&repo, &candidate), before_bytes);
+}
+
+/// Replacing a private edit snapshot with a deletion must not hide the
+/// deletion from the next durable record on the same repository handle.
+#[test]
+fn snapshot_replacement_keeps_deletion_recordable_without_reopen() {
+    let (directory, mut repo) = create_temp_repo();
+    let snapshots = snapshot_chain(&directory, &mut repo, &[b"pending edit\n"]);
+    let working_copy = repo.working_copy();
+    let path = directory.path().join("retention.txt");
+    std::fs::remove_file(&path).unwrap();
+    let snapshot = repo
+        .snapshot(
+            working_copy,
+            ChangeHeader::new("pending delete"),
+            record_options(),
+        )
+        .unwrap();
+    assert_eq!(snapshot.change().supersedes(), Some(&snapshots[0]));
+
+    // No status, reopen, retry, or repair between capture and this record.
+    let deletion = repo
+        .record(ChangeHeader::new("durable delete"), record_options())
+        .expect("a private snapshot must not consume the baseline deletion");
+    assert_eq!(deletion.deleted_files(), &["retention.txt".to_string()]);
+    assert!(deletion.change().hunks().iter().any(|op| matches!(
+        op, GraphOp::FileDel { path, .. } if path == "retention.txt"
+    )));
+    assert!(deletion.change().dependencies().iter().all(|hash| repo
+        .load_change(hash)
+        .unwrap()
+        .kind()
+        .is_durable()));
+    assert!(repo.get_file_content("retention.txt").unwrap().is_none());
+    assert!(repo.status(StatusOptions::default()).unwrap().is_clean());
+    assert!(matches!(
+        repo.record(ChangeHeader::new("actual no-op"), record_options()),
+        Err(RecordError::NothingToRecord)
+    ));
+    drop(repo);
+    let reopened = Repository::open(directory.path()).unwrap();
+    assert!(reopened
+        .get_file_content("retention.txt")
+        .unwrap()
+        .is_none());
+}
+
+/// An untracked reappearance is captured before `add` can stage an inode.
+/// Both snapshot and durable record must undelete the original claimant.
+#[test]
+fn snapshot_of_unstaged_reappearance_reuses_recorded_identity() {
+    let (directory, repo) = create_temp_repo();
+    let working_copy = repo.working_copy();
+    let path = directory.path().join("recreated.txt");
+    std::fs::write(&path, b"original\n").unwrap();
+    repo.add("recreated.txt", TrackingOptions::default())
+        .unwrap();
+    let original = repo
+        .record(ChangeHeader::new("original"), record_options())
+        .unwrap();
+    let identity = repo
+        .get_inode_and_position("recreated.txt")
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    repo.record(ChangeHeader::new("delete"), record_options())
+        .unwrap();
+    std::fs::write(&path, b"restored\n").unwrap();
+
+    let snapshot = repo
+        .snapshot(
+            working_copy,
+            ChangeHeader::new("capture before add"),
+            record_options().include_untracked(true),
+        )
+        .expect("snapshot attributes must target the undeleted claimant");
+    assert!(snapshot.change().hunks().iter().any(|op| matches!(
+        op, GraphOp::FileUndel { path, .. } if path == "recreated.txt"
+    )));
+    assert!(!snapshot
+        .change()
+        .hunks()
+        .iter()
+        .any(|op| matches!(op, GraphOp::FileAdd { .. })));
+    assert!(
+        repo.get_file_content("recreated.txt").unwrap().is_none(),
+        "a private capture must not resurrect the file in the durable view"
+    );
+    assert!(direct_view_hashes(&repo, "dev").contains(original.hash()));
+    assert!(!direct_view_hashes(&repo, "dev").contains(snapshot.hash()));
+
+    repo.add("recreated.txt", TrackingOptions::default())
+        .unwrap();
+    let restored = repo
+        .record(ChangeHeader::new("restore"), record_options())
+        .unwrap();
+    assert!(!restored.change().dependencies().contains(snapshot.hash()));
+    assert_eq!(
+        repo.get_inode_and_position("recreated.txt")
+            .unwrap()
+            .unwrap(),
+        identity
+    );
+    assert_eq!(
+        repo.get_file_content("recreated.txt").unwrap().unwrap(),
+        b"restored\n"
+    );
+    assert!(repo.status(StatusOptions::default()).unwrap().is_clean());
+    drop(repo);
+    let reopened = Repository::open(directory.path()).unwrap();
+    assert_eq!(
+        reopened
+            .get_inode_and_position("recreated.txt")
+            .unwrap()
+            .unwrap(),
+        identity
+    );
+    assert_eq!(
+        reopened.get_file_content("recreated.txt").unwrap().unwrap(),
+        b"restored\n"
+    );
+}
+
+#[test]
+fn snapshot_replacement_preserves_staged_additions_until_durable_record() {
+    let (directory, mut repo) = create_temp_repo();
+    snapshot_chain(&directory, &mut repo, &[b"pending edit\n"]);
+    let working_copy = repo.working_copy();
+    std::fs::write(directory.path().join("staged.txt"), b"keep staged\n").unwrap();
+    repo.add("staged.txt", TrackingOptions::default()).unwrap();
+    std::fs::remove_file(directory.path().join("retention.txt")).unwrap();
+    repo.snapshot(
+        working_copy,
+        ChangeHeader::new("replace capture"),
+        record_options(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(directory.path().join("staged.txt")).unwrap(),
+        b"keep staged\n"
+    );
+    assert!(repo.is_tracked("staged.txt").unwrap());
+    assert!(repo.get_file_content("staged.txt").unwrap().is_none());
+    let staged = repo
+        .record(
+            ChangeHeader::new("durable deletion and staged addition"),
+            record_options(),
+        )
+        .unwrap();
+    assert_eq!(staged.deleted_files(), &["retention.txt".to_string()]);
+    assert!(repo.get_file_content("retention.txt").unwrap().is_none());
+    assert!(staged.change().dependencies().iter().all(|hash| repo
+        .load_change(hash)
+        .unwrap()
+        .kind()
+        .is_durable()));
+    assert_eq!(
+        repo.get_file_content("staged.txt").unwrap().unwrap(),
+        b"keep staged\n"
+    );
+}
+
+#[test]
+fn snapshot_reappearance_refuses_stale_promotion_without_losing_newer_work() {
+    let (directory, repo) = create_temp_repo();
+    let working_copy = repo.working_copy();
+    let path = directory.path().join("recreated.txt");
+    std::fs::write(&path, b"original\n").unwrap();
+    repo.add("recreated.txt", TrackingOptions::default())
+        .unwrap();
+    repo.record(ChangeHeader::new("original"), record_options())
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    repo.record(ChangeHeader::new("deleted"), record_options())
+        .unwrap();
+    std::fs::write(&path, b"first reappearance\n").unwrap();
+    let snapshot = repo
+        .snapshot(
+            working_copy,
+            ChangeHeader::new("first capture"),
+            record_options().include_untracked(true),
+        )
+        .unwrap();
+    let baseline = direct_view_hashes(&repo, "dev");
+    let private_view = Repository::snapshot_view_name(working_copy);
+    let captured = persisted_change_bytes(&repo, snapshot.hash());
+    std::fs::write(&path, b"newer work must survive\n").unwrap();
+    let error = repo
+        .promote_snapshot(
+            working_copy,
+            ChangeHeader::new("stale promotion"),
+            record_options().include_untracked(true),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("create a new snapshot"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"newer work must survive\n");
+    assert_eq!(direct_view_hashes(&repo, "dev"), baseline);
+    assert_eq!(
+        direct_view_hashes(&repo, &private_view),
+        vec![*snapshot.hash()]
+    );
+    assert_eq!(persisted_change_bytes(&repo, snapshot.hash()), captured);
+    assert!(repo.get_file_content("recreated.txt").unwrap().is_none());
+
+    repo.snapshot(
+        working_copy,
+        ChangeHeader::new("fresh capture"),
+        record_options().include_untracked(true),
+    )
+    .unwrap();
+    repo.promote_snapshot(
+        working_copy,
+        ChangeHeader::new("fresh promotion"),
+        record_options().include_untracked(true),
+    )
+    .unwrap();
+    assert_eq!(
+        repo.get_file_content("recreated.txt").unwrap().unwrap(),
+        b"newer work must survive\n"
+    );
 }

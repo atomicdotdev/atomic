@@ -231,10 +231,10 @@ mod tests {
     // save steps in future refactors.
     //
     // Tests touch HOME to redirect `GlobalConfig::{load,save}` at an
-    // isolated config dir, so `#[serial]` is required.
+    // isolated config dir, so `#[file_serial]` is required.
     // -----------------------------------------------------------------
 
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     /// Redirect `ATOMIC_CONFIG_DIR` to a tempdir for the lifetime of the guard,
     /// isolating `GlobalConfig` load/save from the real user config. Restores
@@ -252,8 +252,8 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let original = std::env::var_os("ATOMIC_CONFIG_DIR");
             // SAFETY: env mutation is technically UB under concurrent access.
-            // `#[serial]` serializes these tests, and no other test reads
-            // ATOMIC_CONFIG_DIR outside its own `#[serial]` block.
+            // `#[file_serial]` serializes these tests, and no other test reads
+            // ATOMIC_CONFIG_DIR outside its own `#[file_serial]` block.
             unsafe {
                 std::env::set_var("ATOMIC_CONFIG_DIR", tmp.path());
             }
@@ -283,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn config_unchanged_when_verifier_fails() {
         let _guard = HomeGuard::new();
         seed_config("old-org");
@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn writes_to_active_named_profile_not_legacy_block() {
         // Regression for the "org set doesn't pass through" bug: when a named
         // profile is active (default_server set), `org set` must mutate that
@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn config_written_when_verifier_succeeds() {
         let _guard = HomeGuard::new();
         seed_config("old-org");
@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn no_verify_skips_verifier_entirely() {
         let _guard = HomeGuard::new();
         seed_config("old-org");

@@ -130,7 +130,10 @@ pub(crate) use helpers::{
     node_id_to_option_hash, position_to_option_hash, position_to_option_hash_resolved,
     vertex_to_option_hash,
 };
-pub use hunk::{globalize_hunk, should_use_opaque_generated_vertices, CRDT_DIFF_LINE_THRESHOLD};
+pub use hunk::{
+    alive_content_vertex_count, globalize_hunk, should_use_opaque_generated_vertices,
+    CRDT_DIFF_LINE_THRESHOLD,
+};
 pub use name_conflict::{
     globalize_solve_name_conflict, globalize_unsolve_name_conflict, NameConflictClaim,
 };

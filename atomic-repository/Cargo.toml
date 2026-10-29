@@ -15,6 +15,8 @@ rust-version.workspace = true
 # `ATOMIC_INJECT_WALK_READ_DIR_ERROR` walk-error injection). Shipping builds
 # never compile these seams: no environment value can alter adoption.
 adoption-test-injection = []
+# Request-local deterministic resource counters for query tests/benchmarks only.
+query-test-instrumentation = []
 
 [dependencies]
 unicode-normalization = "0.1"
@@ -45,6 +47,7 @@ ignore = { workspace = true }
 git2 = { workspace = true }
 
 syntext = { workspace = true }
+regex = "1"
 tempfile = { workspace = true }
 log = { workspace = true }
 chrono = { workspace = true }

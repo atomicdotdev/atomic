@@ -22,7 +22,7 @@
 //!    overwriting newer external work (RFC §8.5).
 //!
 //! No nested pushes are ever started from hooks: the queue runs only from
-//! the explicit `git bridge binding publish --queue` entry, and every
+//! the explicit `git shim binding publish --queue` entry, and every
 //! transferred ref is filtered through the reviewed transport allowlist
 //! ([`is_transferable_ref`]) so WIP recovery refs and snapshots are
 //! structurally excluded. The namespace allowlist is only the ref NAME
@@ -282,7 +282,7 @@ pub fn transfer_binding_refs(
         .collect();
 
     // CB-10B review R8: per-ref transfer evidence. The journal is
-    // consent-gated (the bridge opt-in) and lossy; every transferred ref
+    // consent-gated (the shim opt-in) and lossy; every transferred ref
     // gets an event after its exact-target verification.
     let journal =
         atomic_repository::repository::observability::BridgeEventJournal::for_repository(repo);

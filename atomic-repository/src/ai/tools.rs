@@ -707,7 +707,9 @@ impl<'a> ToolExecutor for RepoToolExecutor<'a> {
             ToolDefinition {
                 name: "kg_search".into(),
                 description: "Search the repository knowledge graph for nodes matching a \
-                              query. Returns files, functions, changes, views, goals, intents."
+                              query. Returns files, functions, changes, views, goals, intents. \
+                              VCS nodes and source content are filtered to the current view; \
+                              vault-only nodes are shared."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -734,7 +736,7 @@ impl<'a> ToolExecutor for RepoToolExecutor<'a> {
                     "properties": {
                         "node_id": {
                             "type": "string",
-                            "description": "Node ID (e.g. \"file:src/main.rs\", \"change:abc123\")"
+                            "description": "Canonical resource IRI copied from a search result; files are project-qualified and changes use their full content hash"
                         },
                         "depth": {
                             "type": "integer",
@@ -772,10 +774,11 @@ impl<'a> ToolExecutor for RepoToolExecutor<'a> {
             },
             ToolDefinition {
                 name: "code_search".into(),
-                description: "Search the source code content for a pattern. Returns matching \
-                              lines with file paths and line numbers. Supports regex, path \
-                              filtering, and file type filtering. Requires a content index \
-                              (built by 'atomic vault query enrich')."
+                description: "Search the current view's recorded source for a pattern. \
+                              Returns matching lines with file paths and line numbers. \
+                              Supports regex, path filtering, and file type filtering. \
+                              Reads recorded bytes through the graph, so files that are \
+                              not materialized in the working copy are still searchable."
                     .into(),
                 parameters: json!({
                     "type": "object",
@@ -850,15 +853,31 @@ impl<'a> ToolExecutor for RepoToolExecutor<'a> {
 }
 
 impl<'a> RepoToolExecutor<'a> {
+    /// The view these tools read: this working copy's registered desired view.
+    ///
+    /// Every tool that reads recorded source or VCS nodes resolves it the same
+    /// way `atomic query code` does, so a tool call and the equivalent CLI
+    /// query observe the same state — including files that are recorded but
+    /// not materialized in the working copy.
+    fn desired_view(&self) -> Result<String, crate::RepositoryError> {
+        let working_copy = self.repo.require_working_copy_id()?;
+        self.repo.desired_view_name(working_copy)
+    }
+
     fn exec_kg_search(&self, args: &serde_json::Value) -> Result<String, String> {
         let query = args["query"]
             .as_str()
             .ok_or("missing required parameter: query")?;
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
 
+        // Scoped to the desired view: VCS nodes and source content are
+        // filtered by the view's closure, while vault-only nodes stay shared.
+        let view = self
+            .desired_view()
+            .map_err(|e| format!("kg_search failed: {e}"))?;
         let nodes = self
             .repo
-            .vault_kg_search(query, limit, None)
+            .vault_kg_search_on_view(&view, query, limit, None)
             .map_err(|e| format!("kg_search failed: {e}"))?;
 
         serde_json::to_string_pretty(&nodes).map_err(|e| format!("serialize error: {e}"))
@@ -941,6 +960,12 @@ impl<'a> RepoToolExecutor<'a> {
         }
     }
 
+    /// Search recorded source in this working copy's desired view.
+    ///
+    /// Renders bytes from the graph through the view's closure rather than
+    /// consulting the working-copy content index, so results match
+    /// `atomic query code`, are filtered by the view, and cover recorded
+    /// files that are not materialized on disk.
     fn exec_code_search(&self, args: &serde_json::Value) -> Result<String, String> {
         let pattern = args["pattern"]
             .as_str()
@@ -954,7 +979,10 @@ impl<'a> RepoToolExecutor<'a> {
             case_insensitive: false,
         };
 
-        match crate::content_search::search_content(self.root, pattern, opts) {
+        let view = self
+            .desired_view()
+            .map_err(|e| format!("code_search failed: {e}"))?;
+        match self.repo.search_content_on_view(&view, pattern, opts) {
             Ok(result) => {
                 if result.matches.is_empty() {
                     Ok("No matches found.".into())
@@ -969,9 +997,6 @@ impl<'a> RepoToolExecutor<'a> {
                     serde_json::to_string_pretty(&response)
                         .map_err(|e| format!("serialize error: {e}"))
                 }
-            }
-            Err(crate::content_search::ContentSearchError::IndexNotFound) => {
-                Err("Content index not built. Run 'atomic vault query enrich' first.".into())
             }
             Err(e) => Err(format!("code_search failed: {e}")),
         }

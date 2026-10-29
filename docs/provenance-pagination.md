@@ -50,8 +50,8 @@ multiple pages.
 
 ```sh
 cargo test -p atomic-cli --bin atomic commands::agent::owner::tests
-cargo test -p atomic-repository --test provenance_checkpoint_test
-cargo test -p atomic-cli --test database_owner_integration_test
+cargo test -p atomic-repository --test it -- provenance_checkpoint_test::
+cargo test -p atomic-cli --test it -- database_owner_integration_test::
 cargo test --workspace
 ```
 

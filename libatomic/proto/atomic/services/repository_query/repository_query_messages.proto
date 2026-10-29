@@ -64,6 +64,7 @@ enum FileStatus {
   FILE_STATUS_UNTRACKED = 3;
   FILE_STATUS_ADDED = 4;
   FILE_STATUS_CONFLICTED = 5;
+  FILE_STATUS_PENDING_UNTRACK = 6;   // staged by `remove --keep`; the next record deletes it
 }
 // Mirrors FileStatusEntry (status.rs:263).
 message FileStatusEntry {
@@ -109,6 +110,7 @@ message ChangeIncludes {
   bool semantic_section = 3;
   bool signatures = 4;
   bool content_chunks = 5;
+  bool blast_radius = 6; // opt-in structural analysis for this change, read-only
 }
 message GetChangeResponse {
   ChangeInfo change = 1;
@@ -134,6 +136,117 @@ message GetChangeResponse {
   // same length. Carry the original hashes: reserializing a graph upgraded
   // from an older storage schema may produce a different content hash.
   repeated Hash provenance_ledger_hashes = 10;
+  // Safe decoded projection of the canonical change when includes.metadata is
+  // true. The V3 bundle remains available; JS clients need not decode it.
+  optional ChangeMetadata metadata = 11;
+  optional ChangeBlastRadius blast_radius = 12;
+  // Change-local governing plan declarations and separately labeled intent
+  // document associations. Present with includes.metadata; no validation run.
+  optional ChangeIntentContext intent_context = 13;
+}
+
+message ChangeIntentContext {
+  uint32 schema_version = 1; // 1
+  Hash change_hash = 2;
+  optional string plan_id = 3; // one known recorded governing reference; not inferred
+  string status = 4; // recorded | missing | ambiguous | partial
+  repeated ChangePlanBinding plans = 5;
+  repeated ChangeIntentAssociation associated_intents = 6;
+  repeated string warnings = 7;
+  string validation_status = 8; // not_checked; absence is NOT SHACL failure
+  string context = 9;
+}
+message ChangeIntentIdentity {
+  string id = 1; // current display ID, resolved by Atomic (may be a human key)
+  string uid = 2; // stable identity when stored; empty for older intents
+  string title = 3;
+  string path = 4; // validated repository-relative .vault/intents/... source
+}
+message ChangePlanBinding {
+  string plan_id = 1; // exact recorded value, retained even if vault lookup fails
+  string source = 2; // provenance_graph | session_turn
+  string session_id = 3;
+  Hash provenance_hash = 4;
+  optional uint32 turn_number = 5; // only for a matched indexed turn, zero-based
+  optional ChangeIntentIdentity intent = 6;
+}
+message ChangeIntentAssociation {
+  string path = 1; // intent document actually touched by this selected change
+  optional ChangeIntentIdentity intent = 2; // current stored identity, not signed history
+  repeated string commitment_node_ids = 3; // committed_via to a patch for this hash
+  repeated string patch_node_ids = 4;
+  repeated Hash provenance_hashes = 5;
+}
+
+// Direct paths are immutable change data. Structural links are observations of
+// the CURRENT repository KG, not a historical/view-isolated graph snapshot.
+message ChangeBlastRadius {
+  Hash change_hash = 1;
+  string mode = 2; // structural | private | partial
+  repeated ChangeImpactFile files = 3; // distinct paths, direct files win
+  repeated ChangeImpactEdge edges = 4; // incoming calls / includes from view syntax, never co-change
+  repeated string warnings = 5;
+  string context = 6;
+}
+message ChangeImpactFile {
+  string path = 1;
+  uint32 hop = 2; // 1: edited directly; 2: callers/importers
+}
+message ChangeImpactEdge {
+  string from_path = 1; // caller/importer
+  string to_path = 2; // directly changed code
+  string relation = 3; // calls | includes (syntax relationships, not KG predicates)
+}
+
+// Recorded values, not estimates or signature-verification results. No prompt,
+// reasoning text/signatures, task plans or arbitrary provider metadata is exposed.
+message ChangeMetadata {
+  uint32 schema_version = 1; // 1
+  Hash change_hash = 2;
+  repeated ChangeAIUsage usage = 3;
+  repeated string affected_paths = 4; // actual hunks/file_ops; no content reconstruction
+  repeated string warnings = 5;
+  // Native atomic change statistics and per-path hunk descriptions, computed
+  // from the decoded graph ops (not provenance DAG nodes or reconstructed diffs).
+  // Additive: absence means the producer predates this projection, not zero.
+  optional ChangeGraphSummary graph_summary = 6;
+}
+message ChangeGraphSummary {
+  uint64 vertices_added = 1;
+  uint64 edges_changed = 2;
+  uint64 content_bytes = 3; // uncompressed change.contents length, not bundle size
+  uint64 files_changed = 4; // unique graph-op paths; root ops have no file path
+  repeated ChangeFileSummary files = 5; // canonical CLI order, includes root rows
+}
+// Canonical display summaries shared with atomic change. Strings contain no
+// ANSI/HTML; consumers render symbol/path/info as text, not executable markup.
+message ChangeFileSummary {
+  string symbol = 1;
+  string path = 2;
+  string info = 3;
+}
+message ChangeAIUsage {
+  uint32 record_index = 1; // occurrence within this change; not a cross-change identity
+  string vendor = 2;
+  string model = 3;
+  optional string model_version = 4;
+  string tool = 5;
+  optional string request_id = 6;
+  optional string session_id = 7;
+  optional string session_slug = 8;
+  optional uint32 step_count = 9;
+  ChangeTokenUsage tokens = 10;
+  // Exact millionths of USD. Absence is unknown/invalid, not zero. Legacy
+  // recorded USD is converted with atomic-core Cost::from_usd, never pricing.
+  optional uint64 cost_micro_usd = 11;
+}
+message ChangeTokenUsage {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 total_tokens = 3; // reported total; do not recompute across billing categories
+  uint64 cache_read_tokens = 4;
+  uint64 cache_write_tokens = 5;
+  uint64 reasoning_tokens = 6;
 }
 // One file's content around a change (add-only): what the graph
 // reconstruction reads server-side for `diff -c` (the legacy
@@ -142,6 +255,11 @@ message ChangeFileContent {
   string path = 1;
   optional bytes before = 2;  // pre-change content (absent = none/unreadable)
   optional bytes after = 3;   // post-change content (absent = none/unreadable)
+  // Distinguish a known absent side (empty diff pane) from failed reconstruction.
+  // Older producers omit these; present payloads still establish their side.
+  optional bool before_exists = 4;
+  optional bool after_exists = 5;
+  bool is_directory = 6;
 }
 // ChangeInfo lives in atomic/common/change.proto (shared change-domain).
 
@@ -232,5 +350,8 @@ message PreviewMutationResponse {
   // The single-file restore preview's pristine bytes (add-only): present
   // iff the request named a content_path the graph holds content for.
   optional bytes pristine_content = 6;
+  // Observed working-copy view for the pristine_content read. A foreign
+  // consumer must not label another view's bytes as the displayed baseline.
+  optional string view = 7;
 }
 // ConflictInfo lives in atomic/common/change.proto (shared change-domain).

@@ -265,17 +265,35 @@ fn test_builder_timestamp_defaults_to_now() {
     let before = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64;
+        .as_millis() as i64;
 
     let graph = ProvenanceGraph::builder("sess-1", "agent").build();
 
     let after = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() as i64;
+        .as_millis() as i64;
 
     assert!(graph.timestamp >= before);
     assert!(graph.timestamp <= after);
+}
+
+#[test]
+fn timestamp_readers_preserve_milliseconds_and_legacy_hashed_bytes() {
+    for (raw, expected) in [
+        (1_792_920_379, "2026-10-25T09:26:19+00:00"),
+        (1_792_920_379_589, "2026-10-25T09:26:19.589+00:00"),
+    ] {
+        let graph = ProvenanceGraph::builder("timestamp-compat", "agent")
+            .timestamp(raw)
+            .build();
+        let bytes = graph.serialize().unwrap();
+        let (loaded, hash) = ProvenanceGraph::deserialize(&bytes).unwrap();
+        assert_eq!(loaded.timestamp_datetime().unwrap().to_rfc3339(), expected);
+        assert_eq!(loaded.timestamp, raw);
+        assert_eq!(loaded.serialize().unwrap(), bytes);
+        assert_eq!(hash, Hash::of(&bytes));
+    }
 }
 
 // ---- Serialization ----

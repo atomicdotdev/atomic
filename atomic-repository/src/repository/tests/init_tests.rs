@@ -159,7 +159,7 @@ fn test_is_internal_path() {
 }
 
 /// Dropping a repository that performed a record must release the redb lock
-/// so the bridge checkpoint verifier can reopen (CB-8A record projection).
+/// so the shim checkpoint verifier can reopen (CB-8A record projection).
 #[test]
 fn test_drop_after_record_releases_the_database_lock() {
     let (_temp_dir, repo) = create_temp_repo();

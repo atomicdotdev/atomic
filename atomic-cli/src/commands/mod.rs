@@ -58,6 +58,8 @@
 
 use std::path::{Path, PathBuf};
 
+use dirs::home_dir;
+
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::{Repository, SANDBOX_POINTER};
 use chrono::{DateTime, Local, Utc};
@@ -73,6 +75,7 @@ pub mod compact;
 pub mod complete;
 pub mod completions;
 pub mod conflicts;
+pub mod diagnostics;
 pub mod diff;
 pub mod doctor;
 pub mod init;
@@ -85,6 +88,7 @@ pub mod op;
 pub mod provenance;
 pub mod record;
 pub mod remove;
+pub mod repo;
 pub mod restore;
 pub mod revise;
 pub(crate) mod rpc;
@@ -147,6 +151,7 @@ pub use clone::Clone;
 pub use compact::Compact;
 pub use completions::Completions;
 pub use conflicts::Conflicts;
+pub use diagnostics::Diagnostics;
 pub use diff::Diff;
 pub use doctor::Doctor;
 pub use git::Git;
@@ -166,6 +171,7 @@ pub use query::Query;
 pub use record::Record;
 pub use remote::Remote;
 pub use remove::Remove;
+pub use repo::Repo;
 pub use restore::Restore;
 pub use revise::Revise;
 pub use sandbox::Sandbox;
@@ -303,6 +309,13 @@ pub fn find_repository_root_from(start_path: &Path) -> CliResult<PathBuf> {
         current = canonical;
     }
 
+    // Never walk above $HOME: ~/.atomic holds global configuration (identity,
+    // config.toml, logs) but no repository database, so treating it as a
+    // search boundary prevents `atomic status`/`record`/etc. from silently
+    // failing when run in the home directory, and keeps home from being
+    // mistaken for a repo root.
+    let home = home_dir();
+
     loop {
         let dot_dir = current.join(DOT_DIR);
         // A bare `.atomic/` may hold global configuration (e.g. ~/.atomic),
@@ -326,6 +339,13 @@ pub fn find_repository_root_from(start_path: &Path) -> CliResult<PathBuf> {
             if let Ok(Some(root)) = atomic_repository::detect_repository_root(&current) {
                 return Ok(root);
             }
+        }
+
+        // Stop at $HOME rather than walking into / — home is not a repo.
+        if home.as_ref().is_some_and(|h| current == *h) {
+            return Err(CliError::RepositoryNotFound {
+                searched_path: start_path.to_path_buf(),
+            });
         }
 
         // Move to parent directory

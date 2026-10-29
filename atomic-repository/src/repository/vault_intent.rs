@@ -1765,16 +1765,26 @@ mod tests {
             serde_json::json!(["memory:auth-decision", "urn:atomic:memory:retry-policy"])
         );
 
+        for name in ["auth-decision", "retry-policy"] {
+            repo.vault_store(
+                &format!("memory/{name}.md"),
+                VaultEntryType::Memory,
+                name.as_bytes().to_vec(),
+                "{}".into(),
+            )
+            .unwrap();
+        }
+        let project = repo.project_id().unwrap();
         let (_, edges) = repo.vault_extract_kg(&result.intent_file, &entry).unwrap();
         assert!(edges.iter().any(|edge| {
-            edge.kind == atomic_core::pristine::ontology::predicate::INFORMED_BY
-                && edge.to_id == "memory:auth-decision"
+            edge.kind == atomic_core::kg::ontology::Predicate::InformedBy
+                && edge.to_id == atomic_core::kg::iri::mint_memory(&project, "auth-decision")
         }));
         let retry_policy = edges
             .iter()
             .find(|edge| {
-                edge.kind == atomic_core::pristine::ontology::predicate::INFORMED_BY
-                    && edge.to_id == "memory:retry-policy"
+                edge.kind == atomic_core::kg::ontology::Predicate::InformedBy
+                    && edge.to_id == atomic_core::kg::iri::mint_memory(&project, "retry-policy")
             })
             .expect("missing retry-policy lineage edge");
         let metadata = retry_policy.metadata.as_ref().unwrap();

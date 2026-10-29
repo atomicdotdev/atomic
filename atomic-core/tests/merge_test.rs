@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use atomic_core::crdt::tables as crdt;
+use atomic_core::pristine::build_metadata::{BUILD_VERSION, CREATED_WITH_KEY, MIGRATED_WITH_KEY};
 use atomic_core::pristine::merge::{merged_legacy_dir, LegacyDatabases};
 use atomic_core::pristine::schema::{LEGACY_DIR_KEY, SCHEMA_VERSION, SCHEMA_VERSION_KEY};
 use atomic_core::pristine::tables::{
@@ -139,6 +140,14 @@ fn merge_copies_both_databases_and_records_the_legacy_dir() {
         assert_eq!(
             meta.get(LEGACY_DIR_KEY).unwrap().unwrap().value(),
             b"1700000000".as_slice()
+        );
+        assert_eq!(
+            meta.get(CREATED_WITH_KEY).unwrap().unwrap().value(),
+            BUILD_VERSION.as_bytes()
+        );
+        assert_eq!(
+            meta.get(MIGRATED_WITH_KEY).unwrap().unwrap().value(),
+            BUILD_VERSION.as_bytes()
         );
         let external = txn.open_table(EXTERNAL).unwrap();
         assert_eq!(external.len().unwrap(), 1);

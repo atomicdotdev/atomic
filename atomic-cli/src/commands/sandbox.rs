@@ -305,13 +305,15 @@ impl Command for Seal {
 // ---------------------------------------------------------------------------
 
 /// What a remote sandbox's grant carries when `--capability` is not given:
-/// enough to read and land its view's work and its agent's provenance.
+/// enough to read and land its view's work, its agent's provenance, and its
+/// agent's session attestations.
 const DEFAULT_CAPABILITIES: &[&str] = &[
     "sandbox.read",
     "sandbox.submit",
     "provenance.read",
     "provenance.write",
     "agent.checkpoint",
+    "attestation.write",
     "vault.read",
     "vault.write",
 ];
@@ -460,7 +462,12 @@ impl Command for Close {
 
 /// Inside a remote sandbox: write its view's tree and make its cache.
 #[derive(Parser, Debug)]
-pub struct Materialize {}
+pub struct Materialize {
+    /// Materialize only entries at or under this path (a monorepo folder),
+    /// plus the directories that lead to it. Default: the whole view.
+    #[arg(long, value_name = "PATH")]
+    pub prefix: Option<String>,
+}
 
 impl Command for Materialize {
     fn run(&self) -> CliResult<()> {
@@ -472,7 +479,7 @@ impl Command for Materialize {
                     .to_string(),
             });
         };
-        let (entries, view) = crate::remote_sandbox::materialize(&root)?;
+        let (entries, view) = crate::remote_sandbox::materialize(&root, self.prefix.as_deref())?;
         println!(
             "Materialized {entries} entries of view '{view}' into {}",
             root.display()

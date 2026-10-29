@@ -85,10 +85,24 @@ message VerifyAttestationRequest {
   // Local key resolution hint: identity-store name (default identity when
   // absent) — the public key that verifies the attestation (add-only).
   optional string identity_name = 5;
+  // Optional explicit Ed25519 public key (32 bytes), never a private key.
+  // Cannot be combined with identity_name. Signature validity doesn't imply trust.
+  optional bytes public_key = 6;
 }
 message VerifyAttestationResponse {
+  // Compatibility result: signature valid AND stored source still fresh.
   bool valid = 1;
   optional string reason = 2;
+  // Absent means verification couldn't be performed (e.g. unavailable public key).
+  optional bool signature_valid = 3;
+  optional bool source_fresh = 4;
+  // Exact stored signed JSON-LD, not a lift of the mutable working document.
+  optional string signed_document = 5;
+  optional string signer_did = 6;
+  optional string current_source_hash = 7;
+  optional string signed_source_hash = 8;
+  // Hash of the exact stored signed_document bytes (including its formatting).
+  optional Hash signed_revision = 9;
 }
 
 message ListAttestationsRequest {

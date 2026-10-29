@@ -317,6 +317,19 @@ impl<'a> SwitchMaterializationExecutor<'a> {
     }
 }
 
+/// The bytes a symlink's target spells, the representation materialization
+/// writes for a symlink entry.
+#[cfg(unix)]
+fn link_target_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    std::fs::read_link(path).map(|target| target.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn link_target_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    std::fs::read_link(path).map(|target| target.to_string_lossy().into_owned().into_bytes())
+}
+
 impl super::materialize::MaterializationEffectExecutor for SwitchMaterializationExecutor<'_> {
     fn create_directory(&mut self, path: &str) -> Result<bool, RepositoryError> {
         if self
@@ -354,7 +367,22 @@ impl super::materialize::MaterializationEffectExecutor for SwitchMaterialization
             })
             .is_none()
         {
-            return match std::fs::read(self.repository.root().join(path)) {
+            // An unleased entry is verified in place. A symlink is compared
+            // by its target, never by reading through it: following a link to
+            // a directory (the `.agents/skills/<name>` layout) failed every
+            // switch with "Is a directory".
+            let absolute = self.repository.root().join(path);
+            let current = match std::fs::symlink_metadata(&absolute) {
+                Ok(metadata) if metadata.file_type().is_symlink() => link_target_bytes(&absolute),
+                Ok(metadata) if metadata.is_dir() => {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!("unleased directory entry blocks file '{path}'"),
+                    });
+                }
+                Ok(_) => std::fs::read(&absolute),
+                Err(error) => Err(error),
+            };
+            return match current {
                 Ok(current) if current == content => Ok(false),
                 Ok(_) => Err(RepositoryError::InvalidOperation {
                     message: format!("unleased filesystem content changed at '{path}'"),
@@ -376,6 +404,13 @@ impl super::materialize::MaterializationEffectExecutor for SwitchMaterialization
             .effect_for_expected_new(path, |value| *value == EffectValue::Absent)
             .is_none()
         {
+            // Nothing Atomic wrote can sit beneath a symlink (the effect
+            // guard never writes through one), so a path whose ancestor is a
+            // symlink on disk has nothing to remove even though the link's
+            // target makes it resolve.
+            if path_beneath_symlink(self.repository.root(), path) {
+                return Ok(false);
+            }
             return match std::fs::symlink_metadata(self.repository.root().join(path)) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Ok(_) => Err(RepositoryError::InvalidOperation {
@@ -606,6 +641,23 @@ impl Repository {
                     new_files.insert(path);
                 }
             }
+            // A path the view once held beneath what is now a present
+            // non-directory (a directory replaced by a symlink, the agents
+            // `.claude/commands -> ../.agents/commands` layout) cannot exist
+            // there any more. Planning its removal would write through the
+            // symlink, which the effect guard refuses.
+            let under_present_leaf = |path: &str| -> bool {
+                path.rmatch_indices('/')
+                    .any(|(index, _)| new_files.contains(&path[..index]))
+            };
+            let new_absent_files: HashSet<String> = new_absent_files
+                .into_iter()
+                .filter(|path| !under_present_leaf(path))
+                .collect();
+            let new_absent_directories: HashSet<String> = new_absent_directories
+                .into_iter()
+                .filter(|path| !under_present_leaf(path))
+                .collect();
 
             (
                 old_files,
@@ -1603,4 +1655,21 @@ impl Repository {
         walk(&self.root, &self.root, &rules, &mut result);
         result
     }
+}
+
+/// Whether a proper ancestor of `path` (relative to `root`) is a symlink on
+/// disk.
+fn path_beneath_symlink(root: &Path, path: &str) -> bool {
+    let components: Vec<_> = Path::new(path).components().collect();
+    let mut current = root.to_path_buf();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component);
+        if std::fs::symlink_metadata(&current)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }

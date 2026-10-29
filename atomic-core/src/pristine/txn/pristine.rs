@@ -181,7 +181,14 @@ fn next_inode_id(read_txn: &ReadTransaction) -> PristineResult<u64> {
         let (_, inode) = decode_view_seq(key.value());
         max_id = max_id.max(inode);
     }
-    for result in read_txn.open_multimap_table(INODE_GRAPH)?.iter()? {
+    // INODE_GRAPH keys start with the big-endian inode, so the final key
+    // proves the maximum even for unbound/orphaned inodes. Do not scan every
+    // content vertex merely to initialize an allocator on each query open.
+    if let Some(result) = read_txn
+        .open_multimap_table(INODE_GRAPH)?
+        .iter()?
+        .next_back()
+    {
         let (key, _values) = result?;
         let (inode, _, _, _) = decode_inode_vertex(key.value());
         max_id = max_id.max(inode);
@@ -276,6 +283,11 @@ impl Pristine {
         // Initialize all tables. Re-check in the write transaction so a
         // concurrently raised requirement cannot race additive initialization.
         let write_txn = db.begin_write()?;
+        let previous_table_count = if is_new_database {
+            0
+        } else {
+            write_txn.list_tables()?.count() + write_txn.list_multimap_tables()?.count()
+        };
         {
             let metadata = write_txn.open_table(PRISTINE_META)?;
             let mut requirements = Vec::new();
@@ -311,6 +323,7 @@ impl Pristine {
             write_txn.open_table(REV_VIEW_CHANGES)?;
             write_txn.open_table(VIEW_SET_ID_INDEX)?;
             write_txn.open_table(CONFLICTS)?;
+            write_txn.open_table(PENDING_UNTRACKS)?;
 
             // Tree tables
             write_txn.open_table(PRISTINE_META)?;
@@ -334,6 +347,7 @@ impl Pristine {
             write_txn.open_multimap_table(CHANGE_DEPS)?;
             write_txn.open_multimap_table(REV_CHANGE_DEPS)?;
             write_txn.open_table(CHANGE_DEPS_INDEXED)?;
+            crate::pristine::applied_changes::initialize(&write_txn)?;
 
             // State tables
             write_txn.open_table(STATES)?;
@@ -375,8 +389,27 @@ impl Pristine {
             write_txn.open_table(SESSION_PROVENANCE)?;
             write_txn.open_table(SESSION_MANIFESTS)?;
             write_txn.open_table(SESSION_HEADS)?;
+            write_txn.open_table(PROJECT_IDENTITY)?;
+            write_txn.open_table(SIGNER_KEYS)?;
+            write_txn.open_multimap_table(KG_TYPES)?;
+            write_txn.open_multimap_table(KG_TYPES_REV)?;
+            if is_new_database {
+                write_txn
+                    .open_table(KG_INDEX_META)?
+                    .insert("kg_generation", crate::kg::KG_GENERATION)?;
+                write_txn
+                    .open_table(PRISTINE_META)?
+                    .insert("required-capability/kg-semweb-v1", 1)?;
+            }
 
             stamp_schema_version(&write_txn)?;
+            if !is_new_database
+                && write_txn.list_tables()?.count() + write_txn.list_multimap_tables()?.count()
+                    > previous_table_count
+            {
+                crate::pristine::build_metadata::record_migration(&write_txn)?;
+            }
+            crate::pristine::build_metadata::record_open(&write_txn, is_new_database)?;
         }
         write_txn.commit()?;
 
@@ -448,27 +481,39 @@ impl Pristine {
     /// // Read operations...
     /// ```
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
-        Self::open_readonly_with_schema_check(path, true)
+        Self::open_readonly_with_schema_check(path, true, true)
+    }
+
+    /// Open for inspection without performing database upgrade or recovery.
+    ///
+    /// Unlike [`Self::open_readonly`], this returns an error when redb needs
+    /// a writable open to upgrade its format or recover after a crash.
+    pub fn open_readonly_without_recovery<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
+        Self::open_readonly_with_schema_check(path, true, false)
     }
 
     /// Open an existing database for read-only repair inspection without
     /// initializing tables or requiring a completed PATH_CLAIMS schema.
     ///
-    /// This method performs no writes.
+    /// A legacy redb format or interrupted transaction can require a writable
+    /// upgrade or recovery before the database is reopened read-only.
     pub fn open_readonly_for_repair<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
-        Self::open_readonly_with_schema_check(path, false)
+        Self::open_readonly_with_schema_check(path, false, true)
     }
 
     fn open_readonly_with_schema_check<P: AsRef<Path>>(
         path: P,
         require_complete_path_claims: bool,
+        allow_recovery: bool,
     ) -> PristineResult<Self> {
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
         let mut builder = Builder::new();
         builder.set_cache_size(cache_bytes);
         let db = match builder.open_read_only(path.as_ref()) {
             Ok(db) => db,
-            Err(redb::DatabaseError::UpgradeRequired(_) | redb::DatabaseError::RepairAborted) => {
+            Err(redb::DatabaseError::UpgradeRequired(_) | redb::DatabaseError::RepairAborted)
+                if allow_recovery =>
+            {
                 // Migration and crash recovery need a writable handle. Close
                 // it cleanly to persist allocator state before acquiring the
                 // shared read lock. Never retry ordinary lock contention here.
@@ -655,6 +700,7 @@ impl Pristine {
     ) -> PristineResult<WriteTxn<'_>> {
         let mut txn = self.db.writable_db()?.begin_write()?;
         let _ = txn.set_durability(durability);
+        crate::pristine::applied_changes::initialize(&txn)?;
         Ok(WriteTxn::new(
             txn,
             &self.next_node_id,
@@ -781,20 +827,32 @@ mod tests {
             .unwrap();
         assert_eq!(
             pristine.required_repository_capabilities().unwrap(),
-            vec![RequiredRepositoryCapability {
-                id: CHANGE_FORMAT_VNEXT_CAPABILITY.id().to_string(),
-                minimum_version: CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version(),
-            }]
+            vec![
+                RequiredRepositoryCapability {
+                    id: CHANGE_FORMAT_VNEXT_CAPABILITY.id().to_string(),
+                    minimum_version: CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version(),
+                },
+                RequiredRepositoryCapability {
+                    id: "kg-semweb-v1".into(),
+                    minimum_version: 1
+                }
+            ]
         );
         drop(pristine);
 
         let reopened = Pristine::open_readonly(&db_path).unwrap();
         assert_eq!(
             reopened.required_repository_capabilities().unwrap(),
-            vec![RequiredRepositoryCapability {
-                id: "change-format-vnext".to_string(),
-                minimum_version: 1,
-            }]
+            vec![
+                RequiredRepositoryCapability {
+                    id: "change-format-vnext".to_string(),
+                    minimum_version: 1,
+                },
+                RequiredRepositoryCapability {
+                    id: "kg-semweb-v1".into(),
+                    minimum_version: 1
+                }
+            ]
         );
     }
 
@@ -817,10 +875,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             pristine.required_repository_capabilities().unwrap(),
-            vec![RequiredRepositoryCapability {
-                id: "change-format-vnext".to_string(),
-                minimum_version: 1,
-            }]
+            vec![
+                RequiredRepositoryCapability {
+                    id: "change-format-vnext".to_string(),
+                    minimum_version: 1,
+                },
+                RequiredRepositoryCapability {
+                    id: "kg-semweb-v1".into(),
+                    minimum_version: 1
+                }
+            ]
         );
     }
 
@@ -973,6 +1037,9 @@ mod tests {
                 .unwrap();
             txn.commit().unwrap();
         }
+        let before = std::fs::read(&path).unwrap();
+        assert!(Pristine::open_readonly_without_recovery(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         // The legacy fixture has no PATH_CLAIMS completion marker, so the
         // schema-strict read-only open correctly refuses it. The repair
         // variant still exercises the read-only upgrade path end to end.
@@ -1055,6 +1122,48 @@ mod tests {
         let reopened = Pristine::open(&db_path).unwrap();
         let mut txn = reopened.write_txn().unwrap();
         assert_eq!(txn.alloc_inode().unwrap().get(), 2);
+        txn.abort().unwrap();
+    }
+
+    #[test]
+    fn inode_graph_end_key_preserves_orphan_high_water_mark_across_opens() {
+        use crate::pristine::{MutTxnT, PathClaimMutTxnT};
+        use crate::types::{
+            ChangePosition, EdgeFlags, GraphNode, Inode, NodeId, Position, SerializedGraphEdge,
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("inode-max.redb");
+        let maximum = (1u64 << 32) + 1;
+        {
+            let pristine = Pristine::open(&path).unwrap();
+            let mut txn = pristine.write_txn().unwrap();
+            for (offset, inode) in [1, 255, 256, 65535, 65536, maximum].into_iter().enumerate() {
+                // Deliberately reverse the other key components: only the
+                // big-endian inode prefix determines the global maximum.
+                let id = NodeId::new(100 - offset as u64);
+                let node = GraphNode::new(id, ChangePosition::new(0), ChangePosition::new(1));
+                let edge = SerializedGraphEdge::new(
+                    EdgeFlags::BLOCK,
+                    Position::new(id, ChangePosition::new(0)),
+                    id,
+                );
+                txn.put_inode_graph(Inode::new(inode), node, edge).unwrap();
+            }
+            txn.complete_path_claim_migration().unwrap();
+            txn.commit().unwrap();
+        }
+        {
+            let readonly = Pristine::open_readonly(&path).unwrap();
+            assert_eq!(
+                readonly
+                    .next_inode
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                maximum + 1
+            );
+        }
+        let writable = Pristine::open_existing(&path).unwrap();
+        let mut txn = writable.write_txn().unwrap();
+        assert_eq!(txn.alloc_inode().unwrap().get(), maximum + 1);
         txn.abort().unwrap();
     }
 

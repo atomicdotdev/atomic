@@ -1,0 +1,33 @@
+@prefix atomic: <https://atomic.dev/ns/workflow#> .
+@prefix shape: <https://atomic.dev/ns/shapes/publication/1.0.0#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+
+shape:ManagedTurn a sh:NodeShape ;
+  sh:targetClass atomic:ManagedTurn ;
+  sh:property [ sh:path atomic:hasPlan ; sh:minCount 1 ; sh:maxCount 1 ; sh:class atomic:WorkIntent ] .
+
+shape:ManagedIntent a sh:NodeShape ;
+  sh:targetClass atomic:ManagedIntent ;
+  sh:property [ sh:path [ sh:inversePath atomic:hasPlan ] ; sh:minCount 1 ; sh:class atomic:SessionTurn ] .
+
+shape:TurnProvenance a sh:NodeShape ;
+  sh:targetClass atomic:SessionTurn ;
+  sh:property [ sh:path atomic:turnExplainedBy ; sh:minCount 1 ; sh:maxCount 1 ; sh:class atomic:ProvenanceGraph ] .
+
+shape:SessionCoverage a sh:NodeShape ;
+  sh:targetObjectsOf atomic:generatedChange ;
+  sh:sparql [
+    sh:message "Every generated change must be covered by an attestation for its generating session." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT $this WHERE {
+        ?turn atomic:generatedChange $this . ?session atomic:hasTurn ?turn .
+        FILTER NOT EXISTS { ?attestation atomic:attestsSession ?session ; atomic:coversChange $this }
+      }
+    """
+  ] .
+
+shape:VerifiedAttestation a sh:NodeShape ;
+  sh:targetClass atomic:Attestation ;
+  sh:property [ sh:path atomic:signedBy ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ; sh:pattern "^did:atomic:[A-Z2-7]{51}[AQ]$" ] ;
+  sh:property [ sh:path atomic:verificationResult ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] .

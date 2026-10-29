@@ -153,6 +153,15 @@ pub enum FileStatus {
     /// The file is recorded in the tree tables but no longer exists on disk.
     Deleted,
 
+    /// File is still tracked, but an `atomic remove --keep` has staged its
+    /// untracking on the current view.
+    ///
+    /// The bytes are untouched on disk and the name binding is still live:
+    /// the next `atomic record` emits the `FileDel` + dead claim through the
+    /// same path as an observed deletion, then the file reads as untracked.
+    /// `atomic add` cancels the pending intent.
+    PendingUntrack,
+
     /// File exists on disk but is not tracked by the repository.
     ///
     /// This is a new file that hasn't been added to version control yet.
@@ -218,6 +227,7 @@ impl FileStatus {
     /// - `D` for Deleted
     /// - `?` for Untracked
     /// - `A` for Added
+    /// - `U` for PendingUntrack
     /// - `C` for Conflicted
     /// - `T` for TypeChanged
     /// - `P` for PermissionsChanged
@@ -228,6 +238,7 @@ impl FileStatus {
             FileStatus::Deleted => 'D',
             FileStatus::Untracked => '?',
             FileStatus::Added => 'A',
+            FileStatus::PendingUntrack => 'U',
             FileStatus::Conflicted => 'C',
             FileStatus::TypeChanged => 'T',
             FileStatus::PermissionsChanged => 'P',
@@ -242,6 +253,7 @@ impl FileStatus {
             FileStatus::Deleted => "deleted",
             FileStatus::Untracked => "untracked",
             FileStatus::Added => "added",
+            FileStatus::PendingUntrack => "untrack pending",
             FileStatus::Conflicted => "conflicted",
             FileStatus::TypeChanged => "type changed",
             FileStatus::PermissionsChanged => "permissions changed",
@@ -608,6 +620,19 @@ impl RepositoryStatus {
     /// Count of deleted files.
     pub fn deleted_count(&self) -> usize {
         self.deleted().count()
+    }
+
+    /// Iterate over tracked files whose untracking a `remove --keep` has
+    /// staged for the next record.
+    pub fn pending_untrack(&self) -> impl Iterator<Item = &FileStatusEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.status == FileStatus::PendingUntrack)
+    }
+
+    /// Count of pending untracks.
+    pub fn pending_untrack_count(&self) -> usize {
+        self.pending_untrack().count()
     }
 
     /// Iterate over untracked files.

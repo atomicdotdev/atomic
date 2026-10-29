@@ -42,7 +42,8 @@ use crate::pristine::traits::{
 
 use super::helpers::{
     collect_preload_edges, collect_until_error, deserialize_conflicts, deserialize_edge,
-    deserialize_view_state, graph_presence, try_collect, try_is_present, AdjIterator,
+    deserialize_pending_untracks, deserialize_view_state, graph_presence, try_collect,
+    try_is_present, AdjIterator,
 };
 
 /// Read-only transaction
@@ -51,6 +52,7 @@ use super::helpers::{
 /// can be active simultaneously.
 pub struct ReadTxn {
     pub(crate) txn: ReadTransaction,
+    pub(crate) legacy_applied_changes: std::sync::OnceLock<std::collections::HashSet<u64>>,
 }
 
 fn operation_serialization_error(error: impl std::fmt::Display) -> PristineError {
@@ -109,7 +111,10 @@ fn decode_working_copy_row(
 impl ReadTxn {
     /// Create a new read transaction
     pub(crate) fn new(txn: ReadTransaction) -> Self {
-        Self { txn }
+        Self {
+            txn,
+            legacy_applied_changes: std::sync::OnceLock::new(),
+        }
     }
 
     /// Open the INODE_GRAPH table for shared use across multiple operations.
@@ -538,6 +543,14 @@ impl ViewTxnT for ReadTxn {
             }
         }
         Ok(out)
+    }
+
+    fn pending_untracks(&self, view_id: u64) -> PristineResult<Vec<String>> {
+        let table = self.txn.open_table(PENDING_UNTRACKS)?;
+        match table.get(&view_id)? {
+            Some(value) => deserialize_pending_untracks(value.value()),
+            None => Ok(Vec::new()),
+        }
     }
 
     fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
@@ -1367,6 +1380,7 @@ impl VaultTxnT for ReadTxn {
 
 impl KgTxnT for ReadTxn {
     fn get_kg_node(&self, id: &str) -> PristineResult<Option<KgNode>> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
@@ -1374,11 +1388,10 @@ impl KgTxnT for ReadTxn {
         };
         match table.get(id)? {
             Some(value) => {
-                let node: KgNode = serde_json::from_slice(value.value()).map_err(|e| {
-                    PristineError::Serialization {
+                let node =
+                    KgNode::from_json(value.value()).map_err(|e| PristineError::Serialization {
                         message: e.to_string(),
-                    }
-                })?;
+                    })?;
                 Ok(Some(node))
             }
             None => Ok(None),
@@ -1386,6 +1399,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn get_kg_edges_from(&self, node_id: &str) -> PristineResult<Vec<KgEdge>> {
+        self.require_current_kg()?;
         let from_table = match self.txn.open_multimap_table(KG_EDGES_FROM) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1415,6 +1429,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn get_kg_edges_to(&self, node_id: &str) -> PristineResult<Vec<KgEdge>> {
+        self.require_current_kg()?;
         let to_table = match self.txn.open_multimap_table(KG_EDGES_TO) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1444,6 +1459,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn kg_fts_search(&self, query: &str, limit: usize) -> PristineResult<Vec<KgNode>> {
+        self.require_current_kg()?;
         let fts_table = match self.txn.open_multimap_table(KG_FTS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1470,40 +1486,11 @@ impl KgTxnT for ReadTxn {
             }
         }
 
-        // Sort by relevance: boost entity nodes (3x) and file nodes (2x)
-        // over change nodes (1x). Entities and files are more useful for
-        // code exploration than individual change records.
-        let mut ranked: Vec<(String, usize)> = hit_counts.into_iter().collect();
-        ranked.sort_by(|a, b| {
-            let boost_a = if a.0.starts_with("entity:") {
-                a.1 * 3
-            } else if a.0.starts_with("file:") {
-                a.1 * 2
-            } else {
-                a.1
-            };
-            let boost_b = if b.0.starts_with("entity:") {
-                b.1 * 3
-            } else if b.0.starts_with("file:") {
-                b.1 * 2
-            } else {
-                b.1
-            };
-            boost_b.cmp(&boost_a)
-        });
-        ranked.truncate(limit);
-
-        // Fetch full nodes
-        let mut nodes = Vec::new();
-        for (id, _) in &ranked {
-            if let Some(node) = self.get_kg_node(id)? {
-                nodes.push(node);
-            }
-        }
-        Ok(nodes)
+        crate::pristine::vault::rank_kg_hits(self, hit_counts, limit)
     }
 
     fn kg_fts_match_ids(&self, query: &str) -> PristineResult<Vec<(String, usize)>> {
+        self.require_current_kg()?;
         let fts_table = match self.txn.open_multimap_table(KG_FTS) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1533,6 +1520,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn count_kg_nodes(&self) -> PristineResult<usize> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
@@ -1542,6 +1530,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn kg_node_ids_by_source(&self, sources: &[&str]) -> PristineResult<Vec<String>> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_NODES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
@@ -1560,6 +1549,7 @@ impl KgTxnT for ReadTxn {
     }
 
     fn count_kg_edges(&self) -> PristineResult<usize> {
+        self.require_current_kg()?;
         let table = match self.txn.open_table(KG_EDGES) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
@@ -1922,6 +1912,17 @@ pub struct CachedGraphTxn<'txn> {
     /// parallel paths use the inode-linear walk and don't hit these finders,
     /// so the lock is effectively uncontended.
     span_index: std::sync::Mutex<crate::pristine::span_index::VertexSpanIndex>,
+    /// Causal probes in different files share these immutable snapshot reads.
+    /// Cache successful reads (including absence), never errors; no entry
+    /// survives the borrowed read transaction or crosses a write boundary.
+    dependency_reads: std::sync::Mutex<CachedDependencyReads>,
+}
+
+#[derive(Default)]
+struct CachedDependencyReads {
+    internal: std::collections::HashMap<Hash, Option<NodeId>>,
+    external: std::collections::HashMap<NodeId, Option<Hash>>,
+    dependencies: std::collections::HashMap<NodeId, Vec<Hash>>,
 }
 
 impl<'txn> CachedGraphTxn<'txn> {
@@ -1934,6 +1935,7 @@ impl<'txn> CachedGraphTxn<'txn> {
             graph_table,
             inode_graph_table,
             span_index: std::sync::Mutex::new(Default::default()),
+            dependency_reads: Default::default(),
         })
     }
 
@@ -1961,15 +1963,65 @@ impl<'txn> CachedGraphTxn<'txn> {
     }
 }
 
+impl PathClaimTxnT for CachedGraphTxn<'_> {
+    fn path_claim_schema_version(&self) -> PristineResult<Option<u32>> {
+        self.txn.path_claim_schema_version()
+    }
+
+    fn get_path_claims(&self, path: &str) -> PristineResult<Vec<PathClaimEvent>> {
+        self.txn.get_path_claims(path)
+    }
+
+    fn iter_path_claims(&self) -> PristineResult<Vec<PathClaimEntry>> {
+        self.txn.iter_path_claims()
+    }
+
+    fn iter_rev_tree_pairs(&self) -> PristineResult<Vec<(Inode, String)>> {
+        self.txn.iter_rev_tree_pairs()
+    }
+}
+
 impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
     type Adj = AdjIterator;
 
     fn get_external(&self, id: NodeId) -> PristineResult<Option<Hash>> {
-        self.txn.get_external(id)
+        if let Some(value) = self
+            .dependency_reads
+            .lock()
+            .unwrap()
+            .external
+            .get(&id)
+            .copied()
+        {
+            return Ok(value);
+        }
+        let value = self.txn.get_external(id)?;
+        self.dependency_reads
+            .lock()
+            .unwrap()
+            .external
+            .insert(id, value);
+        Ok(value)
     }
 
     fn get_internal(&self, hash: &Hash) -> PristineResult<Option<NodeId>> {
-        self.txn.get_internal(hash)
+        if let Some(value) = self
+            .dependency_reads
+            .lock()
+            .unwrap()
+            .internal
+            .get(hash)
+            .copied()
+        {
+            return Ok(value);
+        }
+        let value = self.txn.get_internal(hash)?;
+        self.dependency_reads
+            .lock()
+            .unwrap()
+            .internal
+            .insert(*hash, value);
+        Ok(value)
     }
 
     fn list_registered_changes(&self) -> PristineResult<Vec<(NodeId, Hash)>> {
@@ -2070,7 +2122,23 @@ impl<'txn> GraphTxnT for CachedGraphTxn<'txn> {
     }
 
     fn get_change_deps(&self, change_id: NodeId) -> PristineResult<Vec<Hash>> {
-        self.txn.get_change_deps(change_id)
+        if let Some(value) = self
+            .dependency_reads
+            .lock()
+            .unwrap()
+            .dependencies
+            .get(&change_id)
+            .cloned()
+        {
+            return Ok(value);
+        }
+        let value = self.txn.get_change_deps(change_id)?;
+        self.dependency_reads
+            .lock()
+            .unwrap()
+            .dependencies
+            .insert(change_id, value.clone());
+        Ok(value)
     }
 
     fn change_deps_indexed_count(&self, change_id: NodeId) -> PristineResult<Option<u64>> {
@@ -2256,6 +2324,10 @@ impl<'txn> ViewTxnT for CachedGraphTxn<'txn> {
         self.txn.iter_conflicts(view_id)
     }
 
+    fn pending_untracks(&self, view_id: u64) -> PristineResult<Vec<String>> {
+        self.txn.pending_untracks(view_id)
+    }
+
     fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
         self.txn.snapshot_conflicts()
     }
@@ -2350,110 +2422,23 @@ impl<'txn> crate::pristine::InodeGraphOps for CachedGraphTxn<'txn> {
         inode: Inode,
         pos: Position<NodeId>,
     ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
-        let table = &self.inode_graph_table;
-        let inode_id = inode.get();
-        let change_id = pos.change.get();
-        let target_pos = pos.pos.get();
-
-        // Fast path: probe exact start position
-        let exact_start = encode_inode_vertex(inode_id, change_id, target_pos, 0);
-        let exact_end = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
-        let mut empty_match = None;
-
-        for result in table.range::<&[u8; 32]>(&exact_start..=&exact_end)? {
-            let (key, _) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-            if v_change != change_id || v_start != target_pos {
-                continue;
-            }
-            if v_start != v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-            if empty_match.is_none() {
-                empty_match = Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
-        }
-
-        if let Some(m) = empty_match {
-            return Ok(Some(m));
-        }
-
-        // Slow path: scan all vertices for this change within the inode
-        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
-        let end_key = encode_inode_vertex(inode_id, change_id, u64::MAX, u64::MAX);
-
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            let (key, _) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-            if v_change == change_id && v_start <= target_pos && target_pos < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-        }
-
-        Ok(None)
+        crate::pristine::inode_graph::probe::find_block_in_inode(
+            &self.inode_graph_table,
+            inode,
+            pos,
+        )
     }
-
     fn find_block_end_in_inode(
         &self,
         inode: Inode,
         pos: Position<NodeId>,
     ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
-        let table = &self.inode_graph_table;
-        let inode_id = inode.get();
-        let change_id = pos.change.get();
-        let target_pos = pos.pos.get();
-
-        // Check for empty vertex at exact position
-        let empty_key = encode_inode_vertex(inode_id, change_id, target_pos, target_pos);
-        if try_is_present(table.get(&empty_key)?)? {
-            return Ok(Some(GraphNode {
-                change: NodeId::new(change_id),
-                start: ChangePosition::new(target_pos),
-                end: ChangePosition::new(target_pos),
-            }));
-        }
-
-        // Scan for vertex ending at this position
-        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
-        let end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
-
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            let (key, _) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-            if v_change != change_id {
-                continue;
-            }
-            if v_end == target_pos && v_start < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-            if v_start <= target_pos && target_pos < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-        }
-
-        Ok(None)
+        crate::pristine::inode_graph::probe::find_block_end_in_inode(
+            &self.inode_graph_table,
+            inode,
+            pos,
+        )
     }
-
     fn count_inode_vertices(&self, inode: Inode) -> Result<usize, Self::InodeError> {
         let table = &self.inode_graph_table;
         let inode_id = inode.get();
@@ -2801,6 +2786,10 @@ impl<'txn> ViewTxnT for InodePreloadTxn<'txn> {
 
     fn iter_conflicts(&self, view_id: u64) -> PristineResult<Vec<(u64, Vec<StoredConflict>)>> {
         self.txn.iter_conflicts(view_id)
+    }
+
+    fn pending_untracks(&self, view_id: u64) -> PristineResult<Vec<String>> {
+        self.txn.pending_untracks(view_id)
     }
 
     fn snapshot_conflicts(&self) -> PristineResult<Vec<(u64, Inode, Vec<StoredConflict>)>> {
@@ -3316,5 +3305,169 @@ mod tests {
             .unwrap();
         assert_eq!(preload_edges, edges);
         assert!(preload.has_change_in_graph(global_only_change).unwrap());
+    }
+
+    #[test]
+    fn cached_graph_transaction_preserves_path_claim_observations() {
+        use crate::pristine::{PathClaimId, PathClaimKind, PathClaimMutTxnT, PathClaimState};
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("claims.redb")).unwrap();
+        let mut txn = pristine.write_txn().unwrap();
+        let id = txn.register_change(&Hash::of(b"claim")).unwrap();
+        let event = PathClaimEvent::new(
+            id,
+            0,
+            PathClaimKind::File,
+            PathClaimState::Alive,
+            PathClaimId::new(
+                Position::new(id, ChangePosition::new(8)),
+                GraphNode::ROOT,
+                GraphNode::new(id, ChangePosition::new(0), ChangePosition::new(8)),
+                id,
+            ),
+        );
+        txn.put_path_claim("file.txt", &event).unwrap();
+        txn.commit().unwrap();
+        let txn = pristine.read_txn().unwrap();
+        let cached = CachedGraphTxn::new(&txn).unwrap();
+        assert_eq!(
+            cached.path_claim_schema_version().unwrap(),
+            txn.path_claim_schema_version().unwrap()
+        );
+        assert_eq!(cached.get_path_claims("file.txt").unwrap(), vec![event]);
+        assert_eq!(
+            cached.iter_path_claims().unwrap(),
+            txn.iter_path_claims().unwrap()
+        );
+        assert_eq!(
+            cached.iter_rev_tree_pairs().unwrap(),
+            txn.iter_rev_tree_pairs().unwrap()
+        );
+    }
+
+    #[test]
+    fn cached_dependency_reads_are_scoped_to_the_read_snapshot() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("deps.redb")).unwrap();
+        let hash = Hash::of(b"writer");
+        let dependency = Hash::of(b"dependency");
+        let mut write = pristine.write_txn().unwrap();
+        let id = write.register_change(&hash).unwrap();
+        write.put_change_deps(id, &[]).unwrap();
+        write.commit().unwrap();
+        let before = pristine.read_txn().unwrap();
+        let cached_before = CachedGraphTxn::new(&before).unwrap();
+        assert!(cached_before.get_change_deps(id).unwrap().is_empty());
+        assert_eq!(cached_before.get_external(id).unwrap(), Some(hash));
+        assert_eq!(cached_before.get_internal(&dependency).unwrap(), None);
+
+        let mut write = pristine.write_txn().unwrap();
+        let dependency_id = write.register_change(&dependency).unwrap();
+        write.put_change_deps(dependency_id, &[]).unwrap();
+        write.put_change_deps(id, &[dependency]).unwrap();
+        write.commit().unwrap();
+        assert!(cached_before.get_change_deps(id).unwrap().is_empty());
+        assert_eq!(cached_before.get_internal(&dependency).unwrap(), None);
+        let after = pristine.read_txn().unwrap();
+        let cached_after = CachedGraphTxn::new(&after).unwrap();
+        assert_eq!(cached_after.get_change_deps(id).unwrap(), vec![dependency]);
+        assert_eq!(
+            cached_after.get_internal(&dependency).unwrap(),
+            Some(dependency_id)
+        );
+        assert_eq!(
+            cached_after.get_external(dependency_id).unwrap(),
+            Some(dependency)
+        );
+    }
+
+    #[test]
+    fn exact_namespace_claims_avoid_span_sweeps_and_keep_fallback_verdicts() {
+        use crate::output::{
+            repo::{live_inode_names, live_inode_names_with_claims},
+            RetrieveOptions,
+        };
+        use crate::pristine::PathClaimId;
+        for unlinked in [false, true] {
+            let dir = tempdir().unwrap();
+            let pristine = Pristine::open(dir.path().join("names.redb")).unwrap();
+            let mut write = pristine.write_txn().unwrap();
+            let id = write.register_change(&Hash::of(b"names")).unwrap();
+            write.put_change_deps(id, &[]).unwrap();
+            let inode = Position::new(id, ChangePosition::new(7));
+            let name = GraphNode::new(id, ChangePosition::new(3), ChangePosition::new(7));
+            let flags = EdgeFlags::BLOCK | EdgeFlags::FOLDER | EdgeFlags::PARENT;
+            write
+                .put_graph(
+                    inode.inode_node(),
+                    SerializedGraphEdge::new(flags, inode, id),
+                )
+                .unwrap();
+            write
+                .put_graph(name, SerializedGraphEdge::new(flags, Position::ROOT, id))
+                .unwrap();
+            if unlinked {
+                write
+                    .put_graph(
+                        name,
+                        SerializedGraphEdge::new(flags | EdgeFlags::DELETED, Position::ROOT, id),
+                    )
+                    .unwrap();
+            }
+            write.commit().unwrap();
+            let read = pristine.read_txn().unwrap();
+            let opts =
+                RetrieveOptions::new().with_change_filter(std::collections::HashSet::from([id]));
+            let reference =
+                live_inode_names(&CachedGraphTxn::new(&read).unwrap(), inode, &opts).unwrap();
+            assert_eq!(reference.is_empty(), unlinked);
+            let claim = PathClaimId::new(inode, GraphNode::ROOT, name, id);
+            for claims in [vec![claim], vec![claim, claim]] {
+                let cached = CachedGraphTxn::new(&read).unwrap();
+                assert_eq!(
+                    live_inode_names_with_claims(&cached, inode, &opts, &claims).unwrap(),
+                    reference
+                );
+                assert!(
+                    !cached.span_index.lock().unwrap().contains_change(id.get()),
+                    "exact name claim built a whole-change vertex index"
+                );
+            }
+            let missing = PathClaimId {
+                name: GraphNode::new(id, ChangePosition::new(4), ChangePosition::new(7)),
+                ..claim
+            };
+            let empty = PathClaimId {
+                name: inode.inode_node(),
+                ..claim
+            };
+            let wrong_inode = PathClaimId {
+                claimant: Position::ROOT,
+                ..claim
+            };
+            for claims in [
+                vec![],
+                vec![missing],
+                vec![empty],
+                vec![wrong_inode],
+                vec![claim, missing],
+            ] {
+                let cached = CachedGraphTxn::new(&read).unwrap();
+                assert_eq!(
+                    live_inode_names_with_claims(&cached, inode, &opts, &claims).unwrap(),
+                    reference
+                );
+                assert!(
+                    cached.span_index.lock().unwrap().contains_change(id.get()),
+                    "unproven name claim did not use the original block lookup"
+                );
+            }
+            let invisible = RetrieveOptions::new().with_change_filter(Default::default());
+            assert!(
+                live_inode_names_with_claims(&read, inode, &invisible, &[claim])
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }

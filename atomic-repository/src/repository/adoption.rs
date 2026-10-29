@@ -60,7 +60,7 @@ const PRE_TRANSITION_EVIDENCE_VERSION: u32 = 1;
 /// the payload's evidence set.
 pub(super) const PRE_TRANSITION_CAPTURE_ACTOR: &str = "bridge-pre-transition-capture";
 
-/// Hashed metadata marker embedded in bridge adoption snapshots. The marker
+/// Hashed metadata marker embedded in shim adoption snapshots. The marker
 /// lives in the change's hashed metadata, so an attribution claim is
 /// content-addressed and can never be edited after the fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +206,7 @@ pub fn read_pre_transition_evidence(
         Err(error) => {
             return Err(RepositoryError::InvalidRepository {
                 reason: format!(
-                    "cannot read bridge pre-transition evidence '{}': {error}",
+                    "cannot read shim pre-transition evidence '{}': {error}",
                     path.display()
                 ),
             })
@@ -215,14 +215,14 @@ pub fn read_pre_transition_evidence(
     let evidence: PreTransitionEvidence =
         serde_json::from_slice(&bytes).map_err(|error| RepositoryError::InvalidRepository {
             reason: format!(
-                "bridge pre-transition evidence '{}' is malformed: {error}",
+                "shim pre-transition evidence '{}' is malformed: {error}",
                 path.display()
             ),
         })?;
     if evidence.version != PRE_TRANSITION_EVIDENCE_VERSION {
         return Err(RepositoryError::InvalidRepository {
             reason: format!(
-                "unsupported bridge pre-transition evidence version {}",
+                "unsupported shim pre-transition evidence version {}",
                 evidence.version
             ),
         });
@@ -265,7 +265,7 @@ pub(crate) fn write_pre_transition_evidence(
     }
     result.map_err(|error| RepositoryError::InvalidRepository {
         reason: format!(
-            "cannot write bridge pre-transition evidence '{}': {error}",
+            "cannot write shim pre-transition evidence '{}': {error}",
             path.display()
         ),
     })
@@ -317,7 +317,7 @@ fn record_map(error: super::RecordError) -> RepositoryError {
     match error {
         super::RecordError::Repository(inner) => inner,
         other => RepositoryError::InvalidOperation {
-            message: format!("bridge adoption snapshot capture failed: {other}"),
+            message: format!("shim adoption snapshot capture failed: {other}"),
         },
     }
 }
@@ -686,7 +686,7 @@ pub(super) fn plan_carried_reassembly_trees<'a>(
                         Some(_) => plan.entries.push((
                             path,
                             CarriedEntry::Write {
-                                repository_bytes: carried_e.repository_bytes.clone(),
+                                repository_bytes: carried_e.repository_bytes.to_vec(),
                                 mode: carried_e.mode,
                                 kind: carried_e.kind,
                             },
@@ -694,7 +694,7 @@ pub(super) fn plan_carried_reassembly_trees<'a>(
                         None => plan.entries.push((
                             path,
                             CarriedEntry::Write {
-                                repository_bytes: carried_e.repository_bytes.clone(),
+                                repository_bytes: carried_e.repository_bytes.to_vec(),
                                 mode: carried_e.mode,
                                 kind: carried_e.kind,
                             },
@@ -949,7 +949,7 @@ impl Repository {
     /// Capture pending-edit evidence at a verified workspace boundary.
     ///
     /// Called by the workspace entry protocol after the workspace is verified
-    /// and aligned: a bridge-checkpointed workspace with pending edits gets a
+    /// and aligned: a shim-checkpointed workspace with pending edits gets a
     /// baseline-relative snapshot change plus refreshed evidence, so any
     /// later bound HEAD adoption can prove the carried edit (§7.1 step 6,
     /// §12.3). Content that the active snapshot already covers is not
@@ -2446,7 +2446,7 @@ impl Repository {
                 })
                 .map(|candidate| &candidate.repository_bytes);
             match projected {
-                Some(projected) if projected == repository_bytes => {}
+                Some(projected) if projected[..] == repository_bytes[..] => {}
                 other => {
                     return Err(RepositoryError::InvalidOperation {
                         message: format!(
@@ -2729,7 +2729,7 @@ impl Repository {
                     old_checkpoint.atomic_state.as_bytes(),
                 )
                 .ok_or_else(|| RepositoryError::InvalidRepository {
-                    reason: "bridge checkpoint carries an invalid atomic state".to_string(),
+                    reason: "shim checkpoint carries an invalid atomic state".to_string(),
                 })?,
                 set_id: None,
             }),
@@ -3736,7 +3736,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(unix),
-        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+        ignore = "temporary Unix-only Git shim (PR #207); see RFC temporary platform policy"
     )]
     fn unexplained_walk_never_follows_symlinks_or_leaves_the_root() {
         let directory = tempfile::TempDir::new().unwrap();
@@ -3881,7 +3881,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(unix),
-        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+        ignore = "temporary Unix-only Git shim (PR #207); see RFC temporary platform policy"
     )]
     fn known_gitlink_without_on_disk_marker_is_never_scanned() {
         let directory = tempfile::TempDir::new().unwrap();

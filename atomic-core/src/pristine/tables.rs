@@ -154,6 +154,20 @@ pub const VIEW_SET_ID_INDEX: TableDefinition<u64, &[u8]> =
 /// clears it when a file is recorded without markers.
 pub const CONFLICTS: TableDefinition<&[u8; 16], &[u8]> = TableDefinition::new("conflicts");
 
+/// Per-view pending untracks: `view_id → versioned path list`.
+///
+/// This is **intent state, not a projection**: it records the user's decision
+/// (`atomic remove --keep`) that a live, recorded path must be untracked by the
+/// next record, with its bytes kept on disk. Nothing in the graph authority
+/// derives or rebuilds it — `doctor repair-native-indexes` never touches it,
+/// and `atomic status` reads it only to label a still-tracked path as pending
+/// untrack. `record` consumes marked paths through the explicit-deletion
+/// channel (emitting `FileDel` even though the bytes are present) and clears
+/// each marker as it lands; `add` cancels a pending marker. An entry whose
+/// claim has since died by other means (inserted delete, untracked path) is a
+/// no-op and is silently dropped when observed.
+pub const PENDING_UNTRACKS: TableDefinition<u64, &[u8]> = TableDefinition::new("pending_untracks");
+
 // File Tree Tables
 
 /// Repository metadata and pristine schema completion markers.
@@ -333,6 +347,11 @@ pub const REV_CHANGE_DEPS: MultimapTableDefinition<&[u8; 32], u64> =
 /// A marker is needed because zero dependencies is distinct from "not indexed".
 pub const CHANGE_DEPS_INDEXED: TableDefinition<u64, u64> =
     TableDefinition::new("change_deps_indexed");
+
+/// Completed canonical change ingestion, independent of view membership.
+/// Written atomically with graph, attribute and semantic effects. Registration
+/// alone never creates an entry. This is not a file-visibility index.
+pub const APPLIED_CHANGES: TableDefinition<u64, u8> = TableDefinition::new("applied_changes");
 
 // State Tables
 
@@ -829,6 +848,15 @@ pub const KG_FTS_BY_NODE: MultimapTableDefinition<&str, &str> =
 /// KG index metadata used for transactional index migrations.
 pub const KG_INDEX_META: TableDefinition<&str, u32> = TableDefinition::new("kg_index_meta");
 
+/// View-independent project identity singleton (key 0).
+pub const PROJECT_IDENTITY: TableDefinition<u8, &[u8]> = TableDefinition::new("project_identity");
+/// DID-bound Ed25519 public keys, used by offline attestation projection.
+pub const SIGNER_KEYS: TableDefinition<&str, &str> = TableDefinition::new("signer_keys");
+/// Asserted class membership; excluded from kind-blind neighborhoods.
+pub const KG_TYPES: MultimapTableDefinition<&str, &str> = MultimapTableDefinition::new("kg_types");
+pub const KG_TYPES_REV: MultimapTableDefinition<&str, &str> =
+    MultimapTableDefinition::new("kg_types_rev");
+
 // Embedding Tables (vector similarity search)
 
 /// Vector embeddings: vault_path → EmbeddingRecord (serialized)
@@ -846,7 +874,8 @@ pub const EMBEDDINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("embed
 /// Holds the schema version (`SCHEMA_VERSION_KEY`, little-endian u64) and, for
 /// databases merged from the legacy `pristine.redb` + `changes.redb` layout,
 /// the `.atomic/legacy/` directory the old files were moved to
-/// (`LEGACY_DIR_KEY`, UTF-8).
+/// (`LEGACY_DIR_KEY`, UTF-8). Build identities are UTF-8 values under the
+/// keys in [`super::build_metadata`]; absent historical values remain unknown.
 pub const ATOMIC_META: TableDefinition<&str, &[u8]> = TableDefinition::new("atomic_meta");
 
 // KG Edge Key / FTS Helpers
@@ -1344,11 +1373,15 @@ mod tests {
 
     #[test]
     fn test_edge_key_roundtrip() {
-        let key = encode_edge_key("change:abc", "file:auth.rs", "MODIFIES");
+        let key = encode_edge_key(
+            "change:abc",
+            "file:auth.rs",
+            crate::kg::ontology::Predicate::ModifiesFile.iri(),
+        );
         let (from, to, kind) = decode_edge_key(&key).unwrap();
         assert_eq!(from, "change:abc");
         assert_eq!(to, "file:auth.rs");
-        assert_eq!(kind, "MODIFIES");
+        assert_eq!(kind, crate::kg::ontology::Predicate::ModifiesFile.iri());
     }
 
     #[test]

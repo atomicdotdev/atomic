@@ -209,7 +209,7 @@ impl Command for List {
 mod tests {
     use super::*;
     use atomic_repository::TagKind;
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     // -------------------------------------------------------------------------
     // Command Builder Tests
@@ -281,7 +281,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_list_empty() {
         use tempfile::tempdir;
 
@@ -304,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_list_with_tags() {
         use tempfile::tempdir;
 
@@ -329,7 +329,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_list_verbose() {
         use tempfile::tempdir;
 
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_list_annotated_only() {
         use tempfile::tempdir;
 

@@ -5,11 +5,22 @@
 //!
 //! # What It Does
 //!
-//! 1. Finds the repository root (`.atomic/` must exist)
+//! 1. Finds the repository root if there is one (falls back to a global
+//!    install in the home directory when outside a repository)
 //! 2. Detects which agent is present (or uses `--agent` flag)
-//! 3. Calls `AgentHook::install()` to write hooks into the agent's config
-//! 4. Creates `.atomic/sessions/` directory for session state persistence
-//! 5. Prints a success message with the number of hooks installed
+//! 3. Installs the agent's integration package per its manifest — every
+//!    hook, skill, and prompt lands in the home directory (e.g.
+//!    `~/.claude/settings.json`, `~/.config/opencode/opencode.json`),
+//!    never in the repo; the repo root is used only for agent
+//!    auto-detection, `.atomic/sessions/`, and `--agents-md`
+//!    `[[repo-file]]` entries
+//! 4. Falls back to built-in hook installation (repo-relative inside a
+//!    repository, home directory outside one) only if the package
+//!    cannot be fetched
+//!
+//! Hooks only record turns in projects that have a `.atomic/` directory,
+//! so running `enable` outside a repository is safe — the hooks stay
+//! dormant until they fire inside an Atomic repository.
 //!
 //! # Examples
 //!
@@ -64,22 +75,14 @@ pub struct Enable {
     #[arg(long)]
     all: bool,
 
-    /// Install hooks globally (~/.claude/settings.json).
-    ///
-    /// Global hooks fire for every Claude Code session regardless of
-    /// project. This is the recommended way to enable Atomic tracking —
-    /// install once, works everywhere that has a `.atomic/` directory.
-    #[arg(short, long)]
-    global: bool,
-
     /// Install hooks from an integration-supplied manifest file.
     ///
     /// The manifest (shipped by an integration package such as atomic-codex)
     /// names its own target settings file and the hook commands to register,
     /// and is merged in idempotently — preserving non-Atomic hooks. Because the
     /// definitions live in the integration repo, updating an agent's hook
-    /// wiring never requires rebuilding `atomic`. When set, `--agent`/`--global`
-    /// are not needed; the manifest is self-describing.
+    /// wiring never requires rebuilding `atomic`. When set, `--agent` is not
+    /// needed; the manifest is self-describing.
     #[arg(long, value_name = "FILE")]
     hooks: Option<std::path::PathBuf>,
 
@@ -121,7 +124,6 @@ impl Enable {
             agent: None,
             force: false,
             all: false,
-            global: false,
             hooks: None,
             from: None,
             from_skills: None,
@@ -180,23 +182,46 @@ impl Command for Enable {
             return self.run_manifest(manifest);
         }
 
-        // Global install — writes to ~/.claude/settings.json
-        if self.global {
-            return self.run_global();
-        }
+        // Find the repository root if there is one. Packaged integrations
+        // (the normal path — every registry agent resolves to one) install
+        // entirely into the home directory per their manifest; the repo
+        // root is used only for agent auto-detection, `.atomic/sessions`,
+        // and `--agents-md` `[[repo-file]]` entries. The built-in hook
+        // install below is a fallback for when the package cannot be
+        // fetched — inside a repository it installs repo-relative, and
+        // outside one it targets the home directory, matching where the
+        // packages install.
+        let (install_base, in_repo) = match find_repository_root() {
+            Ok(root) => (root, true),
+            Err(_) => {
+                print_warning(
+                    "No Atomic repository found — installing hooks globally to the home directory.",
+                );
+                print_warning(
+                    "Turns are only recorded in projects that have a .atomic/ directory.",
+                );
+                let home = dirs::home_dir().ok_or_else(|| {
+                    crate::error::CliError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Could not determine the home directory",
+                    ))
+                })?;
+                (home, false)
+            }
+        };
 
-        // Find the repository root
-        let repo_root = find_repository_root()?;
-
-        // Ensure .atomic/sessions directory exists
-        let sessions_dir = repo_root.join(".atomic").join("sessions");
-        if !sessions_dir.exists() {
-            std::fs::create_dir_all(&sessions_dir).map_err(|e| {
-                crate::error::CliError::Io(std::io::Error::new(
-                    e.kind(),
-                    format!("Failed to create sessions directory: {}", e),
-                ))
-            })?;
+        // Ensure .atomic/sessions directory exists — inside repositories
+        // only, so running outside a repo never touches the home .atomic/.
+        if in_repo {
+            let sessions_dir = install_base.join(".atomic").join("sessions");
+            if !sessions_dir.exists() {
+                std::fs::create_dir_all(&sessions_dir).map_err(|e| {
+                    crate::error::CliError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to create sessions directory: {}", e),
+                    ))
+                })?;
+            }
         }
 
         let registry = AgentRegistry::with_defaults();
@@ -204,7 +229,7 @@ impl Command for Enable {
         // Determine which agents to install for
         let agents_to_install: Vec<&str> = if self.all {
             // Install for all detected agents
-            let detected = registry.detect(&repo_root);
+            let detected = registry.detect(&install_base);
             if detected.is_empty() {
                 // Do not install hooks when no agent is detected.
                 print_error(
@@ -228,7 +253,7 @@ impl Command for Enable {
             vec![name.as_str()]
         } else {
             // Auto-detect
-            let detected = registry.detect(&repo_root);
+            let detected = registry.detect(&install_base);
             if detected.is_empty() {
                 // No agent detected — try to install for all, with a hint
                 let available = registry.list();
@@ -358,7 +383,7 @@ impl Command for Enable {
             }
 
             // Check if already installed (and not forcing)
-            if !self.force && agent.is_installed(&repo_root) {
+            if !self.force && agent.is_installed(&install_base) {
                 println!(
                     "  ✓ hooks already installed for {}. Use --force to reinstall.",
                     agent.display_name(),
@@ -367,8 +392,8 @@ impl Command for Enable {
             }
 
             // If forcing, uninstall first
-            if self.force && agent.is_installed(&repo_root) {
-                if let Err(e) = agent.uninstall(&repo_root) {
+            if self.force && agent.is_installed(&install_base) {
+                if let Err(e) = agent.uninstall(&install_base) {
                     print_warning(&format!(
                         "Failed to remove existing hooks for {}: {}",
                         agent.display_name(),
@@ -378,7 +403,7 @@ impl Command for Enable {
             }
 
             // Install
-            match agent.install(&repo_root) {
+            match agent.install(&install_base) {
                 Ok(count) => {
                     if count > 0 {
                         print_success(&format!(
@@ -572,9 +597,19 @@ impl Enable {
 
         // Determine repo_root from the --agents-md / --no-agents-md flags
         // or the interactive prompt. Only relevant when the manifest has
-        // [[repo-file]] entries.
+        // [[repo-file]] entries. Outside a repository the entries are
+        // skipped with a warning rather than failing the whole install —
+        // `enable` does not require a repository.
         let repo_root = if !manifest.repo_files.is_empty() && self.agents_md {
-            Some(find_repository_root()?)
+            match find_repository_root() {
+                Ok(root) => Some(root),
+                Err(_) => {
+                    print_warning(
+                        "--agents-md requires an Atomic repository — skipping [[repo-file]] entries.",
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -625,157 +660,6 @@ impl Enable {
                 ));
             }
         }
-        Ok(())
-    }
-
-    /// Install hooks globally to the agent's user-level settings.
-    ///
-    /// Supports:
-    /// - `claude-code` → `~/.claude/settings.json`
-    /// - `gemini-cli` → `~/.gemini/settings.json`
-    /// - `codex` → `~/.codex/hooks.json`
-    ///
-    /// agy is intentionally absent: its plugin is inherently global and is
-    /// installed by the integrations engine via the standard `enable` path.
-    fn run_global(&self) -> CliResult<()> {
-        use atomic_agent::hooks::claude_code::ClaudeCodeHook;
-        use atomic_agent::hooks::codex::CodexHook;
-        use atomic_agent::hooks::gemini_cli::GeminiCliHook;
-
-        let agent_name = self.agent.as_deref().unwrap_or("claude-code");
-
-        match agent_name {
-            "claude-code" => {
-                let hook = ClaudeCodeHook::new();
-
-                if !self.force && hook.is_installed_global() {
-                    print_success("Global hooks already installed in ~/.claude/settings.json.");
-                    println!("  Use --force to reinstall.");
-                    return Ok(());
-                }
-
-                match hook.install_global(self.force) {
-                    Ok(count) if count > 0 => {
-                        print_success(&format!(
-                            "Installed {} global hook{} for Claude Code",
-                            count,
-                            if count == 1 { "" } else { "s" },
-                        ));
-                        println!();
-                        println!("Hooks written to: ~/.claude/settings.json");
-                        println!();
-                        println!("Every Claude Code session in a project with .atomic/ will now:");
-                        println!("  • Record each turn as an Atomic change with full provenance");
-                        println!("  • Track session metadata (turn number, timing, files)");
-                        println!("  • Create attestations at session end");
-                    }
-                    Ok(_) => {
-                        print_success("Global hooks already up to date.");
-                    }
-                    Err(e) => {
-                        print_error(&format!("Failed to install global hooks: {}", e));
-                    }
-                }
-            }
-
-            "gemini-cli" => {
-                let hook = GeminiCliHook::new();
-
-                if !self.force && hook.is_installed_global() {
-                    print_success("Global hooks already installed in ~/.gemini/settings.json.");
-                    println!("  Use --force to reinstall.");
-                    return Ok(());
-                }
-
-                match hook.install_global(self.force) {
-                    Ok(count) if count > 0 => {
-                        print_success(&format!(
-                            "Installed {} global hook{} for Gemini CLI",
-                            count,
-                            if count == 1 { "" } else { "s" },
-                        ));
-                        println!();
-                        println!("Hooks written to: ~/.gemini/settings.json");
-                        println!();
-                        println!("Every Gemini CLI session in a project with .atomic/ will now:");
-                        println!("  • Record each turn as an Atomic change with full provenance");
-                        println!("  • Track session metadata (turn number, timing, files)");
-                        println!("  • Create attestations at session end");
-                    }
-                    Ok(_) => {
-                        print_success("Global hooks already up to date.");
-                    }
-                    Err(e) => {
-                        print_error(&format!("Failed to install global hooks: {}", e));
-                    }
-                }
-            }
-
-            "agy" => {
-                // agy's plugin is inherently global — the integration package
-                // install (the standard repo-scoped `enable` path) *is* the
-                // global install.
-                println!("The agy plugin is global by nature — install it with:");
-                println!("  atomic agent enable --agent agy");
-                println!();
-                println!("(No --global needed; the integrations engine stages the plugin");
-                println!(" at ~/.gemini/config/plugins/atomic/ from the atomic-agy package.)");
-            }
-
-            "codex" => {
-                let hook = CodexHook::new();
-
-                if !self.force && hook.is_installed_global() {
-                    print_success("Global hooks already installed in ~/.codex/hooks.json.");
-                    println!("  Use --force to reinstall.");
-                    return Ok(());
-                }
-
-                match hook.install_global(self.force) {
-                    Ok(count) if count > 0 => {
-                        print_success(&format!(
-                            "Installed {} global hook{} for Codex",
-                            count,
-                            if count == 1 { "" } else { "s" },
-                        ));
-                        println!();
-                        println!("Hooks written to: ~/.codex/hooks.json");
-                        println!();
-                        println!("Every Codex session in a project with .atomic/ will now:");
-                        println!(
-                            "  \u{2022} Record each turn as an Atomic change with full provenance"
-                        );
-                        println!("  \u{2022} Track session metadata (turn number, timing, files)");
-                        println!("  \u{2022} Capture tool calls through pre/post tool hooks");
-                    }
-                    Ok(_) => {
-                        print_success("Global hooks already up to date.");
-                    }
-                    Err(e) => {
-                        print_error(&format!("Failed to install global hooks: {}", e));
-                    }
-                }
-            }
-
-            "kiro" => {
-                print_success("Kiro hooks are configured through the IDE panel.");
-                println!();
-                println!("Install the atomic-kiro integration (skills, steering, hook scripts):");
-                println!("  atomic agent enable --agent kiro");
-                println!();
-                println!(
-                    "Then configure hooks in Kiro IDE \u{2192} Agent Steering & Skills panel."
-                );
-            }
-
-            other => {
-                print_warning(&format!(
-                    "Global install is not supported for '{}'. Supported agents: claude-code, gemini-cli, codex, kiro (agy via plain enable)",
-                    other
-                ));
-            }
-        }
-
         Ok(())
     }
 }
@@ -860,7 +744,6 @@ mod tests {
             agent: Some("claude-code".to_string()),
             force: false,
             all: false,
-            global: false,
             hooks: None,
             from: None,
             from_skills: None,
@@ -874,7 +757,6 @@ mod tests {
             agent: Some("claude-code".to_string()),
             force: true,
             all: false,
-            global: false,
             hooks: None,
             from: None,
             from_skills: None,
@@ -890,7 +772,6 @@ mod tests {
             agent: None,
             force: false,
             all: true,
-            global: false,
             hooks: None,
             from: None,
             from_skills: None,
@@ -898,22 +779,6 @@ mod tests {
         };
         assert!(cmd.all);
         assert!(cmd.agent.is_none());
-    }
-
-    #[test]
-    fn test_enable_with_global_flag() {
-        let cmd = Enable {
-            agent: Some("claude-code".to_string()),
-            force: false,
-            all: false,
-            global: true,
-            hooks: None,
-            from: None,
-            from_skills: None,
-            agents_md: false,
-        };
-        assert!(cmd.global);
-        assert_eq!(cmd.agent.as_deref(), Some("claude-code"));
     }
 
     #[test]

@@ -201,6 +201,13 @@ pub trait MutTxnT:
     /// full conflict set after a complete materialize, and on view deletion).
     fn del_conflicts_prefix(&mut self, view_id: u64) -> Result<(), PristineError>;
 
+    /// Replace a view's pending-untrack path list. An empty slice clears it.
+    ///
+    /// The list is stored sorted and deduplicated by the caller-visible layer;
+    /// this method stores exactly what it is given.
+    fn put_pending_untracks(&mut self, view_id: u64, paths: &[String])
+        -> Result<(), PristineError>;
+
     // ── Tree Operations ─────────────────────────────────────────
 
     /// Add a file to the tree (creates path↔inode mappings).

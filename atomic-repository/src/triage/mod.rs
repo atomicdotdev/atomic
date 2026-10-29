@@ -13,4 +13,4 @@ pub mod model;
 pub mod report;
 
 pub use model::*;
-pub use report::{build_report, hunk_display_summaries, HunkDisplaySummary};
+pub use report::{build_report, count_hunk_atoms, hunk_display_summaries, HunkDisplaySummary};

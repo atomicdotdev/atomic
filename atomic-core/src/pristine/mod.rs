@@ -149,13 +149,14 @@
 //! The `INODE_GRAPH` secondary index enables O(n) file traversal where n is
 //! proportional to file size, rather than O(N) where N is total graph size.
 
+mod applied_changes;
 mod attribute;
 mod bindings;
+pub mod build_metadata;
 mod capability;
 mod error;
-mod inode_graph;
+pub(crate) mod inode_graph;
 pub mod merge;
-pub mod ontology;
 mod path_claim;
 mod ref_mapping;
 pub mod schema;
@@ -176,7 +177,7 @@ pub use attribute::{
 pub use bindings::{BindingMutTxnT, BindingStoreOutcome, BindingTxnT};
 pub use capability::{
     RepositoryCapability, RequiredRepositoryCapability, UnsupportedRepositoryCapability,
-    BRIDGE_CUTOVER_CAPABILITY, CHANGE_FORMAT_VNEXT_CAPABILITY, REQUIRED_CAPABILITY_PREFIX,
+    CHANGE_FORMAT_VNEXT_CAPABILITY, REQUIRED_CAPABILITY_PREFIX, SHIM_CUTOVER_CAPABILITY,
     SUPPORTED_REPOSITORY_CAPABILITIES,
 };
 pub use error::{PristineError, PristineResult};

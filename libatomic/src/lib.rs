@@ -34,3 +34,17 @@ pub mod atomic {
 pub use crate::atomic as proto;
 
 pub mod daemon;
+pub mod identity_transport;
+pub mod local;
+pub mod signer_refresh;
+
+#[cfg(feature = "node")]
+mod node;
+
+pub use local::LocalService;
+
+/// Protobuf descriptor set built from this crate's canonical `proto/` tree.
+/// Bindings can generate their language types from these bytes without protoc
+/// or access to the Atomic source checkout.
+pub const FILE_DESCRIPTOR_SET: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/atomic_descriptor.bin"));

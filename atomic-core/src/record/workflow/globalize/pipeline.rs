@@ -402,16 +402,11 @@ where
         if let Some(retained) = recorded.name_conflict_resolution() {
             ctx.add_dependency_by_id(retained.change)?;
             ctx.add_dependency_by_id(inode_pos.change)?;
-            // Selection is explicit; the other operations unlink only the
-            // conflicting names. A concurrent rename must keep its content.
-            result.add_hunk(GraphOp::SolveNameConflict {
-                name: EdgeUpdate {
-                    edges: Vec::new(),
-                    inode: position_to_option_hash_resolved(ctx.txn(), retained, None),
-                },
-                path: path.to_string(),
-            });
-            let mut edges = Vec::new();
+            // A resolution is one operation containing the retained inode
+            // AND the losing claims. A separate empty selection operation is
+            // invalid, and using the losing inode as the survivor reverses
+            // the meaning of the resolution.
+            let mut claims = Vec::new();
             for &name in recorded.name_conflict_bindings() {
                 ctx.add_dependency_by_id(name.change)?;
                 for parent in ctx.txn().get_edges(name)? {
@@ -423,33 +418,37 @@ where
                     }
                     ctx.add_dependency_by_id(parent.introduced_by())?;
                     ctx.add_dependency_by_id(parent.dest().change)?;
-                    let previous = flag - EdgeFlags::PARENT;
-                    edges.push(crate::change::NewEdge {
-                        previous,
-                        flag: previous | EdgeFlags::DELETED,
-                        from: position_to_option_hash_resolved(ctx.txn(), parent.dest(), None),
-                        to: GraphNode {
-                            change: ctx.get_external(name.change),
-                            start: name.start,
-                            end: name.end,
-                        },
-                        introduced_by: ctx.get_external(parent.introduced_by()),
-                    });
+                    let source = parent.dest();
+                    claims.push(super::NameConflictClaim::new(
+                        inode_pos,
+                        GraphNode::new(source.change, source.pos, source.pos),
+                        name,
+                        parent.introduced_by(),
+                    ));
                 }
             }
-            if edges.is_empty() {
+            if claims.is_empty() {
                 return Err(GlobalizeError::MissingField {
                     path: path.to_string(),
                     field: "live name binding for name-conflict resolution",
                 });
             }
-            result.add_hunk(GraphOp::SolveNameConflict {
-                name: EdgeUpdate {
-                    edges,
-                    inode: position_to_option_hash_resolved(ctx.txn(), inode_pos, None),
-                },
-                path: path.to_string(),
-            });
+            result.add_hunk(super::globalize_solve_name_conflict(
+                ctx, path, retained, claims,
+            )?);
+            let retained_directory = ctx
+                .txn()
+                .position_inode(retained)?
+                .map(|inode| ctx.txn().is_directory(inode))
+                .transpose()?
+                .unwrap_or(false);
+            if ctx.txn().is_directory(inode)? && retained_directory {
+                // An explicit directory resolution also fixes the parent
+                // anchor for child moves/additions in this same change.
+                // This is assembly context, never a mutation of TREE.
+                let anchor = ctx.external_existing_position(retained)?;
+                ctx.register_directory_anchor(path, anchor);
+            }
             if let Some(ops) = recorded.crdt_ops().cloned() {
                 result.set_file_ops(ops);
             }
@@ -975,7 +974,64 @@ where
         return Ok(anchor);
     }
 
-    if let Some(inode) = ctx.txn().get_inode(directory_path)? {
+    // Closure-projected binding first (preserved-import identity contract):
+    // the ambient TREE/DIRECTORIES may hold the path only in the deferred
+    // lifecycle journal — or bind it to another view's inode — while this
+    // binding was reduced from the assembly view's path claims. The same
+    // visibility, kind, and vertex checks as the ambient path apply, and a
+    // binding the change being assembled itself vacates (file→directory
+    // transitions) is skipped so the in-change DirAdd anchor wins.
+    if let Some(binding) = ctx
+        .projected_paths
+        .get(directory_path)
+        .cloned()
+        .filter(|binding| {
+            !ctx.vacated_bindings
+                .get(directory_path)
+                .is_some_and(|inodes| inodes.contains(&binding.inode))
+        })
+    {
+        if binding.directory {
+            let hash = ctx.txn().get_external(binding.position.change)?.ok_or(
+                GlobalizeError::MissingExternalHash {
+                    node_id: binding.position.change,
+                },
+            )?;
+            if ctx.txn().is_change_visible(binding.position.change) {
+                let inode_node = GraphNode::new(
+                    binding.position.change,
+                    binding.position.pos,
+                    binding.position.pos,
+                );
+                if !ctx.txn().has_vertex(inode_node)? {
+                    return Err(GlobalizeError::InvalidParentMetadata {
+                        path: child_path.to_string(),
+                        parent: directory_path.to_string(),
+                        reason: "projected directory inode anchor is missing from the graph",
+                    });
+                }
+
+                let anchor = Position {
+                    change: Some(hash),
+                    pos: binding.position.pos,
+                };
+                ctx.add_dependency(hash);
+                ctx.register_directory_anchor(directory_path, anchor);
+                return Ok(anchor);
+            }
+        } else {
+            return Err(GlobalizeError::ParentNotDirectory {
+                path: child_path.to_string(),
+                parent: directory_path.to_string(),
+            });
+        }
+    }
+
+    if let Some(inode) = ctx.txn().get_inode(directory_path)?.filter(|inode| {
+        !ctx.vacated_bindings
+            .get(directory_path)
+            .is_some_and(|inodes| inodes.contains(inode))
+    }) {
         if let Some(position) = ctx.txn().inode_position(inode)? {
             let hash = ctx.txn().get_external(position.change)?.ok_or(
                 GlobalizeError::MissingExternalHash {

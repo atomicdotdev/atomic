@@ -5,7 +5,7 @@ fn removal_candidates<T: TreeTxnT>(
     txn: &T,
     path: &Path,
     options: &TrackingOptions,
-) -> Result<Vec<(String, Inode)>, RepositoryError> {
+) -> Result<Vec<(String, Inode, TrackedPathState)>, RepositoryError> {
     let normalized = normalize_path(path);
     let files = if options.recursive {
         tracked_under_prefix(txn, &normalized)
@@ -21,10 +21,112 @@ fn removal_candidates<T: TreeTxnT>(
             path: path.to_path_buf(),
         });
     }
-    Ok(files)
+    files
+        .into_iter()
+        .map(|(candidate, inode)| {
+            tracked_path_state(txn, inode)
+                .map(|state| (candidate, inode, state))
+                .map_err(|e| RepositoryError::Database(e.to_string()))
+        })
+        .collect()
+}
+
+// View-scoped pending-untrack intent (the `atomic remove --keep` marker).
+// The list is tiny and always handled read-modify-write inside the caller's
+// transaction. This is intent state, not a projection: nothing derives it
+// and native-index repair must never clear it.
+fn mark_pending_untrack<T>(txn: &mut T, view_id: u64, path: &str) -> Result<(), RepositoryError>
+where
+    T: atomic_core::pristine::ViewTxnT + atomic_core::pristine::MutTxnT,
+{
+    let mut paths = txn
+        .pending_untracks(view_id)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    if !paths.iter().any(|existing| existing == path) {
+        paths.push(path.to_string());
+        paths.sort();
+    }
+    txn.put_pending_untracks(view_id, &paths)
+        .map_err(|e| RepositoryError::Database(e.to_string()))
+}
+
+/// Cancels pending-untrack intent for anything at or under `roots` on the
+/// current view — the `git add`-cancels-a-staged-removal behavior: re-tracking
+/// is deliberate and supersedes a mark that has not been recorded yet. Markers
+/// live on still-tracked paths, so `add` reaches this even when the path itself
+/// is already tracked and would otherwise be skipped.
+fn cancel_pending_untracks<T>(
+    txn: &mut T,
+    current_view: &str,
+    roots: &[String],
+) -> Result<(), RepositoryError>
+where
+    T: atomic_core::pristine::ViewTxnT + atomic_core::pristine::MutTxnT,
+{
+    let Some(view) = txn
+        .get_view(current_view)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?
+    else {
+        return Ok(());
+    };
+    let existing = txn
+        .pending_untracks(view.id)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let kept: Vec<String> = existing
+        .iter()
+        .filter(|pending| {
+            !roots
+                .iter()
+                .any(|root| *pending == root || pending.starts_with(&format!("{root}/")))
+        })
+        .cloned()
+        .collect();
+    if kept.len() != existing.len() {
+        txn.put_pending_untracks(view.id, &kept)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    }
+    Ok(())
 }
 
 impl Repository {
+    /// Drop pending-untrack markers for `view_name`, keeping any marker not in
+    /// `paths`. Called by record after apply (consuming what it observed) —
+    /// see the marker snapshot in `record_with_lifecycle`.
+    pub(crate) fn clear_pending_untracks(
+        &self,
+        view_name: &str,
+        paths: &[String],
+    ) -> Result<(), RepositoryError> {
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let Some(view) = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        else {
+            return Ok(());
+        };
+        let current = txn
+            .pending_untracks(view.id)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let kept: Vec<String> = current
+            .iter()
+            .filter(|pending| !paths.iter().any(|dropped| dropped == *pending))
+            .cloned()
+            .collect();
+        if kept.len() != current.len() {
+            txn.put_pending_untracks(view.id, &kept)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        }
+        txn.commit()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     // File Tracking Methods
 
     /// Add a file or directory to tracking.
@@ -135,6 +237,12 @@ impl Repository {
 
             stats.files_added += 1;
         }
+
+        // Re-tracking supersedes any pending `--keep` mark at or under the
+        // requested path, so a marked path that gets `add`ed again cancels the
+        // mark (the git `add`-unstages-a-removal behavior) even when the path
+        // was already tracked and skipped above.
+        cancel_pending_untracks(&mut txn, &self.current_view, &[normalize_path(path)])?;
 
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -259,6 +367,14 @@ impl Repository {
             if let Some(inode) = crate::tracking::get_inode(&txn, &normalized)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
             {
+                // Recorded bindings belong to their change (see `remove`); plan
+                // only the staged ones so the batch never orphans a live claim.
+                if tracked_path_state(&txn, inode)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    == TrackedPathState::Recorded
+                {
+                    continue;
+                }
                 operations.push(TreeProjectionOperation::Delete {
                     inode,
                     retire: true,
@@ -407,8 +523,20 @@ impl Repository {
 
     /// Remove a file or directory from tracking.
     ///
-    /// This removes the file from version control tracking. It does NOT
-    /// delete the file from disk.
+    /// Only a **staged** path — one `add` tracked but `record` never recorded —
+    /// is untracked here, by deleting the `TREE`/`REV_TREE` rows `add` created.
+    /// Nothing is deleted from disk; that is the caller's decision.
+    ///
+    /// A **recorded** path cannot be untracked this way. Its name is durable in
+    /// `PATH_CLAIMS` and its `INODES`/`REV_INODES` binding is derived from the
+    /// change that recorded it, so wiping the binding would leave the surviving
+    /// claim unresolvable and every later projection (`status`, `record`,
+    /// `switch`, materialize) would fail with `path claim '<path>' has no inode
+    /// for graph position <pos>` until `atomic doctor repair-native-indexes`
+    /// rebuilt the rows. Such paths are reported untouched in
+    /// [`TrackingStats::pending_deletions`]; removing them from the working copy
+    /// and recording the delete is what actually stops tracking them, which is
+    /// what `atomic remove` does for them, mirroring `git rm`.
     ///
     /// # Arguments
     ///
@@ -419,11 +547,14 @@ impl Repository {
     /// # Example
     ///
     /// ```rust,ignore
-    /// // Remove a single file
-    /// repo.remove(working_copy, "old_file.txt", TrackingOptions::default())?;
+    /// // Untrack a single staged file
+    /// let stats = repo.remove(working_copy, "old_file.txt", TrackingOptions::default())?;
+    /// assert_eq!(stats.files_removed, 1);
     ///
-    /// // Remove a directory recursively
-    /// repo.remove(working_copy, "old_dir/", TrackingOptions::default())?;
+    /// // A recorded path is deferred, not untracked
+    /// let stats = repo.remove(working_copy, "Cargo.lock", TrackingOptions::default())?;
+    /// assert_eq!(stats.files_removed, 0);
+    /// assert!(stats.has_pending_deletions());
     /// ```
     pub fn remove<P: AsRef<Path>>(
         &self,
@@ -439,7 +570,20 @@ impl Repository {
                 .pristine
                 .read_txn()
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            stats.files_removed = removal_candidates(&txn, path, &options)?.len();
+            // Preview reports the same split the mutation applies, so a dry run
+            // never promises an untrack that the recorder owns.
+            for (file_path, _inode, state) in removal_candidates(&txn, path, &options)? {
+                match state {
+                    TrackedPathState::Staged => stats.files_removed += 1,
+                    TrackedPathState::Recorded => {
+                        if options.keep_recorded {
+                            stats.pending_untracks.push(PathBuf::from(file_path));
+                        } else {
+                            stats.defer_deletion(PathBuf::from(file_path));
+                        }
+                    }
+                }
+            }
             return Ok(stats);
         }
         let mut txn = self
@@ -447,11 +591,41 @@ impl Repository {
             .write_txn()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let to_remove = removal_candidates(&txn, path, &options)?;
+        // Resolve the marked view once, and only when this request will mark
+        // something: `--keep` stages the untrack as per-view intent.
+        let mark_view = if options.keep_recorded
+            && to_remove
+                .iter()
+                .any(|(_, _, state)| matches!(state, TrackedPathState::Recorded))
+        {
+            Some(
+                txn.get_view(&self.current_view)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::ViewNotFound {
+                        name: self.current_view.clone(),
+                    })?
+                    .id,
+            )
+        } else {
+            None
+        };
 
-        for (file_path, _inode) in to_remove {
-            remove_from_tree(&mut txn, &file_path)
-                .map_err(|e| RepositoryError::Database(e.to_string()))?;
-            stats.files_removed += 1;
+        for (file_path, _inode, state) in to_remove {
+            match state {
+                TrackedPathState::Staged => {
+                    untrack_staged_path(&mut txn, &file_path)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    stats.files_removed += 1;
+                }
+                TrackedPathState::Recorded => {
+                    if let (true, Some(view_id)) = (options.keep_recorded, mark_view) {
+                        mark_pending_untrack(&mut txn, view_id, &file_path)?;
+                        stats.pending_untracks.push(PathBuf::from(file_path));
+                    } else {
+                        stats.defer_deletion(PathBuf::from(file_path));
+                    }
+                }
+            }
         }
 
         txn.commit()

@@ -1,3 +1,4 @@
+use prost::Message;
 use std::path::PathBuf;
 
 fn collect_protos(dir: &PathBuf, out: &mut Vec<PathBuf>) {
@@ -16,6 +17,8 @@ fn collect_protos(dir: &PathBuf, out: &mut Vec<PathBuf>) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "node")]
+    napi_build::setup();
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest.join("proto");
     let mut files = Vec::new();
@@ -30,6 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The include root carries `atomic/...`, matching the imports
     // (`atomic/common/common.proto`).
     let fds = protox::compile(&files, [proto_root.clone()])?;
+    // Foreign-language bindings generate their types from this exact contract,
+    // without carrying a second copy of the protobuf sources.
+    let out = PathBuf::from(std::env::var("OUT_DIR")?);
+    std::fs::write(out.join("atomic_descriptor.bin"), fds.encode_to_vec())?;
+    println!("cargo:rerun-if-changed={}", proto_root.display());
 
     tonic_build::configure()
         .build_client(true)

@@ -104,12 +104,12 @@ use atomic_repository::{
     Repository, SnapshotStatus, WorkspaceRemediation, WorkspaceTxnMode, WorkspaceTxnStart,
 };
 
-use crate::commands::git::bridge::read_checkpoint_observation;
 use crate::commands::git::observation::{
     classify_provisional_checkpoint, display_git_bytes, observe_git, AtomicAnchorObservation,
     GitObservation, IndexHeadEquivalence, ManifestEquivalence, ProvisionalCheckpointEligibility,
     RefTargetObservation,
 };
+use crate::commands::git::shim::read_checkpoint_observation;
 use crate::commands::workspace_txn::{enter_workspace, observe_workspace};
 use crate::commands::{find_repository_root, Command, DEFAULT_HASH_LENGTH};
 use crate::error::{CliError, CliResult};
@@ -175,7 +175,7 @@ pub struct Status {
     pub short: bool,
 
     /// Emit a versioned JSON document for IDEs and other integrations.
-    #[arg(long, conflicts_with_all = ["short", "debug_ignore"])]
+    #[arg(long, conflicts_with_all = ["short", "debug_ignore", "no_reconcile"])]
     pub json: bool,
 
     /// Don't show untracked files.
@@ -208,7 +208,7 @@ pub struct Status {
     /// Print read-only Git/Atomic checkpoint evidence without reconciliation.
     ///
     /// This forensic mode does not run ordinary file status, reindex, import,
-    /// materialization, or any bridge reconciliation path.
+    /// materialization, or any shim reconciliation path.
     #[arg(long = "no-reconcile", conflicts_with = "reindex")]
     pub no_reconcile: bool,
 
@@ -270,6 +270,7 @@ impl Status {
                 Ok(pb::FileStatus::Untracked) => FileStatus::Untracked,
                 Ok(pb::FileStatus::Added) => FileStatus::Added,
                 Ok(pb::FileStatus::Conflicted) => FileStatus::Conflicted,
+                Ok(pb::FileStatus::PendingUntrack) => FileStatus::PendingUntrack,
                 _ => FileStatus::Clean,
             };
             let path = PathBuf::from(file.path);
@@ -294,10 +295,7 @@ impl Status {
             .map_err(CliError::Repository)?;
         crate::commands::status_git::apply_git_informed_overlays(&repo, &root, &mut status)?;
         crate::commands::git::ref_mapping::print_divergence_notices(&repo)?;
-        if repo
-            .bridge_workspace_active()
-            .map_err(CliError::Repository)?
-        {
+        if repo.shim_workspace_active().map_err(CliError::Repository)? {
             if let Ok(git) = git2::Repository::discover(&root) {
                 if git.state() != git2::RepositoryState::Clean {
                     status.add_notice(format!("Git operation in progress ({:?})", git.state()));
@@ -408,6 +406,7 @@ impl Status {
         let has_changes = status.modified_count() > 0
             || status.deleted_count() > 0
             || status.added_count() > 0
+            || status.pending_untrack_count() > 0
             || status.conflicted_count() > 0
             || status.type_changed_count() > 0
             || status.permissions_changed_count() > 0;
@@ -433,6 +432,15 @@ impl Status {
                 "  {}",
                 hint("(use \"atomic restore <file>...\" to discard changes)")
             );
+            if status.pending_untrack_count() > 0 {
+                println!(
+                    "  {}",
+                    hint(
+                        "(use \"atomic add <file>...\" to cancel a pending untrack; \
+                          'atomic record' completes it)"
+                    )
+                );
+            }
             print_blank();
 
             // Print added files and directories
@@ -460,6 +468,26 @@ impl Status {
                     println!("\t{}    {}", deleted("del dir:"), style_path(&path_str));
                 } else {
                     println!("\t{}   {}", deleted("deleted:"), style_path(&path_str));
+                }
+            }
+
+            // Print files whose untracking `remove --keep` staged: tracked
+            // still, deleted by the next record, bytes kept on disk.
+            for entry in status.pending_untrack() {
+                let path_str = entry.path().display().to_string();
+                let is_dir = entry.details().map(|d| d == "directory").unwrap_or(false);
+                if is_dir {
+                    println!(
+                        "\t{}         {}",
+                        deleted("del dir:"),
+                        style_path(&path_str)
+                    );
+                } else {
+                    println!(
+                        "\t{}      {}",
+                        deleted("untrack pending:"),
+                        style_path(&path_str)
+                    );
                 }
             }
 
@@ -684,6 +712,9 @@ impl Command for Status {
     /// - The repository cannot be opened
     /// - Status computation fails
     fn run(&self) -> CliResult<()> {
+        // A shim-enrolled repository's linked worktrees are not managed yet:
+        // refuse before any constructor registers a second working copy there.
+        crate::commands::git::linked_worktree::refuse_when_shim_enrolled_from_cwd()?;
         if crate::commands::rpc::status(self)? {
             return Ok(());
         }
@@ -891,7 +922,7 @@ fn forensic_manifest_root(repo_root: &Path, repo: &Repository, view: &str) -> Op
 /// observations. No stale-baseline classification is made: index movement is
 /// legitimate Git work between boundaries (CB-11A).
 fn forensic_drift(
-    checkpoint: Option<&crate::commands::git::observation::BridgeCheckpointObservation>,
+    checkpoint: Option<&crate::commands::git::observation::ShimCheckpointObservation>,
     atomic: &AtomicAnchorObservation,
     git: &GitObservation,
 ) -> Vec<String> {
@@ -944,7 +975,7 @@ fn forensic_drift(
 fn build_forensic_report(
     repo_root: &Path,
     atomic: &AtomicAnchorObservation,
-    checkpoint: Option<&crate::commands::git::observation::BridgeCheckpointObservation>,
+    checkpoint: Option<&crate::commands::git::observation::ShimCheckpointObservation>,
     git: &GitObservation,
     eligibility: &ProvisionalCheckpointEligibility,
     manifest_root: Option<&str>,
@@ -975,14 +1006,14 @@ fn build_forensic_report(
 
     match checkpoint {
         Some(checkpoint) => {
-            let _ = writeln!(report, "Bridge checkpoint: present");
+            let _ = writeln!(report, "Shim checkpoint: present");
             let _ = writeln!(report, "  view: {}", checkpoint.view);
             let _ = writeln!(report, "  atomic state: {}", checkpoint.atomic_state);
             let _ = writeln!(report, "  Git HEAD: {}", checkpoint.git_head);
             let _ = writeln!(report, "  Git tree: {}", checkpoint.git_tree);
         }
         None => {
-            let _ = writeln!(report, "Bridge checkpoint: absent");
+            let _ = writeln!(report, "Shim checkpoint: absent");
         }
     }
 
@@ -1257,6 +1288,7 @@ fn json_status_name(status: FileStatus) -> &'static str {
         FileStatus::Deleted => "deleted",
         FileStatus::Untracked => "untracked",
         FileStatus::Added => "added",
+        FileStatus::PendingUntrack => "pending_untrack",
         FileStatus::Conflicted => "conflicted",
         FileStatus::TypeChanged => "type_changed",
         FileStatus::PermissionsChanged => "permissions_changed",
@@ -1313,6 +1345,7 @@ pub fn status_code(status: FileStatus) -> char {
         FileStatus::Added => 'A',
         FileStatus::Deleted => 'D',
         FileStatus::Untracked => '?',
+        FileStatus::PendingUntrack => 'U',
         FileStatus::Conflicted => 'C',
         FileStatus::TypeChanged => 'T',
         FileStatus::PermissionsChanged => 'P',
@@ -1327,6 +1360,7 @@ pub fn status_description(status: FileStatus) -> &'static str {
         FileStatus::Added => "new file",
         FileStatus::Deleted => "deleted",
         FileStatus::Untracked => "untracked",
+        FileStatus::PendingUntrack => "untrack pending",
         FileStatus::Conflicted => "conflict",
         FileStatus::TypeChanged => "type changed",
         FileStatus::PermissionsChanged => "permissions",
@@ -1343,6 +1377,7 @@ pub fn is_recordable(status: FileStatus) -> bool {
         FileStatus::Modified
             | FileStatus::Added
             | FileStatus::Deleted
+            | FileStatus::PendingUntrack
             | FileStatus::TypeChanged
             | FileStatus::PermissionsChanged
     )
@@ -1355,7 +1390,7 @@ mod tests {
     use super::*;
     use atomic_core::types::Merkle;
     use atomic_repository::status::{FileStatus, FileStatusEntry};
-    use serial_test::serial;
+    use serial_test::file_serial;
     use std::path::PathBuf;
 
     // Status Command Construction Tests
@@ -1785,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_run_outside_repository() {
         let _guard = DirGuard::new();
 
@@ -1801,7 +1836,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_run_in_repository() {
         let _guard = DirGuard::new();
 
@@ -1831,7 +1866,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_run_short_format() {
         let _guard = DirGuard::new();
 
@@ -1862,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_run_no_untracked() {
         let _guard = DirGuard::new();
 
@@ -1896,7 +1931,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_run_with_path_filter() {
         let _guard = DirGuard::new();
 
@@ -1931,7 +1966,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_in_subdirectory() {
         let _guard = DirGuard::new();
 
@@ -1967,7 +2002,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_status_with_multiple_file_types() {
         let _guard = DirGuard::new();
 

@@ -130,8 +130,17 @@ impl Command for Push {
                 atomic_repository::repository::provenance_gate::local_session_mac_key_provider(
                     &readonly_repo,
                 );
+            let did_provider =
+                atomic_repository::repository::provenance_gate::local_did_key_provider(
+                    &readonly_repo,
+                );
             readonly_repo
-                .enforce_publication_gate("Git ref export", &closure, Some(&provider))
+                .enforce_publication_gate(
+                    "Git ref export",
+                    &closure,
+                    Some(&provider),
+                    Some(&did_provider),
+                )
                 .map_err(CliError::Repository)?;
         }
         // RFC §8.3 (CB-8B): remote export of a view with unresolved Atomic
@@ -314,6 +323,7 @@ impl Command for Push {
         let tree_oid = super::shadow::stage_and_validate_tree(
             &repo,
             &git_repo,
+            None,
             &repo_root,
             &publication,
             marker_policy,
@@ -903,7 +913,7 @@ impl Push {
         print_warning(&format!(
             "Local provenance verification is advisory: this push is only protected if '{}' \
              enforces managed provenance server-side (Atomic-controlled remote, a \
-             pre-receive/update hook running 'atomic git bridge verify-receive', or a required \
+             pre-receive/update hook running 'atomic git shim verify-receive', or a required \
              CI status check). Pushing to a remote without such enforcement is NOT blocked by \
              Atomic; the push will proceed regardless of what this client verified.",
             self.remote

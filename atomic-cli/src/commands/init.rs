@@ -543,6 +543,8 @@ impl Command for Init {
             }
             other => CliError::Repository(other),
         })?;
+        repo.ensure_project_identity(atomic_core::kg::project_id::MintReason::Created)
+            .map_err(CliError::Repository)?;
         let working_copy = repo
             .require_working_copy_id()
             .map_err(CliError::Repository)?;
@@ -644,7 +646,7 @@ impl Command for Init {
         // The scaffold view was created above; the binding-first bootstrap
         // installs the fetched bindings (fail-closed), resurrects a verified
         // binding for HEAD exactly into the scaffold view, and — with the
-        // explicit key — anchors the bridge. An unbound history is a typed
+        // explicit key — anchors the shim. An unbound history is a typed
         // refusal naming the explicit import path; init itself stays
         // successful (the repository exists), the adoption does not run.
         if self.adopt_git {
@@ -778,7 +780,7 @@ fn add_vault_files_recursive(repo: &Repository, dir: &std::path::Path) -> CliRes
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+    use serial_test::file_serial;
     use tempfile::TempDir;
 
     // -------------------------------------------------------------------------
@@ -1152,7 +1154,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_resolve_path_relative() {
         let temp = TempDir::new().unwrap();
         let original_dir = std::env::current_dir().unwrap();
@@ -1168,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_resolve_path_dot() {
         let temp = TempDir::new().unwrap();
         let original_dir = std::env::current_dir().unwrap();

@@ -44,7 +44,7 @@ use std::path::Path;
 
 use atomic_core::change::provenance_graph::{ProvenanceGraph, ProvenanceNodeKind};
 use atomic_core::types::Base32;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -182,7 +182,8 @@ pub struct RelatedRef {
 ///
 /// This function never fails; any missing data is silently omitted.
 pub fn to_agent_trace_record(graph: &ProvenanceGraph, root: &Path) -> TraceRecord {
-    let timestamp = DateTime::<Utc>::from_timestamp(graph.timestamp, 0)
+    let timestamp = graph
+        .timestamp_datetime()
         .unwrap_or_else(Utc::now)
         .to_rfc3339();
 
@@ -601,6 +602,24 @@ mod tests {
             .edges(edges)
             .timestamp(1_700_000_000)
             .build()
+    }
+
+    #[test]
+    fn trace_timestamp_preserves_milliseconds_and_accepts_legacy_seconds() {
+        let directory = tempfile::tempdir().unwrap();
+        for (raw, expected) in [
+            (1_792_920_379, "2026-10-25T09:26:19+00:00"),
+            (1_792_920_379_589, "2026-10-25T09:26:19.589+00:00"),
+        ] {
+            let graph = ProvenanceGraph::builder("timestamp-compat", "agent")
+                .timestamp(raw)
+                .build();
+            assert_eq!(
+                to_agent_trace_record(&graph, directory.path()).timestamp,
+                expected
+            );
+            assert_eq!(graph.timestamp, raw);
+        }
     }
 
     #[test]

@@ -218,6 +218,13 @@ where
     if start < content.len() {
         lines.push(&content[start..]);
     }
+    if std::env::var("ATOMIC_TRACE_HYPER").is_ok() {
+        eprintln!(
+            "create_content_vertices_per_line: {} line vertices from {} bytes",
+            lines.len(),
+            content.len()
+        );
+    }
 
     // If empty or single line, just create one vertex
     if lines.len() <= 1 {

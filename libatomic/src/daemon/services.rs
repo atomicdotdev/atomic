@@ -27,6 +27,28 @@ use super::convert::*;
 use super::sandbox_wire::hash_from_proto;
 use super::state::{domain_status, repository_error, DaemonState};
 
+/// Delete one already-resolved working-copy path, as `atomic remove` does when a
+/// path has to leave the working copy.
+///
+/// Directories leave recursively: a recorded directory's untrack reports its
+/// contents before the directory itself, so a non-recursive removal would fail
+/// on the still-occupied parents and leave the tree half-untracked. A path that
+/// is already absent needs no deletion and is a success — it is pending its
+/// recorded delete either way.
+///
+/// An unlink that cannot be performed is returned to the caller, never
+/// swallowed: reporting a removal whose bytes are still on disk is the failure
+/// this exists to prevent.
+fn remove_from_working_copy(path: &std::path::Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else if path.exists() {
+        std::fs::remove_file(path)
+    } else {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DaemonService
 // ---------------------------------------------------------------------------
@@ -69,6 +91,8 @@ const METHOD_MATRIX: &[(&str, &str)] = &[
     ("AttestationService", "RecordAttestation"),
     ("AttestationService", "VerifyAttestation"),
     ("KnowledgeService", "QueryGraph"),
+    ("KnowledgeService", "GetProjectIdentity"),
+    ("KnowledgeService", "GetWorkflowSnapshot"),
     ("ProvenanceService", "DispatchTurnEvent"),
     ("ProvenanceService", "AppendHookLog"),
     ("ProvenanceService", "LoadHookLog"),
@@ -124,6 +148,22 @@ impl daemon_service_server::DaemonService for DaemonImpl {
                         required_capabilities: vec!["maintenance.admin".to_string()],
                         allowed_callers: vec![CallerClass::Local as i32],
                         effects: vec![RpcEffect::RepositoryWrite as i32],
+                    }
+                } else if *service == "KnowledgeService"
+                    && matches!(*method, "GetProjectIdentity" | "GetWorkflowSnapshot")
+                {
+                    MethodDescriptorInfo {
+                        service: service.to_string(),
+                        method: method.to_string(),
+                        scope: ExecutionScope::Local as i32,
+                        required_capabilities: vec![if *method == "GetProjectIdentity" {
+                            "repository.read"
+                        } else {
+                            "knowledge.read"
+                        }
+                        .to_owned()],
+                        allowed_callers: vec![CallerClass::Local as i32],
+                        effects: vec![RpcEffect::RepositoryRead as i32],
                     }
                 } else if *service == "ProvenanceService"
                     && matches!(*method, "AppendHookLog" | "LoadHookLog")
@@ -614,6 +654,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                             snapshot: None,
                             untracked: Vec::new(),
                             pristine_content: None,
+                            view: None,
                         })
                     }
                     Some(preview_mutation_request::Operation::Unrecord(preview)) => {
@@ -725,6 +766,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                             snapshot: None,
                             untracked: Vec::new(),
                             pristine_content: None,
+                            view: None,
                         })
                     }
                     None => Err(domain_status(
@@ -743,6 +785,22 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
         request: Request<PreviewRestoreRequest>,
     ) -> Result<Response<PreviewMutationResponse>, Status> {
         let request = request.into_inner();
+        if let Some(path) = &request.content_path {
+            use std::path::Component;
+            if path.is_empty()
+                || std::path::Path::new(path).components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(domain_status(
+                    ErrorCode::InvalidArgument,
+                    "content_path must be repository-relative",
+                ));
+            }
+        }
         let handle = self
             .state
             .resolve(request.repository.as_ref().unwrap_or(&default_ref()))?;
@@ -811,6 +869,7 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
                     snapshot: None,
                     untracked,
                     pristine_content,
+                    view: Some(workspace.view().name.clone()),
                 })
             })
             .await
@@ -1550,7 +1609,12 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             .state
             .resolve(request.repository.as_ref().unwrap_or(&default_ref()))?;
         self.state.log_rpc("RemoveFiles", Some(&handle));
+        // `keep_working_copy` guards the paths tracking untracks outright
+        // (`--delete`); `untrack_only` is `--keep`, the `git rm --cached` shape
+        // that stages a recorded path's untrack as pending intent with bytes
+        // kept. The daemon mirrors the CLI's `git rm` matrix.
         let keep = request.keep_working_copy;
+        let untrack_only = request.untrack_only;
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
         let result = tokio::task::spawn_blocking(move || -> Result<RemoveFilesResponse, Status> {
@@ -1563,10 +1627,24 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             let options = TrackingOptions {
                 force: request.force,
                 dry_run: request.dry_run,
+                // `--keep` (`git rm --cached`): recorded paths stage their
+                // untrack as per-view pending intent instead of deferring to a
+                // working-copy deletion; the next record lands the delete with
+                // the bytes kept.
+                keep_recorded: untrack_only,
                 ..TrackingOptions::default()
             };
-            let mut removed: u32 = 0;
-            let mut to_delete: Vec<std::path::PathBuf> = Vec::new();
+            // Validate every path before applying any of it, as `git rm` does: a
+            // refusal must never leave the other paths half-untracked. The plan
+            // is the same classification a mutation applies, so a preview reports
+            // exactly what the command would do.
+            let mut refusals: Vec<RemovalRefusal> = Vec::new();
+            let mut plan: Vec<(
+                String,
+                usize,
+                Vec<std::path::PathBuf>,
+                Vec<std::path::PathBuf>,
+            )> = Vec::new();
             for path in &request.paths {
                 // Normalize exactly like the CLI: absolute paths must be
                 // inside the repository root and are made relative.
@@ -1583,26 +1661,126 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 } else {
                     path.clone()
                 };
+                let preview = TrackingOptions {
+                    dry_run: true,
+                    ..options.clone()
+                };
                 let stats = repo
-                    .remove(working_copy, &normalized, options.clone())
+                    .remove(working_copy, &normalized, preview)
+                    .map_err(repository_error)?;
+
+                let mut pending: Vec<std::path::PathBuf> = Vec::new();
+                let mut marks: Vec<std::path::PathBuf> = Vec::new();
+                for mark in stats.pending_untracks {
+                    // A staged untrack touches no bytes: nothing can refuse it
+                    // on their behalf.
+                    marks.push(mark);
+                }
+                for candidate in stats.pending_deletions {
+                    let absolute = handle.root.join(&candidate);
+                    if absolute.exists()
+                        && !request.force
+                        // Fail closed when status cannot be computed, as the CLI does.
+                        && repo
+                            .has_uncommitted_edits(working_copy, &candidate)
+                            .unwrap_or(true)
+                    {
+                        refusals.push(RemovalRefusal {
+                            path: candidate.to_string_lossy().to_string(),
+                            reason: "uncommitted-edits".to_string(),
+                        });
+                        continue;
+                    }
+                    pending.push(candidate);
+                }
+                plan.push((normalized, stats.files_removed, pending, marks));
+            }
+
+            // A preview reports and applies nothing. A mutation with any refusal
+            // also applies nothing, so the caller can fix the request and rerun.
+            if request.dry_run || !refusals.is_empty() {
+                let pending_deletions = if request.dry_run {
+                    plan.iter()
+                        .flat_map(|(_, _, pending, _)| pending.iter())
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let pending_untracks = if request.dry_run {
+                    plan.iter()
+                        .flat_map(|(_, _, _, marks)| marks.iter())
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                return Ok(RemoveFilesResponse {
+                    removed: if request.dry_run {
+                        plan.iter()
+                            .map(|(_, removed, _, _)| *removed)
+                            .sum::<usize>() as u32
+                    } else {
+                        0
+                    },
+                    pending_deletions,
+                    refusals,
+                    failed_deletions: Vec::new(),
+                    pending_untracks,
+                    meta: None,
+                });
+            }
+
+            let mut removed: u32 = 0;
+            // What still has to leave the working copy, as (reported path, disk
+            // path). The disk path is always resolved against the repository
+            // root: the daemon's own working directory is wherever it was
+            // started, so a relative path would resolve against nothing and
+            // silently delete nothing while the command reported success.
+            let mut staged_to_delete: Vec<(String, std::path::PathBuf)> = Vec::new();
+            let mut recorded_to_delete: Vec<(String, std::path::PathBuf)> = Vec::new();
+            let mut pending_untracks: Vec<String> = Vec::new();
+            for (normalized, _planned_removed, pending, _marks) in &plan {
+                let stats = repo
+                    .remove(working_copy, normalized, options.clone())
                     .map_err(repository_error)?;
                 removed += stats.files_removed as u32;
-                if !keep {
-                    to_delete.push(handle.root.join(&normalized));
+                // Report the marks the mutation actually landed.
+                for mark in stats.pending_untracks {
+                    pending_untracks.push(mark.to_string_lossy().to_string());
+                }
+                if stats.files_removed > 0 && !keep {
+                    staged_to_delete.push((normalized.clone(), handle.root.join(normalized)));
+                }
+                for path in pending {
+                    recorded_to_delete
+                        .push((path.to_string_lossy().to_string(), handle.root.join(path)));
                 }
             }
             // The CLI deletes from disk only after every tracking removal
-            // succeeded; the daemon mirrors that ordering. A dry run
-            // reports the untrack counts without touching disk.
-            if !request.dry_run {
-                for path in to_delete {
-                    if path.is_file() {
-                        let _ = std::fs::remove_file(&path);
-                    }
+            // succeeded; the daemon mirrors that ordering.
+            let mut pending_deletions: Vec<String> = Vec::new();
+            let mut failed_deletions: Vec<String> = Vec::new();
+            for (reported, path) in staged_to_delete {
+                if let Err(error) = remove_from_working_copy(&path) {
+                    failed_deletions.push(format!("{reported}: {error}"));
+                }
+            }
+            // A recorded path that left the working copy is pending its recorded
+            // delete; one that could not be deleted reports the failure instead,
+            // and is never counted as removed.
+            for (reported, path) in recorded_to_delete {
+                match remove_from_working_copy(&path) {
+                    Ok(()) => pending_deletions.push(reported),
+                    Err(error) => failed_deletions.push(format!("{reported}: {error}")),
                 }
             }
             Ok(RemoveFilesResponse {
                 removed,
+                pending_deletions,
+                refusals,
+                failed_deletions,
+                pending_untracks,
                 meta: None,
             })
         })

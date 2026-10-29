@@ -8,7 +8,7 @@
 //! # Privacy rules (enforced by validated construction, not convention)
 //!
 //! * The sink lives under the Atomic dot directory (`.atomic/`), which the
-//!   bridge projection excludes — telemetry is never exported into Git
+//!   shim projection excludes — telemetry is never exported into Git
 //!   metadata or objects.
 //! * [`BridgeEventKind`] is a closed enum whose fields are validated
 //!   fixed-format identifiers ([`UlidId`], [`OpIdRef`], [`HexBindingId`]) or
@@ -27,16 +27,16 @@
 //! Automatic (library-level) paths — operation recovery and binding-closure
 //! fetch — obtain their journal through [`BridgeEventJournal::for_repository`],
 //! which writes only when the repository has explicitly opted in via
-//! `[git.bridge] enabled = true`. Observational paths (`Repository::status`)
+//! `[git.shim] enabled = true`. Observational paths (`Repository::status`)
 //! never write telemetry at all: they return metrics to the caller, and only
-//! explicit bridge commands decide whether an authorized boundary records
-//! them. Explicit CLI bridge commands construct their journal directly and
+//! explicit shim commands decide whether an authorized boundary records
+//! them. Explicit CLI shim commands construct their journal directly and
 //! are their own consent.
 //!
 //! # Failure policy
 //!
 //! Observability is advisory: [`BridgeEventJournal::emit_lossy`] never
-//! fails a bridge operation. The journal is bounded — a record is appended
+//! fails a shim operation. The journal is bounded — a record is appended
 //! only when the complete record (including its newline) fits under
 //! [`MAX_BRIDGE_EVENT_JOURNAL_BYTES`]; otherwise the event is dropped (the
 //! bound is the documented retention policy; complete history is never
@@ -77,7 +77,7 @@ pub const BRIDGE_EVENT_JOURNAL_RELATIVE_PATH: &str = "bridge/events.jsonl";
 const BRIDGE_EVENT_LOG_TARGET: &str = "atomic::bridge::event";
 
 /// Bounded nonblocking retry budget for the append lock. Contended writers
-/// drop the event after this budget instead of blocking bridge operations.
+/// drop the event after this budget instead of blocking shim operations.
 const APPEND_LOCK_ATTEMPTS: u32 = 24;
 
 #[cfg(target_os = "linux")]
@@ -264,7 +264,7 @@ pub enum RefusalClass {
     MappingRefreshFailed,
     ImportFailed,
     ProjectionFailed,
-    /// CB-13D (RFC §11.2 rule 4): the optional metadata-only bridge watch
+    /// CB-13D (RFC §11.2 rule 4): the optional metadata-only shim watch
     /// daemon classified a run as Atomic→Git export and refused to execute
     /// it — export belongs to an explicit command boundary.
     MetadataOnlyExportSuppressed,
@@ -418,7 +418,7 @@ pub struct BridgeEvent {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum BridgeEventKind {
-    /// One `atomic git bridge reconcile` run: direction classified from the
+    /// One `atomic git shim reconcile` run: direction classified from the
     /// checkpoint/mapping, and how the run ended.
     Reconcile {
         /// Closed direction code.
@@ -455,7 +455,7 @@ pub enum BridgeEventKind {
     },
     /// A candidate-path change source degraded (RFC §11.2 rule 7). The
     /// steady-state tier is observable per transaction in status output;
-    /// explicit bridge command boundaries record the degradation itself.
+    /// explicit shim command boundaries record the degradation itself.
     ChangeSourceFallback {
         /// Closed tier code in use.
         source: TierCode,
@@ -648,15 +648,15 @@ impl From<&super::WorkspaceTxnMode> for WorkspaceModeCode {
     }
 }
 
-/// Whether the bridge telemetry sink is consented for a dot directory.
+/// Whether the shim telemetry sink is consented for a dot directory.
 ///
 /// Automatic paths (recovery, binding fetch) write telemetry only for
-/// repositories that explicitly opted in via `[git.bridge] enabled = true`;
-/// explicit bridge CLI commands construct their journal directly and are
+/// repositories that explicitly opted in via `[git.shim] enabled = true`;
+/// explicit shim CLI commands construct their journal directly and are
 /// their own consent.
-pub fn bridge_opted_in(dot_dir: &Path) -> bool {
+pub fn shim_opted_in(dot_dir: &Path) -> bool {
     atomic_config::RepoConfig::load(&dot_dir.join("config.toml"))
-        .map(|config| config.git.bridge.enabled)
+        .map(|config| config.git.shim.enabled)
         .unwrap_or(false)
 }
 
@@ -699,7 +699,7 @@ impl Clone for BridgeEventJournal {
 impl BridgeEventJournal {
     /// Journal for `repository`, recording its working-copy ID when one is
     /// resolved. This constructor is for automatic library-level paths: it
-    /// honors the repository's bridge consent, so an un-opted repository
+    /// honors the repository's shim consent, so an un-opted repository
     /// never writes telemetry. The journal file is created on first
     /// emission.
     pub fn for_repository(repository: &Repository) -> Self {
@@ -711,21 +711,21 @@ impl BridgeEventJournal {
     }
 
     /// Consent-gated journal for a dot directory without a repository
-    /// handle. Honors the same `[git.bridge] enabled` consent gate as
+    /// handle. Honors the same `[git.shim] enabled` consent gate as
     /// [`Self::for_repository`].
     pub fn for_dot_dir(dot_dir: &Path, working_copy: Option<UlidId>) -> Self {
         Self {
             path: dot_dir.join(BRIDGE_EVENT_JOURNAL_RELATIVE_PATH),
             dot_dir: dot_dir.to_path_buf(),
             working_copy,
-            consented: std::sync::atomic::AtomicBool::new(bridge_opted_in(dot_dir)),
+            consented: std::sync::atomic::AtomicBool::new(shim_opted_in(dot_dir)),
             config_mtime: std::sync::atomic::AtomicU64::new(config_mtime_nanos(dot_dir)),
             live_consent: true,
         }
     }
 
     /// Journal rooted at an Atomic dot directory, without the consent
-    /// gate. Use only from explicit bridge command boundaries (the
+    /// gate. Use only from explicit shim command boundaries (the
     /// command invocation is the consent).
     pub fn new(dot_dir: &Path, working_copy: Option<UlidId>) -> Self {
         Self {
@@ -925,7 +925,7 @@ impl BridgeEventJournal {
     }
 
     /// Append one event, swallowing every error: observability must never
-    /// fail the bridge operation that produced the outcome.
+    /// fail the shim operation that produced the outcome.
     pub fn emit_lossy(&self, kind: BridgeEventKind) {
         let _ = self.emit(kind);
     }
@@ -947,7 +947,7 @@ impl BridgeEventJournal {
             self.config_mtime
                 .store(observed, std::sync::atomic::Ordering::Relaxed);
             self.consented.store(
-                bridge_opted_in(&self.dot_dir),
+                shim_opted_in(&self.dot_dir),
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
@@ -974,7 +974,7 @@ fn config_mtime_nanos(dot_dir: &Path) -> u64 {
 }
 
 impl Repository {
-    /// The serialized, expected-old-leased bridge consent transition
+    /// The serialized, expected-old-leased shim consent transition
     /// (CB-13C F2): performed under the common operation lock with an
     /// atomic same-directory replacement. A concurrent operation holder
     /// cannot have consent changed underneath it, and a diverged
@@ -982,7 +982,7 @@ impl Repository {
     ///
     /// Returns whether the file changed (idempotent re-application is
     /// `Ok(false)`).
-    pub fn set_bridge_consent(
+    pub fn set_shim_consent(
         &self,
         enabled: bool,
         expected_old: Option<bool>,
@@ -995,19 +995,62 @@ impl Repository {
             }
         })?;
         if let Some(expected) = expected_old {
-            if config.git.bridge.enabled != expected {
+            if config.git.shim.enabled != expected {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!(
-                        "bridge consent lease diverged: expected enabled={expected},                          observed enabled={}",
-                        config.git.bridge.enabled
+                        "shim consent lease diverged: expected enabled={expected},                          observed enabled={}",
+                        config.git.shim.enabled
                     ),
                 });
             }
         }
-        if config.git.bridge.enabled == enabled {
+        if config.git.shim.enabled == enabled {
             return Ok(false);
         }
-        config.git.bridge.enabled = enabled;
+        config.git.shim.enabled = enabled;
+        config
+            .save(&config_path)
+            .map_err(|error| RepositoryError::InvalidRepository {
+                reason: format!("cannot save the repository configuration: {error}"),
+            })?;
+        drop(common);
+        Ok(true)
+    }
+
+    /// Record the shim vault projection policy (RFC §6.2) in the
+    /// repository configuration under `[git.shim] vault`.
+    ///
+    /// Serialized, expected-old-leased, and idempotent like
+    /// [`Self::set_shim_consent`]: performed under the common operation lock
+    /// with an atomic same-directory replacement; a diverged `expected_old`
+    /// refuses instead of overwriting. Returns whether the file changed.
+    pub fn set_shim_vault_policy(
+        &self,
+        vault: atomic_config::ShimVaultPolicy,
+        expected_old: Option<atomic_config::ShimVaultPolicy>,
+    ) -> Result<bool, RepositoryError> {
+        let common = self.try_lock_common_operation()?;
+        let config_path = self.dot_dir().join("config.toml");
+        let mut config = atomic_config::RepoConfig::load(&config_path).map_err(|error| {
+            RepositoryError::InvalidRepository {
+                reason: format!("cannot load the repository configuration: {error}"),
+            }
+        })?;
+        if let Some(expected) = expected_old {
+            if config.git.shim.vault != Some(expected) {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!(
+                        "shim vault policy lease diverged: expected {expected:?}, observed {:?}",
+                        config.git.shim.vault
+                    ),
+                });
+            }
+        }
+        if config.git.shim.vault == Some(vault) {
+            drop(common);
+            return Ok(false);
+        }
+        config.git.shim.vault = Some(vault);
         config
             .save(&config_path)
             .map_err(|error| RepositoryError::InvalidRepository {
@@ -1111,7 +1154,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(unix),
-        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+        ignore = "temporary Unix-only Git shim (PR #207); see RFC temporary platform policy"
     )]
     fn ancestor_symlink_target_is_never_followed_mutated_or_erased() {
         let directory = tempfile::tempdir().unwrap();
@@ -1179,7 +1222,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(unix),
-        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+        ignore = "temporary Unix-only Git shim (PR #207); see RFC temporary platform policy"
     )]
     fn owned_crash_fragment_is_repaired_and_the_event_appends() {
         let _directory = tempfile::tempdir().unwrap();
@@ -1210,24 +1253,24 @@ mod tests {
 
     /// CB-13C F2: consent withdrawal under a held common lock refuses
     /// (typed contention) instead of rewriting the file outside the lock.
-    /// Failing before (record_bridge_opt_in truncated the file without
+    /// Failing before (record_shim_opt_in truncated the file without
     /// any lock), passing after.
     #[test]
     fn disable_under_a_held_common_lock_refuses_without_writing() {
         let directory = tempfile::tempdir().unwrap();
         let repo = Repository::init(directory.path()).unwrap();
-        repo.set_bridge_consent(true, None).unwrap();
-        assert!(bridge_opted_in(repo.dot_dir()));
+        repo.set_shim_consent(true, None).unwrap();
+        assert!(shim_opted_in(repo.dot_dir()));
 
         // Hold the common operation lock; the transition must refuse.
         let _holder = repo.try_lock_common_operation().unwrap();
-        let error = repo.set_bridge_consent(false, Some(true)).unwrap_err();
+        let error = repo.set_shim_consent(false, Some(true)).unwrap_err();
         assert!(
             matches!(error, crate::RepositoryError::LockContended { .. }),
             "{error}"
         );
         // The consent is unchanged.
-        assert!(bridge_opted_in(repo.dot_dir()));
+        assert!(shim_opted_in(repo.dot_dir()));
     }
 
     /// CB-13C F2: a previously enabled automatic sink performs no further
@@ -1238,13 +1281,13 @@ mod tests {
     fn cached_sink_performs_no_further_writes_after_disable() {
         let directory = tempfile::tempdir().unwrap();
         let repo = Repository::init(directory.path()).unwrap();
-        repo.set_bridge_consent(true, None).unwrap();
+        repo.set_shim_consent(true, None).unwrap();
         let journal = BridgeEventJournal::for_repository(&repo);
         journal.emit(reconcile()).expect("consented emission lands");
         let after_first = std::fs::read(journal.path()).unwrap();
         assert!(!after_first.is_empty());
 
-        repo.set_bridge_consent(false, Some(true)).unwrap();
+        repo.set_shim_consent(false, Some(true)).unwrap();
         journal
             .emit(reconcile())
             .expect("withdrawn consent drops silently");
@@ -1712,7 +1755,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(unix),
-        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+        ignore = "temporary Unix-only Git shim (PR #207); see RFC temporary platform policy"
     )]
     fn partial_tail_fragment_is_repaired_on_next_emit() {
         let (directory, journal) = journal();
@@ -1752,7 +1795,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(unix),
-        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+        ignore = "temporary Unix-only Git shim (PR #207); see RFC temporary platform policy"
     )]
     fn concurrent_emits_produce_valid_jsonl_within_the_bound() {
         let (directory, journal) = journal();
@@ -1814,7 +1857,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(unix),
-        ignore = "temporary Unix-only Git bridge (PR #207); see RFC temporary platform policy"
+        ignore = "temporary Unix-only Git shim (PR #207); see RFC temporary platform policy"
     )]
     fn symlinked_journal_path_is_refused_and_target_untouched() {
         let (directory, journal) = journal();
@@ -1874,10 +1917,10 @@ mod tests {
     }
 
     /// The automatic library-level sink is consent-gated: without
-    /// `[git.bridge] enabled = true` the journal writes nothing and never
+    /// `[git.shim] enabled = true` the journal writes nothing and never
     /// creates the event file; with explicit opt-in it records normally.
     #[test]
-    fn automatic_sink_requires_bridge_opt_in() {
+    fn automatic_sink_requires_shim_opt_in() {
         let directory = tempfile::tempdir().unwrap();
         let dot_dir = directory.path().join(DOT_DIR);
         std::fs::create_dir_all(&dot_dir).unwrap();
@@ -1892,7 +1935,7 @@ mod tests {
 
         std::fs::write(
             dot_dir.join("config.toml"),
-            "[view]\ndefault = \"main\"\n\n[git.bridge]\nenabled = true\n",
+            "[view]\ndefault = \"main\"\n\n[git.shim]\nenabled = true\n",
         )
         .unwrap();
         let consented = BridgeEventJournal::for_dot_dir(&dot_dir, None);

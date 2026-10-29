@@ -213,6 +213,13 @@ message MaterializeRequest {
   RepositoryRef repository = 1;
   reserved 2, 3; // credentials moved to middleware; mutable view names removed
   optional ViewRef target = 4; // sandbox: inferred from grant; others: required
+  // Partial materialization (a monorepo folder): stream only entries at or
+  // under this path, plus the ancestor directories that lead to them, and
+  // filter the terminal skeleton's live rows the same way so the sandbox
+  // cache is prefix-coherent. Plain relative components only — the same
+  // path-safety rules as TreeEntry.path (no "..", no ".", no root, no
+  // empty components); unset or empty materializes the whole view.
+  optional string path_prefix = 5;
 }
 message MaterializeFrame {
   oneof frame {
@@ -332,6 +339,38 @@ message ChangeSubmitted {
 message ChangeRefused {
   ErrorInfo rejection = 1;      // e.g. {code: VIEW_STALE, context:{...}}
   optional SandboxSkeleton skeleton = 2;   // present on stale-view refusals
+}
+
+// A session-end attestation from a remote sandbox (CB-12B transport): the
+// signed audit node the sandbox's agent created at session end, plus the
+// session state file it verifies under. Both ride to the owner, or every
+// managed change the session recorded fails the owner's publication gate
+// with MissingAttestation — the gate reads the session MAC key from the
+// owner's `.atomic/sessions/<id>.json`, which never leaves the sandbox any
+// other way.
+message SubmitAttestationRequest {
+  RepositoryRef repository = 1;
+  RequestMeta meta = 2;
+  string session_id = 3;        // the session the attestation covers
+  VersionedBytes attestation = 4;  // `Attestation::serialize` (ATST + postcard),
+                                    // schema "atomic.attestation.v1"
+  // The sandbox's session state file, exactly as its SessionStore writes it.
+  // The owner files it under `.atomic/sessions/<session_id>.json` — and only
+  // when it carries a non-empty `mac_key`: a session state file without one
+  // verifies nothing at the gate, so the owner never adopts it.
+  string session_json = 5;
+  optional ViewRef target = 6;
+}
+message SubmitAttestationResponse {
+  oneof outcome {
+    AttestationSubmitted submitted = 1;
+    ErrorInfo refused = 2;      // e.g. a malformed attestation
+  }
+  ResponseMeta meta = 100;
+}
+message AttestationSubmitted {
+  Hash attestation_hash = 1;    // the attestation's content hash, as saved
+  bool session_state = 2;       // whether the session state file was written
 }
 
 

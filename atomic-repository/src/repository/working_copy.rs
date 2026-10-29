@@ -16,7 +16,10 @@ use atomic_core::WorkingCopyId;
 use super::{Repository, DOT_DIR};
 use crate::RepositoryError;
 
-const REPOSITORY_POINTER: &str = "repository";
+/// File inside a linked working copy's own `.atomic` that points at the
+/// common Atomic directory; its presence marks the working copy as
+/// registered against that repository.
+pub const REPOSITORY_POINTER: &str = "repository";
 const WORKING_COPY_ID_FILE: &str = "working_copy_id";
 const CURRENT_VIEW_FILE: &str = "current_view";
 const LOCATION_FINGERPRINT_DOMAIN: &[u8] = b"atomic:working-copy-location:v1\0";

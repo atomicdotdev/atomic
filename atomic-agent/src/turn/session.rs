@@ -760,7 +760,181 @@ pub struct SessionStore {
     sessions_dir: PathBuf,
 }
 
+/// An explicit work-start declaration for one hook turn (1-indexed).
+/// Kept separately from mutable session JSON so later hook saves cannot erase it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnIntentBinding {
+    pub session_id: String,
+    pub turn_number: u32,
+    pub intent_uid: String,
+}
+
 impl SessionStore {
+    /// Bind the currently active turn before recording. Repeating the same
+    /// declaration is idempotent; replacing it or binding a completed turn fails.
+    /// `expected_turn` lets integrations reject delayed commands from an old turn.
+    pub fn bind_turn_intent(
+        &self,
+        session_id: &str,
+        expected_turn: Option<u32>,
+        intent_uid: &str,
+    ) -> AgentResult<TurnIntentBinding> {
+        use fs2::FileExt;
+        use std::io::Write;
+
+        validate_session_id(session_id)?;
+        let failure = |reason: String| AgentError::SessionSaveFailed {
+            session_id: session_id.to_string(),
+            reason,
+        };
+        let dir = self.sessions_dir.join(session_id);
+        std::fs::create_dir_all(&dir)?;
+        // The recorder holds this lock from session load through publication.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(dir.join("turn-end.lock"))?;
+        lock.try_lock_exclusive().map_err(|error| {
+            failure(format!(
+                "cannot bind intent while turn is recording: {error}"
+            ))
+        })?;
+        let session = self
+            .load(session_id)?
+            .ok_or_else(|| failure("unknown session".into()))?;
+        if session.session_id != session_id
+            || !session.is_turn_active()
+            || session.is_ended()
+            || session.incomplete().is_some()
+        {
+            return Err(failure(
+                "intent binding requires an active, complete session turn".into(),
+            ));
+        }
+        let turn_number = session.turn_count.saturating_add(1);
+        if dir
+            .join(format!("intent-{turn_number}.frozen"))
+            .try_exists()?
+        {
+            return Err(failure(
+                "turn recording has already started; governing intent is frozen".into(),
+            ));
+        }
+        if expected_turn.is_some_and(|expected| expected != turn_number) {
+            return Err(failure(format!(
+                "stale intent binding: active turn is {turn_number}"
+            )));
+        }
+        if intent_uid.trim().is_empty() {
+            return Err(failure("intent UID must not be empty".into()));
+        }
+        // Managed work items remain authoritative. Non-UID managed references
+        // retain their existing checkpoint fallback rather than being replaced.
+        if let Some(work_item) = session
+            .managed_run
+            .as_ref()
+            .and_then(|run| run.work_item_id.as_deref())
+        {
+            if work_item != intent_uid {
+                return Err(failure(
+                    "explicit intent conflicts with the managed work item".into(),
+                ));
+            }
+        }
+        let binding = TurnIntentBinding {
+            session_id: session_id.to_string(),
+            turn_number,
+            intent_uid: intent_uid.to_string(),
+        };
+        if let Some(existing) = self.turn_intent_binding(session_id, turn_number)? {
+            return if existing == binding {
+                Ok(existing)
+            } else {
+                Err(failure(
+                    "turn already has a different governing intent".into(),
+                ))
+            };
+        }
+        let path = dir.join(format!("intent-{turn_number}.json"));
+        let tmp = dir.join(format!(
+            "intent-{turn_number}-{}-{}.tmp",
+            std::process::id(),
+            SESSION_TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let result = (|| -> AgentResult<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(
+                &serde_json::to_vec(&binding).map_err(|error| failure(error.to_string()))?,
+            )?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            #[cfg(unix)]
+            std::fs::File::open(&dir)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result?;
+        Ok(binding)
+    }
+
+    /// Read only this turn's declaration; never inherit governance from an
+    /// earlier turn or infer it from files. Corrupt declarations fail closed.
+    pub fn turn_intent_binding(
+        &self,
+        session_id: &str,
+        turn_number: u32,
+    ) -> AgentResult<Option<TurnIntentBinding>> {
+        validate_session_id(session_id)?;
+        let path = self
+            .sessions_dir
+            .join(session_id)
+            .join(format!("intent-{turn_number}.json"));
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let failure = |reason: String| AgentError::SessionLoadFailed {
+            session_id: session_id.to_string(),
+            reason,
+        };
+        let binding: TurnIntentBinding =
+            serde_json::from_slice(&bytes).map_err(|error| failure(error.to_string()))?;
+        if binding.session_id != session_id
+            || binding.turn_number != turn_number
+            || binding.intent_uid.trim().is_empty()
+        {
+            return Err(failure("invalid turn intent binding".into()));
+        }
+        Ok(Some(binding))
+    }
+
+    /// Seal governance before any recording attempt, including one that fails
+    /// before publishing a checkpoint. The caller holds `turn-end.lock`.
+    pub(crate) fn freeze_turn_intent(&self, session_id: &str, turn_number: u32) -> AgentResult<()> {
+        validate_session_id(session_id)?;
+        // Validate existing evidence before recording any content.
+        self.turn_intent_binding(session_id, turn_number)?;
+        let dir = self.sessions_dir.join(session_id);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("intent-{turn_number}.frozen"));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    }
+
     /// Create a new session store at the given directory path.
     ///
     /// Creates the directory if it doesn't exist.
@@ -996,9 +1170,9 @@ impl SessionStore {
         &self.sessions_dir
     }
 
-    /// Write one pending bridge-watch notice for a session (CB-13D).
+    /// Write one pending shim-watch notice for a session (CB-13D).
     ///
-    /// The optional metadata-only bridge watch daemon (RFC §11.2 rule 6)
+    /// The optional metadata-only shim watch daemon (RFC §11.2 rule 6)
     /// calls this when it detects an external Git transition or an unsafe
     /// state while a managed session is active. The notice is a separate
     /// pending file — it never mutates the session state file the
@@ -1043,7 +1217,7 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Take the pending bridge-watch notice for a session, if any (CB-13D).
+    /// Take the pending shim-watch notice for a session, if any (CB-13D).
     ///
     /// Consuming claims the notice atomically first (review R6): the pending
     /// file is renamed to a per-consumer claim name before it is read, so a
@@ -1196,13 +1370,13 @@ impl SessionStore {
 const WATCH_NOTICES_DIRECTORY: &str = "notices";
 /// Process-local sequence for unique notice temp/claim file names.
 static WATCH_NOTICE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-/// Current bridge-watch notice payload version.
+/// Current shim-watch notice payload version.
 pub const WATCH_NOTICE_VERSION: u32 = 1;
-/// Expected `record_type` of a bridge-watch notice payload.
+/// Expected `record_type` of a shim-watch notice payload.
 pub const WATCH_NOTICE_RECORD_TYPE: &str = "bridge-watch-notice";
 
 /// One pending external-transition or unsafe-state notice written by the
-/// optional bridge watch daemon (RFC §11.2 rule 6) for an active managed
+/// optional shim watch daemon (RFC §11.2 rule 6) for an active managed
 /// session. Purely advisory: without the daemon the next agent boundary
 /// still fully reconciles, and the notice never changes command outcomes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1293,6 +1467,50 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = SessionStore::new(dir.path().join("sessions")).unwrap();
         (dir, store)
+    }
+
+    #[test]
+    fn frozen_turn_rejects_late_binding_even_if_recording_failed() {
+        let (_dir, store) = make_store();
+        let mut session = make_session();
+        session.begin_turn();
+        session.phase = Phase::Active;
+        store.save(&session).unwrap();
+        store.freeze_turn_intent(&session.session_id, 1).unwrap();
+        assert!(store
+            .bind_turn_intent(&session.session_id, Some(1), "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .is_err());
+        assert!(store
+            .turn_intent_binding(&session.session_id, 1)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn binding_survives_session_saves_and_rejects_corrupt_identity() {
+        let (_dir, store) = make_store();
+        let mut session = make_session();
+        session.begin_turn();
+        session.phase = Phase::Active;
+        store.save(&session).unwrap();
+        let binding = store
+            .bind_turn_intent(&session.session_id, None, "01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .unwrap();
+        store.save(&session).unwrap();
+        assert_eq!(
+            store.turn_intent_binding(&session.session_id, 1).unwrap(),
+            Some(binding)
+        );
+        let path = store
+            .sessions_dir
+            .join(&session.session_id)
+            .join("intent-1.json");
+        std::fs::write(
+            path,
+            br#"{"session_id":"another-session","turn_number":1,"intent_uid":"intent"}"#,
+        )
+        .unwrap();
+        assert!(store.freeze_turn_intent(&session.session_id, 1).is_err());
     }
 
     // AgentSession construction

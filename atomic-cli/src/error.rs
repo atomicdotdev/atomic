@@ -55,12 +55,16 @@ pub type CliResult<T> = Result<T, CliError>;
 /// - **Internal errors**: Unexpected failures (bugs)
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("SHACL validation found {count} result(s) that prevent conformance")]
+    ShaclViolation { count: usize },
+    #[error("SHACL validation error: {0}")]
+    ShaclError(String),
     // Repository Errors
     /// No Atomic repository found in the current directory or any parent.
     ///
     /// This error occurs when a command that requires a repository is run
     /// outside of any Atomic repository.
-    #[error("Not in an Atomic repository: '{searched_path}' (no repository found in this directory or its parents)")]
+    #[error("Not in an Atomic repository: '{searched_path}' (no repository found in this directory or its parents). Run 'atomic init' here, or cd into an Atomic repository.")]
     RepositoryNotFound {
         /// The path where the search started
         searched_path: PathBuf,
@@ -680,6 +684,8 @@ impl CliError {
     /// The exit code to use when terminating due to this error.
     pub fn exit_code(&self) -> i32 {
         match self {
+            Self::ShaclViolation { .. } => 1,
+            Self::ShaclError(_) => 3,
             // User-fixable, general errors
             Self::NothingToRecord
             | Self::Cancelled
@@ -1022,7 +1028,7 @@ mod tests {
     #[test]
     fn test_stale_baseline_is_typed_user_fixable_refusal() {
         let error = CliError::StaleBaseline {
-            report: "Unsafe operation: record\nRemediation: atomic git bridge reconcile".into(),
+            report: "Unsafe operation: record\nRemediation: atomic git shim reconcile".into(),
         };
         assert_eq!(error.exit_code(), 1);
         assert!(error.is_user_fixable());

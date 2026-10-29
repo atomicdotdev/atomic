@@ -239,11 +239,30 @@ impl Command for Hooks {
                     }
                 }
             }
-            None => find_repository_root().map_err(|e| {
-                // Log to stderr — the agent should continue even if Atomic can't find a repo
-                eprintln!("[atomic] Warning: {}", e);
-                e
-            })?,
+            None => match find_repository_root() {
+                Ok(root) => root,
+                Err(error @ CliError::RepositoryNotFound { .. }) => {
+                    // Same state as the hints path: the hook ran outside an
+                    // Atomic repository (or the repository disappeared since
+                    // the caller's probe). Nothing to record — exit quietly
+                    // instead of failing the hook (and, through the agent
+                    // bridge plugins' strict tool propagation, the tool call).
+                    log::warn!(
+                        "hooks: no Atomic repository for {} {}: {}",
+                        self.agent_name,
+                        self.verb,
+                        error
+                    );
+                    if let Some(response) = agent.stdout_response(hook_type) {
+                        println!("{}", response);
+                    }
+                    return Ok(());
+                }
+                // Only the genuine not-an-Atomic-repository state is quiet.
+                // Any other discovery failure (I/O and friends) stays fatal:
+                // swallowing it would hide real breakage behind exit 0.
+                Err(error) => return Err(error),
+            },
         };
 
         // Hooks are never suppressed under a managed run: sessions adopt its
@@ -376,7 +395,7 @@ impl Command for Hooks {
                 .map_err(|e| CliError::Internal(anyhow!("Failed to dispatch hook event: {}", e)))?;
 
             // Agent recording uses the repository directly, so finish the same
-            // bridge projection as an ordinary CLI/service record. Keep all
+            // shim projection as an ordinary CLI/service record. Keep all
             // provenance/refusal checks ahead of this publication.
             drop(orchestrator);
             if dispatch_result.incomplete.is_none() {
@@ -418,9 +437,12 @@ impl Command for Hooks {
         }
 
         // Some agents (e.g., Antigravity) read a JSON object from hook stdout
-        // as part of their hook contract. Print the adapter's response body.
-        if let Some(response) = agent.stdout_response(hook_type) {
-            println!("{}", response);
+        // as part of their hook contract. Explicit --json selects the bridge
+        // result instead, so stdout always contains at most one document.
+        if !self.json {
+            if let Some(response) = agent.stdout_response(hook_type) {
+                println!("{}", response);
+            }
         }
 
         // Emit the recorded change hash for UI/bridge callers.
@@ -1181,7 +1203,7 @@ mod tests {
             .unwrap();
         drop(repository);
 
-        // The routed view switch keeps the bridge checkpoint aligned with the
+        // The routed view switch keeps the shim checkpoint aligned with the
         // working-copy record; refresh it exactly as the routed path would.
         let atomic = atomic_repository::Repository::open_readonly(root).unwrap();
         let view_info = atomic.get_view_info("agent-view").unwrap();

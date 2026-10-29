@@ -12,23 +12,38 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::patch_evidence::{PatchEvidence, PatchEvidenceLimits};
 use crate::repository::Repository;
 use crate::RepositoryError;
+use atomic_core::kg::{
+    iri,
+    ontology::{Class, Predicate},
+    Direction,
+};
 use atomic_core::pristine::vault::{KgEdge, KgNode};
 
 // ── Query Plan Schema ───────────────────────────────────────────
 
 /// A query plan is a sequence of steps that the executor runs in order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryPlan {
+    pub schema_version: u32,
     /// Ordered list of steps to execute.
     pub steps: Vec<QueryStep>,
 }
 
 /// A single step in the query plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryStep {
+    /// Exact immutable recorded patch evidence, not current file content or KG
+    /// assertions. One literal canonical full-hash change IRI per step.
+    PatchEvidence {
+        change_iri: String,
+        #[serde(default)]
+        limits: PatchEvidenceLimits,
+    },
     /// Full-text keyword search over KG nodes.
     KgSearch {
         /// Search query text.
@@ -48,6 +63,10 @@ pub enum QueryStep {
         /// Traversal depth (1 or 2).
         #[serde(default = "default_depth")]
         depth: u8,
+        #[serde(default)]
+        predicate: Option<Predicate>,
+        #[serde(default)]
+        direction: Direction,
         /// Variable name to bind results to.
         #[serde(default)]
         bind: Option<String>,
@@ -113,6 +132,9 @@ fn default_max_chars() -> usize {
 /// Result of executing a query plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanResult {
+    /// Typed immutable patch evidence, separate from graph assertions and vault content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patch_evidence: Vec<PatchEvidence>,
     /// Nodes collected across all steps.
     pub nodes: Vec<KgNode>,
     /// Edges collected across all steps.
@@ -139,8 +161,35 @@ pub struct StepStat {
 
 // ── Executor ────────────────────────────────────────────────────
 
-/// Execute a query plan against a repository.
+/// Execute a query plan against this working copy's registered desired view.
+///
+/// The `kg_search` step reads VCS nodes and source content through that
+/// view's closure; other steps keep their existing scope.
 pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, RepositoryError> {
+    let working_copy = repo.require_working_copy_id()?;
+    let view = repo.desired_view_name(working_copy)?;
+    execute_plan_on_view(repo, &view, plan)
+}
+
+/// Execute a query plan against a specific view's recorded closure.
+pub fn execute_plan_on_view(
+    repo: &Repository,
+    view_name: &str,
+    plan: &QueryPlan,
+) -> Result<PlanResult, RepositoryError> {
+    execute_plan_inner(repo, view_name, plan)
+}
+
+fn execute_plan_inner(
+    repo: &Repository,
+    view_name: &str,
+    plan: &QueryPlan,
+) -> Result<PlanResult, RepositoryError> {
+    if plan.schema_version != 1 {
+        return Err(RepositoryError::Serialization(
+            "unsupported query plan schema version".into(),
+        ));
+    }
     let overall_start = std::time::Instant::now();
 
     let mut bindings: HashMap<String, Vec<KgNode>> = HashMap::new();
@@ -148,13 +197,36 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
     let mut all_edges: Vec<KgEdge> = Vec::new();
     let mut content: HashMap<String, String> = HashMap::new();
     let mut step_stats: Vec<StepStat> = Vec::new();
+    let mut patch_evidence = Vec::new();
+    // Bound evidence fan-out even for programmatically constructed plans.
+    if plan
+        .steps
+        .iter()
+        .filter(|step| matches!(step, QueryStep::PatchEvidence { .. }))
+        .count()
+        > 8
+    {
+        return Err(RepositoryError::Serialization(
+            "at most 8 patch evidence steps per plan".into(),
+        ));
+    }
 
     for step in &plan.steps {
         let step_start = std::time::Instant::now();
 
         match step {
+            QueryStep::PatchEvidence { change_iri, limits } => {
+                let evidence = repo.patch_evidence(change_iri, *limits)?;
+                let found = evidence.status == crate::patch_evidence::PatchEvidenceStatus::Found;
+                patch_evidence.push(evidence);
+                step_stats.push(StepStat {
+                    step_type: "patch_evidence".into(),
+                    result_count: usize::from(found),
+                    elapsed_ms: step_start.elapsed().as_millis() as u64,
+                });
+            }
             QueryStep::KgSearch { query, limit, bind } => {
-                let nodes = repo.vault_kg_search(query, *limit, None)?;
+                let nodes = repo.vault_kg_search_on_view(view_name, query, *limit, None)?;
                 let count = nodes.len();
 
                 if let Some(var) = bind {
@@ -172,6 +244,8 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
             QueryStep::KgNeighbors {
                 node_id,
                 depth,
+                predicate,
+                direction,
                 bind,
             } => {
                 // Resolve $variable references
@@ -181,15 +255,9 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
                 let mut step_edges = Vec::new();
 
                 for id in &ids {
-                    match repo.vault_kg_neighbors(id, *depth) {
-                        Ok(sg) => {
-                            step_nodes.extend(sg.nodes);
-                            step_edges.extend(sg.edges);
-                        }
-                        Err(e) => {
-                            log::warn!("KG neighbors failed for {}: {}", id, e);
-                        }
-                    }
+                    let sg = repo.workflow_neighbors(id, *depth, *predicate, *direction)?;
+                    step_nodes.extend(sg.nodes);
+                    step_edges.extend(sg.edges);
                 }
 
                 let count = step_nodes.len();
@@ -222,8 +290,11 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
                     .iter()
                     .map(|r| {
                         KgNode::new(
-                            format!("embedding:{}:{}", r.path, r.chunk_idx),
-                            "embedding",
+                            iri::mint_file(
+                                &repo.project_id().expect("repository identity"),
+                                &format!(".vault/{}", r.path),
+                            ),
+                            Class::File,
                             &r.path,
                             "vector_search",
                         )
@@ -279,8 +350,11 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
                                 content.insert(path.clone(), truncated);
 
                                 let node = KgNode::new(
-                                    format!("content:{}", path),
-                                    "content",
+                                    iri::mint_file(
+                                        &repo.project_id().expect("repository identity"),
+                                        &format!(".vault/{path}"),
+                                    ),
+                                    Class::File,
                                     path,
                                     "read_content",
                                 );
@@ -321,6 +395,14 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
                 let filtered: Vec<KgNode> = input_nodes
                     .into_iter()
                     .filter(|node| {
+                        if field == "type" {
+                            return equals
+                                .as_ref()
+                                .is_none_or(|value| node.types.contains(value))
+                                && not_equals
+                                    .as_ref()
+                                    .is_none_or(|value| !node.types.contains(value));
+                        }
                         let value = get_node_field(node, field);
                         if let Some(ref eq) = equals {
                             if value.as_deref() != Some(eq.as_str()) {
@@ -360,10 +442,11 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
     // Deduplicate edges
     {
         let mut seen = std::collections::HashSet::new();
-        all_edges.retain(|e| seen.insert((e.from_id.clone(), e.to_id.clone(), e.kind.clone())));
+        all_edges.retain(|e| seen.insert((e.from_id.clone(), e.to_id.clone(), e.kind)));
     }
 
     Ok(PlanResult {
+        patch_evidence,
         nodes: all_nodes,
         edges: all_edges,
         content,
@@ -427,7 +510,7 @@ fn resolve_paths(source: &str, bindings: &HashMap<String, Vec<KgNode>>) -> Vec<S
 /// Get a field value from a KgNode for filtering.
 fn get_node_field(node: &KgNode, field: &str) -> Option<String> {
     match field {
-        "kind" => Some(node.kind.clone()),
+        "type" => Some(node.primary_type().to_owned()),
         "label" => Some(node.label.clone()),
         "source" => Some(node.source.clone()),
         "summary" => node.summary.clone(),
@@ -450,8 +533,14 @@ fn get_node_field(node: &KgNode, field: &str) -> Option<String> {
 
 /// Parse a query plan from JSON.
 pub fn parse_plan(json: &str) -> Result<QueryPlan, RepositoryError> {
-    serde_json::from_str(json)
-        .map_err(|e| RepositoryError::Serialization(format!("Invalid query plan: {}", e)))
+    let plan: QueryPlan = serde_json::from_str(json)
+        .map_err(|e| RepositoryError::Serialization(format!("Invalid query plan: {}", e)))?;
+    if plan.schema_version != 1 {
+        return Err(RepositoryError::Serialization(
+            "unsupported query plan schema version".into(),
+        ));
+    }
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -461,6 +550,7 @@ mod tests {
     #[test]
     fn test_parse_simple_plan() {
         let json = r#"{
+            "schema_version": 1,
             "steps": [
                 {"type": "kg_search", "query": "authentication", "limit": 5, "bind": "auth_nodes"}
             ]
@@ -480,9 +570,10 @@ mod tests {
     #[test]
     fn test_parse_multi_step_plan() {
         let json = r#"{
+            "schema_version": 1,
             "steps": [
                 {"type": "kg_search", "query": "deploy blocked", "bind": "blockers"},
-                {"type": "filter", "input": "blockers", "field": "kind", "equals": "intent", "bind": "blocking_intents"},
+                {"type": "filter", "input": "blockers", "field": "type", "equals": "https://atomic.dev/ns/workflow#WorkIntent", "bind": "blocking_intents"},
                 {"type": "kg_neighbors", "node_id": "$blocking_intents", "depth": 1, "bind": "context"},
                 {"type": "read_content", "sources": ["$blocking_intents"], "max_chars": 1000}
             ]
@@ -494,6 +585,7 @@ mod tests {
     #[test]
     fn test_parse_vector_search() {
         let json = r#"{
+            "schema_version": 1,
             "steps": [
                 {"type": "vector_search", "query": "caching performance", "top_k": 3}
             ]
@@ -505,6 +597,7 @@ mod tests {
     #[test]
     fn test_parse_defaults() {
         let json = r#"{
+            "schema_version": 1,
             "steps": [
                 {"type": "kg_search", "query": "test"},
                 {"type": "kg_neighbors", "node_id": "intent:X"},
@@ -555,13 +648,13 @@ mod tests {
     #[test]
     fn test_parse_empty_steps_ok() {
         // An empty steps array is valid JSON for our schema (no minimum).
-        let plan = parse_plan(r#"{"steps": []}"#).unwrap();
+        let plan = parse_plan(r#"{"schema_version":1,"steps": []}"#).unwrap();
         assert!(plan.steps.is_empty());
     }
 
     #[test]
     fn test_parse_unknown_step_type_errors() {
-        let json = r#"{"steps": [{"type": "unknown_step", "query": "x"}]}"#;
+        let json = r#"{"schema_version":1,"steps": [{"type": "unknown_step", "query": "x"}]}"#;
         assert!(parse_plan(json).is_err());
     }
 
@@ -578,8 +671,8 @@ mod tests {
         bindings.insert(
             "results".to_string(),
             vec![
-                KgNode::new("intent:PIMO-1", "intent", "PIMO-1", "test"),
-                KgNode::new("intent:PIMO-2", "intent", "PIMO-2", "test"),
+                KgNode::new("intent:PIMO-1", Class::WorkIntent, "PIMO-1", "test"),
+                KgNode::new("intent:PIMO-2", Class::WorkIntent, "PIMO-2", "test"),
             ],
         );
         let ids = resolve_node_ids("$results", &bindings);
@@ -603,7 +696,7 @@ mod tests {
     #[test]
     fn test_resolve_paths_variable_with_metadata() {
         let mut bindings = HashMap::new();
-        let node = KgNode::new("embedding:x:0", "embedding", "some-label", "vector_search")
+        let node = KgNode::new("embedding:x:0", Class::File, "some-label", "vector_search")
             .with_metadata(serde_json::json!({"path": "memory/auth.md"}));
         bindings.insert("results".to_string(), vec![node]);
 
@@ -614,7 +707,7 @@ mod tests {
     #[test]
     fn test_resolve_paths_variable_fallback_to_label() {
         let mut bindings = HashMap::new();
-        let node = KgNode::new("x", "memory", "memory/arch.md", "vault");
+        let node = KgNode::new("x", Class::Memory, "memory/arch.md", "vault");
         bindings.insert("results".to_string(), vec![node]);
 
         let paths = resolve_paths("$results", &bindings);
@@ -624,7 +717,7 @@ mod tests {
     #[test]
     fn test_resolve_paths_variable_skips_non_path_labels() {
         let mut bindings = HashMap::new();
-        let node = KgNode::new("x", "intent", "PIMO-1", "vault");
+        let node = KgNode::new("x", Class::WorkIntent, "PIMO-1", "vault");
         bindings.insert("results".to_string(), vec![node]);
 
         let paths = resolve_paths("$results", &bindings);
@@ -640,11 +733,14 @@ mod tests {
 
     #[test]
     fn test_get_node_field() {
-        let node = KgNode::new("x", "intent", "PIMO-1", "vault")
+        let node = KgNode::new("x", Class::WorkIntent, "PIMO-1", "vault")
             .with_summary("Fix auth")
             .with_metadata(serde_json::json!({"status": "in-progress", "priority": "high"}));
 
-        assert_eq!(get_node_field(&node, "kind"), Some("intent".to_string()));
+        assert_eq!(
+            get_node_field(&node, "type"),
+            Some(Class::WorkIntent.iri().to_string())
+        );
         assert_eq!(get_node_field(&node, "label"), Some("PIMO-1".to_string()));
         assert_eq!(
             get_node_field(&node, "summary"),
@@ -662,11 +758,12 @@ mod tests {
 
     #[test]
     fn test_get_node_field_metadata_types() {
-        let node = KgNode::new("x", "test", "test", "test").with_metadata(serde_json::json!({
-            "count": 42,
-            "active": true,
-            "tags": ["a", "b"],
-        }));
+        let node =
+            KgNode::new("x", Class::Memory, "test", "test").with_metadata(serde_json::json!({
+                "count": 42,
+                "active": true,
+                "tags": ["a", "b"],
+            }));
 
         assert_eq!(get_node_field(&node, "count"), Some("42".to_string()));
         assert_eq!(get_node_field(&node, "active"), Some("true".to_string()));
@@ -676,30 +773,30 @@ mod tests {
 
     #[test]
     fn test_get_node_field_no_metadata() {
-        let node = KgNode::new("x", "test", "test", "test");
+        let node = KgNode::new("x", Class::Memory, "test", "test");
         assert_eq!(get_node_field(&node, "unknown"), None);
     }
 
     #[test]
     fn test_get_node_field_no_summary() {
-        let node = KgNode::new("x", "test", "test", "test");
+        let node = KgNode::new("x", Class::Memory, "test", "test");
         assert_eq!(get_node_field(&node, "summary"), None);
     }
 
     #[test]
     fn test_filter_nodes() {
         let nodes = [
-            KgNode::new("a", "intent", "A", "test")
+            KgNode::new("a", Class::WorkIntent, "A", "test")
                 .with_metadata(serde_json::json!({"status": "done"})),
-            KgNode::new("b", "intent", "B", "test")
+            KgNode::new("b", Class::WorkIntent, "B", "test")
                 .with_metadata(serde_json::json!({"status": "in-progress"})),
-            KgNode::new("c", "change", "C", "test"),
+            KgNode::new("c", Class::Change, "C", "test"),
         ];
 
-        // Filter: kind == "intent"
+        // Filter on an asserted class.
         let filtered: Vec<&KgNode> = nodes
             .iter()
-            .filter(|n| get_node_field(n, "kind").as_deref() == Some("intent"))
+            .filter(|n| n.has_type(Class::WorkIntent))
             .collect();
         assert_eq!(filtered.len(), 2);
 
@@ -714,8 +811,9 @@ mod tests {
     #[test]
     fn test_plan_result_serialization() {
         let result = PlanResult {
-            nodes: vec![KgNode::new("a", "intent", "A", "test")],
-            edges: vec![KgEdge::new("a", "b", "DEPENDS_ON")],
+            patch_evidence: vec![],
+            nodes: vec![KgNode::new("a", Class::WorkIntent, "A", "test")],
+            edges: vec![KgEdge::new("a", "b", Predicate::DependsOnIntent)],
             content: HashMap::new(),
             step_stats: vec![StepStat {
                 step_type: "kg_search".to_string(),
@@ -726,7 +824,7 @@ mod tests {
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("kg_search"));
-        assert!(json.contains("intent"));
+        assert!(json.contains(Class::WorkIntent.iri()));
         // Empty content map should be skipped
         assert!(!json.contains("content"));
     }
@@ -736,6 +834,7 @@ mod tests {
         let mut content = HashMap::new();
         content.insert("memory/a.md".to_string(), "# Hello\n".to_string());
         let result = PlanResult {
+            patch_evidence: vec![],
             nodes: vec![],
             edges: vec![],
             content,
@@ -750,6 +849,7 @@ mod tests {
     #[test]
     fn test_query_plan_json_roundtrip() {
         let plan = QueryPlan {
+            schema_version: 1,
             steps: vec![
                 QueryStep::KgSearch {
                     query: "auth".to_string(),
@@ -758,14 +858,16 @@ mod tests {
                 },
                 QueryStep::Filter {
                     input: "results".to_string(),
-                    field: "kind".to_string(),
-                    equals: Some("intent".to_string()),
+                    field: "type".to_string(),
+                    equals: Some(Class::WorkIntent.iri().to_string()),
                     not_equals: None,
                     bind: Some("intents".to_string()),
                 },
                 QueryStep::KgNeighbors {
                     node_id: "$intents".to_string(),
                     depth: 2,
+                    predicate: Some(Predicate::DependsOnIntent),
+                    direction: Direction::Outgoing,
                     bind: None,
                 },
             ],
@@ -796,6 +898,7 @@ mod tests {
         // Execute a simple search plan
         let plan = parse_plan(
             r#"{
+            "schema_version": 1,
             "steps": [
                 {"type": "kg_search", "query": "auth", "limit": 5, "bind": "results"}
             ]
@@ -818,7 +921,7 @@ mod tests {
         let repo = Repository::init(dir.path()).unwrap();
         repo.init_vault().unwrap();
 
-        let plan = parse_plan(r#"{"steps": []}"#).unwrap();
+        let plan = parse_plan(r#"{"schema_version":1,"steps": []}"#).unwrap();
         let result = execute_plan(&repo, &plan).unwrap();
         assert!(result.nodes.is_empty());
         assert!(result.edges.is_empty());
@@ -844,6 +947,7 @@ mod tests {
 
         let plan = parse_plan(
             r#"{
+            "schema_version": 1,
             "steps": [
                 {"type": "read_content", "sources": ["memory/arch.md"], "max_chars": 500}
             ]
@@ -875,6 +979,7 @@ mod tests {
 
         let plan = parse_plan(
             r#"{
+            "schema_version": 1,
             "steps": [
                 {"type": "read_content", "sources": ["memory/big.md"], "max_chars": 100}
             ]
@@ -897,6 +1002,7 @@ mod tests {
 
         let plan = parse_plan(
             r#"{
+            "schema_version": 1,
             "steps": [
                 {"type": "read_content", "sources": ["memory/nonexistent.md"]}
             ]
@@ -939,9 +1045,10 @@ mod tests {
         // Search then filter to just memory nodes
         let plan = parse_plan(
             r#"{
+            "schema_version": 1,
             "steps": [
                 {"type": "kg_search", "query": "test memory goal", "limit": 10, "bind": "all"},
-                {"type": "filter", "input": "all", "field": "kind", "equals": "memory", "bind": "only_memory"}
+                {"type": "filter", "input": "all", "field": "type", "equals": "https://atomic.dev/ns/workflow#Memory", "bind": "only_memory"}
             ]
         }"#,
         )
@@ -971,6 +1078,7 @@ mod tests {
         // Two search steps that will find the same nodes
         let plan = parse_plan(
             r#"{
+            "schema_version": 1,
             "steps": [
                 {"type": "kg_search", "query": "dup", "limit": 10},
                 {"type": "kg_search", "query": "duplicate", "limit": 10}
@@ -1008,6 +1116,7 @@ mod tests {
         // Search then explore neighbors of results
         let plan = parse_plan(
             r#"{
+            "schema_version": 1,
             "steps": [
                 {"type": "kg_search", "query": "neighbor", "limit": 5, "bind": "found"},
                 {"type": "kg_neighbors", "node_id": "$found", "depth": 1, "bind": "neighbors"}

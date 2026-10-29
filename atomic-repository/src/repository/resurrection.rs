@@ -674,6 +674,16 @@ impl Repository {
     /// are repaired out of the cache; every dropped row makes the importer
     /// treat its commit exactly as a cold cache would.
     pub fn checked_git_sha_markers(&self) -> Result<(Vec<String>, Vec<String>), RepositoryError> {
+        let (verified, stale) = self.checked_git_sha_marker_hashes()?;
+        Ok((verified.into_iter().map(|(sha, _)| sha).collect(), stale))
+    }
+
+    /// [`Self::checked_git_sha_markers`] with the change hash each verified
+    /// SHA maps to, so a caller that needs the hash (per-view membership)
+    /// does not load every change a second time.
+    pub fn checked_git_sha_marker_hashes(
+        &self,
+    ) -> Result<CheckedGitShaMarkerHashes, RepositoryError> {
         use atomic_core::pristine::{GitShaIndexMutTxnT, GitShaIndexTxnT};
 
         let shas = {
@@ -684,7 +694,7 @@ impl Repository {
         let mut stale = Vec::new();
         for sha in shas {
             match self.checked_git_sha(&sha)? {
-                Some(_) => verified.push(sha),
+                Some(hash) => verified.push((sha, hash)),
                 None => stale.push(sha),
             }
         }
@@ -1237,7 +1247,7 @@ impl Repository {
                 },
             )?;
             let change = self.load_change(hash)?;
-            let already_applied = txn.has_change_in_graph(change_id).map_err(pristine_map)?;
+            let already_applied = txn.was_change_applied(change_id).map_err(pristine_map)?;
             let tree_projection =
                 self.plan_tree_projection(&mut txn, change_id, *hash, &change, &[], false)?;
             tree_projection.apply_prerequisites(&mut *txn)?;
@@ -1475,3 +1485,7 @@ fn hex_oid(oid: &atomic_core::operation::GitObjectId) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
+
+/// The verified `(sha, change hash)` rows of `GIT_SHA_INDEX` and the SHAs
+/// whose rows failed validation.
+pub type CheckedGitShaMarkerHashes = (Vec<(String, Hash)>, Vec<String>);

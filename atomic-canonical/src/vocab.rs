@@ -190,6 +190,7 @@ pub const EDGE_NAMES: &[&str] = &[
     "attributedTo",
     "remediates",
     "reviews",
+    "declaresImplementation",
 ];
 
 /// Is this a directive name the system recognizes? Unknown ⇒ gate error.
@@ -219,6 +220,22 @@ pub const REMEDIATION_EDGES: &[&str] = &["remediates"];
 /// are kept out of [`DEPENDENCY_EDGES`] but folded into [`is_known_ref_edge`].
 pub const REVIEW_EDGES: &[&str] = &["reviews"];
 
+/// Explicit intent-to-change claims are not dependency or generating-turn edges.
+pub const IMPLEMENTATION_EDGES: &[&str] = &["declaresImplementation"];
+
+/// Strict full-hash identity, independent of the repository-local node index.
+pub fn is_canonical_change_iri(value: &str) -> bool {
+    let Some(hash) = value.strip_prefix("urn:atomic:change:blake3-256:") else {
+        return false;
+    };
+    hash.len() == 52
+        && data_encoding::BASE32_NOPAD
+            .decode(hash.as_bytes())
+            .is_ok_and(|bytes| {
+                bytes.len() == 32 && data_encoding::BASE32_NOPAD.encode(&bytes) == hash
+            })
+}
+
 /// Is this a typed edge name the system recognizes at all?
 pub fn is_known_edge(name: &str) -> bool {
     EDGE_NAMES.contains(&name)
@@ -232,12 +249,14 @@ pub fn is_known_dependency_edge(name: &str) -> bool {
 }
 
 /// Is this an edge a `:::ref` leaf may declare? The closed set the lift
-/// validates `edge=` against: the dependency subset plus the remediation and
-/// review intent→intent edges. An edge outside this union is a lift error.
+/// validates `edge=` against: dependencies, remediation/review intent links,
+/// and explicit intent-to-change declarations. Only the dependency subset
+/// participates in dependency traversal. An unknown edge is a lift error.
 pub fn is_known_ref_edge(name: &str) -> bool {
     is_known_dependency_edge(name)
         || REMEDIATION_EDGES.contains(&name)
         || REVIEW_EDGES.contains(&name)
+        || IMPLEMENTATION_EDGES.contains(&name)
 }
 
 /// Is this a valid intent status value?

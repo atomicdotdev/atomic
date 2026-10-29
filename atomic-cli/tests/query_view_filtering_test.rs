@@ -1,0 +1,338 @@
+//! CLI presentation and routing for the three view-filtered query verbs.
+
+use std::process::{Command, Output};
+
+use atomic_core::change::ChangeHeader;
+use atomic_repository::{RecordOptions, Repository, TrackingOptions};
+use serde_json::Value;
+
+fn run(dir: &std::path::Path, home: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_atomic"))
+        .args(args)
+        .current_dir(dir)
+        .env("ATOMIC_SERVICE", "local")
+        .env("HOME", home)
+        .output()
+        .unwrap()
+}
+
+fn json(dir: &std::path::Path, home: &std::path::Path, args: &[&str]) -> Value {
+    let output = run(dir, home, args);
+    assert!(
+        output.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn record(repo: &Repository, message: &str) {
+    repo.record(
+        repo.require_working_copy_id().unwrap(),
+        ChangeHeader::new(message),
+        RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true),
+    )
+    .unwrap();
+}
+
+#[test]
+fn query_verbs_render_filtered_json_and_human_output_over_the_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn target() {}\npub fn caller() { target(); }\n",
+    )
+    .unwrap();
+    repo.add(wc, "src/lib.rs", TrackingOptions::default())
+        .unwrap();
+    record(&repo, "base");
+    repo.kg_enrich_from_vcs(wc).unwrap();
+    repo.create_draft_view("feature", "dev").unwrap();
+    repo.switch_view(wc, "feature").unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub fn target(secret: SiblingSecret) {}\npub fn caller() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/sibling.rs"),
+        "pub fn sibling_only() { target(); }\n",
+    )
+    .unwrap();
+    repo.add(wc, "src/sibling.rs", TrackingOptions::default())
+        .unwrap();
+    record(&repo, "sibling");
+    repo.kg_enrich_from_vcs(wc).unwrap();
+    // No content index is required by the view-scoped code/search paths.
+    repo.switch_view(wc, "dev").unwrap();
+    drop(repo);
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn disk_only() {}\n").unwrap();
+
+    for verb in ["search", "code"] {
+        let result = json(
+            dir.path(),
+            home.path(),
+            &["query", verb, "SiblingSecret", "--json"],
+        );
+        if verb == "search" {
+            assert_eq!(result, serde_json::json!([]));
+        } else {
+            assert_eq!(result["matches"], serde_json::json!([]));
+            assert_eq!(result["total_matches"], 0);
+            assert_eq!(result["dir_facets"], serde_json::json!([]));
+        }
+    }
+    let result = json(
+        dir.path(),
+        home.path(),
+        &[
+            "query",
+            "search",
+            "target",
+            "--kind",
+            "https://atomic.dev/ns/workflow#File",
+            "--json",
+        ],
+    );
+    assert_eq!(result.as_array().unwrap().len(), 1);
+    assert_eq!(result[0]["metadata"]["path"], "src/lib.rs");
+    let result = json(
+        dir.path(),
+        home.path(),
+        &["query", "callers", "src/lib.rs#target", "--json"],
+    );
+    assert_eq!(result.as_array().unwrap().len(), 1);
+    assert_eq!(result[0]["path"], "src/lib.rs");
+    assert_eq!(result[0]["name"], "caller");
+    assert_eq!(result[0]["line"], 2);
+    let result = json(
+        dir.path(),
+        home.path(),
+        &[
+            "query", "code", "TARGET", "-i", "-g", "src/", "-t", "rs", "-n", "1", "--json",
+        ],
+    );
+    assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(result["matches"][0]["path"], "src/lib.rs");
+    assert_eq!(result["matches"][0]["line_number"], 1);
+    assert_eq!(result["matches"][0]["byte_offset"], 7);
+    assert_eq!(result["total_matches"], 2);
+    let output = run(dir.path(), home.path(), &["query", "code", "target"]);
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("src/lib.rs:1: pub fn target() {}"), "{text}");
+    assert!(text.contains("2 match(es) in 1 file(s)."), "{text}");
+    let output = run(dir.path(), home.path(), &["query", "code", "["]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid search pattern"));
+    assert!(!dir
+        .path()
+        .join(".atomic/content-index/manifest.json")
+        .exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("src/lib.rs")).unwrap(),
+        "pub fn disk_only() {}\n"
+    );
+}
+
+#[test]
+fn code_keeps_exact_totals_and_late_source_ranking_at_small_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    for (path, content) in [
+        ("docs/a.md", "needle\n".repeat(2500)),
+        ("src/z.rs", "prefix needle\r\nneedle\n".into()),
+    ] {
+        let full = dir.path().join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, content).unwrap();
+        repo.add(wc, path, TrackingOptions::default()).unwrap();
+    }
+    record(&repo, "late ranked source fixture");
+    let expected = repo
+        .search_content_on_view(
+            "dev",
+            "needle",
+            atomic_repository::ContentSearchOptions {
+                max_results: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    drop(repo);
+    let result = json(
+        dir.path(),
+        home.path(),
+        &["query", "code", "needle", "-n", "1", "--json"],
+    );
+    assert_eq!(result, serde_json::to_value(expected).unwrap());
+    assert_eq!(result["matches"][0]["path"], "src/z.rs");
+    assert_eq!(result["total_matches"], 2502);
+    let result = json(
+        dir.path(),
+        home.path(),
+        &["query", "code", "needle", "-n", "0", "--json"],
+    );
+    assert_eq!(result["matches"], serde_json::json!([]));
+    assert_eq!(result["total_matches"], 2502);
+    let narrow = json(
+        dir.path(),
+        home.path(),
+        &[
+            "query", "code", "needle", "-g", "src/", "-t", "rs", "-n", "1", "--json",
+        ],
+    );
+    assert_eq!(narrow["total_matches"], 2);
+    assert_eq!(narrow["matches"][0]["byte_offset"], 7);
+    let invalid = run(
+        dir.path(),
+        home.path(),
+        &["query", "code", "[", "-g", "missing/", "-n", "0"],
+    );
+    assert!(!invalid.status.success());
+    let human = run(
+        dir.path(),
+        home.path(),
+        &["query", "code", "needle", "-n", "1"],
+    );
+    assert!(human.status.success());
+    assert!(String::from_utf8_lossy(&human.stdout).contains("src/z.rs:1: prefix needle"));
+    assert!(!dir
+        .path()
+        .join(".atomic/content-index/manifest.json")
+        .exists());
+}
+
+#[test]
+fn search_kind_with_tiny_pool_returns_the_matching_memory_over_the_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    drop(Repository::init(dir.path()).unwrap());
+    let created = run(
+        dir.path(),
+        home.path(),
+        &[
+            "memory",
+            "new",
+            "--kind",
+            "context",
+            "--text",
+            "Pool starvation regression.",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created = String::from_utf8(created.stdout).unwrap();
+    let memory = created
+        .lines()
+        .find_map(|line| line.strip_prefix("Created memory: "))
+        .unwrap();
+    let repo = Repository::open(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let memory_id = atomic_core::kg::iri::mint_memory(&repo.project_id().unwrap(), memory);
+    for index in 0..12 {
+        let path = format!("pool_{index}.rs");
+        std::fs::write(dir.path().join(&path), format!("// {memory}\n")).unwrap();
+        repo.add(wc, &path, TrackingOptions::default()).unwrap();
+    }
+    record(&repo, "higher scored file candidates");
+    drop(repo);
+    let class = atomic_core::kg::ontology::Class::Memory.iri();
+    let mut expected = None;
+    for pool in ["0", "1", "100"] {
+        let nodes = json(
+            dir.path(),
+            home.path(),
+            &[
+                "query", "search", memory, "--kind", class, "--pool", pool, "--limit", "1",
+                "--json",
+            ],
+        );
+        assert_eq!(nodes.as_array().unwrap().len(), 1, "pool={pool}");
+        assert_eq!(nodes[0]["id"], memory_id);
+        assert!(nodes[0]["types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|ty| ty == class));
+        if let Some(expected) = &expected {
+            assert_eq!(&nodes, expected, "pool changed filtered result");
+        } else {
+            expected = Some(nodes);
+        }
+    }
+    let nodes = json(
+        dir.path(),
+        home.path(),
+        &[
+            "query", "search", memory, "--kind", class, "--pool", "0", "--limit", "0", "--json",
+        ],
+    );
+    assert_eq!(
+        nodes,
+        expected.unwrap(),
+        "CLI zero uses the service default, not literal zero"
+    );
+    let plain = json(
+        dir.path(),
+        home.path(),
+        &[
+            "query", "search", memory, "--pool", "1", "--limit", "1", "--json",
+        ],
+    );
+    assert_eq!(
+        plain[0]["types"][0],
+        atomic_core::kg::ontology::Class::File.iri()
+    );
+    let empty_kind = json(
+        dir.path(),
+        home.path(),
+        &[
+            "query", "search", memory, "--kind", "", "--pool", "1", "--limit", "1", "--json",
+        ],
+    );
+    assert_eq!(empty_kind, plain);
+    for kind in [
+        "Memory",
+        "https://atomic.dev/ns/workflow#memory",
+        "urn:unknown:class",
+    ] {
+        assert_eq!(
+            json(
+                dir.path(),
+                home.path(),
+                &["query", "search", memory, "--kind", kind, "--pool", "1", "--json",]
+            ),
+            serde_json::json!([])
+        );
+    }
+    let output = run(
+        dir.path(),
+        home.path(),
+        &[
+            "query", "search", memory, "--kind", class, "--pool", "1", "--limit", "1",
+        ],
+    );
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.contains(&memory_id) && output.contains("1 result(s)."),
+        "{output}"
+    );
+    assert!(!dir
+        .path()
+        .join(".atomic/content-index/manifest.json")
+        .exists());
+}

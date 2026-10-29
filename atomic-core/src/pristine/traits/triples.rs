@@ -16,6 +16,16 @@ pub trait KgTxnT {
 
     /// Get the 1-hop neighborhood of a node (outgoing + incoming edges + connected nodes).
     fn kg_neighbors(&self, node_id: &str, depth: u8) -> Result<KgSubgraph, PristineError> {
+        self.kg_neighbors_filtered(node_id, depth, None, crate::kg::Direction::Both)
+    }
+
+    fn kg_neighbors_filtered(
+        &self,
+        node_id: &str,
+        depth: u8,
+        predicate: Option<crate::kg::ontology::Predicate>,
+        direction: crate::kg::Direction,
+    ) -> Result<KgSubgraph, PristineError> {
         let depth = depth.min(2);
         let mut visited = std::collections::HashSet::new();
         let mut result_edges = Vec::new();
@@ -30,12 +40,22 @@ pub trait KgTxnT {
 
             for current_id in &frontier {
                 for edge in self.get_kg_edges_from(current_id)? {
+                    if direction == crate::kg::Direction::Incoming
+                        || predicate.is_some_and(|p| p != edge.kind)
+                    {
+                        continue;
+                    }
                     if visited.insert(edge.to_id.clone()) {
                         next_frontier.push(edge.to_id.clone());
                     }
                     result_edges.push(edge);
                 }
                 for edge in self.get_kg_edges_to(current_id)? {
+                    if direction == crate::kg::Direction::Outgoing
+                        || predicate.is_some_and(|p| p != edge.kind)
+                    {
+                        continue;
+                    }
                     if visited.insert(edge.from_id.clone()) {
                         next_frontier.push(edge.from_id.clone());
                     }
@@ -49,8 +69,7 @@ pub trait KgTxnT {
         // Deduplicate edges
         {
             let mut seen = std::collections::HashSet::new();
-            result_edges
-                .retain(|e| seen.insert((e.from_id.clone(), e.to_id.clone(), e.kind.clone())));
+            result_edges.retain(|e| seen.insert((e.from_id.clone(), e.to_id.clone(), e.kind)));
         }
 
         // Collect nodes

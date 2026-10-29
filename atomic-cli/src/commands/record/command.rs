@@ -185,7 +185,7 @@ impl Command for Record {
             ));
         }
 
-        // CB-8A (RFC §7.6, §8.1): an Atomic-origin record is a bridge
+        // CB-8A (RFC §7.6, §8.1): an Atomic-origin record is a shim
         // transition. In an active Git shadow the recorded durable state is
         // projected immediately — an operation-specific commit on the view's
         // mapped ref with the scope-correct HEAD placement and the index

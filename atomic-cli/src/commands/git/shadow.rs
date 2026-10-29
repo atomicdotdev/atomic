@@ -1,6 +1,6 @@
 //! The shadow-publication pipeline and its CB-4B equivalence capability.
 //!
-//! `atomic git push`, native push with an active bridge, and shadow projection
+//! `atomic git push`, native push with an active shim, and shadow projection
 //! build an Atomic `ProjectTree`, observe Git index/worktree state read-only,
 //! and require an equivalent report before any publication mutation. The
 //! already-equivalent index supplies the tree; this module never stages an
@@ -24,9 +24,10 @@ use atomic_core::operation::GitHashAlgorithm;
 use atomic_core::Base32;
 use atomic_objects::content_key;
 use atomic_repository::{
-    compare_project_state, compare_project_to_index, compare_project_to_worktree,
-    observe_git_index, observe_worktree, ConversionPolicy, EquivalenceClaims, GitAttributesFilter,
-    GitObjectKind, ManifestRoot, MismatchKind, ProjectTree, Repository,
+    compare_project_state, compare_project_state_tolerating_untracked, compare_project_to_index,
+    compare_project_to_worktree, compare_project_to_worktree_with_index, observe_git_index,
+    observe_worktree, ConversionPolicy, EquivalenceClaims, GitAttributesFilter, GitObjectKind,
+    ManifestRoot, MismatchKind, ProjectTree, Repository,
 };
 
 use crate::error::{CliError, CliResult};
@@ -251,8 +252,8 @@ fn verify_git_publication_with_project(
     )
 }
 
-/// Whether native publication must run the Git bridge gate.
-pub(crate) fn bridge_publication_required(repo_root: &Path) -> bool {
+/// Whether native publication must run the Git shim gate.
+pub(crate) fn shim_publication_required(repo_root: &Path) -> bool {
     GitRepository::discover(repo_root)
         .map(|repository| shadow_sync_active(&repository))
         .unwrap_or(false)
@@ -260,7 +261,7 @@ pub(crate) fn bridge_publication_required(repo_root: &Path) -> bool {
 
 /// Native Atomic publication is unchanged without an active Git shadow. Once
 /// the shadow marker exists, however, publication is gated fail-closed.
-pub(crate) fn verify_bridge_publication(
+pub(crate) fn verify_shim_publication(
     repo: &Repository,
     repo_root: &Path,
     view: &str,
@@ -335,9 +336,9 @@ fn verify_git_publication_with_policy(
             conversion_policy_root: Some(policy.root().content_key),
             git_tree_root: Some(project.git.root.clone()),
         };
-        compare_project_state(&project, &index, &worktree, &policy, &claims)
+        compare_project_state_tolerating_untracked(&project, &index, &worktree, &policy, &claims)
     } else {
-        compare_project_to_worktree(&project, &worktree, &policy)
+        compare_project_to_worktree_with_index(&project, &worktree, &index, &policy)
     };
     if !report.is_equivalent() {
         let details = report
@@ -444,6 +445,13 @@ fn current_conversion_policy(
             )
         })
         .collect();
+    // RFC §6.2: resolve the vault half of the exclusion policy from the
+    // recorded repository configuration (already loaded above), then the
+    // tracked Git HEAD tree — the same decision every other policy factory
+    // makes, so publication equivalence agrees with import and verify.
+    // Fails closed on a corrupt configuration.
+    policy.exclusions = atomic_repository::ExclusionPolicy::resolve_for_git(git_repo)
+        .map_err(|error| git_error(format!("cannot resolve the bridge vault policy: {error}")))?;
     Ok((policy, repo_config.filters))
 }
 
@@ -464,7 +472,7 @@ impl ShadowSwitchSync {
     }
 
     /// Restore the Git evidence captured before synchronization. This is used
-    /// when the final bridge checkpoint cannot be refreshed after Git itself
+    /// when the final shim checkpoint cannot be refreshed after Git itself
     /// was aligned successfully.
     pub(crate) fn rollback(self, repo_root: &Path) -> CliResult<()> {
         let Self::Synchronized(receipt) = self else {
@@ -573,6 +581,12 @@ pub(crate) fn sync_git_head_to_view(
     if !shadow_sync_active(&git_repo) {
         return Ok(ShadowSwitchSync::SkippedInactive);
     }
+    // A retained shadow exclude line is not enrollment (RFC §2 / CB-13C):
+    // colocated-but-unenrolled repositories keep native view switches with
+    // no Git projection and no checkpoint requirement.
+    if !repo.shim_workspace_active().map_err(CliError::Repository)? {
+        return Ok(ShadowSwitchSync::SkippedInactive);
+    }
     let working_copy = repo
         .require_working_copy_id()
         .map_err(CliError::Repository)?;
@@ -624,6 +638,10 @@ pub(crate) fn sync_git_head_to_view(
 /// Selecting an inherited agent view does not materialize the worktree.
 /// Reuse its already verified Git tree and preserve both staged and unstaged
 /// edits. This narrower transition is valid only for identical closures.
+///
+/// Unenrolled working copies are native: a `.git` directory (or a retained
+/// shadow exclude line) is not shim consent (RFC §2 / CB-13C), so they skip
+/// the Git-side coordination entirely instead of demanding a checkpoint.
 pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()> {
     let git = match GitRepository::open(root) {
         Ok(git) if shadow_sync_active(&git) => git,
@@ -634,18 +652,26 @@ pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()
         atomic_repository::database_lock_wait(),
     )
     .map_err(CliError::Repository)?;
-    if repo.is_sandbox()
-        && !repo
-            .bridge_workspace_active()
-            .map_err(CliError::Repository)?
-    {
+    // Enrollment is checkpoint-or-explicit-opt-in (the same predicate every
+    // workspace boundary uses). The retained exclude marker alone must never
+    // make a native agent session require a shim checkpoint.
+    if !repo.shim_workspace_active().map_err(CliError::Repository)? {
         return Ok(());
     }
     let Some(before) = super::checkpoint::read_checkpoint(root).map_err(checkpoint_error_of)?
     else {
-        return Err(git_error(
-            "agent view selection requires a verified bridge checkpoint",
-        ));
+        // Enrolled but not anchored. Selecting the view would move Git
+        // HEAD/refs — a shim-specific destructive operation — so it fails
+        // closed with the shared anchor-or-disable remediation rather than a
+        // bare internal error.
+        return Err(CliError::StaleBaseline {
+            report: format!(
+                "agent view selection on an enrolled but unanchored Git shim: {}",
+                atomic_repository::UnanchoredWorkspace::MissingCheckpoint
+                    .remediation()
+                    .unwrap_or_default()
+            ),
+        });
     };
     let old = repo
         .view_identity(&before.view)
@@ -731,7 +757,7 @@ pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()
 
 /// Refresh the verified workspace checkpoint from the live repository
 /// handle (CB-8A). redb admits only one writable handle per process, so the
-/// bridge verifier's own writable open cannot run while a repository handle
+/// shim verifier's own writable open cannot run while a repository handle
 /// is pinned; this re-observes the git HEAD/view state and writes the
 /// version-2 checkpoint directly.
 pub(crate) fn refresh_checkpoint_from_live_handle(
@@ -792,11 +818,35 @@ pub(crate) fn sync_git_projection_after_record(
         return Ok(());
     }
     let repo = Repository::open(repo_root).map_err(CliError::Repository)?;
-    if repo.is_sandbox()
-        && !repo
-            .bridge_workspace_active()
-            .map_err(CliError::Repository)?
+    // A retained shadow exclude line is not enrollment (RFC §2 / CB-13C):
+    // a colocated-but-unenrolled repository never projects its records into
+    // Git and never anchors a shim implicitly. Native records stand alone.
+    if !repo.shim_workspace_active().map_err(CliError::Repository)? {
+        return Ok(());
+    }
+    // An enrolled workspace without a verified checkpoint is unanchored. The
+    // record projection would move Git HEAD and write the first checkpoint,
+    // anchoring the shim as a side effect of an agent record. Anchoring is
+    // explicit (`atomic git shim reconcile`); the destructive Git mutation
+    // fails closed here while the already-durable Atomic record stands.
+    if super::checkpoint::read_checkpoint(repo_root)
+        .map_err(checkpoint_error_of)?
+        .is_none()
     {
+        append_shadow_log(
+            repo_root,
+            "record-projection:unanchored",
+            view,
+            "enrolled shim has no verified checkpoint; projection skipped \
+             (run `atomic git shim reconcile` to anchor, or `atomic git shim disable`)",
+        );
+        if std::io::stderr().is_terminal() {
+            print_warning(
+                "Recorded on an enrolled but unanchored Git shim; the record projection \
+                 was skipped. Anchor the workspace (`atomic git shim reconcile`) or disable \
+                 the shim (`atomic git shim disable`).",
+            );
+        }
         return Ok(());
     }
     let working_copy = repo
@@ -833,7 +883,7 @@ pub(crate) fn sync_git_projection_after_record(
         return Ok(());
     }
 
-    // An Atomic-origin record is a bridge transition (RFC §7.6): the
+    // An Atomic-origin record is a shim transition (RFC §7.6): the
     // recorded durable state is the worktree's content, so the projection
     // re-stages the primary index manifest to the projected tree — the same
     // semantics as `git commit -a` — and commits. Staged-but-unrecorded
@@ -885,7 +935,7 @@ pub(crate) fn sync_git_projection_after_record(
     drop(repo);
     // The projection moved Git HEAD; refresh the verified checkpoint so the
     // next workspace entry sees the post-transition baseline (RFC §7.2).
-    crate::commands::git::bridge::refresh_checkpoint_if_aligned(repo_root)?;
+    crate::commands::git::shim::refresh_checkpoint_if_aligned(repo_root)?;
     Ok(())
 }
 
@@ -1076,14 +1126,12 @@ pub(crate) fn project_view_to_git_with_conflicts(
         // V1 must run before even content-addressed object writes. A clean
         // state must not carry raw marker text; a conflicted state projects
         // markers deliberately and is resolved below.
-        let (policy, _) = {
-            let discovered = GitRepository::discover(repo_root)
-                .map_err(|error| git_error(format!("cannot discover Git repository: {error}")))?;
-            current_conversion_policy(repo_root, &discovered)?
-        };
+        let discovered = GitRepository::discover(repo_root)
+            .map_err(|error| git_error(format!("cannot discover Git repository: {error}")))?;
+        let (policy, _) = current_conversion_policy(repo_root, &discovered)?;
         let conflict_export = resolve_conflict_export(repo, view, &policy, allow_conflicts)?;
         if matches!(conflict_export, ConflictExport::Clean) {
-            refuse_conflict_markers(repo, repo_root, view)?;
+            refuse_conflict_markers(repo, &discovered, Some(&provisional), repo_root, view)?;
         }
         let publication = match &conflict_export {
             ConflictExport::Clean => verify_git_publication_mode(repo, repo_root, view, false)?,
@@ -1171,7 +1219,7 @@ pub(crate) fn project_view_to_git_with_conflicts(
                     GitObjectKind::Blob => git2::ObjectType::Blob,
                     GitObjectKind::Tree => git2::ObjectType::Tree,
                 };
-                (oid.clone(), kind, object.bytes.clone())
+                (oid.clone(), kind, object.bytes.to_vec())
             })
             .collect();
         if !project_objects.is_empty() {
@@ -1191,6 +1239,7 @@ pub(crate) fn project_view_to_git_with_conflicts(
         let tree_oid = stage_and_validate_tree(
             repo,
             git_repo,
+            Some(&target_ref),
             repo_root,
             &publication,
             if matches!(conflict_export, ConflictExport::Snapshot { .. }) {
@@ -1835,11 +1884,24 @@ fn git_error(message: impl Into<String>) -> CliError {
 /// Whether git shadow sync is established for this repo (the `.git/info/exclude`
 /// carries Atomic's shadow patterns, written by import/push). Used to gate the
 /// view-switch git-follow so we never touch HEAD in a plain (non-shadow) repo.
+/// NOTE: this marker is *retained* by `git shim disable` and by plain
+/// `atomic init` inside an existing Git checkout — it is not enrollment. Use
+/// [`shim_workspace_enrolled`] wherever the question is shim participation.
 fn shadow_sync_active(git_repo: &GitRepository) -> bool {
     let exclude = git_repo.path().join("info").join("exclude");
     std::fs::read_to_string(exclude)
         .map(|c| c.lines().any(|l| l.trim() == "/.atomic/"))
         .unwrap_or(false)
+}
+
+/// Whether the working copy at `root` participates in the colocated Git
+/// shim: a verified checkpoint (written by an explicit shim command) or
+/// the explicit `[git.shim] enabled` opt-in (RFC §2 / CB-13C). A `.git`
+/// directory next to `.atomic` — with or without a retained shadow exclude
+/// line — is not consent.
+pub(crate) fn shim_workspace_enrolled(root: &Path) -> CliResult<bool> {
+    let repo = Repository::open_readonly(root).map_err(CliError::Repository)?;
+    repo.shim_workspace_active().map_err(CliError::Repository)
 }
 
 /// Acquire the repo-scoped shadow-commit lock, or return `None` (a no-op skip)
@@ -1884,6 +1946,7 @@ pub(crate) fn acquire_shadow_lock(
 pub(crate) fn stage_and_validate_tree(
     repo: &Repository,
     git_repo: &GitRepository,
+    baseline_ref: Option<&str>,
     repo_root: &Path,
     publication: &VerifiedPublication,
     conflict_markers: ConflictMarkerPolicy,
@@ -1896,7 +1959,7 @@ pub(crate) fn stage_and_validate_tree(
     // ── Rule V1 — no unresolved conflict markers ────────────────────────────
     // Shares `atomic record`'s detector so the two paths cannot disagree.
     if conflict_markers == ConflictMarkerPolicy::Refuse {
-        refuse_conflict_markers(repo, repo_root, view)?;
+        refuse_conflict_markers(repo, git_repo, baseline_ref, repo_root, view)?;
     }
 
     // Prevention: make sure git is configured to exclude Atomic's shadow /
@@ -1940,7 +2003,15 @@ pub(crate) fn stage_and_validate_tree(
     Ok(tree_oid)
 }
 
-fn refuse_conflict_markers(repo: &Repository, repo_root: &Path, view: &str) -> CliResult<()> {
+/// `baseline_ref` names the ref the projection commits onto; its tip is the
+/// Git state a marker must be new against (HEAD when the ref is absent).
+fn refuse_conflict_markers(
+    repo: &Repository,
+    git_repo: &GitRepository,
+    baseline_ref: Option<&str>,
+    repo_root: &Path,
+    view: &str,
+) -> CliResult<()> {
     let working_copy = repo
         .require_working_copy_id()
         .map_err(CliError::Repository)?;
@@ -1953,11 +2024,23 @@ fn refuse_conflict_markers(repo: &Repository, repo_root: &Path, view: &str) -> C
     // canonical content still holds the markers). The switch/shadow boundary
     // therefore ALSO scans the materialized view content: unresolved markers
     // must never become Git evidence, whatever their worktree status.
+    //
+    // Markers the baseline commit already holds byte-for-byte are not this
+    // commit's doing (llmlang: a dependabot merge committed `Cargo.lock`
+    // with its markers; every later `atomic record` of an unrelated file was
+    // refused here AFTER the record had landed, leaving Git behind Atomic
+    // for good). Only a file whose projected bytes the baseline does not
+    // hold can introduce or keep an unresolved marker.
+    let baseline = baseline_tree(git_repo, baseline_ref);
     let marker = marker.or_else(|| {
-        repo.first_view_conflict_marker(working_copy)
-            .map_err(CliError::Repository)
-            .ok()
-            .flatten()
+        repo.first_view_conflict_marker_where(working_copy, &|path, content| {
+            !baseline
+                .as_ref()
+                .is_some_and(|tree| tree_holds_bytes(git_repo, tree, path, content))
+        })
+        .map_err(CliError::Repository)
+        .ok()
+        .flatten()
     });
     let Some((path, line)) = marker else {
         return Ok(());
@@ -1982,6 +2065,40 @@ fn refuse_conflict_markers(repo: &Repository, repo_root: &Path, view: &str) -> C
             path, line
         ),
     })
+}
+
+/// The tree the projection builds on: the tip of `baseline_ref` when it
+/// resolves, else HEAD's. `None` (unborn, or neither resolves) leaves every
+/// marker counted.
+fn baseline_tree<'g>(git: &'g GitRepository, baseline_ref: Option<&str>) -> Option<git2::Tree<'g>> {
+    let from_ref = baseline_ref
+        .and_then(|name| git.find_reference(name).ok())
+        .and_then(|reference| reference.peel_to_tree().ok());
+    from_ref.or_else(|| git.head().ok()?.peel_to_tree().ok())
+}
+
+/// Whether `tree` holds exactly `bytes`: at `path`, or — after a rename of
+/// the marker-bearing file — as the same blob anywhere in the tree. A tree
+/// or gitlink entry at `path` is not a blob and does not count.
+fn tree_holds_bytes(git: &GitRepository, tree: &git2::Tree<'_>, path: &str, bytes: &[u8]) -> bool {
+    let Ok(blob_oid) = git2::Oid::hash_object(git2::ObjectType::Blob, bytes) else {
+        return false;
+    };
+    let at_path = tree.get_path(Path::new(path)).ok().is_some_and(|entry| {
+        entry.kind() == Some(git2::ObjectType::Blob) && entry.id() == blob_oid
+    });
+    if at_path {
+        return true;
+    }
+    let mut found = false;
+    let _ = tree.walk(git2::TreeWalkMode::PreOrder, |_, entry| {
+        if entry.kind() == Some(git2::ObjectType::Blob) && entry.id() == blob_oid {
+            found = true;
+            return git2::TreeWalkResult::Abort;
+        }
+        git2::TreeWalkResult::Ok
+    });
+    found
 }
 
 fn write_project_tree(git: &GitRepository, project: &ProjectTree) -> CliResult<git2::Oid> {
@@ -2071,6 +2188,7 @@ fn is_forbidden_shadow_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::is_forbidden_shadow_path as forbidden;
+    use super::*;
 
     #[test]
     fn forbids_provenance_and_excluded_paths() {
@@ -2086,5 +2204,222 @@ mod tests {
         // A file that merely *contains* the substring is not forbidden.
         assert!(!forbidden("docs/.atomicignore.md"));
         assert!(!forbidden("my.vault/keep.txt"));
+    }
+
+    // ── Agent shim gating (RFC §2 / CB-13C) ─────────────────────────────
+    //
+    // The retained `.git/info/exclude` marker is not enrollment: only a
+    // verified checkpoint or the explicit `[git.shim] enabled` opt-in
+    // participates in the Git shim.
+
+    use git2::Oid;
+
+    fn commit_file(git: &GitRepository, root: &Path, content: &[u8]) -> Oid {
+        std::fs::write(root.join("tracked.txt"), content).unwrap();
+        let mut index = git.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        index.write().unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        let tree = git.find_tree(tree_oid).unwrap();
+        let signature = git2::Signature::now("Atomic Test", "test@atomic.invalid").unwrap();
+        let parents = git
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| git.find_commit(oid).unwrap());
+        match parents.as_ref() {
+            Some(parent) => git
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "checkpoint",
+                    &tree,
+                    &[parent],
+                )
+                .unwrap(),
+            None => git
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    "checkpoint",
+                    &tree,
+                    &[],
+                )
+                .unwrap(),
+        }
+    }
+
+    /// Atomic + colocated Git with the retained shadow exclude marker, no
+    /// shim checkpoint and no shim opt-in: a native, unenrolled repo.
+    fn native_colocated_with_retained_marker(root: &Path) -> GitRepository {
+        atomic_repository::Repository::init(root).unwrap();
+        let git = GitRepository::init(root).unwrap();
+        commit_file(&git, root, b"native\n");
+        std::fs::create_dir_all(root.join(".git").join("info")).unwrap();
+        std::fs::write(
+            root.join(".git").join("info").join("exclude"),
+            "/.atomic/\n",
+        )
+        .unwrap();
+        git
+    }
+
+    fn enroll_via_config(root: &Path) {
+        let config = root.join(".atomic").join("config.toml");
+        let mut content = std::fs::read_to_string(&config).unwrap_or_default();
+        content.push_str("\n[git.shim]\nenabled = true\n");
+        std::fs::write(&config, content).unwrap();
+    }
+
+    fn write_aligned_checkpoint(root: &Path, git: &GitRepository) {
+        let head = git.head().unwrap().target().unwrap();
+        let tree = git.find_commit(head).unwrap().tree_id();
+        let atomic = crate::commands::git::checkpoint::observe_current_atomic(root).unwrap();
+        crate::commands::git::checkpoint::write_verified_checkpoint(
+            root,
+            crate::commands::git::checkpoint::VerifiedCheckpointInput {
+                view: &atomic.view,
+                atomic_state: &atomic.state,
+                git_head: &head.to_string(),
+                git_tree: &tree.to_string(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn current_view(root: &Path) -> String {
+        let repo = atomic_repository::Repository::open_readonly(root).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        repo.desired_view_name(working_copy).unwrap()
+    }
+
+    #[test]
+    fn agent_view_selection_is_native_without_shim_enrollment() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = native_colocated_with_retained_marker(root);
+        drop(git);
+        // Regression: the retained marker previously demanded a checkpoint
+        // and failed every hook dispatch with exit 128.
+        sync_inherited_agent_view(root, &current_view(root)).unwrap();
+        assert!(!root.join(".atomic/bridge").exists());
+    }
+
+    #[test]
+    fn agent_view_selection_reports_remediation_when_enrolled_unanchored() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = native_colocated_with_retained_marker(root);
+        drop(git);
+        enroll_via_config(root);
+        let error = sync_inherited_agent_view(root, &current_view(root)).unwrap_err();
+        match error {
+            CliError::StaleBaseline { report } => {
+                assert!(report.contains("atomic git shim reconcile"), "{report}");
+                assert!(report.contains("atomic git shim disable"), "{report}");
+            }
+            other => panic!("expected StaleBaseline, got: {other:?}"),
+        }
+        // The destructive Git mutation fails closed: nothing was anchored.
+        assert!(!root.join(".atomic/bridge").exists());
+    }
+
+    #[test]
+    fn agent_view_selection_preserves_integrity_when_head_drifts() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = native_colocated_with_retained_marker(root);
+        write_aligned_checkpoint(root, &git);
+        commit_file(&git, root, b"drifted\n");
+        drop(git);
+        let error = sync_inherited_agent_view(root, &current_view(root)).unwrap_err();
+        match error {
+            CliError::GitError { message } => {
+                assert!(
+                    message.contains("Git HEAD changed during agent view selection"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected GitError, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_projection_is_native_without_shim_enrollment() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = native_colocated_with_retained_marker(root);
+        drop(git);
+        let view = current_view(root);
+        let hash = atomic_core::types::Hash::of(b"recorded");
+        sync_git_projection_after_record(root, &view, &hash).unwrap();
+        assert!(!root.join(".atomic/bridge").exists());
+        assert!(git_ref_count(root, "refs/atomic") == 0);
+    }
+
+    #[test]
+    fn record_projection_skips_instead_of_anchoring_when_enrolled_unanchored() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = native_colocated_with_retained_marker(root);
+        drop(git);
+        enroll_via_config(root);
+        let view = current_view(root);
+        let hash = atomic_core::types::Hash::of(b"recorded");
+        sync_git_projection_after_record(root, &view, &hash).unwrap();
+        assert!(!root.join(".atomic/bridge/workspace.json").exists());
+        let log = std::fs::read_to_string(root.join(".atomic/hook-errors.log")).unwrap();
+        assert!(log.contains("record-projection:unanchored"), "{log}");
+    }
+
+    #[test]
+    fn view_switch_git_follow_is_native_without_shim_enrollment() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = native_colocated_with_retained_marker(root);
+        drop(git);
+        // Resolve the view before opening the writable handle (redb admits
+        // one database handle per process).
+        let view = current_view(root);
+        let repo = atomic_repository::Repository::open_for_workspace_transaction_wait(
+            root,
+            atomic_repository::database_lock_wait(),
+        )
+        .unwrap();
+        match sync_git_head_to_view(&repo, root, &view).unwrap() {
+            ShadowSwitchSync::SkippedInactive => {}
+            other => panic!("expected SkippedInactive, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enrollment_helper_matches_checkpoint_or_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = native_colocated_with_retained_marker(root);
+        // Unenrolled: marker alone is not consent.
+        assert!(!shim_workspace_enrolled(root).unwrap());
+        write_aligned_checkpoint(root, &git);
+        // A checkpoint (explicit shim command evidence) enrolls, even when
+        // configuration says disabled.
+        assert!(shim_workspace_enrolled(root).unwrap());
+        drop(git);
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = native_colocated_with_retained_marker(root);
+        drop(git);
+        enroll_via_config(root);
+        // Explicit opt-in enrolls without a checkpoint.
+        assert!(shim_workspace_enrolled(root).unwrap());
+    }
+
+    fn git_ref_count(root: &Path, pattern: &str) -> usize {
+        let git = GitRepository::open(root).unwrap();
+        git.references_glob(pattern)
+            .map(|refs| refs.flatten().count())
+            .unwrap_or(0)
     }
 }

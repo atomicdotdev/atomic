@@ -292,7 +292,7 @@ impl New {
                 result.files_written,
             ));
             let repo_root = find_repository_root()?;
-            if crate::commands::git::shadow::bridge_publication_required(&repo_root) {
+            if crate::commands::git::shadow::shim_publication_required(&repo_root) {
                 let shadow_sync =
                     crate::commands::git::shadow::sync_git_head_to_view(repo, &repo_root, name)?;
                 drop(shadow_sync);
@@ -503,7 +503,7 @@ pub fn resolve_overlay_creation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     // -------------------------------------------------------------------------
     // Directory Guard for Safe Current Dir Changes
@@ -668,7 +668,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_run_creates_view_forked_from_current() {
         use tempfile::tempdir;
 
@@ -701,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_run_creates_empty_view_with_flag() {
         use tempfile::tempdir;
 
@@ -731,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_run_with_switch() {
         use tempfile::tempdir;
 
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_run_duplicate_view() {
         use tempfile::tempdir;
 
@@ -794,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_run_with_explicit_from() {
         use tempfile::tempdir;
 
@@ -821,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_run_from_nonexistent_view_fails() {
         use tempfile::tempdir;
 

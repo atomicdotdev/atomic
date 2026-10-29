@@ -81,12 +81,13 @@ use atomic_core::types::{
     Base32, ChangePosition, EdgeFlags, GraphNode, Hash as ContentHash, Merkle, Position, SetId,
 };
 use atomic_repository::{
-    compare_project_state, git_resolution_metadata, git_synthesis_metadata,
-    graph_visibility_closure, observe_git_index, observe_worktree, verify_prospective_equivalence,
-    ContentFilter, ConversionPolicy, EquivalenceClaims, EquivalenceReport, GitAttributesFilter,
-    GitResolutionOrigin, GitSynthesisOrigin, LossNote, ManifestDisposition, MoveBasis,
-    MoveEvidence, PlatformCapabilities, ProbableMove, ProjectTree, RenameCandidate, RepoPath,
-    Repository, RepositoryEntry, RepositoryManifest, VerifiedProspectiveEquivalence,
+    compare_project_state, compare_project_state_tolerating_untracked, git_resolution_metadata,
+    git_synthesis_metadata, graph_visibility_closure, observe_git_index, observe_worktree,
+    verify_prospective_equivalence, ContentFilter, ConversionPolicy, EquivalenceClaims,
+    EquivalenceReport, ExclusionPolicy, GitAttributesFilter, GitResolutionOrigin,
+    GitSynthesisOrigin, LossNote, ManifestDisposition, MoveBasis, MoveEvidence,
+    PlatformCapabilities, ProbableMove, ProjectTree, RenameCandidate, RepoPath, Repository,
+    RepositoryEntry, RepositoryManifest, VerifiedProspectiveEquivalence,
 };
 
 use crate::error::{CliError, CliResult};
@@ -366,6 +367,13 @@ pub(crate) fn staged_expectation_for(
     semantic_paths: &[String],
     touched: Option<&std::collections::BTreeSet<String>>,
 ) -> atomic_repository::StagedExpectation {
+    // Only the disposable real-history unit-test driver can defer content
+    // proof to its private import's final promotion. Shipping builds and
+    // ordinary shim imports retain their existing verification contract.
+    #[cfg(test)]
+    if real_import_sample::content_verification_deferred() {
+        return atomic_repository::StagedExpectation::empty();
+    }
     let mut entries = std::collections::BTreeMap::new();
     for entry in &prospective.manifest.entries {
         if entry.disposition != atomic_repository::ManifestDisposition::Included {
@@ -381,7 +389,7 @@ pub(crate) fn staged_expectation_for(
         entries.insert(
             path,
             atomic_repository::StagedPathExpectation {
-                bytes: entry.repository_bytes.clone(),
+                bytes: entry.repository_bytes.to_vec(),
                 mode: entry.mode,
                 kind: entry.kind,
             },
@@ -397,7 +405,12 @@ pub(crate) fn staged_expectation_for(
     // the CRDT tables (review F4). Rebuilding this list from `parsed.files`
     // here would demand FileOps for unchanged union content and shadow the
     // caller's argument, so the parameter is used verbatim.
-    let semantic_paths = semantic_paths.to_vec();
+    // Recorded paths carry the repository's raw spelling; the expectation
+    // speaks canonical identities throughout.
+    let semantic_paths = semantic_paths
+        .iter()
+        .map(|path| atomic_repository::canonical_path_identity(path))
+        .collect();
     atomic_repository::StagedExpectation {
         paths: parsed
             .files
@@ -415,8 +428,40 @@ pub(crate) fn staged_expectation_for(
             entries,
             semantic_paths,
             verify_paths: touched.cloned(),
+            semantic_verify_paths: None,
         }),
     }
+}
+
+/// The paths whose semantic closure the staged check replays for `parsed`,
+/// or `None` for the whole tree.
+///
+/// A single-parent commit of an incremental import that excludes nothing
+/// changes the closure of exactly the trunks it touches; every other trunk's
+/// closure is what the previous import already replayed byte-exact, so only
+/// the touched paths (plus every recorded delta path) replay. Merges,
+/// exclusions, a fresh import's commits and `ATOMIC_FULL_SEMANTIC_VERIFY=1`
+/// keep the whole-tree replay.
+fn semantic_replay_scope(
+    parsed: &ParsedCommit,
+    semantic_paths: &[String],
+    closure_unchanged: bool,
+    incremental: bool,
+) -> Option<std::collections::BTreeSet<String>> {
+    if parsed.is_merge
+        || !closure_unchanged
+        || !incremental
+        || std::env::var_os("ATOMIC_FULL_SEMANTIC_VERIFY").is_some()
+    {
+        return None;
+    }
+    let mut scope = touched_paths(parsed);
+    scope.extend(
+        semantic_paths
+            .iter()
+            .map(|path| atomic_repository::canonical_path_identity(path)),
+    );
+    Some(scope)
 }
 
 /// Every path a single-parent commit touches: added, modified, deleted,
@@ -491,7 +536,7 @@ pub struct ParsedCommit {
     /// change origin. Never used as Atomic dependencies.
     pub parent_oids: Vec<Oid>,
     /// Committer time (Unix seconds), the first deterministic tie-break for
-    /// bridge sequencing.
+    /// shim sequencing.
     pub committer_time: i64,
     /// Whether this is a merge commit.
     pub is_merge: bool,
@@ -698,7 +743,7 @@ pub struct ParallelImportOptions {
     pub validate_equivalence: bool,
     /// Verify only the paths each single-parent commit touches, and the whole
     /// tree at the last written commit and at merges. Set by `git import`;
-    /// bridge reconcile keeps the full-tree check on every commit.
+    /// shim reconcile keeps the full-tree check on every commit.
     pub verify_touched_paths: bool,
 }
 
@@ -749,6 +794,7 @@ impl Default for ClosureLedger {
             ancestry: HashMap::new(),
             closures: HashMap::new(),
             member_origins: None,
+            target_closure: None,
         }
     }
 }
@@ -767,6 +813,12 @@ pub(crate) struct ClosureLedger {
     closures: HashMap<String, std::sync::Arc<HashSet<ContentHash>>>,
     /// Full-chain view membership with Git origins, loaded once per run.
     member_origins: Option<Vec<(ContentHash, Option<String>)>>,
+    /// The complete Git ancestry of this import's target tip (the branch
+    /// closure the walk accumulates). Members whose Git origin is inside
+    /// this set are sibling legs of the same import target — never
+    /// superseded from the view — while origins outside it are genuinely
+    /// replaced history. `None` only before the walk sets it.
+    target_closure: Option<std::sync::Arc<HashSet<String>>>,
 }
 
 impl ClosureLedger {
@@ -882,6 +934,10 @@ impl ClosureLedger {
     /// persisted/reconstructed ancestor closure. Non-Git members (native
     /// Atomic work) cannot be attributed and stay visible: their content is
     /// genuinely part of the view state Git commits build on.
+    ///
+    /// These exclusions are ASSEMBLY visibility only. Which of them are
+    /// genuinely replaced history — and may leave the view — is decided by
+    /// [`ClosureLedger::supersede_exclusions_for`].
     fn exclusions_for(
         &mut self,
         repo: &Repository,
@@ -917,6 +973,58 @@ impl ClosureLedger {
             }
         }
         Ok(exclusions)
+    }
+
+    /// The genuinely replaced history among `sha`'s assembly exclusions:
+    /// excluded view members whose Git origin is ALSO outside this import's
+    /// full target closure. These — and only these — may leave the target
+    /// view when `sha` lands.
+    ///
+    /// An assembly exclusion whose origin IS inside the target closure is a
+    /// sibling leg of the same import target: the walk reaches it (or the
+    /// merge that reunifies the legs) later, the merge resolution
+    /// re-references it through `ensure_union_state`, and evicting it
+    /// mid-walk would leave descendant commits assembling against a missing
+    /// baseline — the sibling-eviction corruption. Origins outside the
+    /// target closure are history the target replaced (e.g. an incremental
+    /// import after a force-push rewrite): evicting them keeps the published
+    /// boundary equal to the commit's interpreted closure.
+    fn supersede_exclusions_for(
+        &mut self,
+        repo: &Repository,
+        git: &GitRepository,
+        sha: &str,
+        target_view: &str,
+        has_git_parent: bool,
+    ) -> CliResult<Vec<ContentHash>> {
+        let assembly = self.exclusions_for(repo, git, sha, target_view, has_git_parent)?;
+        if assembly.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Clone the Arc before the mutable `origins_for` call: no borrow of
+        // `self` may outlive it.
+        let target = match self.target_closure.clone() {
+            Some(target) => target,
+            // No target closure known: the historical behavior (evict every
+            // assembly exclusion) stays fail-safe for callers that never
+            // establish the walk's target.
+            None => return Ok(assembly),
+        };
+        let mut origins: HashMap<ContentHash, Option<String>> = HashMap::new();
+        for (hash, origin_sha) in self.origins_for(repo, target_view)? {
+            origins.insert(hash, origin_sha);
+        }
+        let mut superseded = Vec::with_capacity(assembly.len());
+        for hash in assembly {
+            let replaced = origins
+                .get(&hash)
+                .and_then(|origin| origin.as_deref())
+                .is_some_and(|origin| !target.contains(origin));
+            if replaced {
+                superseded.push(hash);
+            }
+        }
+        Ok(superseded)
     }
 
     /// Record that importing `sha` introduced `hash` into `target_view`.
@@ -1011,17 +1119,36 @@ pub(crate) struct VerifiedImportCommit {
 
 pub(crate) struct ProspectiveImportPlan {
     commits: Vec<VerifiedImportCommit>,
+    /// Compact first-parent stream preflight; historical payloads are not retained.
+    stream: Option<StreamPreflight>,
     /// Explicit Git closure boundaries detected before sequencing; stamped
     /// into every synthesized change's unhashed provenance.
     boundaries: Vec<&'static str>,
 }
 
+struct StreamPreflight {
+    tip: Oid,
+    ordered: Vec<Oid>,
+    expected_tree: GitObjectId,
+    raw_tree: GitObjectId,
+    changed_paths: Vec<PathBuf>,
+    merges: usize,
+    empty: usize,
+    files: usize,
+}
+
 impl ProspectiveImportPlan {
+    pub(crate) fn is_stream(&self) -> bool {
+        self.stream.is_some()
+    }
     pub(crate) fn boundaries(&self) -> &[&'static str] {
         &self.boundaries
     }
 
     pub(crate) fn expected_git_tree(&self) -> Option<GitObjectId> {
+        if let Some(stream) = &self.stream {
+            return Some(stream.expected_tree.clone());
+        }
         self.commits
             .last()
             .map(|commit| commit.verified.expected_git_tree().clone())
@@ -1029,12 +1156,18 @@ impl ProspectiveImportPlan {
 
     /// The last verified commit's RAW Git tree OID (HEAD-stability anchor).
     pub(crate) fn raw_git_tree(&self) -> Option<GitObjectId> {
+        if let Some(stream) = &self.stream {
+            return Some(stream.raw_tree.clone());
+        }
         self.commits
             .last()
             .map(|commit| commit.raw_tree_oid.clone())
     }
 
     pub(crate) fn changed_paths(&self) -> Vec<PathBuf> {
+        if let Some(stream) = &self.stream {
+            return stream.changed_paths.clone();
+        }
         let mut paths = std::collections::BTreeSet::new();
         for commit in &self.commits {
             for file in &commit.parsed.files {
@@ -1050,7 +1183,7 @@ impl ProspectiveImportPlan {
 
 /// Fold the Git tree `tree_oid` into the tree OID the prospective gate must
 /// compare against: the complete Git tree MINUS the entries this import
-/// declares excluded — the conversion policy's bridge-private paths
+/// declares excluded — the conversion policy's Shim-private paths
 /// (`.atomic*/`, `.vault/`) and the import-ignore patterns (e.g. a Rust
 /// workspace's `Cargo.lock`).
 ///
@@ -1070,7 +1203,7 @@ pub(crate) fn import_expected_tree_oid(
 ) -> CliResult<GitObjectId> {
     // Fold the Git tree into the tree OID the prospective gate must compare
     // against: the complete Git tree MINUS the entries the versioned
-    // conversion policy declares bridge-private (`.atomic*/`, `.vault/`).
+    // conversion policy declares Shim-private (`.atomic*/`, `.vault/`).
     // No tracked path is ever stripped: RFC tree-fidelity (§8.4 table, line
     // 648) and the colocated status contract (line 844) say tracked entries
     // are never excluded by ignore rules (review ::26 R1/R2). Raw component and
@@ -1276,11 +1409,6 @@ fn repository_entries_from_git_tree(
                         0o100644 => (atomic_core::change::InodeKind::Regular, 0o644u16, None),
                         0o100755 => (atomic_core::change::InodeKind::Regular, 0o755u16, None),
                         0o120000 => (atomic_core::change::InodeKind::Symlink, 0o777u16, None),
-                        0o160000 => {
-                            let oid = git_object_id(policy.object_format, entry.id())?;
-                            let bytes = oid_bytes_as_hex(&oid);
-                            (atomic_core::change::InodeKind::Gitlink, 0o644u16, Some(oid))
-                        }
                         mode => {
                             return Err(git_error(format!(
                                 "unsupported parent-tree Git mode {mode:#o} at '{}'",
@@ -1294,6 +1422,28 @@ fn repository_entries_from_git_tree(
                                 git_error(format!("cannot build prospective entry: {e}"))
                             })?;
                     entries.insert(repository_entry.path.clone(), repository_entry);
+                }
+                Some(git2::ObjectType::Commit) if entry.filemode() == 0o160000 => {
+                    // A gitlink stores a foreign commit's ID, not an object
+                    // that must be present in this repository's ODB.
+                    let path = RepoPath::from_bytes(&path)
+                        .map_err(|error| git_error(error.to_string()))?;
+                    let disposition = policy
+                        .exclusions
+                        .exclusion(&path)
+                        .map(ManifestDisposition::Excluded)
+                        .unwrap_or(ManifestDisposition::Included);
+                    let oid = git_object_id(policy.object_format, entry.id())?;
+                    let entry = RepositoryEntry::new(
+                        path,
+                        oid_bytes_as_hex(&oid),
+                        0o644,
+                        atomic_core::change::InodeKind::Gitlink,
+                        Some(oid),
+                        disposition,
+                    )
+                    .map_err(|error| git_error(error.to_string()))?;
+                    entries.insert(entry.path.clone(), entry);
                 }
                 _ => {
                     return Err(git_error(format!(
@@ -1382,24 +1532,31 @@ impl ProspectiveProjectTree {
             self.entries.clear();
         }
 
+        // Two phases: every path the commit vacates (rename sources,
+        // deletions) leaves the fold before any insertion, so a rename chain
+        // or swap (`a→b`, `c→a`) folds the same whatever order libgit2 emits
+        // the deltas in.
         for file in &parsed.files {
-            if file.operation == FileOperation::Renamed {
-                if let Some(old_path) = &file.old_path {
-                    self.entries.remove(
-                        &RepoPath::from_bytes(old_path.as_bytes()).map_err(|e| {
-                            git_error(format!("invalid Git path '{old_path}': {e}"))
-                        })?,
-                    );
-                }
+            let vacated = match file.operation {
+                FileOperation::Renamed => file.old_path.as_deref(),
+                FileOperation::Deleted => Some(file.path.as_str()),
+                _ => None,
+            };
+            if let Some(vacated) = vacated {
+                self.entries.remove(
+                    &RepoPath::from_bytes(vacated.as_bytes())
+                        .map_err(|e| git_error(format!("invalid Git path '{vacated}': {e}")))?,
+                );
+            }
+        }
+        for file in &parsed.files {
+            if file.operation == FileOperation::Deleted {
+                continue;
             }
             // CB-9C path fidelity: the canonical String identity decodes to
             // the exact raw bytes before entering the RepoPath-keyed fold.
             let path = RepoPath::from_bytes(file.path.as_bytes())
                 .map_err(|e| git_error(format!("invalid Git path '{}': {e}", file.path)))?;
-            if file.operation == FileOperation::Deleted {
-                self.entries.remove(&path);
-                continue;
-            }
             let bytes = file.new_content.clone().ok_or_else(|| {
                 git_error(format!(
                     "commit {} omitted bytes for '{}'",
@@ -1473,7 +1630,7 @@ impl ProspectiveProjectTree {
             .map_err(|e| git_error(format!("cannot fold prospective manifest: {e}")))?;
         // CB-9B ::15 AC-3: the gate proves the projection is EXACTLY the
         // commit's complete Git tree minus ONLY the entries the versioned
-        // conversion policy declares bridge-private (`.atomic*/`, `.vault/`)
+        // conversion policy declares Shim-private (`.atomic*/`, `.vault/`)
         // — never any ignore-rule exclusion of tracked files (RFC §8.4;
         // review ::26 R1). The exclusion set is deterministic and derived
         // before the fold, so the comparison stays unforgeable evidence that
@@ -1528,7 +1685,35 @@ pub(crate) fn conversion_policy(git: &GitRepository) -> CliResult<ConversionPoli
         case_sensitive: !config.get_bool("core.ignorecase").unwrap_or(false),
         unicode_normalizing: config.get_bool("core.precomposeunicode").unwrap_or(false),
     };
+    // RFC §6.2: `.vault/` is private by default but may be tracked under
+    // explicit policy. Resolve the vault half from the recorded repository
+    // configuration, then the tracked Git HEAD tree, so every command that
+    // builds this policy agrees with the import that synthesized the
+    // projection. Fails closed on a corrupt configuration.
+    policy.exclusions = ExclusionPolicy::resolve_for_git(git)
+        .map_err(|error| git_error(format!("cannot resolve the shim vault policy: {error}")))?;
     Ok(policy)
+}
+
+/// Record the vault projection policy (RFC §6.2) for a freshly imported
+/// repository.
+///
+/// `tracked` is the policy resolved BEFORE the repository (and its default
+/// configuration) was created — the same unambiguous HEAD-tree detection
+/// the import plan above just used. `git import` is the first command that
+/// needs the decision, so it persists the detected value once, here, and
+/// every later command reconstructs this exact conversion policy from the
+/// record instead of re-detecting against a moving HEAD.
+pub(crate) fn record_imported_vault_policy(repo: &Repository, tracked: bool) -> CliResult<()> {
+    if tracked {
+        repo.set_shim_vault_policy(atomic_config::ShimVaultPolicy::Tracked, None)
+            .map_err(CliError::from)?;
+        print_info(
+            "Git tracks .vault/: recorded shim vault policy 'tracked' — the vault joins \
+             the manifest projection exactly like any other tracked path.",
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn git_object_id(algorithm: GitHashAlgorithm, oid: Oid) -> CliResult<GitObjectId> {
@@ -1707,7 +1892,7 @@ pub(crate) fn verify_commit_closure_objects_with_shallow(
 /// Kahn's algorithm over the collected parent→child edges with a min-heap
 /// keyed by (committer time, tagged OID bytes). Identical repositories
 /// always produce identical ordering regardless of revwalk internals, and
-/// every import labels this as bridge sequencing. Returns the ordered OIDs
+/// every import labels this as shim sequencing. Returns the ordered OIDs
 /// and the number of sibling ties that had to be broken by the
 /// (committer time, OID) rule.
 pub(crate) fn sequence_commits_deterministically(
@@ -1780,7 +1965,7 @@ pub(crate) fn sequence_commits_deterministically(
     while let Some(entry) = ready.pop() {
         if !ready.is_empty() {
             // At least one sibling was ready: the (committer time, OID) rule
-            // decided who goes first — record it for the bridge label.
+            // decided who goes first — record it for the shim label.
             tie_breaks += 1;
         }
         ordered.push(entry.oid);
@@ -1799,7 +1984,7 @@ pub(crate) fn sequence_commits_deterministically(
     }
     if ordered.len() != commit_oids.len() {
         return Err(git_error(format!(
-            "bridge sequencing could not order all collected commits ({} of {}); the Git graph \
+            "shim sequencing could not order all collected commits ({} of {}); the Git graph \
              is cyclic or incomplete",
             ordered.len(),
             commit_oids.len()
@@ -1816,7 +2001,7 @@ pub(crate) fn sequence_commits_deterministically(
 /// importing it now would fabricate a second, differently-derived history
 /// below changes the view already contains. Returns the count of deepened
 /// commits so callers can diagnose; the walk order is the deterministic
-/// bridge order.
+/// shim order.
 pub(crate) fn detect_deepened_history(
     git: &GitRepository,
     ordered_oids: &[Oid],
@@ -1864,7 +2049,7 @@ pub(crate) fn detect_deepened_history(
     Err(git_error(format!(
         "Git history deepened below already-imported commits: {} unindexed commit(s) (oldest \
          {}) sit below indexed descendants; deepening must never silently reinterpret prior \
-         bridge sequencing. Import the deepened history into a fresh view or explicitly \
+         shim sequencing. Import the deepened history into a fresh view or explicitly \
          rebuild the affected view.",
         deepened.len(),
         deepened.last().cloned().unwrap_or_default()
@@ -1941,7 +2126,8 @@ pub(crate) fn verify_complete_equivalence(
         git_tree_root: Some(git_object_id(policy.object_format, tree.id())?),
         ..EquivalenceClaims::default()
     };
-    let report = compare_project_state(&project, &index, &observed, &policy, &claims);
+    let report =
+        compare_project_state_tolerating_untracked(&project, &index, &observed, &policy, &claims);
     if report.is_equivalent() {
         Ok(())
     } else {
@@ -2035,6 +2221,7 @@ struct ImportLine {
     start: ChangePosition,
     end: ChangePosition,
     incoming_by: ContentHash,
+    incoming_from: Position<Option<ContentHash>>,
     content: Vec<u8>,
 }
 
@@ -2096,6 +2283,7 @@ impl ImportLineIndex {
                             start: contents.start,
                             end: contents.end,
                             incoming_by: change_hash,
+                            incoming_from: inode_pos,
                             content: change.contents
                                 [contents.start.as_usize()..contents.end.as_usize()]
                                 .to_vec(),
@@ -2132,6 +2320,14 @@ impl ImportLineIndex {
                             start: insertion.start,
                             end: insertion.end,
                             incoming_by: change_hash,
+                            incoming_from: stream_position(
+                                insertion
+                                    .predecessors
+                                    .first()
+                                    .copied()
+                                    .unwrap_or(indexed.inode_pos),
+                                change_hash,
+                            ),
                             content: change.contents
                                 [insertion.start.as_usize()..insertion.end.as_usize()]
                                 .to_vec(),
@@ -2197,7 +2393,7 @@ impl ImportLineIndex {
                     .collect()
             };
 
-            let seed = match repo.import_line_index_seed(&file.path) {
+            let seed = match repo.import_line_index_seed(&repository_path(&file.path)) {
                 Ok(Some(seed)) => seed,
                 Ok(None) => continue,
                 Err(err) => {
@@ -2225,13 +2421,25 @@ impl ImportLineIndex {
                 .lines
                 .iter()
                 .zip(old_lines)
-                .map(|(line, content)| {
+                .enumerate()
+                .map(|(index, (line, content))| {
                     imported_changes.insert(line.incoming_by);
                     ImportLine {
                         change: line.change,
                         start: line.start,
                         end: line.end,
                         incoming_by: line.incoming_by,
+                        incoming_from: if index == 0 {
+                            Position {
+                                change: Some(seed.inode_pos.change),
+                                pos: seed.inode_pos.pos,
+                            }
+                        } else {
+                            Position {
+                                change: Some(seed.lines[index - 1].change),
+                                pos: seed.lines[index - 1].end,
+                            }
+                        },
                         content,
                     }
                 })
@@ -2299,13 +2507,25 @@ impl ImportLineIndex {
             .lines
             .iter()
             .zip(line_contents)
-            .map(|(line, content)| {
+            .enumerate()
+            .map(|(index, (line, content))| {
                 imported_changes.insert(line.incoming_by);
                 ImportLine {
                     change: line.change,
                     start: line.start,
                     end: line.end,
                     incoming_by: line.incoming_by,
+                    incoming_from: if index == 0 {
+                        Position {
+                            change: Some(seed.inode_pos.change),
+                            pos: seed.inode_pos.pos,
+                        }
+                    } else {
+                        Position {
+                            change: Some(seed.lines[index - 1].change),
+                            pos: seed.lines[index - 1].end,
+                        }
+                    },
                     content,
                 }
             })
@@ -2359,7 +2579,7 @@ impl ImportLineIndex {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum PendingLineIndexUpdate {
     DirectoryAdd {
         path: String,
@@ -2384,7 +2604,7 @@ enum PendingLineIndexUpdate {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PendingLineReplacement {
     start_idx: usize,
     old_len: usize,
@@ -2917,7 +3137,7 @@ fn build_graph_first_change(
         };
         dependencies.extend(position_hashes(&parent_pos));
 
-        let dirname = extract_filename(&directory_path);
+        let dirname = repository_path(extract_filename(&directory_path));
         if dirname.is_empty() {
             return Err(vec![GraphFirstSkip {
                 path: directory_path,
@@ -2953,22 +3173,31 @@ fn build_graph_first_change(
                 end: name_end,
                 inode: inode_pos,
             },
-            path: directory_path.clone(),
+            path: repository_path(&directory_path).into_owned(),
         });
         pending.push(PendingLineIndexUpdate::DirectoryAdd {
             path: directory_path.clone(),
             inode_pos,
         });
         directory_anchors.insert(directory_path, inode_pos);
+        // Keep the empty directory anchor distinct from the next file's name
+        // start. A later move into this directory resolves context through the
+        // moved file's inode index first; an unrelated name starting at the
+        // same position would otherwise impersonate that directory marker.
+        contents.push(0);
     }
 
     for file in &parsed.files {
+        // Index keys remain canonical escaped Git identities. Persist names
+        // and operation paths using native repository spelling so subsequent
+        // ordinary imports and native records address the same path claims.
+        let repo_path = repository_path(&file.path);
         match file.operation {
             FileOperation::Added | FileOperation::Copied => {
                 let new_content = file.new_content.as_deref().unwrap_or(&[]);
                 let encoding = Encoding::detect(new_content);
 
-                let filename = extract_filename(&file.path);
+                let filename = repository_path(extract_filename(&file.path));
                 let name_start = ChangePosition::new(contents.len() as u64);
                 contents.extend_from_slice(filename.as_bytes());
                 let name_end = ChangePosition::new(contents.len() as u64);
@@ -3042,7 +3271,7 @@ fn build_graph_first_change(
                         inode: inode_pos,
                     },
                     contents: first_content,
-                    path: file.path.clone(),
+                    path: repo_path.to_string(),
                     encoding: Some(encoding),
                 });
 
@@ -3059,14 +3288,14 @@ fn build_graph_first_change(
                             end,
                             inode: inode_pos,
                         }),
-                        local: Local::new(&file.path, (idx + 1) as u64),
+                        local: Local::new(repo_path.as_ref(), (idx + 1) as u64),
                         encoding: Some(encoding),
                     });
                 }
 
                 if !graph_only {
                     file_ops.push(build_graph_first_file_ops_for_added_file(
-                        &file.path,
+                        &repo_path,
                         &new_line_contents,
                         &new_ranges,
                         encoding,
@@ -3095,12 +3324,12 @@ fn build_graph_first_change(
                 let new_content = file.new_content.as_deref().unwrap_or(&[]);
                 let encoding = Encoding::detect(new_content);
 
-                let new_filename = extract_filename(&file.path);
+                let new_filename = repository_path(extract_filename(&file.path));
                 let name_start = ChangePosition::new(contents.len() as u64);
                 contents.extend_from_slice(new_filename.as_bytes());
                 let name_end = ChangePosition::new(contents.len() as u64);
 
-                let old_filename = extract_filename(old_path);
+                let old_filename = repository_path(extract_filename(old_path));
                 let old_name_end = indexed.inode_pos.pos;
                 let old_name_start = ChangePosition::new(
                     old_name_end.get().saturating_sub(old_filename.len() as u64),
@@ -3137,7 +3366,7 @@ fn build_graph_first_change(
                         end: name_end,
                         inode: indexed.inode_pos,
                     },
-                    path: file.path.clone(),
+                    path: repo_path.to_string(),
                 });
                 pending.push(PendingLineIndexUpdate::Rename {
                     old_path: old_path.to_string(),
@@ -3150,7 +3379,7 @@ fn build_graph_first_change(
                 {
                     if let Some(diff_lines) = file.diff_lines.as_ref() {
                         let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
-                            &file.path, diff_lines,
+                            &repo_path, diff_lines,
                         );
                         file_ops.push(ops);
                     }
@@ -3217,12 +3446,9 @@ fn build_graph_first_change(
                             inode: indexed.inode_pos,
                         };
                         for line_idx in start_idx..end_idx {
-                            let from = if line_idx == 0 {
-                                indexed.inode_pos
-                            } else {
-                                indexed.lines[line_idx - 1].end_pos()
-                            };
                             let old_line = &indexed.lines[line_idx];
+                            let from = old_line.incoming_from;
+                            dependencies.extend(position_hashes(&from));
                             dependencies.insert(old_line.change);
                             dependencies.insert(old_line.incoming_by);
                             edge_update.edges.push(NewEdge {
@@ -3245,7 +3471,7 @@ fn build_graph_first_change(
                         if new_ranges.is_empty() {
                             hunks.push(GraphOp::Edit {
                                 change: Atom::EdgeUpdate(edge_update),
-                                local: Local::new(&file.path, replacement.new_start as u64),
+                                local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                                 encoding: Some(encoding),
                             });
                         } else if replacement.old_len == 0 {
@@ -3264,7 +3490,7 @@ fn build_graph_first_change(
                                     end: first.1,
                                     inode: indexed.inode_pos,
                                 }),
-                                local: Local::new(&file.path, replacement.new_start as u64),
+                                local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                                 encoding: Some(encoding),
                             });
                         } else {
@@ -3284,7 +3510,7 @@ fn build_graph_first_change(
                                     end: first.1,
                                     inode: indexed.inode_pos,
                                 },
-                                local: Local::new(&file.path, replacement.new_start as u64),
+                                local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                                 encoding: Some(encoding),
                             });
                         }
@@ -3309,19 +3535,21 @@ fn build_graph_first_change(
                                     inode: indexed.inode_pos,
                                 }),
                                 local: Local::new(
-                                    &file.path,
+                                    repo_path.as_ref(),
                                     (replacement.new_start + new_idx) as u64,
                                 ),
                                 encoding: Some(encoding),
                             });
                         }
 
+                        let successor_incoming_by_current =
+                            !new_ranges.is_empty() && successor.is_some();
                         pending_replacements.push(PendingLineReplacement {
                             start_idx,
                             old_len: replacement.old_len,
                             new_ranges,
                             new_lines: replacement.new_lines,
-                            successor_incoming_by_current: successor.is_some(),
+                            successor_incoming_by_current,
                         });
                     }
 
@@ -3341,17 +3569,15 @@ fn build_graph_first_change(
                     });
                     continue;
                 };
+                dependencies.extend(position_hashes(&indexed.inode_pos));
                 let mut edge_update = EdgeUpdate {
                     edges: Vec::with_capacity(indexed.lines.len()),
                     inode: indexed.inode_pos,
                 };
                 for line_idx in 0..indexed.lines.len() {
-                    let from = if line_idx == 0 {
-                        indexed.inode_pos
-                    } else {
-                        indexed.lines[line_idx - 1].end_pos()
-                    };
                     let old_line = &indexed.lines[line_idx];
+                    let from = old_line.incoming_from;
+                    dependencies.extend(position_hashes(&from));
                     dependencies.insert(old_line.change);
                     dependencies.insert(old_line.incoming_by);
                     edge_update.edges.push(NewEdge {
@@ -3362,15 +3588,11 @@ fn build_graph_first_change(
                         introduced_by: Some(old_line.incoming_by),
                     });
                 }
-                hunks.push(GraphOp::Edit {
-                    change: Atom::EdgeUpdate(edge_update),
-                    local: Local::new(&file.path, 1),
-                    encoding: file
-                        .old_content
-                        .as_deref()
-                        .map(Encoding::detect)
-                        .filter(|enc| *enc != Encoding::Binary)
-                        .or(Some(Encoding::Utf8)),
+                hunks.push(GraphOp::FileDel {
+                    del: edge_update,
+                    contents: None,
+                    path: repo_path.to_string(),
+                    encoding: file.old_content.as_deref().map(Encoding::detect),
                 });
                 pending.push(PendingLineIndexUpdate::Delete {
                     path: file.path.clone(),
@@ -3379,7 +3601,7 @@ fn build_graph_first_change(
                 if !graph_only {
                     if let Some(diff_lines) = file.diff_lines.as_ref() {
                         let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
-                            &file.path, diff_lines,
+                            &repo_path, diff_lines,
                         );
                         file_ops.push(ops);
                     }
@@ -3393,6 +3615,7 @@ fn build_graph_first_change(
             skips.push(GraphFirstSkip::new(file, "modified_missing_line_index"));
             continue;
         };
+        dependencies.extend(position_hashes(&indexed.inode_pos));
         let Some(new_content) = file.new_content.as_deref() else {
             skips.push(GraphFirstSkip::new(file, "modified_missing_new_content"));
             continue;
@@ -3410,7 +3633,7 @@ fn build_graph_first_change(
                         vec![new_content.to_vec()]
                     },
                 }]
-            } else if parsed.is_merge {
+            } else if parsed.is_merge || graph_only {
                 current_state_replacements(indexed, new_content)
             } else {
                 let Some(diff_lines) = file.diff_lines.as_ref() else {
@@ -3419,7 +3642,7 @@ fn build_graph_first_change(
                 };
                 if !graph_only {
                     let (ops, _) = atomic_core::record::workflow::build_crdt_ops_from_git_diff(
-                        &file.path, diff_lines,
+                        &repo_path, diff_lines,
                     );
                     file_ops.push(ops);
                 }
@@ -3447,12 +3670,7 @@ fn build_graph_first_change(
             }
         }
 
-        let encoding = file
-            .new_content
-            .as_deref()
-            .map(Encoding::detect)
-            .filter(|enc| *enc != Encoding::Binary)
-            .or(Some(Encoding::Utf8));
+        let encoding = file.new_content.as_deref().map(Encoding::detect);
 
         let mut pending_replacements = Vec::new();
 
@@ -3496,12 +3714,9 @@ fn build_graph_first_change(
             };
 
             for line_idx in start_idx..end_idx {
-                let from = if line_idx == 0 {
-                    indexed.inode_pos
-                } else {
-                    indexed.lines[line_idx - 1].end_pos()
-                };
                 let old_line = &indexed.lines[line_idx];
+                let from = old_line.incoming_from;
+                dependencies.extend(position_hashes(&from));
                 dependencies.insert(old_line.change);
                 dependencies.insert(old_line.incoming_by);
                 edge_update.edges.push(NewEdge {
@@ -3524,7 +3739,7 @@ fn build_graph_first_change(
             if new_ranges.is_empty() {
                 hunks.push(GraphOp::Edit {
                     change: Atom::EdgeUpdate(edge_update),
-                    local: Local::new(&file.path, replacement.new_start as u64),
+                    local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                     encoding,
                 });
             } else if replacement.old_len == 0 {
@@ -3543,7 +3758,7 @@ fn build_graph_first_change(
                         end: first.1,
                         inode: indexed.inode_pos,
                     }),
-                    local: Local::new(&file.path, replacement.new_start as u64),
+                    local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                     encoding,
                 });
             } else {
@@ -3563,7 +3778,7 @@ fn build_graph_first_change(
                         end: first.1,
                         inode: indexed.inode_pos,
                     },
-                    local: Local::new(&file.path, replacement.new_start as u64),
+                    local: Local::new(repo_path.as_ref(), replacement.new_start as u64),
                     encoding,
                 });
             }
@@ -3587,17 +3802,18 @@ fn build_graph_first_change(
                         end,
                         inode: indexed.inode_pos,
                     }),
-                    local: Local::new(&file.path, (replacement.new_start + new_idx) as u64),
+                    local: Local::new(repo_path.as_ref(), (replacement.new_start + new_idx) as u64),
                     encoding,
                 });
             }
 
+            let successor_incoming_by_current = !new_ranges.is_empty() && successor.is_some();
             pending_replacements.push(PendingLineReplacement {
                 start_idx,
                 old_len: replacement.old_len,
                 new_ranges,
                 new_lines: replacement.new_lines,
-                successor_incoming_by_current: successor.is_some(),
+                successor_incoming_by_current,
             });
         }
 
@@ -3806,6 +4022,16 @@ fn parse_git_diff_replacements(lines: &[GitDiffLine]) -> Option<Vec<GitReplaceme
     Some(blocks)
 }
 
+fn stream_position(
+    mut position: Position<Option<ContentHash>>,
+    hash: ContentHash,
+) -> Position<Option<ContentHash>> {
+    if position.change.is_none() {
+        position.change = Some(hash);
+    }
+    position
+}
+
 fn apply_line_index_updates(
     line_index: &mut ImportLineIndex,
     change_hash: ContentHash,
@@ -3835,11 +4061,20 @@ fn apply_line_index_updates(
                 let lines = new_ranges
                     .iter()
                     .zip(new_lines)
-                    .map(|(&(start, end), content)| ImportLine {
+                    .enumerate()
+                    .map(|(index, (&(start, end), content))| ImportLine {
                         change: change_hash,
                         start,
                         end,
                         incoming_by: change_hash,
+                        incoming_from: if index == 0 {
+                            inode_pos
+                        } else {
+                            Position {
+                                change: Some(change_hash),
+                                pos: new_ranges[index - 1].1,
+                            }
+                        },
                         content,
                     })
                     .collect();
@@ -3866,15 +4101,29 @@ fn apply_line_index_updates(
                     let adjusted_end = adjusted_start
                         .saturating_add(replacement.old_len)
                         .min(indexed.lines.len());
+                    let predecessor = if adjusted_start == 0 {
+                        indexed.inode_pos
+                    } else {
+                        indexed.lines[adjusted_start - 1].end_pos()
+                    };
                     let new_lines: Vec<ImportLine> = replacement
                         .new_ranges
                         .iter()
                         .zip(replacement.new_lines)
-                        .map(|(&(start, end), content)| ImportLine {
+                        .enumerate()
+                        .map(|(index, (&(start, end), content))| ImportLine {
                             change: change_hash,
                             start,
                             end,
                             incoming_by: change_hash,
+                            incoming_from: if index == 0 {
+                                predecessor
+                            } else {
+                                Position {
+                                    change: Some(change_hash),
+                                    pos: replacement.new_ranges[index - 1].1,
+                                }
+                            },
                             content,
                         })
                         .collect();
@@ -3884,8 +4133,15 @@ fn apply_line_index_updates(
 
                     if replacement.successor_incoming_by_current {
                         let successor_idx = adjusted_start + replacement.new_ranges.len();
+                        let from = indexed
+                            .lines
+                            .get(successor_idx - 1)
+                            .map(ImportLine::end_pos);
                         if let Some(successor) = indexed.lines.get_mut(successor_idx) {
                             successor.incoming_by = change_hash;
+                            if let Some(from) = from {
+                                successor.incoming_from = from;
+                            }
                         }
                     }
 
@@ -4024,11 +4280,11 @@ impl ParallelImporter {
         }
 
         // CB-9A §7: deterministic topological sequencing — Kahn's algorithm
-        // with (committer time, tagged OID) tie-breaks, labeled as bridge
+        // with (committer time, tagged OID) tie-breaks, labeled as shim
         // sequencing.
         let (commit_oids, tie_breaks) = sequence_commits_deterministically(&git, &collected)?;
         trace_git_import(format!(
-            "bridge sequencing: {} commits ordered by (committer time, oid); {} tie-break(s)",
+            "shim sequencing: {} commits ordered by (committer time, oid); {} tie-break(s)",
             commit_oids.len(),
             tie_breaks
         ));
@@ -4060,7 +4316,7 @@ impl ParallelImporter {
         // The complete-tree expectation (review R3) must start from the
         // current durable projection: the source view when importing from
         // another repository, otherwise this repository's own view (the
-        // incremental git-shadow-sync flow). Bridge-private files tracked
+        // incremental git-shadow-sync flow). Shim-private files tracked
         // in the view but absent from Git (e.g. `.atomicignore`) then stay
         // in the expectation exactly as they stay alive in the view.
         let current = match source {
@@ -4086,6 +4342,7 @@ impl ParallelImporter {
         if commit_oids.is_empty() {
             return Ok(ProspectiveImportPlan {
                 commits: Vec::new(),
+                stream: None,
                 boundaries,
             });
         }
@@ -4178,6 +4435,7 @@ impl ParallelImporter {
         trace_git_import(format!("prospective total: {:?}", total_start.elapsed()));
         Ok(ProspectiveImportPlan {
             commits: verified_commits,
+            stream: None,
             boundaries,
         })
     }
@@ -4186,6 +4444,25 @@ impl ParallelImporter {
         &self,
         prospective: &ProjectTree,
         commits: &[VerifiedImportCommit],
+        branch_name: &str,
+        git: &GitRepository,
+    ) -> CliResult<()> {
+        let mut changed = std::collections::BTreeSet::new();
+        for commit in commits {
+            for file in &commit.parsed.files {
+                changed.insert(file.path.as_str());
+                if let Some(old_path) = file.old_path.as_deref() {
+                    changed.insert(old_path);
+                }
+            }
+        }
+        self.verify_worktree_path_set(prospective, changed, branch_name, git)
+    }
+
+    fn verify_worktree_path_set<'a>(
+        &self,
+        prospective: &ProjectTree,
+        changed: impl IntoIterator<Item = &'a str>,
         branch_name: &str,
         git: &GitRepository,
     ) -> CliResult<()> {
@@ -4202,15 +4479,7 @@ impl ParallelImporter {
             .workdir()
             .ok_or_else(|| git_error("checked-out import branch has no worktree"))?;
         let filter = GitAttributesFilter::for_repository(root);
-        let mut changed = std::collections::BTreeSet::new();
-        for commit in commits {
-            for file in &commit.parsed.files {
-                changed.insert(file.path.as_str());
-                if let Some(old_path) = file.old_path.as_deref() {
-                    changed.insert(old_path);
-                }
-            }
-        }
+        let mut present = atomic_repository::worktree_presence::WorktreeEntries::new(root);
         let expected: BTreeMap<_, _> = prospective
             .manifest
             .entries
@@ -4224,7 +4493,23 @@ impl ParallelImporter {
             // canonical String identity decodes before filesystem access.
             let physical = root.join(canonical_tree_path(path));
             let Some(entry) = expected.get(repo_path.as_bytes()) else {
-                if physical.symlink_metadata().is_ok() {
+                let prefix = format!("{path}/");
+                let needs_directory = expected
+                    .keys()
+                    .any(|candidate| candidate.starts_with(prefix.as_bytes()));
+                // Exact-name lookup: `symlink_metadata` resolves the old
+                // spelling of a case-only rename on a case-insensitive
+                // filesystem, and children behind an ancestor that became a
+                // symlink to a directory; neither is a lingering Git path.
+                let lingering = present
+                    .exact_metadata(&canonical_tree_path(path))
+                    .map_err(|error| {
+                        git_error(format!(
+                            "cannot inspect deleted worktree path '{path}': {error}"
+                        ))
+                    })?
+                    .is_some_and(|metadata| !(needs_directory && metadata.file_type().is_dir()));
+                if lingering {
                     return Err(git_error(format!(
                         "deleted Git path '{path}' is still present in the worktree"
                     )));
@@ -4246,7 +4531,14 @@ impl ParallelImporter {
                     "cannot clean changed worktree path '{path}': {error}"
                 ))
             })?;
-            if cleaned.bytes != entry.repository_bytes {
+            // Raw bytes that ARE the committed blob are Git's own clean
+            // state: Git keeps such a file clean by its index stat even when
+            // a later `text=auto` attribute would normalize it on the next
+            // add (a CRLF file committed before the repository adopted
+            // `eol=lf`). The filter still runs first, so a required driver
+            // that fails keeps refusing the import.
+            let raw_matches = bytes[..] == entry.repository_bytes[..];
+            if !raw_matches && cleaned.bytes[..] != entry.repository_bytes[..] {
                 return Err(git_error(format!(
                     "changed worktree path '{path}' does not match the verified Git tree"
                 )));
@@ -4347,22 +4639,185 @@ impl ParallelImporter {
                 })
             })
             .collect::<CliResult<Vec<_>>>()?;
+        let expected = git_object_id(policy.object_format, parsed.tree_oid)?;
+        let claim = self.resolve_view_claim(source, branch_name, parsed, &hashes)?;
+        // A record projection names its exact view state next to the change
+        // roots. The roots' dependency closure is NOT that state once the
+        // view holds independent changes (a rename commuting with an earlier
+        // edit of the same file), so the projection at the named state is
+        // the identity to verify whenever that state is present. This is the
+        // path a Git branch created from an imported tip takes
+        // (docs/shim-review-testing.md §9): its projection commits name the
+        // originating view, not the new branch.
+        let mut state_projection_failure = None;
+        if let Some(state) = claim.state {
+            match source.project_tree_at_state(&claim.view, state, policy) {
+                Ok(projection) => {
+                    verify_prospective_equivalence(&projection, &expected).map_err(|error| {
+                        git_error(format!(
+                            "commit {} carries a forged Atomic state claim: {error}",
+                            parsed.git_sha
+                        ))
+                    })?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    trace_git_import(format!(
+                        "commit {} names state {state} on view '{}' that is not projectable \
+                         ({error}); verifying its change closure instead",
+                        parsed.git_sha, claim.view
+                    ));
+                    state_projection_failure = Some(error.to_string());
+                }
+            }
+        }
+        // The closure projection is view-independent; the view only guards
+        // that the roots are members of a known view. A failure here names
+        // the state projection failure that led to it, so the cause is not
+        // hidden behind a forgery verdict.
+        let with_cause = |message: String| match &state_projection_failure {
+            Some(cause) => {
+                format!("{message} (the claimed state could not be projected: {cause})")
+            }
+            None => message,
+        };
         let closure = source
-            .project_tree_for_change_closure(branch_name, &hashes, policy)
+            .project_tree_for_change_closure(&claim.view, &hashes, policy)
             .map_err(|error| {
-                git_error(format!(
+                git_error(with_cause(format!(
                     "commit {} carries an unverifiable Atomic change closure: {error}",
                     parsed.git_sha
-                ))
+                )))
             })?;
-        let expected = git_object_id(policy.object_format, parsed.tree_oid)?;
         verify_prospective_equivalence(&closure, &expected).map_err(|error| {
-            git_error(format!(
+            git_error(with_cause(format!(
                 "commit {} carries a forged Atomic change closure: {error}",
                 parsed.git_sha
-            ))
+            )))
         })?;
         Ok(())
+    }
+
+    /// The view a commit's Atomic claim is verified against, and the state
+    /// it names when the view holds that state.
+    ///
+    /// The view is the commit's own `Atomic-View` header when that view
+    /// exists (a record projection reached through a Git branch that has no
+    /// Atomic view yet), else the branch's view. Every claimed root must be
+    /// a member of that view; the named `Atomic-State` binds the roots and
+    /// is kept only when every root is a member at that state.
+    fn resolve_view_claim(
+        &self,
+        source: &Repository,
+        branch_name: &str,
+        parsed: &ParsedCommit,
+        claimed_roots: &[ContentHash],
+    ) -> CliResult<ViewClaim> {
+        let message = parsed.full_message();
+        let view = match parse_header_trailer(&message, "Atomic-View") {
+            Some(named) if view_exists(source, &named)? => named,
+            _ => branch_name.to_string(),
+        };
+        if !view_exists(source, &view)? {
+            return Err(git_error(format!(
+                "commit {} claims Atomic changes on view '{view}', which does not exist",
+                parsed.git_sha
+            )));
+        }
+        let claimed_state = parse_header_trailer(&message, "Atomic-State")
+            .and_then(|encoded| Merkle::from_base32(encoded.as_bytes()));
+        let history = source
+            .effective_history(Some(&view))
+            .map_err(|error| CliError::Internal(error.into()))?;
+        let mut members = HashSet::with_capacity(history.len());
+        let mut state = None;
+        for entry in &history {
+            members.insert(entry.hash);
+            if state.is_none()
+                && claimed_state == Some(entry.state)
+                && claimed_roots.iter().all(|root| members.contains(root))
+            {
+                state = Some(entry.state);
+            }
+        }
+        if !claimed_roots.iter().all(|root| members.contains(root)) {
+            return Err(git_error(format!(
+                "commit {} claims Atomic changes that are not members of view '{view}'",
+                parsed.git_sha
+            )));
+        }
+        Ok(ViewClaim { view, state })
+    }
+
+    /// A tip that moved backwards onto an already-interpreted commit (`git
+    /// reset --hard HEAD~1`, a rebase dropping the newest commit, a
+    /// force-pull to an ancestor) plans no commits, so the per-commit
+    /// supersede gate never ran: the view kept the dropped history, every
+    /// later command refused with `HeadChanged`, and `shim status` called
+    /// the mapping synchronized. Apply the same gate against the tip: view
+    /// members whose Git origin lies outside the tip's ancestry and
+    /// interpreted closure leave the view, dependents included.
+    fn rewind_view_to_interpreted_tip(
+        &self,
+        repo: &mut Repository,
+        branch_name: &str,
+    ) -> CliResult<usize> {
+        let Ok(git) = self.open_git_repo() else {
+            return Ok(0);
+        };
+        let Some(tip) = git
+            .find_branch(branch_name, git2::BranchType::Local)
+            .ok()
+            .and_then(|branch| branch.get().target())
+        else {
+            return Ok(0);
+        };
+        let tip_sha = tip.to_string();
+        let view = self.options.target_view.clone();
+        let Some(tip_hash) = repo
+            .checked_git_sha(&tip_sha)
+            .map_err(|e| CliError::Internal(e.into()))?
+        else {
+            return Ok(0);
+        };
+        let is_member = |repo: &Repository, hash: &ContentHash| -> CliResult<bool> {
+            Ok(repo
+                .effective_history(Some(&view))
+                .map_err(|e| CliError::Internal(e.into()))?
+                .iter()
+                .any(|entry| entry.hash == *hash))
+        };
+        if !is_member(repo, &tip_hash)? {
+            return Ok(0);
+        }
+        let mut ledger = ClosureLedger::default();
+        let ancestry = ledger.ancestry_of(&git, &tip_sha)?;
+        ledger.target_closure = Some(ancestry);
+        let superseded = ledger.supersede_exclusions_for(repo, &git, &tip_sha, &view, true)?;
+        let mut removed = 0usize;
+        for hash in superseded {
+            if !is_member(repo, &hash)? {
+                continue;
+            }
+            let outcome = repo
+                .unrecord(
+                    &hash,
+                    atomic_repository::unrecord::UnrecordOptions {
+                        view: Some(view.clone()),
+                        cascade: true,
+                        update_working_copy: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| CliError::Internal(e.into()))?;
+            trace_git_import(format!(
+                "rewind '{branch_name}': unrecorded {} change(s) behind {}",
+                outcome.unrecorded.len(),
+                hash.to_base32()
+            ));
+            removed += outcome.unrecorded.len();
+        }
+        Ok(removed)
     }
 
     /// Import commits from a branch into an Atomic repository.
@@ -4401,6 +4856,12 @@ impl ParallelImporter {
             ..ImportStats::default()
         };
         if plan.commits.is_empty() {
+            let superseded = self.rewind_view_to_interpreted_tip(repo, branch_name)?;
+            if superseded > 0 {
+                print_info(&format!(
+                    "Superseded {superseded} change(s) no longer reachable from the Git tip of '{branch_name}'"
+                ));
+            }
             return Ok(stats);
         }
 
@@ -4409,8 +4870,21 @@ impl ParallelImporter {
         let import_start = Instant::now();
         let mut line_index = ImportLineIndex::default();
         let write_start = Instant::now();
-        let (write_stats, all_imported_commits) =
-            self.phase2_write(repo, &plan.commits, &mut line_index, plan.boundaries())?;
+        // The import target tip for the supersede gate: the branch this walk
+        // accumulates into the target view. A resolvable local branch names
+        // its tip; a detached §7.5 import falls back to the walked commits.
+        let target_tip = self.open_git_repo().ok().and_then(|git| {
+            git.find_branch(branch_name, git2::BranchType::Local)
+                .ok()
+                .and_then(|branch| branch.get().target())
+        });
+        let (write_stats, all_imported_commits) = self.phase2_write(
+            repo,
+            &plan.commits,
+            &mut line_index,
+            plan.boundaries(),
+            target_tip,
+        )?;
         // CB-13C F4: a phase-2 failure is a FAILED partial import — the
         // landed commits are durable and accounted in the stats; the
         // caller surfaces the failure and the aggregate still emits.
@@ -4647,36 +5121,48 @@ impl ParallelImporter {
         git_repo: &GitRepository,
         target_oid: Oid,
     ) -> CliResult<Vec<Oid>> {
-        // Incremental single-branch import is the latency-sensitive path. Walk
-        // the first-parent chain from the tip and stop at the imported frontier
-        // instead of rev-walking and filtering the repository's entire history.
-        // CB-9B: every multi-parent merge on the chain also imports the
-        // complete closure of its other parents — the union state must contain
-        // every parent's knowledge before the resolution is assembled.
-        if self.options.incremental && self.options.mainline_only {
+        // Linearized import — the documented plain-import behavior. Walk the
+        // first-parent chain from the tip, stopping at the imported frontier
+        // for incremental runs. Merge commits arrive as ordinary
+        // first-parent diffs, so each file's graph stays a linear per-line
+        // chain: no concurrent lineages, no merge diamonds, and every
+        // staged verification runs against a provable structure.
+        //
+        // CB-9B's complete-closure walk (below) remains for `--all` and the
+        // shim flows, where the union state must contain every parent's
+        // knowledge before a resolution is assembled (RFC §5.3).
+        if self.options.mainline_only {
             let mut newest_first = Vec::new();
             let mut visited: HashSet<String> = HashSet::new();
-            let mut queue = std::collections::VecDeque::new();
-            queue.push_back(target_oid);
-            while let Some(oid) = queue.pop_front() {
+            let mut current = Some(target_oid);
+            while let Some(oid) = current {
                 if self.options.imported_shas.contains(&oid.to_string()) {
-                    continue;
+                    break;
                 }
                 if !visited.insert(oid.to_string()) {
-                    continue;
+                    break;
                 }
                 newest_first.push(oid);
                 let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
                     message: format!("Failed to load commit {oid}: {e}"),
                 })?;
-                for parent in commit.parent_ids() {
-                    queue.push_back(parent);
-                }
+                current = if commit.parent_count() > 0 {
+                    Some(commit.parent_id(0).map_err(|e| CliError::GitError {
+                        message: format!("Failed to load parent of {oid}: {e}"),
+                    })?)
+                } else {
+                    None
+                };
             }
             newest_first.reverse();
             return Ok(newest_first);
         }
 
+        // `--all` (mainline_only=false) imports the complete reachable
+        // closure per branch: deterministically sequenced, with the
+        // missing-object boundary check and the deepening guard run against
+        // the full closure before already-indexed commits are dropped in
+        // validate_branch_prospectively.
         let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
             message: format!("Failed to create revwalk: {}", e),
         })?;
@@ -4787,6 +5273,7 @@ impl ParallelImporter {
         commits: &[VerifiedImportCommit],
         line_index: &mut ImportLineIndex,
         boundaries: &[&'static str],
+        target_tip: Option<git2::Oid>,
     ) -> CliResult<(WriteStats, Vec<ImportedCommitInfo>)> {
         let working_copy = repo
             .require_working_copy_id()
@@ -4798,6 +5285,29 @@ impl ParallelImporter {
         let mut batch_start = Instant::now();
         let git = self.open_git_repo()?;
         let mut ledger = ClosureLedger::default();
+        // The import target's full Git closure: the ancestry the walk
+        // accumulates into the target view. Assembly exclusions whose Git
+        // origin is inside this set are sibling legs of the same target and
+        // are never superseded from the view (see
+        // `supersede_exclusions_for`); origins outside it are genuinely
+        // replaced history. A resolvable branch tip defines the closure
+        // exactly; otherwise this run's walked commits are the best
+        // available approximation.
+        if let Some(tip) = target_tip {
+            let tip_sha = tip.to_string();
+            let closure = ledger
+                .ancestry_of(&git, &tip_sha)
+                .map_err(|e| CliError::GitError {
+                    message: format!("cannot read target tip {tip_sha} ancestry: {e}"),
+                })?;
+            ledger.target_closure = Some(closure);
+        } else {
+            let closure: HashSet<String> = commits
+                .iter()
+                .map(|candidate| candidate.parsed.git_sha.clone())
+                .collect();
+            ledger.target_closure = Some(std::sync::Arc::new(closure));
+        }
         // The last commit this batch writes verifies the whole tree even when
         // earlier commits verify only the paths they touch.
         let last_written = commits
@@ -4848,6 +5358,51 @@ impl ParallelImporter {
             // resurrection over synthesis. Trailers, names, and index rows
             // cannot reach this path: only crypto + Git-content verification.
             if let Some(binding) = self.verified_binding_for(repo, &git, parsed)? {
+                // A binding whose whole closure is already present locally is
+                // referenced into the target view (metadata only) instead of
+                // restored and re-projected: the first reconcile of a branch
+                // created from an anchored tip re-restored every change of
+                // that tip otherwise (tens of minutes on a few hundred
+                // changes). The closure is the binding's own ordered list,
+                // Atomic-private members included, so the view gains exactly
+                // what a resurrection would have proven present.
+                let ordered = &binding.payload().ordered_changes;
+                let all_local =
+                    !ordered.is_empty() && ordered.iter().all(|hash| repo.has_change(hash));
+                if all_local {
+                    repo.ensure_union_state(&self.options.target_view, ordered)
+                        .map_err(|e| CliError::Internal(e.into()))?;
+                    if repo
+                        .git_commit_closure(&parsed.git_sha)
+                        .map_err(|e| CliError::Internal(e.into()))?
+                        .is_none()
+                    {
+                        repo.record_git_commit_closure(&parsed.git_sha, ordered)
+                            .map_err(|e| CliError::Internal(e.into()))?;
+                    }
+                    let atomic_hash = repo
+                        .checked_git_sha(&parsed.git_sha)
+                        .map_err(|e| CliError::Internal(e.into()))?
+                        .or_else(|| ordered.last().copied())
+                        .expect("non-empty closure");
+                    ledger.record_introduced(
+                        &parsed.git_sha,
+                        atomic_hash,
+                        &self.options.target_view,
+                    );
+                    tracing::info!(target: GIT_IMPORT_LOG_TARGET, "bound commit's closure already present locally; referenced instead of resurrected");
+                    stats.changes_written += 1;
+                    stats.files_processed += parsed.files.len();
+                    imported_commits.push(ImportedCommitInfo {
+                        git_sha: parsed.git_sha.clone(),
+                        short_sha: parsed.short_sha.clone(),
+                        atomic_hash,
+                        is_merge: parsed.is_merge,
+                        message: parsed.full_message(),
+                        squash_insert: None,
+                    });
+                    continue;
+                }
                 tracing::info!(target: GIT_IMPORT_LOG_TARGET, "resurrect from its verified binding");
                 let info = self.resurrect_commit(repo, &git, parsed, &binding)?;
                 stats.changes_written += 1;
@@ -4924,7 +5479,7 @@ impl ParallelImporter {
                 if file.operation == FileOperation::Deleted {
                     continue;
                 }
-                let abs_path = repo_root.join(&file.path);
+                let abs_path = repo_root.join(canonical_tree_path(&file.path));
                 if let Ok(metadata) = std::fs::metadata(&abs_path) {
                     use std::time::SystemTime;
                     let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -4937,8 +5492,7 @@ impl ParallelImporter {
                     let content_hash = std::fs::read(&abs_path)
                         .map(|bytes| Hash::of(&bytes))
                         .unwrap_or(Hash::ZERO);
-                    // Normalize path to forward slashes for TREE compatibility
-                    let normalized = file.path.replace('\\', "/");
+                    let normalized = file.path.clone();
                     index_entries.push((normalized, secs, nanos, size, content_hash));
                 }
             }
@@ -5081,7 +5635,9 @@ impl ParallelImporter {
             match file.operation {
                 FileOperation::Deleted => {
                     // The path must be absent (or empty) in the target view.
-                    if let Ok(Some(content)) = repo.get_file_content_on_view(&file.path, target) {
+                    if let Ok(Some(content)) =
+                        repo.get_file_content_on_view(&*repository_path(&file.path), target)
+                    {
                         if !content.is_empty() {
                             return false;
                         }
@@ -5092,7 +5648,7 @@ impl ParallelImporter {
                         Some(c) => c,
                         None => continue,
                     };
-                    match repo.get_file_content_on_view(&file.path, target) {
+                    match repo.get_file_content_on_view(&*repository_path(&file.path), target) {
                         Ok(Some(actual)) if &actual == expected => {}
                         _ => return false,
                     }
@@ -5125,6 +5681,8 @@ impl ParallelImporter {
         boundaries: &[&'static str],
         touched_only: bool,
     ) -> CliResult<ImportedCommitInfo> {
+        #[cfg(test)]
+        stream::assert_ordinary_recorder_allowed();
         // CB-9B F1-adjacent sibling import: a Git commit already interpreted
         // locally (same full SHA) has exactly one Atomic change. Re-synthesizing
         // it in a second branch view allocates a second incarnation with new
@@ -5156,12 +5714,34 @@ impl ParallelImporter {
                 squash_insert: None,
             });
         }
+        // All-parent traversal can visit another leg between a commit and
+        // its child. Synthesis aligns the view to that leg, so exclusions
+        // alone cannot recover the next parent's missing membership. Restore
+        // its canonical closure by reference before resolving file identities;
+        // never reinterpret an already stored file as a fresh FileAdd.
+        if !self.options.mainline_only && parsed.parent_oids.len() == 1 {
+            let parent_sha = parsed.parent_oids[0].to_string();
+            let closure = ledger.interpreted_closure(repo, git, &parent_sha)?;
+            if closure.is_empty() {
+                return Err(git_error(format!(
+                    "commit {} parent {} has no interpreted closure",
+                    parsed.git_sha, parent_sha
+                )));
+            }
+            let mut members: Vec<_> = closure.iter().copied().collect();
+            members.sort();
+            repo.ensure_union_state(&self.options.target_view, &members)
+                .map_err(|e| CliError::Internal(e.into()))?;
+        }
+
         // CB-9A: root and single-parent commits use normal recorded-file
         // assembly with a hashed Git origin. CB-9B: multi-parent merges
         // assemble a journaled `GitResolution` from the union state, and
         // empty commits stay distinct through the synthesized empty-commit
-        // writer.
-        let info = if parsed.is_merge {
+        // writer. In linearized import (`mainline_only`) merges arrive as
+        // ordinary first-parent diffs and take the normal recorded-file
+        // path — no union state, no leg closures.
+        let info = if parsed.is_merge && !self.options.mainline_only {
             self.write_merge_resolution(
                 repo,
                 git,
@@ -5171,8 +5751,8 @@ impl ParallelImporter {
                 prospective,
                 boundaries,
             )?
-        } else if !parsed.is_empty {
-            self.write_commit_synthesized(
+        } else if parsed.is_empty {
+            self.write_empty_commit_synthesized(
                 repo,
                 git,
                 ledger,
@@ -5183,7 +5763,7 @@ impl ParallelImporter {
                 touched_only,
             )?
         } else {
-            self.write_empty_commit_synthesized(
+            self.write_commit_synthesized(
                 repo,
                 git,
                 ledger,
@@ -5360,8 +5940,7 @@ impl ParallelImporter {
     ) -> CliResult<ImportedCommitInfo> {
         use atomic_core::output::memory::Memory;
         use atomic_core::record::workflow::{
-            record_added_file, record_deleted_file, record_modified_file, DetectedFile,
-            RecordingOptions,
+            record_added_file, record_modified_file, DetectedFile, RecordingOptions,
         };
 
         let working_copy = repo
@@ -5402,7 +5981,7 @@ impl ParallelImporter {
                 },
             )
         } else {
-            if parsed.parent_oids.len() > 1 {
+            if parsed.parent_oids.len() > 1 && !self.options.mainline_only {
                 return Err(git_error(format!(
                     "commit {} has {} parents; multi-parent commits take the GitResolution \
                      path, not single-commit synthesis",
@@ -5448,6 +6027,18 @@ impl ParallelImporter {
             &target,
             !parsed.parent_oids.is_empty(),
         )?;
+        // Genuinely replaced history among those exclusions: origins outside
+        // the import target's full closure. Same-closure sibling legs stay
+        // view members (the merge resolution re-references them), so a
+        // mid-walk eviction can never leave a descendant commit assembling
+        // against a missing baseline.
+        let superseded = ledger.supersede_exclusions_for(
+            repo,
+            git,
+            &parsed.git_sha,
+            &target,
+            !parsed.parent_oids.is_empty(),
+        )?;
         let leg_mode = !excluded.is_empty();
 
         enum EffectiveOp {
@@ -5487,7 +6078,7 @@ impl ParallelImporter {
                 // The exact assembly view bytes (excluded lineages invisible,
                 // storage errors propagated — fail closed, never swallowed).
                 let view_baseline: Option<Vec<u8>> = repo
-                    .get_file_content_on_view_excluding(&file.path, &target, &excluded)
+                    .get_file_content_on_view_excluding(&*repository_path(&file.path), &target, &excluded)
                     .map_err(|e| {
                         CliError::Internal(anyhow::anyhow!(
                             "cannot read exact baseline for '{}': {e}",
@@ -5508,7 +6099,7 @@ impl ParallelImporter {
                     _ => None,
                 };
                 let projected = if file.new_mode.is_some() {
-                    repo.projected_attributes_on_view_excluding(&file.path, &target, &excluded)
+                    repo.projected_attributes_on_view_excluding(&repository_path(&file.path), &target, &excluded)
                         .map_err(|e| {
                             CliError::Internal(anyhow::anyhow!(
                                 "cannot project current attributes for '{}': {e}",
@@ -5671,8 +6262,19 @@ impl ParallelImporter {
         // Pre-register added paths so tracking metadata exists before
         // recording (same hygiene as the legacy path). Fail closed: a
         // tracking failure must not silently produce an untracked import.
-        let mut added_paths: Vec<&str> = Vec::new();
+        let mut added_paths: Vec<std::borrow::Cow<'_, str>> = Vec::new();
         let mut deleted_paths: Vec<String> = Vec::new();
+        // Paths this commit vacates: deletions and the source side of
+        // renames. The tracking tree binds their old inode until the
+        // change's own projection unbinds it.
+        let deleted_in_commit: HashSet<&str> = effective
+            .iter()
+            .filter_map(|(file, op, _, _)| match op {
+                EffectiveOp::Deleted => Some(file.path.as_str()),
+                EffectiveOp::Renamed => file.old_path.as_deref(),
+                _ => None,
+            })
+            .collect();
         for (file, op, _baseline, _attrs) in &effective {
             match op {
                 EffectiveOp::Added => {
@@ -5684,14 +6286,27 @@ impl ParallelImporter {
                     if matches!(file.new_mode, Some(0o160000 | 0o120000)) {
                         continue;
                     }
-                    added_paths.push(&file.path);
+                    // A path under a regular file or symlink this same
+                    // commit deletes or renames away (issue #279): TREE
+                    // still binds the old
+                    // inode at the parent until the change's own projection
+                    // unbinds it, so pre-registering the child is refused
+                    // with "projected parent ... is not a directory". The
+                    // graph DirAdd/FileAdd create the projection instead.
+                    if sits_under_deleted_path(&file.path, &deleted_in_commit) {
+                        continue;
+                    }
+                    added_paths.push(repository_path(&file.path));
                 }
-                EffectiveOp::Deleted => deleted_paths.push(file.path.clone()),
+                EffectiveOp::Deleted => {
+                    deleted_paths.push(repository_path(&file.path).into_owned())
+                }
                 _ => {}
             }
         }
         if !self.options.preserve_working_copy && !added_paths.is_empty() {
-            repo.add_batch(working_copy, &added_paths)
+            let added_refs: Vec<&str> = added_paths.iter().map(|path| path.as_ref()).collect();
+            repo.add_batch(working_copy, &added_refs)
                 .map_err(|e| CliError::Internal(e.into()))?;
         }
 
@@ -5738,7 +6353,8 @@ impl ParallelImporter {
                         // The view already renders the new bytes but the
                         // graph-backed attributes differ: the attribute
                         // writes alone are the delta (CB-9C).
-                        let mut attr_rec = RecordedFile::new(&file.path);
+                        let mut attr_rec =
+                            RecordedFile::new(repository_path(&file.path).into_owned());
                         attr_rec.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
                         if let Some((inode, position)) = repo
                             .get_inode_and_position_on_view_excluding(
@@ -5787,8 +6403,8 @@ impl ParallelImporter {
                         ))
                     })?;
                     let memory_wc = Memory::new();
-                    memory_wc.add_file(&file.path, content);
-                    let detected = DetectedFile::added(&file.path);
+                    memory_wc.add_file(&repository_path(&file.path), content);
+                    let detected = DetectedFile::added(repository_path(&file.path).into_owned());
                     match record_added_file(&memory_wc, &detected, &core_options) {
                         Ok(mut rec) if !rec.is_empty() => {
                             // CB-9C: carry the Git mode/kind as graph-backed
@@ -5816,21 +6432,27 @@ impl ParallelImporter {
 
                 EffectiveOp::Renamed => {
                     let old_path = file.old_path.as_deref().unwrap_or(&file.path);
-                    let parent_path = Path::new(&file.path)
+                    let old_repository_path = repository_path(old_path);
+                    let parent_path = Path::new(&*repository_path(&file.path))
                         .parent()
                         .and_then(|p| p.to_str())
-                        .unwrap_or("");
+                        .map(str::to_string)
+                        .unwrap_or_default();
                     let can_emit_move = parent_path.is_empty()
                         || repo
                             .get_inode_and_position_on_view_excluding(
-                                parent_path,
+                                &parent_path,
                                 &target,
                                 &excluded,
                             )
                             .map_err(|e| CliError::Internal(e.into()))?
                             .is_some();
                     let inode_pos = repo
-                        .get_inode_and_position_on_view_excluding(old_path, &target, &excluded)
+                        .get_inode_and_position_on_view_excluding(
+                            &old_repository_path,
+                            &target,
+                            &excluded,
+                        )
                         .map_err(|e| CliError::Internal(e.into()))?;
                     let new_bytes = file.new_content.as_deref().unwrap_or(&[]);
                     let ambiguous = renamed_pairing_is_ambiguous(baseline.as_slice(), new_bytes);
@@ -5878,13 +6500,14 @@ impl ParallelImporter {
                                 self.old_bytes_for(repo, file)
                             };
                             let mut move_rec = repo
-                                .record_foreign_moved_file(
+                                .record_foreign_moved_file_excluding(
                                     &target,
-                                    &file.path,
-                                    old_path,
+                                    &repository_path(&file.path),
+                                    &old_repository_path,
                                     &old_content,
                                     &new_content_owned,
                                     false,
+                                    &excluded,
                                 )
                                 .map_err(|message| {
                                     CliError::Internal(anyhow::anyhow!(
@@ -5915,17 +6538,22 @@ impl ParallelImporter {
                             // greedy match discarded alongside this delta's
                             // own candidate.
                             if old_path != file.path {
-                                deleted_paths.push(old_path.to_string());
+                                deleted_paths.push(repository_path(old_path).into_owned());
                                 // The downgrade is real delete+add semantics:
                                 // the old path must carry a canonical FileDel
                                 // record like a plain imported deletion, bound
                                 // to the actual deleted trunk (review CB-9C
                                 // R2) so the semantic lifecycle tombstones
                                 // instead of leaving the old trunk Alive.
-                                let deleted_record =
-                                    repo.record_foreign_deleted_file(old_path).map_err(
-                                        |message| CliError::Internal(anyhow::anyhow!(message)),
-                                    )?;
+                                let deleted_record = repo
+                                    .record_foreign_deleted_file_on_view_excluding(
+                                        &old_repository_path,
+                                        &target,
+                                        &excluded,
+                                    )
+                                    .map_err(|message| {
+                                        CliError::Internal(anyhow::anyhow!(message))
+                                    })?;
                                 if deleted_record.is_empty() {
                                     return Err(CliError::Internal(anyhow::anyhow!(
                                         "cannot import ambiguous rename source '{}': canonical FileDel is empty",
@@ -6011,8 +6639,9 @@ impl ParallelImporter {
                                     None => continue,
                                 };
                             let memory_wc = Memory::new();
-                            memory_wc.add_file(&file.path, content);
-                            let detected = DetectedFile::added(&file.path);
+                            memory_wc.add_file(&repository_path(&file.path), content);
+                            let detected =
+                                DetectedFile::added(repository_path(&file.path).into_owned());
                             match record_added_file(&memory_wc, &detected, &core_options) {
                                 Ok(mut rec) if !rec.is_empty() => {
                                     for value in attrs {
@@ -6045,7 +6674,7 @@ impl ParallelImporter {
                         ))
                     })?;
                     let memory_wc = Memory::new();
-                    memory_wc.add_file(&file.path, new_content);
+                    memory_wc.add_file(&repository_path(&file.path), new_content);
 
                     // The baseline is the commit's own context: in leg mode
                     // the Git parent-tree bytes (sibling content excluded),
@@ -6057,9 +6686,11 @@ impl ParallelImporter {
                         self.old_bytes_for(repo, file)
                     };
                     let mut detected = DetectedFile::modified(&file.path);
-                    if let Ok(Some((inode, pos))) = repo
-                        .get_inode_and_position_on_view_excluding(&file.path, &target, &excluded)
-                    {
+                    if let Ok(Some((inode, pos))) = repo.get_inode_and_position_on_view_excluding(
+                        &repository_path(&file.path),
+                        &target,
+                        &excluded,
+                    ) {
                         detected.inode = Some(inode);
                         detected.position = Some(pos);
                     }
@@ -6079,7 +6710,11 @@ impl ParallelImporter {
                     // the whole-file replacement record — the same shape
                     // their add used.
                     let recorded = if repo
-                        .get_inode_and_position_on_view_excluding(&file.path, &target, &excluded)
+                        .get_inode_and_position_on_view_excluding(
+                            &repository_path(&file.path),
+                            &target,
+                            &excluded,
+                        )
                         .map_err(|e| CliError::Internal(e.into()))?
                         .is_some()
                     {
@@ -6098,13 +6733,20 @@ impl ParallelImporter {
                         // the file tracked.
                         let conflicted = !leg_mode
                             && repo
-                                .path_has_persisted_conflict(&file.path, &target)
+                                .path_has_persisted_conflict(&repository_path(&file.path), &target)
                                 .map_err(|e| CliError::Internal(e.into()))?;
                         repo.record_foreign_modified_file_on_view_excluding(
-                            &file.path,
+                            &repository_path(&file.path),
                             &old_content,
                             new_content,
-                            conflicted,
+                            // A truncation to an empty file retains the
+                            // file's identity through a content-only
+                            // replacement on every import path: a
+                            // delete-every-line edit kills the path claim
+                            // and fails the staged tree check ("staged tree
+                            // is missing '<path>'") on the mainline walk
+                            // exactly as it did on the full-history one.
+                            conflicted || new_content.is_empty(),
                             &target,
                             &excluded,
                         )
@@ -6141,7 +6783,8 @@ impl ParallelImporter {
                         // Bytes unchanged but the graph-backed attributes
                         // differ: the attribute writes alone are the delta
                         // (CB-9C chmod-only/kind-only commits).
-                        let mut attr_rec = RecordedFile::new(&file.path);
+                        let mut attr_rec =
+                            RecordedFile::new(repository_path(&file.path).into_owned());
                         attr_rec.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
                         if let Some((inode, position)) = repo
                             .get_inode_and_position_on_view_excluding(
@@ -6179,7 +6822,11 @@ impl ParallelImporter {
                     // placeholder-trunk delete tombstoned nobody and left the
                     // moved-to/created trunk row Alive after graph deletion.
                     let recorded = repo
-                        .record_foreign_deleted_file(&file.path)
+                        .record_foreign_deleted_file_on_view_excluding(
+                            &repository_path(&file.path),
+                            &target,
+                            &excluded,
+                        )
                         .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?;
                     recorded_files.push(recorded);
                 }
@@ -6230,8 +6877,16 @@ impl ParallelImporter {
             .map(|recorded| recorded.path().to_string())
             .collect();
         let touched = touched_only.then(|| touched_paths(parsed));
-        let expectation =
+        let mut expectation =
             staged_expectation_for(parsed, prospective, &semantic_paths, touched.as_ref());
+        if let Some(tree) = expectation.tree.as_mut() {
+            tree.semantic_verify_paths = semantic_replay_scope(
+                parsed,
+                &semantic_paths,
+                excluded.is_empty() && superseded.is_empty(),
+                self.options.incremental,
+            );
+        }
         let progress = SlowImportProgress::start(
             slow_import_commit_label(parsed),
             slow_import_record_summary(parsed, &recorded_files),
@@ -6263,14 +6918,16 @@ impl ParallelImporter {
                 &expectation,
                 Some(&parsed.git_sha),
                 &parent_closure,
-                // CB-9B review B4: a single-parent commit's assembly
-                // exclusions are Git-origin members outside its interpreted
-                // closure — history the commit's Git ancestry replaced. They
-                // leave the target view in the same transaction, so the
-                // published boundary equals the isolated interpretation the
-                // staged check verifies, and the import never exits 4 after
-                // publishing a diverged boundary.
-                true,
+                // CB-9B review B4: the genuinely replaced history among this
+                // commit's assembly exclusions — origins outside the import
+                // target's full closure — leaves the target view in the same
+                // transaction, so the published boundary equals the isolated
+                // interpretation the staged check verifies and the import
+                // never exits 4 after publishing a diverged boundary.
+                // Same-closure sibling legs are excluded from assembly only:
+                // the walk still reaches them, and evicting them mid-walk
+                // would corrupt later commits' baselines.
+                &superseded,
             )
             .map_err(|e| CliError::Internal(e.into()))?;
         let progress_reported = progress.finish();
@@ -6323,7 +6980,7 @@ impl ParallelImporter {
     /// falling back to the Git parent-tree bytes captured in Phase 1 for
     /// history whose baseline is not in the graph.
     fn old_bytes_for(&self, repo: &Repository, file: &ParsedFile) -> Vec<u8> {
-        match repo.get_file_content(&file.path) {
+        match repo.get_file_content(&*repository_path(&file.path)) {
             Ok(Some(bytes)) => bytes,
             _ => file.old_content.as_deref().unwrap_or(&[]).to_vec(),
         }
@@ -6423,6 +7080,16 @@ impl ParallelImporter {
             &self.options.target_view,
             !parsed.parent_oids.is_empty(),
         )?;
+        // Genuinely replaced history among the exclusions — same gate as
+        // write_commit_synthesized: sibling legs of the import target stay
+        // view members.
+        let superseded = ledger.supersede_exclusions_for(
+            repo,
+            git,
+            &parsed.git_sha,
+            &self.options.target_view,
+            !parsed.parent_oids.is_empty(),
+        )?;
         let parent_closure: Vec<atomic_core::types::Hash> = if parsed.parent_oids.is_empty() {
             Vec::new()
         } else {
@@ -6451,9 +7118,10 @@ impl ParallelImporter {
                 ),
                 &excluded,
                 // CB-9B review B4: an empty commit still advances the exact
-                // interpreted closure — superseded exclusions leave the view
-                // in the same transaction (see write_commit_synthesized).
-                true,
+                // interpreted closure — genuinely replaced history leaves the
+                // view in the same transaction (see write_commit_synthesized);
+                // same-closure sibling legs stay members.
+                &superseded,
             )
             .map_err(|e| CliError::Internal(e.into()))?;
         // Index git SHA → Atomic change in GIT_SHA_INDEX
@@ -6508,9 +7176,7 @@ impl ParallelImporter {
         boundaries: &[&'static str],
     ) -> CliResult<ImportedCommitInfo> {
         use atomic_core::output::memory::Memory;
-        use atomic_core::record::workflow::{
-            record_added_file, record_deleted_file, DetectedFile, RecordingOptions,
-        };
+        use atomic_core::record::workflow::{record_added_file, DetectedFile, RecordingOptions};
 
         let working_copy = repo
             .require_working_copy_id()
@@ -6591,8 +7257,11 @@ impl ParallelImporter {
         .map_err(|e| CliError::Internal(e.into()))?;
 
         // Record the union→merge-tree delta through the normal workflow.
-        // The candidate path set is the union of the per-parent diffs from
-        // Phase 1; the recorded delta is classified against the exact union
+        // Per-parent Git diffs alone cannot identify the delta: identical
+        // parent blobs can still render differently in the Atomic union
+        // (independent reverts and criss-cross resolutions, for example).
+        // Include every path in the verified merge manifest, plus deletions
+        // from Phase 1. Classify the delta against the exact union
         // visibility (parents' closures only — not the whole view) so
         // reverting side-parent content and resolving conflicts are both
         // captured without inheriting unrelated lineages. Storage and
@@ -6602,32 +7271,119 @@ impl ParallelImporter {
         // the local-record size cap must not refuse a large tracked binary
         // (the 500 MB opaque corpus).
         let core_options = RecordingOptions::new().unlimited_file_size();
+        // Equal Git blobs can still have independent semantic writers. In
+        // particular, two branches can make the same edit and then merge
+        // without any parent-to-merge diff. Record that convergence as an
+        // explicit causal resolution instead of leaving a last-applied row
+        // to choose the line's identity.
+        let convergent_paths = repo
+            .foreign_merge_concurrent_semantic_paths(&target, &excluded)
+            .map_err(|message| {
+                git_error(format!("cannot inspect merge semantic writers: {message}"))
+            })?;
+        let mut files: std::collections::BTreeMap<_, _> = parsed
+            .files
+            .iter()
+            .cloned()
+            .map(|file| (file.path.clone(), file))
+            .collect();
+        let merge_tree = git
+            .find_tree(parsed.tree_oid)
+            .map_err(|e| git_error(e.to_string()))?;
+        let mut attribute_paths: std::collections::HashSet<_> = files.keys().cloned().collect();
+        attribute_paths.extend(convergent_paths.iter().cloned());
+        for entry in &prospective.manifest.entries {
+            if entry.disposition != atomic_repository::ManifestDisposition::Included {
+                continue;
+            }
+            let path = String::from_utf8_lossy(entry.path.as_bytes()).into_owned();
+            // Parent-relative Delete + Rename/Add can share a destination.
+            // They are candidate paths, not two actions on the parent union:
+            // deleting that path can remove the already-correct survivor.
+            // The verified target manifest defines one desired state per path;
+            // canonical union claims still select its inode and name resolution.
+            files.insert(
+                path.clone(),
+                ParsedFile {
+                    new_mode: git_mode_at(git, &merge_tree, &path),
+                    path,
+                    operation: FileOperation::Modified,
+                    new_content: Some(entry.repository_bytes.to_vec()),
+                    old_content: None,
+                    diff_lines: None,
+                    old_path: None,
+                },
+            );
+        }
+        let files: Vec<_> = files.into_values().collect();
         let mut recorded_files: Vec<RecordedFile> = Vec::new();
         let mut deleted_paths: Vec<String> = Vec::new();
-        let mut added_paths: Vec<&str> = Vec::new();
-        for file in &parsed.files {
+        let mut added_paths: Vec<std::borrow::Cow<'_, str>> = Vec::new();
+        let mut resolved_names = std::collections::HashSet::new();
+        for file in &files {
+            if let Some(bytes) = &file.new_content {
+                if let Some(records) = repo
+                    .record_foreign_name_resolution_on_view_excluding(
+                        &file.path, bytes, &target, &excluded,
+                    )
+                    .map_err(|message| {
+                        git_error(format!(
+                            "cannot resolve merge path '{}': {message}",
+                            file.path
+                        ))
+                    })?
+                {
+                    recorded_files.extend(records);
+                    resolved_names.insert(file.path.clone());
+                }
+            }
+        }
+        let deleted_in_merge: HashSet<&str> = files
+            .iter()
+            .filter(|file| file.new_content.is_none())
+            .map(|file| file.path.as_str())
+            .collect();
+        for file in &files {
+            if resolved_names.contains(&file.path) {
+                continue;
+            }
+            // See `write_commit_synthesized`: a child of a same-commit
+            // deletion is projected by its own graph FileAdd (issue #279).
             if file.new_content.is_some()
+                && !sits_under_deleted_path(&file.path, &deleted_in_merge)
                 && repo
-                    .get_file_content_on_view_excluding(&file.path, &target, &excluded)
+                    .get_inode_and_position_on_view_excluding(
+                        &repository_path(&file.path),
+                        &target,
+                        &excluded,
+                    )
                     .map_err(|e| {
                         CliError::Internal(anyhow::anyhow!(
-                            "cannot read exact union baseline for '{}': {e}",
+                            "cannot resolve exact union identity for '{}': {e}",
                             file.path
                         ))
                     })?
                     .is_none()
             {
-                added_paths.push(&file.path);
+                added_paths.push(repository_path(&file.path));
             }
         }
         if !self.options.preserve_working_copy && !added_paths.is_empty() {
-            repo.add_batch(working_copy, &added_paths)
+            let added_refs: Vec<&str> = added_paths.iter().map(|path| path.as_ref()).collect();
+            repo.add_batch(working_copy, &added_refs)
                 .map_err(|e| CliError::Internal(e.into()))?;
         }
         let record_start = std::time::Instant::now();
-        for file in &parsed.files {
+        for file in &files {
+            if resolved_names.contains(&file.path) {
+                continue;
+            }
             let union_bytes = repo
-                .get_file_content_on_view_excluding(&file.path, &target, &excluded)
+                .get_file_content_on_view_excluding(
+                    &*repository_path(&file.path),
+                    &target,
+                    &excluded,
+                )
                 .map_err(|e| {
                     CliError::Internal(anyhow::anyhow!(
                         "cannot read exact union baseline for '{}': {e}",
@@ -6635,10 +7391,12 @@ impl ParallelImporter {
                     ))
                 })?;
             match (&file.new_content, union_bytes) {
-                (Some(new_content), Some(union_content)) if union_content == *new_content => {
+                (Some(new_content), Some(union_content))
+                    if union_content == *new_content && !convergent_paths.contains(&file.path) =>
+                {
                     // The union already matches the merge tree here.
                 }
-                (Some(new_content), Some(_union_content)) => {
+                (Some(new_content), Some(union_content)) => {
                     // The union may hold conflicting spans (both sides
                     // edited the same region additively). A resolution
                     // replaces the file's whole content region with the
@@ -6651,7 +7409,14 @@ impl ParallelImporter {
                     // conflicted union render forces the whole-file-replace
                     // safety path.
                     let rec = repo
-                        .record_resolution_modified_file(&file.path, new_content, &target, true)
+                        .record_foreign_modified_file_on_view_excluding(
+                            &repository_path(&file.path),
+                            &union_content,
+                            new_content,
+                            true,
+                            &target,
+                            &excluded,
+                        )
                         .map_err(|message| {
                             CliError::Internal(anyhow::anyhow!(
                                 "cannot record merge resolution for '{}': {message}",
@@ -6668,8 +7433,8 @@ impl ParallelImporter {
                 }
                 (Some(new_content), None) => {
                     let memory_wc = Memory::new();
-                    memory_wc.add_file(&file.path, new_content);
-                    let detected = DetectedFile::added(&file.path);
+                    memory_wc.add_file(&repository_path(&file.path), new_content);
+                    let detected = DetectedFile::added(repository_path(&file.path).into_owned());
                     match record_added_file(&memory_wc, &detected, &core_options) {
                         Ok(rec) if !rec.is_empty() => {
                             recorded_files.push(rec);
@@ -6689,19 +7454,12 @@ impl ParallelImporter {
                     }
                 }
                 (None, Some(_union_content)) => {
-                    let (inode, position) = repo
-                        .get_inode_and_position(&file.path)
-                        .map_err(|error| CliError::Internal(error.into()))?
-                        .ok_or_else(|| {
-                            git_error(format!(
-                                "cannot import merge deletion '{}': no stable inode binding",
-                                file.path
-                            ))
-                        })?;
-                    let mut detected = DetectedFile::deleted(&file.path);
-                    detected.inode = Some(inode);
-                    detected.position = Some(position);
-                    let recorded = record_deleted_file(&detected, &core_options)
+                    let recorded = repo
+                        .record_foreign_deleted_file_on_view_excluding(
+                            &repository_path(&file.path),
+                            &target,
+                            &excluded,
+                        )
                         .map_err(|message| CliError::Internal(anyhow::anyhow!(message)))?;
                     if recorded.is_empty() {
                         return Err(CliError::Internal(anyhow::anyhow!(
@@ -6710,11 +7468,77 @@ impl ParallelImporter {
                         )));
                     }
                     recorded_files.push(recorded);
-                    deleted_paths.push(file.path.clone());
+                    deleted_paths.push(repository_path(&file.path).into_owned());
                 }
                 (None, None) => {}
             }
         }
+        // The Git merge selects attributes as well as bytes. Carry them on
+        // the same canonical survivor/addition record, including chmod-only
+        // merges whose content required no hunk. Never write attributes on
+        // the losing records of a name resolution.
+        for file in &files {
+            let Some(mode) = file.new_mode.filter(|_| file.new_content.is_some()) else {
+                continue;
+            };
+            let expected = expected_materialization(mode)?;
+            let existing = recorded_files.iter().rposition(|record| {
+                record.path() == file.path
+                    && record.name_conflict_resolution().is_none()
+                    && record.kind() != Some(atomic_core::record::workflow::DetectionKind::Deleted)
+            });
+            // Full-tree comparison must not manufacture attribute-only
+            // records for untouched files whose union already matches.
+            if existing.is_none() && !attribute_paths.contains(&file.path) {
+                continue;
+            }
+            let index = if let Some(index) = existing {
+                index
+            } else {
+                let (inode, position) = repo
+                    .get_inode_and_position_on_view_excluding(
+                        &repository_path(&file.path),
+                        &target,
+                        &excluded,
+                    )
+                    .map_err(|e| CliError::Internal(e.into()))?
+                    .ok_or_else(|| {
+                        git_error(format!(
+                            "merge attribute resolution for '{}' has no canonical inode",
+                            file.path
+                        ))
+                    })?;
+                let mut record = RecordedFile::new(repository_path(&file.path).into_owned());
+                record.set_kind(atomic_core::record::workflow::DetectionKind::Modified);
+                record.set_inode(inode);
+                record.set_position(position);
+                recorded_files.push(record);
+                recorded_files.len() - 1
+            };
+            recorded_files[index].set_attr(atomic_core::change::InodeAttr::Mode(expected.mode()));
+            recorded_files[index].set_attr(atomic_core::change::InodeAttr::Kind(expected.kind()));
+        }
+        let mut directories = std::collections::BTreeSet::new();
+        merge_tree
+            .walk(git2::TreeWalkMode::PreOrder, |prefix, entry| {
+                if entry.kind() == Some(git2::ObjectType::Tree) {
+                    if let Some(name) = entry.name() {
+                        directories.insert(format!("{prefix}{name}"));
+                    }
+                }
+                git2::TreeWalkResult::Ok
+            })
+            .map_err(|e| git_error(e.to_string()))?;
+        let mut directory_records = repo
+            .record_foreign_directory_resolutions_on_view_excluding(
+                &directories,
+                &recorded_files,
+                &target,
+                &excluded,
+            )
+            .map_err(|message| git_error(format!("cannot resolve merge directories: {message}")))?;
+        directory_records.append(&mut recorded_files);
+        recorded_files = directory_records;
         let record_ms = record_start.elapsed().as_millis();
 
         let metadata = git_resolution_metadata(
@@ -7183,12 +8007,12 @@ impl ParallelImporter {
                 // otherwise manufacture the linkage tier.
                 let anchor_binds_event = anchored_operation
                     .map(|operation| {
-                        repo.bridge_anchor_binds_operation(line.as_bytes(), operation)
+                        repo.shim_anchor_binds_operation(line.as_bytes(), operation)
                             .unwrap_or(false)
                     })
                     .unwrap_or(false);
                 let authenticated = !event_id.is_empty()
-                    && repo.bridge_event_captured(line.as_bytes()).unwrap_or(false)
+                    && repo.shim_event_captured(line.as_bytes()).unwrap_or(false)
                     && anchored_operation.is_some()
                     && anchor_binds_event
                     && operation_verified
@@ -7752,6 +8576,16 @@ fn parse_commit(
     _index: usize,
     oid_to_index: &std::collections::HashMap<Oid, usize>,
 ) -> CliResult<ParsedCommit> {
+    parse_commit_with_scope(git_repo, oid, _index, oid_to_index, true)
+}
+
+fn parse_commit_with_scope(
+    git_repo: &GitRepository,
+    oid: Oid,
+    _index: usize,
+    oid_to_index: &std::collections::HashMap<Oid, usize>,
+    include_merge_union: bool,
+) -> CliResult<ParsedCommit> {
     let parse_start = Instant::now();
     let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
         message: format!("Failed to find commit {}: {}", oid, e),
@@ -7880,17 +8714,22 @@ fn parse_commit(
     // delta, not just the first-parent delta. A path where the merge reverts
     // side-parent content or resolves a conflict differs from the union but
     // may equal the first parent, so the file list is the union of the
-    // per-parent diffs (deduped by path; Deleted wins over other states).
-    if is_merge {
+    // per-parent diffs. Keep the first-parent operation for shared paths:
+    // all deltas describe the same target bytes, but replacing a Rename with
+    // a side-parent Modify loses its old path and retains a stale name.
+    if is_merge && include_merge_union {
         trace_git_import(format!(
             "parse-union {} candidate_paths={}",
             short_sha,
             files.len()
         ));
-        let mut union_paths: std::collections::BTreeMap<String, ParsedFile> =
+        let mut union_paths: std::collections::BTreeMap<String, Vec<ParsedFile>> =
             std::collections::BTreeMap::new();
         for file in files {
-            union_paths.insert(file.path.clone(), file);
+            // A rename can replace an existing destination inode. Retain
+            // both its deletion and the move, in delta order: dropping the
+            // deletion leaves two canonical name claimants at the target.
+            union_paths.entry(file.path.clone()).or_default().push(file);
         }
         for parent_number in 1..commit.parent_count() {
             let parent_tree = commit
@@ -7912,15 +8751,10 @@ fn parse_commit(
             for delta in side_diff.deltas() {
                 let new_file = delta.new_file();
                 let old_file = delta.old_file();
-                if new_file.mode() == git2::FileMode::Commit
-                    || old_file.mode() == git2::FileMode::Commit
-                {
-                    continue;
-                }
                 let path = new_file
-                    .path()
-                    .or_else(|| old_file.path())
-                    .map(|p| p.to_string_lossy().to_string())
+                    .path_bytes()
+                    .or_else(|| old_file.path_bytes())
+                    .map(atomic_repository::escape_repo_path)
                     .unwrap_or_default();
                 if path.is_empty() {
                     continue;
@@ -7933,16 +8767,15 @@ fn parse_commit(
                 let new_content = if operation == FileOperation::Deleted {
                     None
                 } else {
-                    get_file_content(git_repo, &tree, &path).ok()
+                    Some(get_file_content(git_repo, &tree, &path)?)
                 };
                 let mode = if operation == FileOperation::Deleted {
                     None
                 } else {
-                    git_mode_at(&tree, &path)
+                    git_mode_at(git_repo, &tree, &path)
                 };
-                union_paths.insert(
-                    path.clone(),
-                    ParsedFile {
+                union_paths.entry(path.clone()).or_insert_with(|| {
+                    vec![ParsedFile {
                         path,
                         operation,
                         new_content,
@@ -7950,11 +8783,11 @@ fn parse_commit(
                         diff_lines: None,
                         old_path: None,
                         new_mode: mode,
-                    },
-                );
+                    }]
+                });
             }
         }
-        files = union_paths.into_values().collect();
+        files = union_paths.into_values().flatten().collect();
     }
     let is_empty = files.is_empty();
 
@@ -8131,37 +8964,11 @@ fn parse_diff_files(
                 if origin != '+' && origin != '-' && origin != ' ' {
                     return true;
                 }
-                let path = delta
-                    .new_file()
-                    .path()
-                    .or_else(|| delta.old_file().path())
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-
-                // The diff-line map uses the same canonical identity as the
-                // parsed deltas (reversible escape), so capture and lookup
-                // agree for raw non-UTF-8 paths.
                 let line_path = delta
                     .new_file()
-                    .path()
-                    .or_else(|| delta.old_file().path())
-                    .map(|p| {
-                        #[cfg(unix)]
-                        let raw = {
-                            use std::os::unix::ffi::OsStrExt;
-                            p.as_os_str().as_bytes().to_vec()
-                        };
-                        #[cfg(not(unix))]
-                        let raw = p.as_os_str().to_string_lossy().into_owned().into_bytes();
-                        let needs_escaping = raw
-                            .iter()
-                            .any(|byte| !byte.is_ascii_graphic() || *byte == b'%');
-                        if needs_escaping {
-                            atomic_repository::escape_repo_path(&raw)
-                        } else {
-                            String::from_utf8_lossy(&raw).into_owned()
-                        }
-                    })
+                    .path_bytes()
+                    .or_else(|| delta.old_file().path_bytes())
+                    .map(atomic_repository::escape_repo_path)
                     .unwrap_or_default();
 
                 lines_by_path
@@ -8188,27 +8995,7 @@ fn parse_diff_files(
     // Refusing here (the historical behavior) lost the file from the imported
     // history instead of preserving it.
     let delta_path = |file: &git2::DiffFile| -> CliResult<Option<String>> {
-        let Some(path) = file.path() else {
-            return Ok(None);
-        };
-        // Raw bytes are unix-only; windows paths are always well-formed UTF-16
-        // round-trips, so the escape is applied to the UTF-8 bytes instead.
-        #[cfg(unix)]
-        let raw = {
-            use std::os::unix::ffi::OsStrExt;
-            path.as_os_str().as_bytes().to_vec()
-        };
-        #[cfg(not(unix))]
-        let raw = path.as_os_str().to_string_lossy().into_owned().into_bytes();
-        let needs_escaping = raw
-            .iter()
-            .any(|byte| !byte.is_ascii_graphic() || *byte == b'%');
-        if needs_escaping {
-            Ok(Some(atomic_repository::escape_repo_path(&raw)))
-        } else {
-            // ASCII-safe and UTF-8 by construction.
-            Ok(Some(String::from_utf8_lossy(&raw).into_owned()))
-        }
+        Ok(file.path_bytes().map(atomic_repository::escape_repo_path))
     };
 
     let mut files = Vec::new();
@@ -8259,7 +9046,7 @@ fn parse_diff_files(
                 FileOperation::Modified | FileOperation::Deleted | FileOperation::Renamed
             ) {
                 parent_tree.and_then(|pt| {
-                    pt.get_path(&canonical_tree_path(&path))
+                    git_tree_entry(git_repo, pt, &path)
                         .ok()
                         .filter(|entry| entry.kind() == Some(git2::ObjectType::Commit))
                         .and_then(|entry| {
@@ -8364,23 +9151,167 @@ fn parse_diff_files(
     // Modified delta carrying the exact old bytes, new bytes, and the new
     // canonical mode. Kind and mode then ride the graph-backed attribute
     // registers instead of a spurious delete/recreate.
-    let mut normalized: Vec<ParsedFile> = Vec::with_capacity(files.len());
-    for file in files {
-        if file.operation == FileOperation::Added {
-            if let Some(previous) = normalized.iter_mut().rev().find(|previous| {
-                previous.path == file.path && previous.operation == FileOperation::Deleted
-            }) {
-                // Merge delete+add into one typechange modification.
-                previous.operation = FileOperation::Modified;
-                previous.new_content = file.new_content.clone();
-                previous.new_mode = file.new_mode;
-                continue;
+    Ok(normalize_typechanges(normalize_rename_collisions(files)))
+}
+
+fn normalize_typechanges(files: Vec<ParsedFile>) -> Vec<ParsedFile> {
+    // libgit2 can emit Added before Deleted for the same path. Pair both
+    // orders before merge deduplication or prospective folding can discard
+    // the addition. Preserve the old target bytes as the modify baseline.
+    let deletions: HashMap<_, _> = files
+        .iter()
+        .filter(|file| file.operation == FileOperation::Deleted)
+        .map(|file| (file.path.clone(), file.old_content.clone()))
+        .collect();
+    let typechanges: HashSet<_> = files
+        .iter()
+        .filter(|file| file.operation == FileOperation::Added && deletions.contains_key(&file.path))
+        .map(|file| file.path.clone())
+        .collect();
+    files
+        .into_iter()
+        .filter_map(|mut file| {
+            if typechanges.contains(&file.path) {
+                if file.operation == FileOperation::Deleted {
+                    return None;
+                }
+                if file.operation == FileOperation::Added {
+                    file.operation = FileOperation::Modified;
+                    file.old_content = deletions[&file.path].clone();
+                    // The two deltas' line streams are not one coherent diff.
+                    file.diff_lines = None;
+                }
             }
+            Some(file)
+        })
+        .collect()
+}
+
+/// The collisions between a commit's renames and its other deltas.
+///
+/// `onto_deleted`: target path of a rename whose target the commit also
+/// deletes → the moved bytes and mode. `reoccupied`: source path of a rename
+/// that an `Added` delta of the same commit re-occupies → the bytes the
+/// source held in the parent. Only a plain add re-occupies: a rename or copy
+/// landing on the vacated path (a swap or rotation) is Git's own rename
+/// chain and is left to the fold.
+#[derive(Default)]
+struct RenameCollisions {
+    onto_deleted: HashMap<String, (Option<Vec<u8>>, Option<u32>)>,
+    reoccupied: HashMap<String, Option<Vec<u8>>>,
+}
+
+impl RenameCollisions {
+    fn collect(files: &[ParsedFile]) -> Self {
+        let added: HashSet<&str> = files
+            .iter()
+            .filter(|file| file.operation == FileOperation::Added)
+            .map(|file| file.path.as_str())
+            .collect();
+        let deleted: HashSet<&str> = files
+            .iter()
+            .filter(|file| file.operation == FileOperation::Deleted)
+            .map(|file| file.path.as_str())
+            .collect();
+        let renames = files
+            .iter()
+            .filter(|file| file.operation == FileOperation::Renamed)
+            .filter_map(|file| file.old_path.as_deref().map(|old_path| (file, old_path)));
+        let onto_deleted: HashMap<String, (Option<Vec<u8>>, Option<u32>)> = renames
+            .clone()
+            .filter(|(file, _)| deleted.contains(file.path.as_str()))
+            .map(|(file, _)| (file.path.clone(), (file.new_content.clone(), file.new_mode)))
+            .collect();
+        let reoccupied = renames
+            .filter(|(file, old_path)| {
+                !onto_deleted.contains_key(&file.path) && added.contains(old_path)
+            })
+            .map(|(file, old_path)| (old_path.to_string(), file.old_content.clone()))
+            .collect();
+        Self {
+            onto_deleted,
+            reoccupied,
         }
-        normalized.push(file);
     }
 
-    Ok(normalized)
+    fn is_empty(&self) -> bool {
+        self.onto_deleted.is_empty() && self.reoccupied.is_empty()
+    }
+
+    /// Rewrite one delta into the shape Git itself reports for the
+    /// collision; deltas not involved are returned untouched.
+    fn rewrite(&self, file: ParsedFile) -> ParsedFile {
+        match file.operation {
+            FileOperation::Renamed if self.onto_deleted.contains_key(&file.path) => ParsedFile {
+                path: file.old_path.clone().unwrap_or_default(),
+                operation: FileOperation::Deleted,
+                new_content: None,
+                old_content: file.old_content,
+                diff_lines: None,
+                old_path: None,
+                new_mode: None,
+            },
+            FileOperation::Renamed
+                if file
+                    .old_path
+                    .as_ref()
+                    .is_some_and(|old_path| self.reoccupied.contains_key(old_path)) =>
+            {
+                ParsedFile {
+                    operation: FileOperation::Added,
+                    old_content: None,
+                    diff_lines: None,
+                    old_path: None,
+                    ..file
+                }
+            }
+            FileOperation::Added if self.reoccupied.contains_key(&file.path) => ParsedFile {
+                operation: FileOperation::Modified,
+                old_content: self.reoccupied[&file.path].clone(),
+                diff_lines: None,
+                ..file
+            },
+            FileOperation::Deleted if self.onto_deleted.contains_key(&file.path) => {
+                let (new_content, new_mode) = self.onto_deleted[&file.path].clone();
+                ParsedFile {
+                    operation: FileOperation::Modified,
+                    new_content,
+                    new_mode,
+                    diff_lines: None,
+                    ..file
+                }
+            }
+            _ => file,
+        }
+    }
+}
+
+/// Resolve a rename that collides with another delta of the same commit.
+///
+/// Rename detection pairs a vacated blob with an added path even when the
+/// commit re-occupies the vacated path (emanote `dc1fb69`: `README.md`
+/// moved into `emanote/` while a symlink to the moved file takes the old
+/// path) or deletes the entry that held the target path (the mirror: a
+/// symlink replaced by the regular file it pointed to). The fold then holds
+/// a rename plus a same-path add or delete, and applying them in delta order
+/// lost one entry, so the prospective tree never matched Git
+/// (`prospective import tree mismatch`).
+///
+/// Git itself reports both shapes as a typechange beside an add (or a
+/// delete), so normalize to that: the re-occupied source becomes a Modified
+/// delta carrying the exact old bytes and the rename degrades to a plain add;
+/// a rename onto a deleted path becomes a plain delete of the source and a
+/// Modified delta of the target carrying the deleted entry's bytes as its
+/// baseline. Ordinary renames, swaps and rotations are returned untouched.
+fn normalize_rename_collisions(files: Vec<ParsedFile>) -> Vec<ParsedFile> {
+    let collisions = RenameCollisions::collect(&files);
+    if collisions.is_empty() {
+        return files;
+    }
+    files
+        .into_iter()
+        .map(|file| collisions.rewrite(file))
+        .collect()
 }
 
 fn parse_diff_files_via_git_cli(
@@ -8390,16 +9321,17 @@ fn parse_diff_files_via_git_cli(
     tree: &Tree<'_>,
     parent_tree: &Tree<'_>,
 ) -> CliResult<Vec<ParsedFile>> {
-    let repo_root = git_repo.path().parent().ok_or_else(|| CliError::GitError {
-        message: "Failed to locate git repository root".to_string(),
-    })?;
-
     let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+        // The caller may run alongside another thread that changes or removes
+        // the process cwd. Git resolves cwd even with --git-dir; anchor the
+        // child to this live repository instead of inheriting that global state.
+        .current_dir(git_repo.path())
+        .arg("--git-dir")
+        .arg(git_repo.path())
         .arg("diff-tree")
         .arg("-r")
         .arg("--name-status")
+        .arg("-z")
         .arg("-M")
         .arg(parent_oid.to_string())
         .arg(commit_oid.to_string())
@@ -8418,83 +9350,70 @@ fn parse_diff_files_via_git_cli(
     }
 
     let mut files = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if line.is_empty() {
-            continue;
+    // NUL framing preserves tabs, newlines, non-UTF-8 bytes, and literal '%'.
+    // Never parse Git's display quoting as a repository path.
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
+            break;
         }
-        let mut parts = line.split('\t');
-        let status = parts.next().unwrap_or_default();
-        let Some(kind) = status.chars().next() else {
-            continue;
+        let kind = status[0];
+        let source = fields
+            .next()
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| git_error("missing path in git diff-tree output"))?;
+        let old_path =
+            matches!(kind, b'R' | b'C').then(|| atomic_repository::escape_repo_path(source));
+        let raw_path = if old_path.is_some() {
+            fields
+                .next()
+                .filter(|path| !path.is_empty())
+                .ok_or_else(|| git_error("missing destination in git diff-tree output"))?
+        } else {
+            source
         };
-
-        match kind {
-            'A' => {
-                let Some(path) = parts.next() else { continue };
-                files.push(ParsedFile {
-                    path: path.to_string(),
-                    operation: FileOperation::Added,
-                    new_content: get_file_content(git_repo, tree, path).ok(),
-                    old_content: None,
-                    diff_lines: None,
-                    old_path: None,
-                    new_mode: git_mode_at(tree, path),
-                });
+        let path = atomic_repository::escape_repo_path(raw_path);
+        let operation = match kind {
+            b'A' => FileOperation::Added,
+            b'M' | b'T' => FileOperation::Modified,
+            b'D' => FileOperation::Deleted,
+            b'R' => FileOperation::Renamed,
+            b'C' => FileOperation::Copied,
+            _ => {
+                return Err(git_error(format!(
+                    "unsupported git diff-tree status: {}",
+                    String::from_utf8_lossy(status)
+                )))
             }
-            'M' => {
-                let Some(path) = parts.next() else { continue };
-                files.push(ParsedFile {
-                    path: path.to_string(),
-                    operation: FileOperation::Modified,
-                    new_content: get_file_content(git_repo, tree, path).ok(),
-                    old_content: get_file_content(git_repo, parent_tree, path).ok(),
-                    diff_lines: None,
-                    old_path: None,
-                    new_mode: git_mode_at(tree, path),
-                });
-            }
-            'D' => {
-                let Some(path) = parts.next() else { continue };
-                files.push(ParsedFile {
-                    path: path.to_string(),
-                    operation: FileOperation::Deleted,
-                    new_content: None,
-                    old_content: get_file_content(git_repo, parent_tree, path).ok(),
-                    diff_lines: None,
-                    old_path: None,
-                    new_mode: None,
-                });
-            }
-            'R' => {
-                let Some(old_path) = parts.next() else {
-                    continue;
-                };
-                let Some(path) = parts.next() else { continue };
-                files.push(ParsedFile {
-                    path: path.to_string(),
-                    operation: FileOperation::Renamed,
-                    new_content: get_file_content(git_repo, tree, path).ok(),
-                    old_content: get_file_content(git_repo, parent_tree, old_path).ok(),
-                    diff_lines: None,
-                    old_path: Some(old_path.to_string()),
-                    new_mode: git_mode_at(tree, path),
-                });
-            }
-            'C' => {
-                let old_path = parts.next();
-                let Some(path) = parts.next() else { continue };
-                files.push(ParsedFile {
-                    path: path.to_string(),
-                    operation: FileOperation::Copied,
-                    new_content: get_file_content(git_repo, tree, path).ok(),
-                    old_content: None,
-                    diff_lines: None,
-                    old_path: old_path.map(|path| path.to_string()),
-                    new_mode: git_mode_at(tree, path),
-                });
-            }
-            _ => {}
-        }
+        };
+        let new_content = if operation == FileOperation::Deleted {
+            None
+        } else {
+            Some(get_file_content(git_repo, tree, &path)?)
+        };
+        let old_content = if matches!(operation, FileOperation::Added | FileOperation::Copied) {
+            None
+        } else {
+            Some(get_file_content(
+                git_repo,
+                parent_tree,
+                old_path.as_deref().unwrap_or(&path),
+            )?)
+        };
+        let new_mode = if operation == FileOperation::Deleted {
+            None
+        } else {
+            git_mode_at(git_repo, tree, &path)
+        };
+        files.push(ParsedFile {
+            path,
+            operation,
+            new_content,
+            old_content,
+            diff_lines: None,
+            old_path,
+            new_mode,
+        });
     }
 
     Ok(files)
@@ -8603,21 +9522,65 @@ fn expected_materialization(git_mode: u32) -> CliResult<ExpectedMaterialization>
     Ok(expected)
 }
 
-fn git_mode_at(tree: &Tree<'_>, path: &str) -> Option<u32> {
-    tree.get_path(Path::new(path))
+fn git_mode_at(git_repo: &GitRepository, tree: &Tree<'_>, path: &str) -> Option<u32> {
+    git_tree_entry(git_repo, tree, path)
         .ok()
         .map(|entry| entry.filemode() as u32)
 }
 
 /// Whether a path exists in the tree (any entry kind).
-fn tree_entry_exists(_git_repo: &GitRepository, tree: &Tree, path: &str) -> bool {
-    tree.get_path(Path::new(path)).is_ok()
+fn tree_entry_exists(git_repo: &GitRepository, tree: &Tree, path: &str) -> bool {
+    git_tree_entry(git_repo, tree, path).is_ok()
 }
 
-/// Get file content from a git tree.
-/// A Git tree lookup path from the canonical String identity: the reversible
-/// escape decodes back to the exact raw bytes (review CB-9C R7).
-fn canonical_tree_path(path: &str) -> PathBuf {
+/// Whether `path` lies under a path this same commit vacates: a regular
+/// file or symlink replaced by a directory of the same name.
+fn sits_under_deleted_path(path: &str, deleted: &HashSet<&str>) -> bool {
+    !deleted.is_empty()
+        && path
+            .rmatch_indices('/')
+            .any(|(end, _)| deleted.contains(&path[..end]))
+}
+
+/// The view a commit's Atomic claim is verified against and, when the view
+/// holds it, the state the commit names.
+struct ViewClaim {
+    view: String,
+    state: Option<Merkle>,
+}
+
+fn view_exists(source: &Repository, view: &str) -> CliResult<bool> {
+    source
+        .view_exists(view)
+        .map_err(|error| CliError::Internal(error.into()))
+}
+
+/// The repository's spelling of a canonical (escaped) Git path: the raw
+/// bytes when they are UTF-8, exactly as native tracking records a path, so
+/// TREE, FILE_INDEX and the change's own file ops carry the name `atomic
+/// status` and `atomic restore <path>` see on disk. Registering the escaped
+/// identity instead left every path with a space or a non-ASCII byte
+/// tracked as `has%20space.txt`: dirty status right after import, and a
+/// view the next incremental import could not verify. A path with
+/// non-UTF-8 bytes keeps its escaped identity (the repository API takes
+/// `&str`), and so does a name with a literal `%`: the projection decodes
+/// tree names, so a raw `%` would be read as an escape (a pre-existing
+/// limit shared with native tracking).
+pub(super) fn repository_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if !path.contains('%') {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    match atomic_repository::unescape_repo_path(path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+    {
+        Some(raw) if !raw.contains('%') => std::borrow::Cow::Owned(raw),
+        _ => std::borrow::Cow::Borrowed(path),
+    }
+}
+
+/// A physical filesystem path decoded from the canonical String identity.
+pub(super) fn canonical_tree_path(path: &str) -> PathBuf {
     match atomic_repository::unescape_repo_path(path) {
         Ok(raw) => {
             #[cfg(unix)]
@@ -8627,22 +9590,56 @@ fn canonical_tree_path(path: &str) -> PathBuf {
             }
             #[cfg(not(unix))]
             {
-                let _ = raw;
-                PathBuf::from(path)
+                match String::from_utf8(raw) {
+                    Ok(decoded) => PathBuf::from(decoded),
+                    Err(_) => PathBuf::from(path),
+                }
             }
         }
         Err(_) => PathBuf::from(path),
     }
 }
 
+/// Look up raw Git path components without routing them through host paths.
+/// Git trees can contain names (including non-UTF-8 bytes) that the host
+/// filesystem cannot represent. Their repository identities must still be
+/// decoded exactly for blob, gitlink, existence, and mode lookups.
+fn git_tree_entry(
+    git_repo: &GitRepository,
+    tree: &Tree<'_>,
+    path: &str,
+) -> CliResult<git2::TreeEntry<'static>> {
+    let raw = atomic_repository::unescape_repo_path(path)
+        .map_err(|error| git_error(format!("invalid encoded Git path '{path}': {error}")))?;
+    let mut components = raw.split(|byte| *byte == b'/').peekable();
+    let mut current = tree.clone();
+    while let Some(component) = components.next() {
+        if component.is_empty() || component.contains(&0) {
+            return Err(git_error(format!("invalid Git tree path '{path}'")));
+        }
+        let entry = current
+            .get_name_bytes(component)
+            .ok_or_else(|| git_error(format!("Path not found in tree: '{path}'")))?;
+        if components.peek().is_none() {
+            return Ok(entry.to_owned());
+        }
+        let subtree_id = entry.id();
+        drop(entry);
+        current = git_repo
+            .find_tree(subtree_id)
+            .map_err(|error| git_error(format!("cannot read Git subtree for '{path}': {error}")))?;
+    }
+    Err(git_error(format!("invalid empty Git tree path '{path}'")))
+}
+
 fn get_file_content(git_repo: &GitRepository, tree: &Tree, path: &str) -> CliResult<Vec<u8>> {
     // CB-9C path fidelity: the String identity is the reversible escape of
     // the raw Git bytes, so the tree lookup decodes before reading.
-    let entry = tree
-        .get_path(&canonical_tree_path(path))
-        .map_err(|e| CliError::GitError {
-            message: format!("Path not found in tree: {}", e),
-        })?;
+    let entry = git_tree_entry(git_repo, tree, path)?;
+
+    if entry.kind() == Some(ObjectType::Commit) {
+        return Ok(entry.id().to_string().into_bytes());
+    }
 
     if entry.kind() != Some(ObjectType::Blob) {
         return Err(CliError::GitError {
@@ -8688,6 +9685,17 @@ fn parse_commit_message(message: &str) -> (String, Option<String>) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+#[path = "parallel_import_regression_tests.rs"]
+mod import_regression_tests;
+
+#[cfg(test)]
+#[path = "real_import_sample.rs"]
+mod real_import_sample;
+
+#[path = "stream.rs"]
+mod stream;
 
 #[cfg(test)]
 mod tests {
@@ -9337,8 +10345,8 @@ mod tests {
         let repo = GitRepository::init(temp.path()).unwrap();
         repo.set_head("refs/heads/main").unwrap();
         let signature = git2::Signature::new(
-            "Bridge",
-            "bridge@example.com",
+            "Shim",
+            "shim@example.com",
             &git2::Time::new(committer_time, 0),
         )
         .unwrap();
@@ -9375,7 +10383,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_sequencing_orders_parents_before_children_and_is_deterministic() {
+    fn shim_sequencing_orders_parents_before_children_and_is_deterministic() {
         let (_temp, git) = chained_git_repo(4, 1_700_000_000);
         // Collect in an arbitrary order; sequencing must restore the causal
         // order regardless of input order.
@@ -9420,14 +10428,14 @@ mod tests {
     }
 
     #[test]
-    fn bridge_sequencing_breaks_ties_by_committer_time_then_tagged_oid() {
+    fn shim_sequencing_breaks_ties_by_committer_time_then_tagged_oid() {
         // Two independent roots committed at the same time: the ready set has
         // two entries, so the (committer time, OID) rule decides the order.
         let temp = tempfile::TempDir::new().unwrap();
         let git = GitRepository::init(temp.path()).unwrap();
         let signature = git2::Signature::new(
-            "Bridge",
-            "bridge@example.com",
+            "Shim",
+            "shim@example.com",
             &git2::Time::new(1_700_000_000, 0),
         )
         .unwrap();
@@ -9450,7 +10458,7 @@ mod tests {
         assert_eq!(ordered.len(), 2);
         assert!(
             tie_breaks >= 1,
-            "the tie must be recorded as a bridge decision"
+            "the tie must be recorded as a shim decision"
         );
         // Same committer time: the lower tagged OID bytes win.
         let mut by_oid = roots.clone();
@@ -9458,8 +10466,8 @@ mod tests {
         assert_eq!(ordered, by_oid, "ties break by tagged OID bytes");
         // A later committer time wins over a lower OID.
         let later_signature = git2::Signature::new(
-            "Bridge",
-            "bridge@example.com",
+            "Shim",
+            "shim@example.com",
             &git2::Time::new(1_700_000_100, 0),
         )
         .unwrap();

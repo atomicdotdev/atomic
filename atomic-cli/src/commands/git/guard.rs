@@ -6,8 +6,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::{
-    self, BridgeCheckpoint, CheckpointAtomicState, CheckpointError, GitAdminIdentity,
-    ManifestRootEvidence,
+    self, CheckpointAtomicState, CheckpointError, GitAdminIdentity, ManifestRootEvidence,
+    ShimCheckpoint,
 };
 use super::observation::{
     display_git_bytes, observe_git, GitObservation, HeadObservation, ObservationError,
@@ -31,16 +31,16 @@ pub(crate) enum GuardOperation {
     ForensicStatus,
     /// A historical diff does not interpret the working copy.
     HistoryOnlyDiff,
-    /// Bridge bootstrap/reconciliation is the remediation path and must not
+    /// Shim bootstrap/reconciliation is the remediation path and must not
     /// recursively guard itself.
-    BridgeBootstrap,
+    ShimBootstrap,
 }
 
 impl GuardOperation {
     pub(crate) fn is_bypass(self) -> bool {
         matches!(
             self,
-            Self::ForensicStatus | Self::HistoryOnlyDiff | Self::BridgeBootstrap
+            Self::ForensicStatus | Self::HistoryOnlyDiff | Self::ShimBootstrap
         )
     }
 }
@@ -58,7 +58,7 @@ impl std::fmt::Display for GuardOperation {
             Self::AgentSessionEnd => "agent session-end",
             Self::ForensicStatus => "status --no-reconcile",
             Self::HistoryOnlyDiff => "history-only diff",
-            Self::BridgeBootstrap => "bridge bootstrap/reconcile",
+            Self::ShimBootstrap => "shim bootstrap/reconcile",
         })
     }
 }
@@ -188,9 +188,9 @@ pub(crate) struct GuardEvidence {
 pub(crate) enum GuardPassReason {
     Bypass,
     NoGit,
-    /// Colocated with Git, but the working copy never enrolled in the bridge
+    /// Colocated with Git, but the working copy never enrolled in the shim
     /// (RFC §2): the stale-baseline guard has no baseline to protect.
-    BridgeNotEnabled,
+    ShimNotEnabled,
     Unchanged,
     AtomicAdvanced,
     EquivalentView,
@@ -224,9 +224,9 @@ pub(crate) enum GuardRefusalReason {
 impl std::fmt::Display for GuardRefusalReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::CheckpointMissing => "no bridge checkpoint establishes the filesystem baseline",
-            Self::StaleGitBaseline => "Git moved away from the bridge checkpoint",
-            Self::Diverged => "both Git and Atomic moved away from the bridge checkpoint",
+            Self::CheckpointMissing => "no shim checkpoint establishes the filesystem baseline",
+            Self::StaleGitBaseline => "Git moved away from the shim checkpoint",
+            Self::Diverged => "both Git and Atomic moved away from the shim checkpoint",
             Self::DetachedHead => "Git HEAD is detached",
             Self::UnbornHead => "Git HEAD is unborn",
             Self::MissingHeadTarget => "Git HEAD points to a missing branch target",
@@ -482,10 +482,10 @@ pub(crate) fn guard_working_copy(request: GuardRequest<'_>) -> Result<GuardOutco
         atomic,
         git: GuardGitEvidence::Repository(Box::new(git_evidence(&repository))),
     };
-    if !bridge_workspace_active(request.root)? {
+    if !shim_workspace_active(request.root)? {
         return Ok(GuardOutcome::Pass(Box::new(GuardPass {
             operation: request.operation,
-            reason: GuardPassReason::BridgeNotEnabled,
+            reason: GuardPassReason::ShimNotEnabled,
             old: None,
             current: Some(current),
         })));
@@ -512,21 +512,21 @@ pub(crate) fn guard_working_copy(request: GuardRequest<'_>) -> Result<GuardOutco
     Ok(outcome)
 }
 
-/// Whether the working copy at `root` enrolled in the Git bridge (explicit
-/// opt-in or a checkpoint written by an explicit bridge command).
-fn bridge_workspace_active(root: &Path) -> Result<bool, GuardError> {
+/// Whether the working copy at `root` enrolled in the Git shim (explicit
+/// opt-in or a checkpoint written by an explicit shim command).
+fn shim_workspace_active(root: &Path) -> Result<bool, GuardError> {
     let repository = atomic_repository::Repository::open_readonly(root).map_err(|error| {
         CheckpointError::Atomic(format!("cannot open repository read-only: {error}"))
     })?;
     repository
-        .bridge_workspace_active()
+        .shim_workspace_active()
         .map_err(|error| CheckpointError::Atomic(error.to_string()).into())
 }
 
 /// Pure causal-baseline classifier used by every future command boundary.
 pub(crate) fn classify_guard(
     operation: GuardOperation,
-    checkpoint: Option<&BridgeCheckpoint>,
+    checkpoint: Option<&ShimCheckpoint>,
     current: &GuardEvidence,
 ) -> GuardOutcome {
     if operation.is_bypass() {
@@ -722,7 +722,7 @@ pub(crate) fn classify_guard(
     }))
 }
 
-fn checkpoint_evidence(checkpoint: &BridgeCheckpoint) -> GuardEvidence {
+fn checkpoint_evidence(checkpoint: &ShimCheckpoint) -> GuardEvidence {
     let head = match (&checkpoint.git_head_symref, checkpoint.git_head.is_empty()) {
         (Some(symref), false) => GitHeadEvidence::Attached {
             symref: symref.clone(),
@@ -853,7 +853,7 @@ fn remediation(
     current: &GuardEvidence,
 ) -> GuardRemediation {
     let forensic = "atomic status --no-reconcile".to_string();
-    let reconcile = "atomic git bridge reconcile".to_string();
+    let reconcile = "atomic git shim reconcile".to_string();
     match reason {
         GuardRefusalReason::CheckpointMissing | GuardRefusalReason::StaleGitBaseline => {
             GuardRemediation {
@@ -880,7 +880,7 @@ fn remediation(
             }
         }
         GuardRefusalReason::UnbornHead => GuardRemediation {
-            summary: "Create the repository's initial Git commit, then establish a bridge checkpoint."
+            summary: "Create the repository's initial Git commit, then establish a shim checkpoint."
                 .to_string(),
             commands: vec![forensic, "git status".to_string(), reconcile],
         },
@@ -927,7 +927,7 @@ fn remediation(
         GuardRefusalReason::AtomicEvidenceChanged => GuardRemediation {
             summary: "Verify graph projection integrity; the same Atomic state must not produce a different provisional root."
                 .to_string(),
-            commands: vec![forensic, "atomic git bridge verify".to_string()],
+            commands: vec![forensic, "atomic git shim verify".to_string()],
         },
     }
 }
@@ -968,7 +968,7 @@ mod tests {
     use std::fs;
     use std::process::Command;
 
-    use super::super::checkpoint::{BridgeCheckpoint, GitAdminIdentity, CHECKPOINT_VERSION};
+    use super::super::checkpoint::{GitAdminIdentity, ShimCheckpoint, CHECKPOINT_VERSION};
     use super::*;
 
     fn root(value: &str) -> ManifestRootEvidence {
@@ -979,8 +979,8 @@ mod tests {
         }
     }
 
-    fn checkpoint() -> BridgeCheckpoint {
-        BridgeCheckpoint {
+    fn checkpoint() -> ShimCheckpoint {
+        ShimCheckpoint {
             version: CHECKPOINT_VERSION,
             view: "main".to_string(),
             atomic_state: "atomic-1".to_string(),
@@ -1125,7 +1125,7 @@ mod tests {
                 .remediation
                 .commands
                 .iter()
-                .any(|command| command == "atomic git bridge reconcile"));
+                .any(|command| command == "atomic git shim reconcile"));
         }
 
         let mut diverged = current();
@@ -1252,7 +1252,7 @@ mod tests {
         for operation in [
             GuardOperation::ForensicStatus,
             GuardOperation::HistoryOnlyDiff,
-            GuardOperation::BridgeBootstrap,
+            GuardOperation::ShimBootstrap,
         ] {
             assert_eq!(
                 pass_reason(classify_guard(operation, None, &current())),
@@ -1282,7 +1282,7 @@ mod tests {
             "Git refs digest: refs-1",
             "Atomic manifest root:",
             "Git manifest root:",
-            "atomic git bridge reconcile",
+            "atomic git shim reconcile",
         ] {
             assert!(report.contains(required), "missing {required:?}:\n{report}");
         }

@@ -507,22 +507,22 @@ impl Push {
 
     /// Async implementation of the push command.
     async fn run_async(&self) -> CliResult<()> {
-        // For an active Git bridge, run CB-4B through a read-only Atomic handle
+        // For an active Git shim, run CB-4B through a read-only Atomic handle
         // before writable open can recover/create an operation and before the
         // first HTTP `/code` negotiation POST. Plain Atomic repositories retain
         // their original writable-open/recovery behavior.
         let repo_root = find_repository_root()?;
-        let preflight = if crate::commands::git::shadow::bridge_publication_required(&repo_root) {
+        let preflight = if crate::commands::git::shadow::shim_publication_required(&repo_root) {
             let readonly_repo =
                 Repository::open_readonly(&repo_root).map_err(CliError::Repository)?;
             let local_view = self.get_local_view(&readonly_repo)?;
-            let publication = crate::commands::git::shadow::verify_bridge_publication(
+            let publication = crate::commands::git::shadow::verify_shim_publication(
                 &readonly_repo,
                 &repo_root,
                 &local_view,
             )?
             .ok_or_else(|| CliError::GitError {
-                message: "Git bridge publication marker disappeared during preflight".to_string(),
+                message: "Git shim publication marker disappeared during preflight".to_string(),
             })?;
             Some((local_view, publication))
         } else {
@@ -724,8 +724,15 @@ impl Push {
                     atomic_repository::repository::provenance_gate::local_session_mac_key_provider(
                         &repo,
                     );
-                repo.enforce_publication_gate("Atomic push", &push_closure, Some(&provider))
-                    .map_err(CliError::Repository)?;
+                let did_provider =
+                    atomic_repository::repository::provenance_gate::local_did_key_provider(&repo);
+                repo.enforce_publication_gate(
+                    "Atomic push",
+                    &push_closure,
+                    Some(&provider),
+                    Some(&did_provider),
+                )
+                .map_err(CliError::Repository)?;
             }
         }
 
@@ -1003,6 +1010,19 @@ impl Push {
         let push_operation = repo
             .prepare_remote_operation(working_copy, OperationKind::Push, &remote_name, evidence)
             .map_err(CliError::Repository)?;
+
+        // Bind the local project identity before anything moves: an unbound
+        // remote adopts ours; a remote bound to a DIFFERENT identity refuses
+        // the push here rather than publishing under the wrong namespace.
+        if let Some(local_identity) = repo.project_identity().map_err(CliError::Repository)? {
+            match libatomic::identity_transport::bind_before_push(&local_identity, &remote).await {
+                Ok(libatomic::identity_transport::PushBind::Bound(project_id)) => {
+                    print_success(&format!("Bound project identity {project_id} to remote"));
+                }
+                Ok(libatomic::identity_transport::PushBind::Unsupported) => {}
+                Err(error) => return Err(CliError::Repository(error)),
+            }
+        }
 
         // Send everything in one `/code` push: objects stored + refs CAS-moved.
         if !pack.is_empty() {

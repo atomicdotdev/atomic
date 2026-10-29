@@ -62,125 +62,6 @@ impl ClaudeCodeHook {
     fn settings_path(repo_root: &Path) -> PathBuf {
         repo_root.join(CLAUDE_DIR).join(SETTINGS_FILE)
     }
-
-    /// Returns the path to the global `~/.claude/settings.json`.
-    ///
-    /// Global hooks apply to every Claude Code session regardless of project.
-    pub fn global_settings_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|home| home.join(CLAUDE_DIR).join(SETTINGS_FILE))
-    }
-
-    /// Install hooks globally to `~/.claude/settings.json`.
-    ///
-    /// # Returns
-    ///
-    /// The number of hooks installed (0 if already up to date).
-    pub fn install_global(&self, force: bool) -> AgentResult<usize> {
-        let settings_path =
-            Self::global_settings_path().ok_or_else(|| AgentError::ConfigError {
-                operation: "resolve home".to_string(),
-                path: PathBuf::from("~/.claude/settings.json"),
-                reason: "Could not determine home directory".to_string(),
-            })?;
-
-        // Create ~/.claude/ if needed
-        if let Some(parent) = settings_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|e| AgentError::ConfigError {
-                    operation: "create directory".to_string(),
-                    path: parent.to_path_buf(),
-                    reason: e.to_string(),
-                })?;
-            }
-        }
-
-        let (mut raw, mut hooks) = settings::read_settings(&settings_path)?;
-
-        // If forcing, remove existing atomic hooks first
-        if force {
-            settings::remove_atomic_hooks(&mut hooks.session_start);
-            settings::remove_atomic_hooks(&mut hooks.session_end);
-            settings::remove_atomic_hooks(&mut hooks.stop);
-            settings::remove_atomic_hooks(&mut hooks.user_prompt_submit);
-            settings::remove_atomic_hooks(&mut hooks.pre_tool_use);
-            settings::remove_atomic_hooks(&mut hooks.post_tool_use);
-        }
-
-        let count = install_hooks_into(&mut hooks, &settings_path)?;
-
-        // Add permissions.deny rule
-        let permissions_changed = settings::ensure_deny_rule(&mut raw);
-
-        if count == 0 && !permissions_changed {
-            return Ok(0);
-        }
-
-        // Serialize hooks back into raw settings
-        let hooks_val = serde_json::to_value(&hooks).map_err(|e| AgentError::ConfigError {
-            operation: "serialize hooks".to_string(),
-            path: settings_path.clone(),
-            reason: e.to_string(),
-        })?;
-        raw.insert("hooks".to_string(), hooks_val);
-        settings::write_settings(&settings_path, &raw)?;
-
-        Ok(count)
-    }
-
-    /// Remove hooks from the global `~/.claude/settings.json`.
-    pub fn uninstall_global(&self) -> AgentResult<()> {
-        let settings_path = match Self::global_settings_path() {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-
-        if !settings_path.exists() {
-            return Ok(());
-        }
-
-        let (mut raw, mut hooks) = settings::read_settings(&settings_path)?;
-
-        settings::remove_atomic_hooks(&mut hooks.session_start);
-        settings::remove_atomic_hooks(&mut hooks.session_end);
-        settings::remove_atomic_hooks(&mut hooks.stop);
-        settings::remove_atomic_hooks(&mut hooks.user_prompt_submit);
-        settings::remove_atomic_hooks(&mut hooks.pre_tool_use);
-        settings::remove_atomic_hooks(&mut hooks.post_tool_use);
-
-        let hooks_val = serde_json::to_value(&hooks).map_err(|e| AgentError::ConfigError {
-            operation: "serialize hooks".to_string(),
-            path: settings_path.clone(),
-            reason: e.to_string(),
-        })?;
-        raw.insert("hooks".to_string(), hooks_val);
-        settings::write_settings(&settings_path, &raw)?;
-
-        Ok(())
-    }
-
-    /// Check if hooks are installed globally in `~/.claude/settings.json`.
-    pub fn is_installed_global(&self) -> bool {
-        let settings_path = match Self::global_settings_path() {
-            Some(p) => p,
-            None => return false,
-        };
-
-        if !settings_path.exists() {
-            return false;
-        }
-
-        match settings::read_settings(&settings_path) {
-            Ok((_, hooks)) => {
-                settings::has_any_atomic_hook(&hooks.session_start)
-                    || settings::has_any_atomic_hook(&hooks.session_end)
-                    || settings::has_any_atomic_hook(&hooks.stop)
-                    || settings::has_any_atomic_hook(&hooks.user_prompt_submit)
-                    || settings::has_any_atomic_hook(&hooks.pre_tool_use)
-                    || settings::has_any_atomic_hook(&hooks.post_tool_use)
-            }
-            Err(_) => false,
-        }
-    }
 }
 
 impl Default for ClaudeCodeHook {
@@ -274,9 +155,8 @@ impl AgentHook for ClaudeCodeHook {
             return false;
         };
 
-        // Check if any hook command starts with our prefix
-        let json_str = raw.to_string();
-        json_str.contains(ATOMIC_HOOK_PREFIX)
+        super::live::json_hooks_active("claude-code", &raw, "hooks", ATOMIC_HOOK_PREFIX)
+            .unwrap_or(false)
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {

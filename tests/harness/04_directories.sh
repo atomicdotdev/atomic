@@ -518,21 +518,25 @@ create_file "removable/two.txt" "two"
 
 assert_success "add removable/one.txt" atomic add removable/one.txt
 assert_success "add removable/two.txt" atomic add removable/two.txt
-record_change "Add removable dir" >/dev/null 2>&1 || true
 
-# Remove directory contents from tracking
-rm_out="$(atomic remove removable/one.txt 2>&1)" || true
-rm_out2="$(atomic remove removable/two.txt 2>&1)" || true
+# Staged (never recorded): remove untracks the name and keeps the bytes.
+assert_success "remove staged file keeps bytes" atomic remove removable/one.txt
+assert_file_exists "staged removable/one.txt still on disk" "removable/one.txt"
+assert_status_flag "staged removable/one.txt reads untracked" "??" "removable/one.txt"
 
-if echo "$rm_out" | grep -qiE "removed|untrack" || [[ $? -eq 0 ]]; then
-    _pass "remove dir files from tracking"
-else
-    _skip "remove dir files from tracking" "remove command may not exist yet"
-fi
+# Recorded: remove mirrors git rm — the bytes leave the working copy and the
+# deletion stays pending until a record finalizes the untrack.
+assert_success "record removable/two.txt" atomic record -m "track two" removable/two.txt
+assert_success "remove recorded file" atomic remove removable/two.txt
+assert_file_not_exists "recorded removable/two.txt gone from disk" "removable/two.txt"
+assert_status_flag "recorded removable/two.txt pending deletion" "D" "removable/two.txt"
+assert_success "record the removal" atomic record -m "stop tracking two"
+assert_status_no_entry "removable/two.txt has no pending state after record" "removable/two.txt"
 
-# Files should still exist on disk
-assert_file_exists "removable/one.txt still on disk" "removable/one.txt"
-assert_file_exists "removable/two.txt still on disk" "removable/two.txt"
+# Git parity: bytes recreated at the recorded-deleted path are untracked,
+# never an implicit re-add candidate.
+create_file "removable/two.txt" "reborn"
+assert_status_flag "recreated removable/two.txt reads untracked" "??" "removable/two.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Directory with only subdirectories"

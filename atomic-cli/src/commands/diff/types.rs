@@ -713,6 +713,9 @@ impl From<FileStatus> for FileChangeStatus {
             FileStatus::TypeChanged => FileChangeStatus::TypeChanged,
             FileStatus::Clean => FileChangeStatus::Modified, // Shouldn't happen
             FileStatus::Untracked => FileChangeStatus::Untracked,
+            // The diff reads a pending untrack as the deletion the next
+            // record lands, matching the repository-level mapping.
+            FileStatus::PendingUntrack => FileChangeStatus::Deleted,
             FileStatus::Conflicted => FileChangeStatus::Modified,
             FileStatus::PermissionsChanged => FileChangeStatus::Modified,
         }
