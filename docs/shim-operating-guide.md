@@ -42,12 +42,19 @@ cargo build -p atomic-cli --no-default-features --features teams
 cargo build -p atomic-cli --no-default-features --features git-shim
 ```
 
-A build without `git-shim` omits `atomic git` and refuses Git clone/adoption,
-`status --git`, and `diff --git`. Native init, record, and view operations
+A build without `git-shim` omits `atomic git`, `atomic stage`, and
+`atomic unstage`, and refuses Git clone/adoption, `status --git`, and
+`diff --git`. Native init, record, and view operations
 remain available. An already enrolled workspace requires a shim-enabled
 binary: the native-only CLI refuses before command execution, including RPC
 dispatch, instead of updating Atomic without its Git publication adapter.
 Use a shim-enabled binary to continue or to explicitly disable enrollment.
+
+`atomic stage` and `atomic unstage` are Git interoperability commands for
+colocated repositories. Stage writes file content to the Git index; unstage
+restores index entries to Git HEAD while keeping worktree edits. Native Atomic
+uses `atomic add` for tracking and `atomic record` for recording changes,
+without requiring a staging step.
 
 This split does not remove Git-related repository data or every transitive
 Git dependency. Repository guards, graph history, closure resolution, and

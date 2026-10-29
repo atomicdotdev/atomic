@@ -24,6 +24,8 @@ use crate::output::{print_blank, print_hint, print_info, print_success};
 /// Staging never decides what a future managed commit will contain; it only
 /// selects content. Paths that are neither durably tracked nor recorded as
 /// intent-to-add are refused: tracking decisions belong to `atomic add`.
+/// This is a Git interoperability command; native Atomic recording does not
+/// require staging.
 #[derive(Parser, Debug)]
 pub struct Stage {
     /// Paths to stage content for.
@@ -36,6 +38,8 @@ pub struct Stage {
 }
 
 /// Move index entries back to the Git baseline without touching the worktree.
+///
+/// This is a Git interoperability command for colocated repositories.
 #[derive(Parser, Debug)]
 pub struct Unstage {
     /// Paths to unstage.

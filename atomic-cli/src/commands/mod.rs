@@ -94,6 +94,7 @@ pub(crate) mod rpc;
 pub mod sandbox;
 pub mod session;
 pub mod split;
+#[cfg(feature = "git-shim")]
 pub mod stage;
 pub mod stash;
 pub mod status;
@@ -180,6 +181,7 @@ pub use sandbox::Sandbox;
 pub use server::ServerCmd;
 pub use session::Session;
 pub use split::Split;
+#[cfg(feature = "git-shim")]
 pub use stage::{Stage, Unstage};
 pub use stash::Stash;
 pub use status::Status;

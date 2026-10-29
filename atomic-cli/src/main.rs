@@ -66,7 +66,7 @@ mod service;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 #[cfg(feature = "git-shim")]
-use commands::Git;
+use commands::{Git, Stage, Unstage};
 
 use commands::{
     Add,
@@ -103,13 +103,11 @@ use commands::{
     ServerCmd,
     Session,
     Split,
-    Stage,
     Stash,
     Status,
     Tag,
     Triage,
     Unrecord,
-    Unstage,
     Update,
     Vault,
     View,
@@ -260,9 +258,15 @@ enum Commands {
     ///
     /// Stages content of tracked or intent-to-add paths. Staging never
     /// creates durable tracking; run `atomic add` for that.
+    /// This is a Git interoperability command; native Atomic recording
+    /// does not require staging.
+    #[cfg(feature = "git-shim")]
     Stage(Stage),
 
     /// Move Git index entries back to the baseline without touching the worktree.
+    ///
+    /// This is a Git interoperability command for colocated repositories.
+    #[cfg(feature = "git-shim")]
     Unstage(Unstage),
 
     /// Remove files from tracking.
@@ -1046,7 +1050,9 @@ fn main() {
         Commands::Session(session) => session.run(),
 
         Commands::Split(split) => split.run(),
+        #[cfg(feature = "git-shim")]
         Commands::Stage(stage) => stage.run(),
+        #[cfg(feature = "git-shim")]
         Commands::Unstage(unstage) => unstage.run(),
 
         Commands::Record(record) => record.run(),

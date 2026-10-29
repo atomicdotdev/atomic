@@ -35,20 +35,87 @@ fn ok(root: &Path, home: &Path, args: &[&str]) -> Output {
 }
 
 #[test]
-fn git_command_matches_build_feature() {
+fn git_commands_match_build_feature() {
     let root = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
-    let output = atomic(root.path(), home.path(), &["git", "--help"]);
-    assert_eq!(
-        output.status.success(),
-        cfg!(feature = "git-shim"),
-        "{}",
-        text(&output)
-    );
-    if cfg!(feature = "git-shim") {
-        assert!(text(&output).contains("import"));
-        assert!(text(&output).contains("shim"));
+    let help = text(&ok(root.path(), home.path(), &["--help"]));
+    for command in ["git", "stage", "unstage"] {
+        assert_eq!(
+            help.lines()
+                .any(|line| line.split_whitespace().next() == Some(command)),
+            cfg!(feature = "git-shim"),
+            "{command} availability in root help: {help}"
+        );
+        let output = atomic(root.path(), home.path(), &[command, "--help"]);
+        assert_eq!(
+            output.status.success(),
+            cfg!(feature = "git-shim"),
+            "{command}: {}",
+            text(&output)
+        );
+        if command == "git" && cfg!(feature = "git-shim") {
+            assert!(text(&output).contains("import"));
+            assert!(text(&output).contains("shim"));
+        }
     }
+}
+
+#[cfg(not(feature = "git-shim"))]
+#[test]
+fn disabled_staging_commands_preserve_unenrolled_git_index_and_native_history() {
+    let root = TempDir::new().unwrap();
+    let home = TempDir::new().unwrap();
+    let (root, home) = (root.path(), home.path());
+    ok(root, home, &["init", "--no-vault", "--view", "main"]);
+    fs::write(root.join("tracked.txt"), b"baseline\n").unwrap();
+    ok(root, home, &["add", "tracked.txt"]);
+    ok(root, home, &["record", "-m", "native baseline"]);
+    let native_history = ok(root, home, &["log"]).stdout;
+
+    // An unenrolled colocated repository bypasses the enrollment guard.
+    // Keep distinct HEAD, index, and worktree bytes: either staging operation
+    // would change the real index if its command were still available.
+    let git = git2::Repository::init(root).unwrap();
+    let mut index = git.index().unwrap();
+    index.add_path(Path::new("tracked.txt")).unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let signature = git2::Signature::now("Feature test", "feature@example.invalid").unwrap();
+    let head = git
+        .commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            "Git baseline",
+            &git.find_tree(tree_id).unwrap(),
+            &[],
+        )
+        .unwrap();
+    let entry = index.get_path(Path::new("tracked.txt"), 0).unwrap();
+    index.add_frombuffer(&entry, b"staged\n").unwrap();
+    index.write().unwrap();
+    let index_path = git.path().join("index");
+    let index_bytes = fs::read(&index_path).unwrap();
+    drop(index);
+    drop(git);
+    fs::write(root.join("tracked.txt"), b"working\n").unwrap();
+    assert!(!root.join(".atomic/bridge/workspace.json").exists());
+
+    for command in ["stage", "unstage"] {
+        let output = atomic(root, home, &[command, "tracked.txt"]);
+        assert!(!output.status.success(), "{command}: {}", text(&output));
+        assert_eq!(fs::read(&index_path).unwrap(), index_bytes, "{command}");
+        assert_eq!(fs::read(root.join("tracked.txt")).unwrap(), b"working\n");
+        assert_eq!(ok(root, home, &["log"]).stdout, native_history);
+        assert!(!root.join(".atomic/bridge/workspace.json").exists());
+    }
+    let git = git2::Repository::open(root).unwrap();
+    assert_eq!(git.head().unwrap().target(), Some(head));
+    let repo = atomic_repository::Repository::open_readonly(root).unwrap();
+    assert!(repo
+        .list_tracked_files()
+        .unwrap()
+        .iter()
+        .any(|file| file.path == Path::new("tracked.txt")));
 }
 
 #[test]

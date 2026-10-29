@@ -53,12 +53,19 @@ the CLI. The existing per-repository `[git.shim] enabled` setting controls
 enrollment at runtime; these are separate decisions. Default builds preserve
 the existing opt-in policy.
 
-Without the feature, `atomic git` is absent, Git clone/adoption and
-`status --git` / `diff --git` refuse with a build-feature explanation, and
-native initialization, recording, and view operations remain available.
+Without the feature, `atomic git`, `atomic stage`, and `atomic unstage` are
+absent. Git clone/adoption and `status --git` / `diff --git` refuse with a
+build-feature explanation, and native initialization, recording, and view
+operations remain available.
 An enrolled workspace (including one with a verified checkpoint) refuses
 operations before writable repository access or RPC dispatch. Use an enabled
 build to continue or explicitly disable enrollment with that build first.
+
+`atomic stage` and `atomic unstage` are Git interoperability commands. They
+write the colocated repository's Git index or restore its entries to Git HEAD,
+respectively, while preserving worktree edits. They do not provide a separate
+native Atomic staging area. Use `atomic add` to establish tracking and
+`atomic record` to record native changes without requiring staging.
 
 This feature does not remove every transitive Git dependency: repository
 guards and agent integrations still use Git metadata. Building the entire
