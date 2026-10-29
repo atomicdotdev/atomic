@@ -666,15 +666,34 @@ pub fn intent_new(args: &super::intent::new::IntentNew) -> CliResult<bool> {
         developer: None,
         intent: None,
         model: None,
+        intent_kind: Some(args.kind.clone()),
+        review_target: args.review.clone(),
         view: None,
         expected_snapshot: None,
     };
     let response = session.create_vault_entity(request)?;
     let entry = response.entry.expect("created entry");
+    let expected_kind = if args.review.is_some() {
+        "review"
+    } else {
+        &args.kind
+    };
+    if expected_kind != "feature" && entry.manifest_kind.as_deref() != Some(expected_kind) {
+        return Err(CliError::Internal(anyhow::anyhow!(
+            "intent {} was created, but the service did not confirm kind '{}'; upgrade the service and inspect the intent",
+            entry.id, expected_kind
+        )));
+    }
     println!("Created intent: {}", entry.id);
     println!("  file: {}", entry.vault_path.clone().unwrap_or_default());
     println!("  template: {}", args.template);
-    println!("  kind: {}", args.kind);
+    println!(
+        "  kind: {}",
+        entry.manifest_kind.as_deref().unwrap_or(&args.kind)
+    );
+    if let Some(target) = &args.review {
+        println!("  reviews: {target}");
+    }
     Ok(true)
 }
 
@@ -1104,6 +1123,8 @@ pub fn memory_new(args: &super::memory::new::MemoryNew) -> CliResult<bool> {
         developer: None,
         intent: None,
         model: None,
+        intent_kind: None,
+        review_target: None,
         view: None,
         expected_snapshot: None,
     };
@@ -5983,6 +6004,8 @@ pub fn vault_goal_start(args: &super::vault::goal::GoalStart) -> CliResult<bool>
         developer: args.developer.clone(),
         intent: args.intent.clone(),
         model: args.model.clone(),
+        intent_kind: None,
+        review_target: None,
         view: None,
         expected_snapshot: None,
     };

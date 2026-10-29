@@ -141,10 +141,6 @@ fn create_intent(
 
 impl Command for IntentNew {
     fn run(&self) -> CliResult<()> {
-        if crate::commands::rpc::intent_new(self)? {
-            return Ok(());
-        }
-
         if self.template != "feature" {
             return Err(CliError::InvalidArgument {
                 message: format!(
@@ -152,6 +148,10 @@ impl Command for IntentNew {
                     self.template
                 ),
             });
+        }
+
+        if crate::commands::rpc::intent_new(self)? {
+            return Ok(());
         }
 
         let root = find_repository_root()?;

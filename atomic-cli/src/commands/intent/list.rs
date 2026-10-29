@@ -54,8 +54,8 @@ pub struct IntentList {
     pub identity: Option<String>,
 
     /// Only list intents of this classification (one of feature, review, bug,
-    /// chore, remediation). Read from the manifest `IntentSummary.kind` — no
-    /// lift. Mutually exclusive with `--review`.
+    /// chore, remediation). Read from intent frontmatter or the legacy manifest
+    /// fallback. Mutually exclusive with `--review`.
     #[arg(long, value_name = "KIND", conflicts_with = "review")]
     pub kind: Option<String>,
 
@@ -238,7 +238,7 @@ pub(crate) struct Row {
     /// name an intent without a second lookup. The table stays id-only.
     pub(crate) title: String,
     pub(crate) status: String,
-    /// Classification tag, read from the manifest `IntentSummary.kind` (no lift).
+    /// Classification from the stored frontmatter, falling back to the manifest.
     pub(crate) kind: String,
     pub(crate) attested: Attested,
     pub(crate) verifies: Verifies,
@@ -351,9 +351,9 @@ fn compute_row(
 
 /// Build the (optionally kind-filtered) rows for the listing.
 ///
-/// Enumeration reuses [`Repository::vault_intent_list`]; the `kind` tag is read
-/// straight from the manifest `IntentSummary.kind` (a manifest read, never a
-/// lift). Factored out of [`Command::run`] so the kind tag + filter are
+/// Enumeration reuses [`Repository::vault_intent_list`]; the `kind` tag prefers
+/// stored frontmatter over the manifest fallback. Factored out of [`Command::run`]
+/// so the kind tag + filter are
 /// unit-testable without a global identity store. A row whose id is missing from
 /// the manifest (should not happen — the same manifest backs both) degrades to
 /// the default `feature`.
@@ -369,7 +369,7 @@ fn build_rows(
         let kind = manifest
             .intents
             .get(&info.id)
-            .map(|s| s.kind.clone())
+            .map(|s| repo.vault_intent_effective_kind(&s.vault_path, &s.kind))
             .unwrap_or_else(|| "feature".to_string());
         if let Some(f) = filter {
             if kind != f {
@@ -449,7 +449,7 @@ impl IntentList {
 }
 
 /// One row reconstructed from the wire's per-entry classification — the
-/// routed twin of [`compute_row`]: the handler computed the manifest kind
+/// routed twin of [`compute_row`]: the handler computed the effective kind
 /// and the attestation/verifies state with the same domain logic, so the
 /// row maps straight off the wire columns.
 pub(crate) fn wire_row(entry: &atomic_client::proto::VaultEntry) -> Row {
@@ -511,7 +511,7 @@ impl Command for IntentList {
 
         // Enumerate via the SAME source `atomic vault intent list` uses; already
         // sorted by id. Attestation entries are never in `manifest.intents`. The
-        // kind tag is read from the manifest summary (no lift).
+        // kind tag uses stored frontmatter with a manifest fallback.
         let mut rows = build_rows(&repo, verifier.as_ref(), filter.as_deref())?;
         sort_rows(&mut rows, self.sort, self.reverse);
 
