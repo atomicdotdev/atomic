@@ -165,6 +165,24 @@ fn read_only_open_merges_a_legacy_repository() {
 }
 
 #[test]
+fn non_migrating_read_only_open_leaves_legacy_databases_untouched() {
+    let legacy = legacy_repository(true);
+    let dot = legacy.root.join(".atomic");
+    let graph = std::fs::read(dot.join(LEGACY_PRISTINE_FILE)).unwrap();
+    let changes = std::fs::read(dot.join(LEGACY_CHANGE_STORE_FILE)).unwrap();
+    assert!(Repository::open_readonly_without_migration(&legacy.root).is_err());
+    assert_eq!(
+        std::fs::read(dot.join(LEGACY_PRISTINE_FILE)).unwrap(),
+        graph
+    );
+    assert_eq!(
+        std::fs::read(dot.join(LEGACY_CHANGE_STORE_FILE)).unwrap(),
+        changes
+    );
+    assert!(!dot.join(DATABASE_FILE).exists());
+}
+
+#[test]
 fn legacy_repository_without_a_change_store_merges() {
     let legacy = legacy_repository(false);
 

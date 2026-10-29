@@ -39,6 +39,7 @@ pub(crate) struct Report {
     pub generated_at: String,
     pub atomic: AtomicInfo,
     pub workspace: Workspace,
+    pub repository: super::metrics::RepositoryMetrics,
     pub integrations: Integrations,
     pub skills: Skills,
     /// Every agent Atomic has an adapter for, and whether its hooks are active.
@@ -770,6 +771,7 @@ pub(crate) fn collect_from(
                 reason: reason.to_string(),
             },
         },
+        repository: super::metrics::collect(&sources.workspace),
         integrations: Integrations {
             root: sources
                 .integrations_root

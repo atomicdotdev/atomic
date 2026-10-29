@@ -831,7 +831,7 @@ default = "{}"
     /// format upgrade; afterwards the database is reopened read-only.
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Self, RepositoryError> {
         Self::wait_for_database(DEFAULT_DATABASE_WAIT, || {
-            Self::open_readonly_mode(path.as_ref(), false)
+            Self::open_readonly_mode(path.as_ref(), false, false)
         })
     }
 
@@ -843,14 +843,30 @@ default = "{}"
     pub fn open_readonly_for_operation_inspection<P: AsRef<Path>>(
         path: P,
     ) -> Result<Self, RepositoryError> {
-        Self::open_readonly_mode(path.as_ref(), true)
+        Self::open_readonly_mode(path.as_ref(), true, false)
+    }
+
+    /// Open an existing current-layout repository without migration or repair.
+    ///
+    /// This narrow inspection mode rejects legacy layouts and sandboxes rather
+    /// than invoking their migration or provisioning paths.
+    pub fn open_readonly_without_migration<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<Self, RepositoryError> {
+        Self::open_readonly_mode(path.as_ref(), false, true)
     }
 
     fn open_readonly_mode(
         path: &Path,
         operation_inspection: bool,
+        no_migration: bool,
     ) -> Result<Self, RepositoryError> {
         if let Some((working_root, canonical, view)) = sandbox::detect_sandbox(path) {
+            if no_migration {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "non-migrating sandbox inspection is unavailable".to_string(),
+                });
+            }
             return Self::open_sandbox_readonly(working_root, canonical, &view);
         }
         let layout = working_copy::discover_layout(path)?;
@@ -859,9 +875,17 @@ default = "{}"
 
         // Open the pristine database in read-only mode. Identity validation below
         // performs no repair and reports a typed migration-required error.
-        let pristine = Arc::new(
-            Pristine::open_readonly(ensure_database(&dot_dir)?).map_err(RepositoryError::from)?,
-        );
+        let database = if no_migration {
+            database::require_current_database(&dot_dir)?
+        } else {
+            ensure_database(&dot_dir)?
+        };
+        let pristine = if no_migration {
+            Pristine::open_readonly_without_recovery(database)
+        } else {
+            Pristine::open_readonly(database)
+        };
+        let pristine = Arc::new(pristine.map_err(RepositoryError::from)?);
         let (working_copy_id, current_view) =
             working_copy::load_registered_identity(&pristine, &layout)?;
 
@@ -961,7 +985,9 @@ default = "{}"
         path: P,
         timeout: std::time::Duration,
     ) -> Result<Self, RepositoryError> {
-        Self::wait_for_database(timeout, || Self::open_readonly_mode(path.as_ref(), false))
+        Self::wait_for_database(timeout, || {
+            Self::open_readonly_mode(path.as_ref(), false, false)
+        })
     }
 
     fn wait_for_database(

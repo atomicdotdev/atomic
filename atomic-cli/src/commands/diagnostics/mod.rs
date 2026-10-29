@@ -3,7 +3,14 @@
 //! Collects the context a support conversation otherwise asks for one
 //! follow-up at a time: the Atomic version and install source, installed
 //! agent integration packages and their versions, installed skills, which
-//! agents have Atomic hooks enabled, and whether the Git shim is enabled.
+//! agents have Atomic hooks enabled, whether the Git shim is enabled, and
+//! repository counts and selected read-only redb table statistics.
+//!
+//! Registered changes are repository-wide graph identities, not a count of
+//! content files. Intent counts come from the vault manifest. Current-view
+//! counts include direct ancestor membership, without dependency expansion.
+//! Table fragmentation describes internal
+//! redb page space, not reclaimable database space or compaction history.
 //!
 //! Values that cannot be read are reported as unknown with a safe reason.
 //! No configuration is written, repaired, or fetched; normal command logging
@@ -22,6 +29,7 @@
 //! ```
 
 mod collect;
+mod metrics;
 mod render;
 
 use clap::Args;

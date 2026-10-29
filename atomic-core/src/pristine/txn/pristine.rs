@@ -469,27 +469,39 @@ impl Pristine {
     /// // Read operations...
     /// ```
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
-        Self::open_readonly_with_schema_check(path, true)
+        Self::open_readonly_with_schema_check(path, true, true)
+    }
+
+    /// Open for inspection without performing database upgrade or recovery.
+    ///
+    /// Unlike [`Self::open_readonly`], this returns an error when redb needs
+    /// a writable open to upgrade its format or recover after a crash.
+    pub fn open_readonly_without_recovery<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
+        Self::open_readonly_with_schema_check(path, true, false)
     }
 
     /// Open an existing database for read-only repair inspection without
     /// initializing tables or requiring a completed PATH_CLAIMS schema.
     ///
-    /// This method performs no writes.
+    /// A legacy redb format or interrupted transaction can require a writable
+    /// upgrade or recovery before the database is reopened read-only.
     pub fn open_readonly_for_repair<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
-        Self::open_readonly_with_schema_check(path, false)
+        Self::open_readonly_with_schema_check(path, false, true)
     }
 
     fn open_readonly_with_schema_check<P: AsRef<Path>>(
         path: P,
         require_complete_path_claims: bool,
+        allow_recovery: bool,
     ) -> PristineResult<Self> {
         let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
         let mut builder = Builder::new();
         builder.set_cache_size(cache_bytes);
         let db = match builder.open_read_only(path.as_ref()) {
             Ok(db) => db,
-            Err(redb::DatabaseError::UpgradeRequired(_) | redb::DatabaseError::RepairAborted) => {
+            Err(redb::DatabaseError::UpgradeRequired(_) | redb::DatabaseError::RepairAborted)
+                if allow_recovery =>
+            {
                 // Migration and crash recovery need a writable handle. Close
                 // it cleanly to persist allocator state before acquiring the
                 // shared read lock. Never retry ordinary lock contention here.
@@ -1013,6 +1025,9 @@ mod tests {
                 .unwrap();
             txn.commit().unwrap();
         }
+        let before = std::fs::read(&path).unwrap();
+        assert!(Pristine::open_readonly_without_recovery(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         // The legacy fixture has no PATH_CLAIMS completion marker, so the
         // schema-strict read-only open correctly refuses it. The repair
         // variant still exercises the read-only upgrade path end to end.

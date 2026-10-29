@@ -10,6 +10,7 @@ use super::collect::{
     AgentState, Enabled, FileCounts, FileState, GitHooks, HookActivity, IntegrationState, Report,
     ShimStatus, SkillMetadataStatus, SkillsPackage, Workspace,
 };
+use super::metrics::{Observation, RepositoryMetrics};
 
 /// Width of the label column.
 const LABEL: usize = 16;
@@ -39,6 +40,7 @@ pub(crate) fn render_text(report: &Report) -> String {
     field(o, "Workspace", &workspace);
     blank(o);
 
+    render_repository(o, &report.repository);
     render_integrations(o, report);
     render_skills(o, report);
     render_agents(o, &report.agents);
@@ -50,6 +52,87 @@ pub(crate) fn render_text(report: &Report) -> String {
     }
 
     out
+}
+
+fn render_repository(o: &mut String, repository: &RepositoryMetrics) {
+    section(o, "Repository and redb");
+    match repository {
+        RepositoryMetrics::NotApplicable { reason } => {
+            field(o, "Status", &format!("not applicable — {reason}"))
+        }
+        RepositoryMetrics::Unavailable {
+            reason,
+            database_bytes,
+        } => {
+            field(o, "Status", &format!("unknown — {reason}"));
+            if let Some(bytes) = database_bytes {
+                field(o, "Database size", &format!("{bytes} bytes"));
+            }
+        }
+        RepositoryMetrics::Available {
+            database_bytes,
+            registered_changes,
+            views,
+            intents,
+            current_view,
+            tables,
+            last_compacted,
+        } => {
+            field(
+                o,
+                "Database size",
+                &display_number(database_bytes, " bytes"),
+            );
+            field(
+                o,
+                "Registered changes",
+                &display_number(registered_changes, ""),
+            );
+            field(o, "Views", &display_number(views, ""));
+            match current_view {
+                Observation::Available { value } => field(
+                    o,
+                    "Current view",
+                    &format!(
+                        "{} direct membership ({} own, {} inherited)",
+                        value.membership, value.own, value.inherited
+                    ),
+                ),
+                Observation::Unavailable { reason } => {
+                    field(o, "Current view", &format!("unknown — {reason}"))
+                }
+            }
+            match intents {
+                Observation::Available { value } => field(o, "Intent manifest", &format!("{} total ({} backlog, {} planned, {} in progress, {} needs review, {} done, {} icebox, {} other)", value.total, value.backlog, value.planned, value.in_progress, value.needs_review, value.done, value.icebox, value.other)),
+                Observation::Unavailable { reason } => field(o, "Intent manifest", &format!("unknown — {reason}")),
+            }
+            match last_compacted {
+                Observation::Available { value } => field(o, "Last compacted", value),
+                Observation::Unavailable { reason } => {
+                    field(o, "Last compacted", &format!("unknown — {reason}"))
+                }
+            }
+            field(o, "redb tables", "");
+            for table in tables {
+                match &table.statistics {
+                    Observation::Available { value } => line(o, &format!("    {}: {} entries; {} stored, {} metadata, {} fragmented bytes; height {}, {} leaf / {} branch pages", table.name, value.entries, value.stored_bytes, value.metadata_bytes, value.fragmented_bytes, value.tree_height, value.leaf_pages, value.branch_pages)),
+                    Observation::Unavailable { reason } => line(o, &format!("    {}: unknown — {reason}", table.name)),
+                }
+            }
+            line(
+                o,
+                "    Table fragmentation is not a reclaimable-space estimate.",
+            );
+        }
+    }
+    blank(o);
+}
+
+fn display_number(value: &Observation<u64>, suffix: &str) -> String {
+    match value {
+        Observation::Available { value } => format!("{value}{suffix}"),
+        Observation::Unavailable { reason } => format!("unknown — {reason}"),
+    }
 }
 
 fn render_integrations(o: &mut String, report: &Report) {
@@ -269,6 +352,9 @@ mod tests {
                 arch: "x86_64",
             },
             workspace: Workspace::NotFound,
+            repository: RepositoryMetrics::NotApplicable {
+                reason: "not inside an Atomic workspace",
+            },
             integrations: Integrations {
                 root: Some("~/.atomic/integrations".to_string()),
                 root_overridden: false,
@@ -368,6 +454,9 @@ Atomic
   Install source:  cargo
   Platform:        linux x86_64
   Workspace:       none (not inside an Atomic workspace)
+
+Repository and redb
+  Status:          not applicable — not inside an Atomic workspace
 
 Agent integrations (installed packages)
   Receipts:        ~/.atomic/integrations

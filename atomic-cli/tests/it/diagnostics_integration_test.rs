@@ -226,6 +226,187 @@ fn claude_enabled_requires_an_active_hook_not_unrelated_text() {
 }
 
 #[test]
+fn repository_metrics_are_explicit_outside_a_workspace() {
+    let fixture = Fixture::new();
+    assert_eq!(fixture.json()["repository"]["status"], "not_applicable");
+}
+
+#[test]
+fn repository_metrics_report_real_repository_without_modifying_database() {
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--view", "main"]);
+    let path = fixture.work.path().join(".atomic/atomic.redb");
+    let before = std::fs::read(&path).unwrap();
+    let report = fixture.json();
+    let repo = &report["repository"];
+    assert_eq!(repo["status"], "available", "{repo}");
+    assert!(repo["views"]["value"].as_u64().unwrap() >= 1, "{repo}");
+    assert_eq!(repo["current_view"]["status"], "available", "{repo}");
+    let current = &repo["current_view"]["value"];
+    assert_eq!(
+        current["membership"].as_u64().unwrap(),
+        current["own"].as_u64().unwrap() + current["inherited"].as_u64().unwrap()
+    );
+    assert!(
+        repo["registered_changes"]["value"].as_u64().unwrap()
+            >= current["membership"].as_u64().unwrap()
+    );
+    assert_eq!(repo["last_compacted"]["status"], "unavailable");
+    assert!(repo["database_bytes"]["value"].as_u64().unwrap() > 0);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let text = fixture.ok(&["diagnostics"]);
+    assert!(text.contains("Repository and redb"));
+    assert!(text.contains("Last compacted:  unknown"));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn repository_metrics_track_changes_and_do_not_reveal_content() {
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--view", "main"]);
+    let before = fixture.json();
+    std::fs::write(
+        fixture.work.path().join("private.txt"),
+        "SYNTHETIC_PRIVATE_CONTENT\n",
+    )
+    .unwrap();
+    fixture.ok(&["add", "private.txt"]);
+    fixture.ok(&["record", "-m", "private record"]);
+    let json = fixture.ok(&["diagnostics", "--json"]);
+    let after: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        after["repository"]["registered_changes"]["value"]
+            .as_u64()
+            .unwrap(),
+        before["repository"]["registered_changes"]["value"]
+            .as_u64()
+            .unwrap()
+            + 1
+    );
+    assert_eq!(
+        after["repository"]["current_view"]["value"]["membership"]
+            .as_u64()
+            .unwrap(),
+        before["repository"]["current_view"]["value"]["membership"]
+            .as_u64()
+            .unwrap()
+            + 1
+    );
+    assert!(!json.contains("SYNTHETIC_PRIVATE_CONTENT"));
+    assert!(!json.contains("private.txt"));
+    assert!(!json.contains("private record"));
+}
+
+#[test]
+fn repository_metrics_distinguish_view_membership_from_registered_changes() {
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--view", "main", "--no-vault"]);
+    let base = fixture.json();
+    let parent_count = base["repository"]["current_view"]["value"]["membership"]
+        .as_u64()
+        .unwrap();
+    let registered = base["repository"]["registered_changes"]["value"]
+        .as_u64()
+        .unwrap();
+    fixture.ok(&[
+        "view", "create", "feature", "--draft", "--parent", "main", "--switch",
+    ]);
+    let draft = fixture.json();
+    assert_eq!(draft["repository"]["current_view"]["value"]["own"], 0);
+    assert_eq!(
+        draft["repository"]["current_view"]["value"]["inherited"],
+        parent_count
+    );
+    std::fs::write(fixture.work.path().join("draft.txt"), "draft\n").unwrap();
+    fixture.ok(&["add", "draft.txt"]);
+    fixture.ok(&["record", "-m", "draft"]);
+    let draft = fixture.json();
+    assert_eq!(draft["repository"]["current_view"]["value"]["own"], 1);
+    assert_eq!(
+        draft["repository"]["current_view"]["value"]["membership"],
+        parent_count + 1
+    );
+    fixture.ok(&["view", "switch", "main"]);
+    let parent = fixture.json();
+    assert_eq!(
+        parent["repository"]["current_view"]["value"]["membership"],
+        parent_count
+    );
+    assert_eq!(
+        parent["repository"]["registered_changes"]["value"],
+        registered + 1
+    );
+}
+
+#[test]
+fn repository_metrics_count_manifest_intents_without_exposing_titles() {
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--view", "main"]);
+    let before = fixture.json();
+    fixture.ok(&["intent", "new", "private intent title"]);
+    let text = fixture.ok(&["diagnostics", "--json"]);
+    let after: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        after["repository"]["intents"]["value"]["total"]
+            .as_u64()
+            .unwrap(),
+        before["repository"]["intents"]["value"]["total"]
+            .as_u64()
+            .unwrap()
+            + 1
+    );
+    assert!(!text.contains("private intent title"));
+}
+
+#[test]
+fn repository_metrics_fail_closed_when_database_is_busy() {
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--view", "main"]);
+    let path = fixture.work.path().join(".atomic/atomic.redb");
+    let database = redb::Database::open(&path).unwrap();
+    let report = fixture.json();
+    assert_eq!(report["repository"]["status"], "unavailable", "{report}");
+    assert!(report["repository"]["database_bytes"].as_u64().unwrap() > 0);
+    drop(database);
+}
+
+#[test]
+fn repository_metrics_do_not_migrate_a_legacy_layout() {
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--view", "main"]);
+    let dot = fixture.work.path().join(".atomic");
+    let current = dot.join("atomic.redb");
+    let legacy = dot.join("pristine.redb");
+    std::fs::rename(&current, &legacy).unwrap();
+    let before = std::fs::read(&legacy).unwrap();
+    let report = fixture.json();
+    assert_eq!(report["repository"]["status"], "unavailable", "{report}");
+    assert_eq!(std::fs::read(&legacy).unwrap(), before);
+    assert!(!current.exists());
+}
+
+#[test]
+fn repository_metrics_do_not_guess_when_tables_are_absent() {
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--view", "main"]);
+    let path = fixture.work.path().join(".atomic/atomic.redb");
+    std::fs::rename(&path, path.with_extension("saved")).unwrap();
+    drop(redb::Database::create(&path).unwrap());
+    let before = std::fs::read(&path).unwrap();
+    let report = fixture.json();
+    let repo = &report["repository"];
+    assert_eq!(repo["status"], "available", "{repo}");
+    assert_eq!(
+        repo["registered_changes"]["status"], "unavailable",
+        "{repo}"
+    );
+    assert_eq!(repo["views"]["status"], "unavailable", "{repo}");
+    assert_eq!(repo["intents"]["status"], "unavailable", "{repo}");
+    assert_eq!(repo["current_view"]["status"], "unavailable", "{repo}");
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
 fn built_in_claude_hooks_work_without_a_receipt() {
     let fixture = Fixture::new();
     let path = fixture.home.path().join(".claude/settings.json");
@@ -878,6 +1059,11 @@ fn linked_atomic_workspace_finds_active_workspace_hooks() {
     std::fs::write(settings, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"atomic agent hooks claude-code stop"}]}]}}"#).unwrap();
     let report = fixture.json();
     assert_eq!(report["workspace"]["status"], "found");
+    assert_eq!(report["repository"]["status"], "available", "{report}");
+    assert_eq!(
+        report["repository"]["current_view"]["status"], "unavailable",
+        "an unregistered linked worktree cannot borrow another working copy's view"
+    );
     assert_eq!(
         find(&report["agents"], "name", "claude-code")["enabled"],
         "yes"
@@ -885,6 +1071,19 @@ fn linked_atomic_workspace_finds_active_workspace_hooks() {
     assert!(fixture
         .ok(&["diagnostics"])
         .contains("Claude Code (claude-code): yes"));
+}
+
+#[test]
+fn repository_metrics_read_registered_linked_worktree_view() {
+    let fixture = Fixture::new();
+    fixture.linked_git_worktree(true);
+    drop(atomic_repository::Repository::open(fixture.work.path()).unwrap());
+    let report = fixture.json();
+    assert_eq!(report["repository"]["status"], "available", "{report}");
+    assert_eq!(
+        report["repository"]["current_view"]["status"], "available",
+        "{report}"
+    );
 }
 
 #[test]
