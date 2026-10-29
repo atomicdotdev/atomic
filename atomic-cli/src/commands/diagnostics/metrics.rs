@@ -2,6 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
+use atomic_core::pristine::build_metadata::{
+    read_version, CREATED_WITH_KEY, LAST_WRITABLE_OPEN_WITH_KEY, MIGRATED_WITH_KEY,
+};
 use atomic_core::pristine::tables::{
     node_type, CHANGE_META, GRAPH, NODE_TYPES, VAULT_ENTRIES, VAULT_MANIFEST, VIEWS,
 };
@@ -44,9 +47,34 @@ pub(crate) enum RepositoryMetrics {
         views: Observation<u64>,
         intents: Observation<IntentCounts>,
         current_view: Observation<CurrentViewCounts>,
+        #[serde(flatten)]
+        build_versions: Box<BuildVersions>,
         tables: Vec<TableMetric>,
         last_compacted: Observation<String>,
     },
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct BuildVersions {
+    pub created_with: Observation<String>,
+    pub migrated_with: Observation<String>,
+    pub last_writable_open_with: Observation<String>,
+}
+
+fn build_version(txn: &redb::ReadTransaction, key: &str) -> Observation<String> {
+    match read_version(txn, key) {
+        Ok(Some(value))
+            if !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b" .()-_+".contains(&b)) =>
+        {
+            Observation::available(value)
+        }
+        Ok(None) => Observation::unavailable("not recorded"),
+        _ => Observation::unavailable("build metadata unreadable or invalid"),
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -261,6 +289,11 @@ pub(crate) fn collect(workspace: &Result<Option<PathBuf>, SourceError>) -> Repos
         views: view_count,
         intents: intents(&txn),
         current_view: current_view(root),
+        build_versions: Box::new(BuildVersions {
+            created_with: build_version(&txn, CREATED_WITH_KEY),
+            migrated_with: build_version(&txn, MIGRATED_WITH_KEY),
+            last_writable_open_with: build_version(&txn, LAST_WRITABLE_OPEN_WITH_KEY),
+        }),
         tables: vec![
             table_metric("change_meta", changes),
             table_metric("views", views),

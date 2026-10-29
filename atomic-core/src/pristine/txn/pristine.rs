@@ -283,6 +283,11 @@ impl Pristine {
         // Initialize all tables. Re-check in the write transaction so a
         // concurrently raised requirement cannot race additive initialization.
         let write_txn = db.begin_write()?;
+        let previous_table_count = if is_new_database {
+            0
+        } else {
+            write_txn.list_tables()?.count() + write_txn.list_multimap_tables()?.count()
+        };
         {
             let metadata = write_txn.open_table(PRISTINE_META)?;
             let mut requirements = Vec::new();
@@ -398,6 +403,13 @@ impl Pristine {
             }
 
             stamp_schema_version(&write_txn)?;
+            if !is_new_database
+                && write_txn.list_tables()?.count() + write_txn.list_multimap_tables()?.count()
+                    > previous_table_count
+            {
+                crate::pristine::build_metadata::record_migration(&write_txn)?;
+            }
+            crate::pristine::build_metadata::record_open(&write_txn, is_new_database)?;
         }
         write_txn.commit()?;
 

@@ -75,6 +75,7 @@ fn render_repository(o: &mut String, repository: &RepositoryMetrics) {
             views,
             intents,
             current_view,
+            build_versions,
             tables,
             last_compacted,
         } => {
@@ -89,6 +90,21 @@ fn render_repository(o: &mut String, repository: &RepositoryMetrics) {
                 &display_number(registered_changes, ""),
             );
             field(o, "Views", &display_number(views, ""));
+            for (label, version) in [
+                ("Created with", &build_versions.created_with),
+                ("Last migrated with", &build_versions.migrated_with),
+                (
+                    "Last writable initialization open with",
+                    &build_versions.last_writable_open_with,
+                ),
+            ] {
+                match version {
+                    Observation::Available { value } => field(o, label, value),
+                    Observation::Unavailable { reason } => {
+                        field(o, label, &format!("unknown — {reason}"))
+                    }
+                }
+            }
             match current_view {
                 Observation::Available { value } => field(
                     o,

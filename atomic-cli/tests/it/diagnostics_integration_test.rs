@@ -252,12 +252,61 @@ fn repository_metrics_report_real_repository_without_modifying_database() {
             >= current["membership"].as_u64().unwrap()
     );
     assert_eq!(repo["last_compacted"]["status"], "unavailable");
+    assert_eq!(repo["created_with"]["status"], "available", "{repo}");
+    assert_eq!(
+        repo["last_writable_open_with"]["status"], "available",
+        "{repo}"
+    );
+    let version = fixture.ok(&["--version"]);
+    assert_eq!(
+        repo["created_with"]["value"],
+        version.trim().trim_start_matches("atomic ")
+    );
+    assert_eq!(repo["migrated_with"]["status"], "unavailable", "{repo}");
     assert!(repo["database_bytes"]["value"].as_u64().unwrap() > 0);
     assert_eq!(std::fs::read(&path).unwrap(), before);
     let text = fixture.ok(&["diagnostics"]);
     assert!(text.contains("Repository and redb"));
+    assert!(text.contains("Created with:"));
+    assert!(text.contains("Last migrated with:"));
     assert!(text.contains("Last compacted:  unknown"));
     assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn repository_build_metadata_reports_unknown_and_rejects_untrusted_values() {
+    use atomic_core::pristine::build_metadata::{CREATED_WITH_KEY, LAST_WRITABLE_OPEN_WITH_KEY};
+    use atomic_core::pristine::tables::ATOMIC_META;
+
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--no-vault"]);
+    let path = fixture.work.path().join(".atomic/atomic.redb");
+    let database = redb::Database::open(&path).unwrap();
+    let write = database.begin_write().unwrap();
+    {
+        let mut meta = write.open_table(ATOMIC_META).unwrap();
+        meta.remove(CREATED_WITH_KEY).unwrap();
+        meta.insert(
+            LAST_WRITABLE_OPEN_WITH_KEY,
+            b"SYNTHETIC_SECRET\nforged: value".as_slice(),
+        )
+        .unwrap();
+    }
+    write.commit().unwrap();
+    drop(database);
+    let before = std::fs::read(&path).unwrap();
+    let json = fixture.ok(&["diagnostics", "--json"]);
+    let report: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        report["repository"]["created_with"]["reason"],
+        "not recorded"
+    );
+    assert_eq!(
+        report["repository"]["last_writable_open_with"]["reason"],
+        "build metadata unreadable or invalid"
+    );
+    assert!(!json.contains("SYNTHETIC_SECRET"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
 
 #[test]

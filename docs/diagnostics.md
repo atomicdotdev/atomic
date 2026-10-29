@@ -20,6 +20,7 @@ invocation appends to.
 |---|---|
 | Atomic version, install source, platform | The running binary (`atomic --version`); install source uses the same detection as `atomic update` |
 | Workspace | The same upward search other commands use |
+| Repository build metadata | Builds recorded at database creation, last completed table initialization, legacy-layout or path-claim migration, and last normal writable table-initialization open |
 | Agent integrations (installed packages) | Install receipts in `~/.atomic/integrations/<agent>/receipt.json`, plus last recorded hook dispatch from the current repository's hook log |
 | Skills | The cached `atomic-skills` package manifest and each installed skill's `metadata.version` and `metadata.updatedAt` frontmatter |
 | Enabled agents | Whether supported settings contain recognizable active Atomic hooks, with the evidence and inspection limitations |
@@ -48,6 +49,13 @@ and their linked working copies share committed history; other repositories are
 not searched. An absent observation does not prove the hook never ran.
 If another process holds the repository database for writing, the timestamp is
 reported as unknown rather than opening or modifying the database.
+
+Repository build metadata is recorded only from the introduction of this feature;
+older creation and migration builds remain unknown. The last writable initialization
+open is not the last access: read-only commands and fast writable opens do not update
+it. Diagnostics itself does not update these fields. The migration field covers the
+additive table initialization, legacy split-database merge and path-claim backfill,
+not redb's internal format upgrade.
 
 ## Privacy
 
