@@ -378,10 +378,12 @@ ranking and limits; no working-copy content index or checkout is required. Calle
 use request-scoped tree-sitter parsing, not persisted KG code edges. This
 correctness-first path renders/scans the selected view per query. RPC clients can
 select a view explicitly; omitting it uses the working copy's registered desired
-view. Other query verbs retain their existing scope semantics. The separate
-working-copy content index is still available to its existing consumers. Existing
-ambient ignore rules still suppress ignored paths, including recorded files; that
-policy is intentional and unchanged.
+view. Other query verbs retain their existing scope semantics. The agent tool
+loop's `code_search` and `kg_search` read the same recorded view. The separate
+working-copy content index remains only for its maintenance consumers — Git
+import refresh and post-record index updates — and no search path consults it.
+Existing ambient ignore rules still suppress ignored paths, including recorded
+files; that policy is intentional and unchanged.
 
 Recorded code search applies path/type filters **before reading file contents**,
 then scans eligible files one at a time. It keeps at most the requested number of

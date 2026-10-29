@@ -113,4 +113,51 @@ fn recorded_query_resources() {
     );
     assert_eq!(result.matches[0].path, "cutoff.txt");
     assert_eq!(result.matches[0].line_content.len(), 10 * 1024 * 1024);
+
+    // Agent tool path: the same recorded search reached through
+    // `RepoToolExecutor::code_search`, with the view resolved from the
+    // working copy's registered desired view. The tool adds one view-pointer
+    // resolution and JSON serialization on top of the measured direct path,
+    // so it must retrieve the same files and retain no more display records.
+    repo.set_current_view(wc, &parent).unwrap();
+    let executor = atomic_repository::ai::tools::RepoToolExecutor::new(&repo);
+    let call = atomic_repository::ai::tools::ToolCall {
+        id: "bench".into(),
+        name: "code_search".into(),
+        arguments: serde_json::json!({"pattern": "needle", "max_results": 50}),
+    };
+    let run_tool = || {
+        atomic_repository::query_diagnostics::measure(|| {
+            atomic_repository::ai::tools::ToolExecutor::execute(&executor, &call).unwrap()
+        })
+    };
+    let (_response, _resources) = run_tool();
+    let mut tool_durations = Vec::<Duration>::new();
+    let mut last = None;
+    for _ in 0..5 {
+        let start = Instant::now();
+        let (response, resources) = run_tool();
+        tool_durations.push(start.elapsed());
+        let total = serde_json::from_str::<serde_json::Value>(&response).unwrap()["total_matches"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            total, 102_000,
+            "the tool path reports the same exhaustive total"
+        );
+        assert_eq!(
+            resources.files_retrieved, 2003,
+            "the tool path retrieves the same files as the direct path"
+        );
+        assert!(resources.displayed_records_high_water <= 50);
+        last = Some(resources);
+    }
+    tool_durations.sort();
+    println!(
+        "tool limit=50 min={:?} median={:?} max={:?} resources={}",
+        tool_durations[0],
+        tool_durations[2],
+        tool_durations[4],
+        serde_json::to_string(&last.unwrap()).unwrap()
+    );
 }

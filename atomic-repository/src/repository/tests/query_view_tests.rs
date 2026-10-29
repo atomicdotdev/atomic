@@ -1,4 +1,5 @@
 use super::*;
+use crate::ai::tools::{RepoToolExecutor, ToolCall, ToolExecutor};
 use crate::{ContentSearchOptions, CrossViewInsertOptions, RecordOptions};
 use atomic_core::kg::{iri, ontology::Class};
 use atomic_core::pristine::vault::KgNode;
@@ -543,6 +544,119 @@ fn query_code_ignores_stale_indexes_and_filters_counts_facets_and_limits() {
     assert!(repo
         .search_content_on_view("dev", "[", ContentSearchOptions::default())
         .is_err());
+}
+
+fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: "call-1".into(),
+        name: name.into(),
+        arguments,
+    }
+}
+
+#[test]
+fn agent_code_search_tool_reads_recorded_view_without_a_content_index() {
+    let (temp, repo) = create_temp_repo();
+    assert!(
+        !temp.path().join(".atomic/content-index").exists(),
+        "the fixture must not ship a content index"
+    );
+    std::fs::write(temp.path().join("needle.rs"), "needle here\nneedle again\n").unwrap();
+    repo.add("needle.rs", TrackingOptions::default()).unwrap();
+    record(&repo, "needle source");
+    let executor = RepoToolExecutor::new(&repo);
+    let response = executor
+        .execute(&tool_call(
+            "code_search",
+            serde_json::json!({"pattern": "needle"}),
+        ))
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(parsed["total_matches"], 2);
+    assert_eq!(parsed["showing"], 2);
+    assert_eq!(parsed["matches"][0]["path"], "needle.rs");
+    assert_eq!(parsed["matches"][0]["line_number"], 1);
+    // Ambient ignore rules still suppress recorded paths through the tool.
+    std::fs::write(temp.path().join(".atomicignore"), "needle.rs\n").unwrap();
+    let response = executor
+        .execute(&tool_call(
+            "code_search",
+            serde_json::json!({"pattern": "needle"}),
+        ))
+        .unwrap();
+    assert_eq!(response, "No matches found.");
+}
+
+#[test]
+fn agent_code_search_tool_respects_the_desired_view() {
+    let (temp, mut repo, _) = fixture();
+    let matches = |repo: &TestRepository, pattern: &str| -> u64 {
+        let executor = RepoToolExecutor::new(repo);
+        let response = executor
+            .execute(&tool_call(
+                "code_search",
+                serde_json::json!({"pattern": pattern}),
+            ))
+            .unwrap();
+        // The tool reports an empty result set as a plain sentence.
+        if response == "No matches found." {
+            return 0;
+        }
+        serde_json::from_str::<serde_json::Value>(&response).unwrap()["total_matches"]
+            .as_u64()
+            .unwrap()
+    };
+    // The fixture's working copy desires `feature`, whose bytes are on disk.
+    assert_eq!(matches(&repo, "sibling_marker"), 1);
+    // Repoint the desired view at `dev` without materializing: feature-only
+    // content must leave the results even though its bytes remain on disk,
+    // and inherited content must stay.
+    repo.set_current_view("dev").unwrap();
+    assert_eq!(matches(&repo, "sibling_marker"), 0);
+    assert_eq!(matches(&repo, "inherited_marker"), 1);
+    // The disk still holds the feature bytes, proving the answer came from
+    // the graph rather than the working copy.
+    assert!(std::fs::read_to_string(temp.path().join("src/sibling.rs"))
+        .unwrap()
+        .contains("sibling_marker"));
+}
+
+#[test]
+fn agent_kg_search_tool_respects_the_desired_view() {
+    let (_temp, mut repo, _) = fixture();
+    let search = |repo: &TestRepository, query: &str| -> Vec<serde_json::Value> {
+        let executor = RepoToolExecutor::new(repo);
+        let response = executor
+            .execute(&tool_call(
+                "kg_search",
+                serde_json::json!({"query": query, "limit": 10}),
+            ))
+            .unwrap();
+        serde_json::from_str(&response).unwrap()
+    };
+    // The feature change's provenance nodes are reachable through `feature`.
+    assert!(!search(&repo, "sibling_history_marker").is_empty());
+    // Through `dev` the same nodes fall outside the view's closure.
+    repo.set_current_view("dev").unwrap();
+    assert!(search(&repo, "sibling_history_marker").is_empty());
+}
+
+#[test]
+fn agent_code_search_matches_indexed_search_on_a_synchronized_copy() {
+    let (temp, repo, _) = fixture();
+    // The fixture leaves the working copy synchronized with `feature` and the
+    // content index built from those exact bytes.
+    let opts = ContentSearchOptions::default();
+    let graph = repo
+        .search_content_on_view("feature", "target|marker", opts.clone())
+        .unwrap();
+    let indexed =
+        crate::content_search::search_content(temp.path(), "target|marker", opts).unwrap();
+    assert_eq!(
+        serde_json::to_value(&graph).unwrap(),
+        serde_json::to_value(&indexed).unwrap(),
+        "graph-backed and index-backed search must agree on a synchronized copy"
+    );
 }
 
 #[test]

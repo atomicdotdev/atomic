@@ -17,8 +17,10 @@ The ignored diagnostic constructs 2,000 approximately 4 KiB recorded sources, a
 100,000-line dense source, exactly-10-MiB and cutoff+1 files, and a 20-level view
 chain. Setup is outside the timings. Each exact-file, prefix, and all-files query
 runs at display limits 0, 1, and 50, with one warmup and five measured repeats.
-It reports minimum/median/maximum, exact totals, files retrieved, cumulative bytes
-retained, consumer output-buffer high-water, and displayed-record high-water.
+A final arm runs the all-files query through the agent tool executor on the same
+fixture. It reports minimum/median/maximum, exact totals, files retrieved,
+cumulative bytes retained, consumer output-buffer high-water, and
+displayed-record high-water.
 These are warm ChangeStore/OS-cache measurements, not cold-disk claims. No cache
 flush is attempted. Deterministic resource assertions, not elapsed time, are gates.
 
@@ -109,3 +111,37 @@ exclude separately identified renderer/graph/ChangeStore costs; this is not an
 RSS benchmark or a claim that the whole request is constant-memory. Machine load
 and filesystem caches affect timings, so the diagnostic gates resource counts
 and result equivalence, not these elapsed-time numbers.
+
+## Agent tool path
+
+The agent tool loop reaches the same recorded search through
+`RepoToolExecutor::code_search`, with the view resolved from the working copy's
+registered desired view. The tool adds one view-pointer resolution and JSON
+serialization on top of the measured direct path; it retrieves the same files
+and retains no more display records. The ignored benchmark measures both on the
+same fixture: after the direct arms, it repoints the working copy at the deepest
+view and runs the tool at display limit 50, asserting the exhaustive total
+(102,000), the same 2,003 file retrievals, and a displayed-record high-water of
+at most 50. The dropped trigram prefilter is therefore bounded by the same
+documented costs as the direct path, with no additional retrieval or retention.
+
+| Scope | Display limit | Direct median (ms) | Tool median (ms) |
+|---|---:|---:|---:|
+| All files | 50 | 176.26 | 201.44 |
+
+Measured on the same run as the table above (Apple M5 Max, 48 GiB RAM, macOS,
+Rust 1.98.0, release profile). The tool path's minimum/median/maximum was
+200.21 / 201.44 / 211.43 ms against the direct path's 174.81 / 176.26 /
+183.60 ms — roughly 25 ms of median overhead for the view-pointer resolution
+and JSON serialization of the retained records, on a fixture where the search
+itself costs ~176 ms. Its resource counters are identical to the direct path:
+2,003 files retrieved, 19,376,650 cumulative retained bytes, 10,485,760-byte
+consumer-buffer high-water, and a displayed-record high-water of 50. The
+exhaustive total is the same 102,000. The dropped trigram prefilter therefore
+costs nothing beyond the already-documented scan, and the tool adds no
+retrieval or retention of its own.
+
+Run the reproduce command above; the tool line is printed as
+`tool limit=50 min=… median=… max=… resources=…` alongside the direct arms.
+Elapsed times remain machine-dependent diagnostics; the deterministic resource
+assertions are the gate.

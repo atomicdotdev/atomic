@@ -192,7 +192,9 @@ pub use ai::{
 pub use ai::tools::{run_tool_loop_sync, AgentConfig, AgentResult, RepoToolExecutor, ToolExecutor};
 
 // Query plan exports
-pub use query_plan::{execute_plan, parse_plan, PlanResult, QueryPlan, QueryStep, StepStat};
+pub use query_plan::{
+    execute_plan, execute_plan_on_view, parse_plan, PlanResult, QueryPlan, QueryStep, StepStat,
+};
 
 // Status exports
 pub use status::{
