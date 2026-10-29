@@ -49,7 +49,7 @@ use atomic_repository::git_binding::{
 use atomic_repository::BindingChangeSource;
 use atomic_repository::{BindingPublication, Repository};
 
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
 
 /// The RFC §8.6 fetch refspec for the create-only binding namespace.
 pub const BINDING_REFSPEC: &str = "+refs/atomic/bindings/*:refs/atomic/bindings/*";
@@ -66,17 +66,17 @@ pub const QUEUE_MAX_DEFAULT: usize = 64;
 ///
 /// A missing remote is a typed error: refspecs are only meaningful for a
 /// configured remote, and guessing one would hide a typo from the operator.
-pub fn configure_fetch_refspecs(git: &GitRepository, remote: &str) -> CliResult<usize> {
+pub fn configure_fetch_refspecs(git: &GitRepository, remote: &str) -> ShimResult<usize> {
     // Fail closed when the remote does not exist.
     git.find_remote(remote)
         .map_err(|error| {
-            CliError::GitError {
+            ShimError::GitError {
                 message: format!(
                     "cannot configure Atomic fetch refspecs: remote '{remote}' does not exist ({error})"
                 ),
             }
         })?;
-    let mut config = git.config().map_err(|error| CliError::GitError {
+    let mut config = git.config().map_err(|error| ShimError::GitError {
         message: format!("cannot read Git config: {error}"),
     })?;
     let existing: Vec<String> = config
@@ -91,7 +91,7 @@ pub fn configure_fetch_refspecs(git: &GitRepository, remote: &str) -> CliResult<
             }
             Ok(out)
         })
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: format!("cannot read remote refspecs: {error}"),
         })?;
     let mut added = 0;
@@ -109,15 +109,15 @@ pub fn configure_fetch_refspecs(git: &GitRepository, remote: &str) -> CliResult<
                 &format!("remote.{remote}.fetch"),
                 refspec,
             ])
-            .current_dir(git.workdir().ok_or_else(|| CliError::GitError {
+            .current_dir(git.workdir().ok_or_else(|| ShimError::GitError {
                 message: "Git repository has no working directory".to_string(),
             })?)
             .status()
-            .map_err(|error| CliError::GitError {
+            .map_err(|error| ShimError::GitError {
                 message: format!("cannot run git config: {error}"),
             })?;
         if !status.success() {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!("git config --add remote.{remote}.fetch {refspec} failed"),
             });
         }
@@ -172,16 +172,16 @@ pub fn run_local_publish_queue(
     working_copy: WorkingCopyId,
     git: &GitRepository,
     max: usize,
-) -> CliResult<QueueOutcome> {
+) -> ShimResult<QueueOutcome> {
     let mut outcome = QueueOutcome::default();
     let mut ids: Vec<atomic_repository::git_binding::BindingId> =
-        repo.binding_ids().map_err(CliError::Repository)?;
+        repo.binding_ids().map_err(ShimError::Repository)?;
     ids.sort_by_key(|id| id.to_hex());
     for id in ids {
         if outcome.published >= max {
             break;
         }
-        let Some(binding) = repo.load_binding(&id).map_err(CliError::Repository)? else {
+        let Some(binding) = repo.load_binding(&id).map_err(ShimError::Repository)? else {
             outcome.unresolvable += 1;
             outcome.refs.push(Repository::binding_ref_name(&id));
             continue;
@@ -197,7 +197,7 @@ pub fn run_local_publish_queue(
         match repo.verify_published_binding_carrier(git, &id) {
             Ok(Some(verified)) => {
                 if verified.binding.encode() != binding.encode() {
-                    return Err(CliError::GitError {
+                    return Err(ShimError::GitError {
                         message: format!(
                             "binding ref '{ref_name}' publishes binding {} with bytes differing \
                              from the stored binding; refusing to treat it as present or to \
@@ -211,7 +211,7 @@ pub fn run_local_publish_queue(
             }
             Ok(None) => {}
             Err(error) => {
-                return Err(CliError::GitError {
+                return Err(ShimError::GitError {
                     message: format!(
                         "binding ref '{ref_name}' exists but is not a verifiable carrier of \
                          stored binding {} (create-only violation, refusing to transfer or \
@@ -223,7 +223,7 @@ pub fn run_local_publish_queue(
         }
         match repo
             .publish_binding(working_copy, git, &binding, None)
-            .map_err(CliError::Repository)?
+            .map_err(ShimError::Repository)?
         {
             BindingPublication::Published { .. } => outcome.published += 1,
             BindingPublication::Idempotent { .. } => outcome.already_present += 1,
@@ -260,23 +260,23 @@ pub fn transfer_binding_refs(
     git: &GitRepository,
     remote: &str,
     degraded_fallback: bool,
-) -> CliResult<Vec<String>> {
+) -> ShimResult<Vec<String>> {
     // The advertised-ref surface: exactly the reviewed binding namespace.
     let refs =
-        transferable_binding_refs(git).map_err(|error| CliError::GitError { message: error })?;
+        transferable_binding_refs(git).map_err(|error| ShimError::GitError { message: error })?;
     if refs.is_empty() {
         return Ok(Vec::new());
     }
     let workdir = git
         .workdir()
-        .ok_or_else(|| CliError::GitError {
+        .ok_or_else(|| ShimError::GitError {
             message: "Git repository has no working directory".to_string(),
         })?
         .to_path_buf();
 
     let stored_ids: BTreeSet<String> = repo
         .binding_ids()
-        .map_err(CliError::Repository)?
+        .map_err(ShimError::Repository)?
         .into_iter()
         .map(|id| id.to_hex())
         .collect();
@@ -307,7 +307,7 @@ pub fn transfer_binding_refs(
         // the SHAPE of the surface, the stored-binding set decides its
         // MEMBERSHIP, and the carrier validation decides its CONTENT.
         let Some(id) = binding_id_from_ref_name(name) else {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!(
                     "binding ref '{name}' does not carry its binding id in the canonical \
                      refs/atomic/bindings/<shard>/<id> layout; unregistered refs never transfer"
@@ -316,7 +316,7 @@ pub fn transfer_binding_refs(
         };
         let canonical = Repository::binding_ref_name(&id);
         if name != &canonical {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!(
                     "binding ref '{name}' is not the canonical ref for binding {} \
                      ('{canonical}'); re-shaped binding refs never transfer",
@@ -325,7 +325,7 @@ pub fn transfer_binding_refs(
             });
         }
         if !stored_ids.contains(&id.to_hex()) {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!(
                     "binding ref '{name}' is not backed by a stored binding; unregistered \
                      binding refs never transfer because their reachable object surface was \
@@ -335,8 +335,8 @@ pub fn transfer_binding_refs(
         }
         let stored_binding = repo
             .load_binding(&id)
-            .map_err(CliError::Repository)?
-            .ok_or_else(|| CliError::GitError {
+            .map_err(ShimError::Repository)?
+            .ok_or_else(|| ShimError::GitError {
                 message: format!(
                     "stored binding {} disappeared between enumeration and transfer",
                     id.to_hex()
@@ -344,12 +344,12 @@ pub fn transfer_binding_refs(
             })?;
         let verified = repo
             .verify_published_binding_carrier(git, &id)
-            .map_err(CliError::Repository)?
-            .ok_or_else(|| CliError::GitError {
+            .map_err(ShimError::Repository)?
+            .ok_or_else(|| ShimError::GitError {
                 message: format!("binding ref '{name}' vanished during carrier validation"),
             })?;
         if verified.binding.encode() != stored_binding.encode() {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!(
                     "binding ref '{name}' publishes binding {} with bytes differing from the \
                      stored binding; the published bytes never transfer",
@@ -358,7 +358,7 @@ pub fn transfer_binding_refs(
             });
         }
         let oid = git2::Oid::from_bytes(verified.carrier_oid.as_bytes()).map_err(|error| {
-            CliError::GitError {
+            ShimError::GitError {
                 message: format!("binding carrier oid is invalid: {error}"),
             }
         })?;
@@ -377,7 +377,7 @@ pub fn transfer_binding_refs(
         .args(&args)
         .current_dir(&workdir)
         .status()
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: format!("cannot run git push: {error}"),
         })?;
     if !status.success() {
@@ -403,7 +403,7 @@ pub fn transfer_binding_refs(
         if degraded_fallback {
             return publish_degraded_head_fallback(repo, repo_root, remote, &spec, &journal);
         }
-        return Err(CliError::GitError { message: detail });
+        return Err(ShimError::GitError { message: detail });
     }
 
     // Publication is reported only after remote verification (RFC §8.6);
@@ -432,7 +432,7 @@ fn publish_degraded_head_fallback(
     remote: &str,
     spec: &[(String, String)],
     journal: &atomic_repository::repository::observability::BridgeEventJournal,
-) -> CliResult<Vec<String>> {
+) -> ShimResult<Vec<String>> {
     let mut pushed: Vec<(String, String)> = Vec::new();
     for (name, oid) in spec {
         if !is_transferable_ref(name) {
@@ -448,7 +448,7 @@ fn publish_degraded_head_fallback(
             .arg(format!("{oid}:{degraded}"))
             .current_dir(repo_root)
             .status()
-            .map_err(|error| CliError::GitError {
+            .map_err(|error| ShimError::GitError {
                 message: format!("cannot run degraded fallback push: {error}"),
             })?;
         if status.success() {
@@ -505,7 +505,7 @@ fn verify_remote_binding_refs(
     workdir: &Path,
     remote: &str,
     expected: &[(String, String)],
-) -> CliResult<Vec<String>> {
+) -> ShimResult<Vec<String>> {
     verify_remote_binding_refs_pattern(workdir, remote, expected, "refs/atomic/bindings/*")
 }
 
@@ -514,16 +514,16 @@ fn verify_remote_binding_refs_pattern(
     remote: &str,
     expected: &[(String, String)],
     pattern: &str,
-) -> CliResult<Vec<String>> {
+) -> ShimResult<Vec<String>> {
     let output = Command::new("git")
         .args(["ls-remote", remote, pattern])
         .current_dir(workdir)
         .output()
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: format!("cannot run git ls-remote: {error}"),
         })?;
     if !output.status.success() {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: format!(
                 "remote verification of the binding namespace failed (ls-remote exited {}); \
                  publication is NOT reported",
@@ -553,7 +553,7 @@ fn verify_remote_binding_refs_pattern(
         }
     }
     if !gaps.is_empty() {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: format!(
                 "binding transfer verification FAILED — publication not reported: {}",
                 gaps.join("; ")
@@ -574,16 +574,16 @@ pub fn observe_remote_ref(
     workdir: &Path,
     remote: &str,
     remote_ref: &str,
-) -> CliResult<Option<String>> {
+) -> ShimResult<Option<String>> {
     let output = Command::new("git")
         .args(["ls-remote", remote, remote_ref])
         .current_dir(workdir)
         .output()
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: format!("cannot run git ls-remote: {error}"),
         })?;
     if !output.status.success() {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: format!(
                 "cannot observe remote '{remote}' ref '{remote_ref}' (ls-remote exited {})",
                 output.status

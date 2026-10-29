@@ -17,10 +17,11 @@ use atomic_agent::integrations::{IntegrationManifest, Receipt};
 use serde::Serialize;
 
 use crate::commands::find_repository_root;
-use crate::commands::git::hook_dispatchers::{inspect_dispatchers, DispatcherReport};
 use crate::commands::update::{detect_source, StdEnv};
 use crate::error::CliError;
 use crate::logging::redact;
+#[cfg(feature = "git-shim")]
+use atomic_git_shim::commands::{inspect_dispatchers, DispatcherReport};
 
 /// Version of the JSON document. Bumped when a field changes meaning.
 pub(crate) const SCHEMA: u32 = 1;
@@ -1334,7 +1335,23 @@ fn collect_git_shim(
         Ok(_) => (ShimStatus::Disabled, None),
         Err(reason) => (ShimStatus::Unknown, Some(reason.to_string())),
     };
-    let hooks = match inspect_dispatchers(root) {
+    GitShim {
+        status,
+        reason,
+        hooks: collect_git_hooks(root, home),
+    }
+}
+
+#[cfg(not(feature = "git-shim"))]
+fn collect_git_hooks(_root: &Path, _home: Option<&Path>) -> GitHooks {
+    GitHooks::Unreadable {
+        reason: "Git hook inspection is unavailable: this binary was built without the `git-shim` feature".to_string(),
+    }
+}
+
+#[cfg(feature = "git-shim")]
+fn collect_git_hooks(root: &Path, home: Option<&Path>) -> GitHooks {
+    match inspect_dispatchers(root) {
         Ok(None) => GitHooks::NoGitRepository,
         Ok(Some(DispatcherReport::External { hooks_path })) => GitHooks::ExternallyManaged {
             hooks_path: display_path(&hooks_path, home),
@@ -1352,11 +1369,6 @@ fn collect_git_shim(
         Err(_) => GitHooks::Unreadable {
             reason: "cannot inspect Git repository hooks or administrative paths".to_string(),
         },
-    };
-    GitShim {
-        status,
-        reason,
-        hooks,
     }
 }
 
@@ -1935,7 +1947,14 @@ mod tests {
 
         assert!(matches!(report.workspace, Workspace::Found { .. }));
         assert_eq!(report.git_shim.status, ShimStatus::Disabled);
-        assert!(matches!(report.git_shim.hooks, GitHooks::NoGitRepository));
+        if cfg!(feature = "git-shim") {
+            assert!(matches!(report.git_shim.hooks, GitHooks::NoGitRepository));
+        } else {
+            assert!(
+                matches!(report.git_shim.hooks, GitHooks::Unreadable { ref reason }
+                if reason.contains("without the `git-shim` feature"))
+            );
+        }
     }
 
     #[test]
@@ -1957,11 +1976,18 @@ mod tests {
         );
 
         assert_eq!(report.git_shim.status, ShimStatus::Enabled);
-        let GitHooks::Inspected { dispatchers } = &report.git_shim.hooks else {
-            panic!("a Git repository's hooks are inspected");
-        };
-        assert_eq!(dispatchers.len(), 5);
-        assert!(dispatchers.iter().all(|d| d.state == "not_installed"));
+        if cfg!(feature = "git-shim") {
+            let GitHooks::Inspected { dispatchers } = &report.git_shim.hooks else {
+                panic!("a Git repository's hooks are inspected");
+            };
+            assert_eq!(dispatchers.len(), 5);
+            assert!(dispatchers.iter().all(|d| d.state == "not_installed"));
+        } else {
+            assert!(
+                matches!(report.git_shim.hooks, GitHooks::Unreadable { ref reason }
+                if reason.contains("without the `git-shim` feature"))
+            );
+        }
     }
 
     #[test]

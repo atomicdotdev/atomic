@@ -30,7 +30,7 @@ use atomic_repository::{
     ManifestRoot, MismatchKind, ProjectTree, Repository,
 };
 
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
 use crate::output::{print_info, print_warning};
 
 /// Marker handling is explicit at the publication boundary; callers cannot
@@ -44,11 +44,11 @@ pub(crate) enum ConflictMarkerPolicy {
 /// Private capability proving that the Atomic project tree, Git index, and
 /// physical worktree were equivalent under one concrete conversion policy.
 ///
-/// Construction is intentionally restricted to [`verify_git_publication`].
+/// Construction is intentionally restricted to `verify_git_publication`.
 /// Every publication mutation path requires this value and re-observes its
 /// leases immediately before its final ref/network effect.
 #[derive(Clone, Debug)]
-pub(crate) struct VerifiedPublication {
+pub struct VerifiedPublication {
     pub(crate) view: String,
     pub(crate) atomic_state: String,
     pub(crate) policy: ConversionPolicy,
@@ -86,7 +86,7 @@ impl VerifiedPublication {
         &self.git_tree
     }
 
-    pub(crate) fn git_tree_oid(&self) -> CliResult<git2::Oid> {
+    pub(crate) fn git_tree_oid(&self) -> ShimResult<git2::Oid> {
         if self.git_tree.algorithm() != GitHashAlgorithm::Sha1 {
             return Err(git_error(format!(
                 "Git publication through libgit2 does not support {:?} repositories",
@@ -104,7 +104,7 @@ impl VerifiedPublication {
         &mut self,
         git_repo: &GitRepository,
         commit_oid: git2::Oid,
-    ) -> CliResult<()> {
+    ) -> ShimResult<()> {
         let commit = git_repo.find_commit(commit_oid).map_err(|error| {
             git_error(format!(
                 "cannot bind published Git commit {commit_oid}: {error}"
@@ -136,7 +136,7 @@ impl VerifiedPublication {
         repo: &Repository,
         repo_root: &Path,
         git_repo: &GitRepository,
-    ) -> CliResult<()> {
+    ) -> ShimResult<()> {
         self.reobserve(repo, repo_root)?;
         let observed = git_repo.head().ok().and_then(|head| head.target());
         if observed != self.git_head {
@@ -153,7 +153,7 @@ impl VerifiedPublication {
         repo: &Repository,
         repo_root: &Path,
         git_repo: &GitRepository,
-    ) -> CliResult<()> {
+    ) -> ShimResult<()> {
         self.reobserve(repo, repo_root)?;
         let expected = self
             .git_head
@@ -175,7 +175,7 @@ impl VerifiedPublication {
 
     /// Re-observe every lease represented by this capability. This rejects an
     /// Atomic view/state change, policy change, index edit, or worktree edit.
-    pub(crate) fn reobserve(&self, repo: &Repository, repo_root: &Path) -> CliResult<()> {
+    pub fn reobserve(&self, repo: &Repository, repo_root: &Path) -> ShimResult<()> {
         let current = verify_git_publication_mode(
             repo,
             repo_root,
@@ -202,7 +202,7 @@ pub(crate) fn verify_git_publication(
     repo: &Repository,
     repo_root: &Path,
     view: &str,
-) -> CliResult<VerifiedPublication> {
+) -> ShimResult<VerifiedPublication> {
     verify_git_publication_mode(repo, repo_root, view, true)
 }
 
@@ -211,7 +211,7 @@ fn verify_git_publication_mode(
     repo_root: &Path,
     view: &str,
     require_index_equivalence: bool,
-) -> CliResult<VerifiedPublication> {
+) -> ShimResult<VerifiedPublication> {
     let git_repo = GitRepository::discover(repo_root)
         .map_err(|error| git_error(format!("cannot discover Git repository: {error}")))?;
     let (policy, filters) = current_conversion_policy(repo_root, &git_repo)?;
@@ -237,7 +237,7 @@ fn verify_git_publication_with_project(
     view: &str,
     project: atomic_repository::ProjectTree,
     require_index_equivalence: bool,
-) -> CliResult<VerifiedPublication> {
+) -> ShimResult<VerifiedPublication> {
     let git_repo = GitRepository::discover(repo_root)
         .map_err(|error| git_error(format!("cannot discover Git repository: {error}")))?;
     let (policy, filters) = current_conversion_policy(repo_root, &git_repo)?;
@@ -253,7 +253,7 @@ fn verify_git_publication_with_project(
 }
 
 /// Whether native publication must run the Git shim gate.
-pub(crate) fn shim_publication_required(repo_root: &Path) -> bool {
+pub fn shim_publication_required(repo_root: &Path) -> bool {
     GitRepository::discover(repo_root)
         .map(|repository| shadow_sync_active(&repository))
         .unwrap_or(false)
@@ -261,11 +261,11 @@ pub(crate) fn shim_publication_required(repo_root: &Path) -> bool {
 
 /// Native Atomic publication is unchanged without an active Git shadow. Once
 /// the shadow marker exists, however, publication is gated fail-closed.
-pub(crate) fn verify_shim_publication(
+pub fn verify_shim_publication(
     repo: &Repository,
     repo_root: &Path,
     view: &str,
-) -> CliResult<Option<VerifiedPublication>> {
+) -> ShimResult<Option<VerifiedPublication>> {
     let Ok(git_repo) = GitRepository::discover(repo_root) else {
         return Ok(None);
     };
@@ -284,7 +284,7 @@ fn verify_git_publication_with_policy(
     filters: ContentFilterConfig,
     require_index_equivalence: bool,
     conflict_project: Option<atomic_repository::ProjectTree>,
-) -> CliResult<VerifiedPublication> {
+) -> ShimResult<VerifiedPublication> {
     let project = match conflict_project {
         Some(project) => project,
         None => {
@@ -295,7 +295,7 @@ fn verify_git_publication_with_policy(
             // ordinary graph projection applies.
             let captured = repo
                 .capture_view_conflict_set(view)
-                .map_err(CliError::Repository)?;
+                .map_err(ShimError::Repository)?;
             match captured {
                 Some(_) => {
                     let (conflict_policy, _) = current_conversion_policy(
@@ -307,7 +307,7 @@ fn verify_git_publication_with_policy(
                     let projection = repo
                         .prepare_conflict_snapshot_projection(view, &conflict_policy)
                         .map_err(|error| {
-                            CliError::Repository(
+                            ShimError::Repository(
                                 atomic_repository::RepositoryError::InvalidOperation {
                                     message: error.to_string(),
                                 },
@@ -364,7 +364,7 @@ fn verify_git_publication_with_policy(
     }
     let atomic_state = repo
         .get_view_info(view)
-        .map_err(CliError::Repository)?
+        .map_err(ShimError::Repository)?
         .state_base32();
     let git_head = GitRepository::discover(repo_root)
         .ok()
@@ -386,7 +386,7 @@ fn verify_git_publication_with_policy(
 fn current_conversion_policy(
     repo_root: &Path,
     git_repo: &GitRepository,
-) -> CliResult<(ConversionPolicy, ContentFilterConfig)> {
+) -> ShimResult<(ConversionPolicy, ContentFilterConfig)> {
     let config = git_repo
         .config()
         .map_err(|error| git_error(format!("cannot read Git configuration: {error}")))?;
@@ -457,7 +457,7 @@ fn current_conversion_policy(
 
 /// Result of coordinating an Atomic view switch with its local Git shadow.
 #[derive(Debug)]
-pub(crate) enum ShadowSwitchSync {
+pub enum ShadowSwitchSync {
     /// The working copy is not inside a Git repository.
     SkippedNoGit,
     /// Git exists, but Atomic shadow sync has not been established.
@@ -467,14 +467,14 @@ pub(crate) enum ShadowSwitchSync {
 }
 
 impl ShadowSwitchSync {
-    pub(crate) fn is_synchronized(&self) -> bool {
+    pub fn is_synchronized(&self) -> bool {
         matches!(self, Self::Synchronized(_))
     }
 
     /// Restore the Git evidence captured before synchronization. This is used
     /// when the final shim checkpoint cannot be refreshed after Git itself
     /// was aligned successfully.
-    pub(crate) fn rollback(self, repo_root: &Path) -> CliResult<()> {
+    pub fn rollback(self, repo_root: &Path) -> ShimResult<()> {
         let Self::Synchronized(receipt) = self else {
             return Ok(());
         };
@@ -496,7 +496,7 @@ impl ShadowSwitchSync {
 }
 
 #[derive(Debug)]
-pub(crate) struct ShadowSwitchReceipt {
+pub struct ShadowSwitchReceipt {
     target_ref: String,
     snapshot: GitSwitchSnapshot,
 }
@@ -516,7 +516,7 @@ struct GitSwitchSnapshot {
 }
 
 impl GitSwitchSnapshot {
-    fn capture(git_repo: &GitRepository, target_ref: &str) -> CliResult<Self> {
+    fn capture(git_repo: &GitRepository, target_ref: &str) -> ShimResult<Self> {
         let index_path = git_repo.path().join("index");
         let index = match std::fs::read(&index_path) {
             Ok(bytes) => Some(bytes),
@@ -551,7 +551,7 @@ impl GitSwitchSnapshot {
 
 /// Project the just-materialized Atomic view into its local Git mirror.
 ///
-/// The working copy is staged exclusively through [`stage_and_validate_tree`].
+/// The working copy is staged exclusively through `stage_and_validate_tree`.
 /// The Git representation follows the view-scope HEAD policy (RFC §8.1):
 ///
 /// - **Shared** views map to a `refs/heads/<name>` branch and a symbolic
@@ -569,11 +569,11 @@ impl GitSwitchSnapshot {
 /// Plain non-Git and non-shadow repositories are typed no-ops. Once shadow sync
 /// is active, every failure is returned to the caller and the original Git
 /// HEAD, target ref, and index are restored where possible.
-pub(crate) fn sync_git_head_to_view(
+pub fn sync_git_head_to_view(
     repo: &Repository,
     repo_root: &Path,
     view: &str,
-) -> CliResult<ShadowSwitchSync> {
+) -> ShimResult<ShadowSwitchSync> {
     let git_repo = match GitRepository::discover(repo_root) {
         Ok(repo) => repo,
         Err(_) => return Ok(ShadowSwitchSync::SkippedNoGit),
@@ -584,15 +584,18 @@ pub(crate) fn sync_git_head_to_view(
     // A retained shadow exclude line is not enrollment (RFC §2 / CB-13C):
     // colocated-but-unenrolled repositories keep native view switches with
     // no Git projection and no checkpoint requirement.
-    if !repo.shim_workspace_active().map_err(CliError::Repository)? {
+    if !repo
+        .shim_workspace_active()
+        .map_err(ShimError::Repository)?
+    {
         return Ok(ShadowSwitchSync::SkippedInactive);
     }
     let working_copy = repo
         .require_working_copy_id()
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     let desired_view = repo
         .desired_view_name(working_copy)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     if desired_view != view {
         return Err(git_error(format!(
             "cannot synchronize Git shadow for view '{view}': current Atomic view is '{desired_view}'"
@@ -604,7 +607,7 @@ pub(crate) fn sync_git_head_to_view(
     // stale evidence for the newly materialized view.
     let shadow_lock = repo
         .try_lock_shadow_commit()
-        .map_err(CliError::Repository)?
+        .map_err(ShimError::Repository)?
         .ok_or_else(|| {
             git_error(
                 "another shadow materialize is in flight; retry the view switch after it completes",
@@ -642,7 +645,7 @@ pub(crate) fn sync_git_head_to_view(
 /// Unenrolled working copies are native: a `.git` directory (or a retained
 /// shadow exclude line) is not shim consent (RFC §2 / CB-13C), so they skip
 /// the Git-side coordination entirely instead of demanding a checkpoint.
-pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()> {
+pub fn sync_inherited_agent_view(root: &Path, view: &str) -> ShimResult<()> {
     let git = match GitRepository::open(root) {
         Ok(git) if shadow_sync_active(&git) => git,
         _ => return Ok(()),
@@ -651,11 +654,14 @@ pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()
         root,
         atomic_repository::database_lock_wait(),
     )
-    .map_err(CliError::Repository)?;
+    .map_err(ShimError::Repository)?;
     // Enrollment is checkpoint-or-explicit-opt-in (the same predicate every
     // workspace boundary uses). The retained exclude marker alone must never
     // make a native agent session require a shim checkpoint.
-    if !repo.shim_workspace_active().map_err(CliError::Repository)? {
+    if !repo
+        .shim_workspace_active()
+        .map_err(ShimError::Repository)?
+    {
         return Ok(());
     }
     let Some(before) = super::checkpoint::read_checkpoint(root).map_err(checkpoint_error_of)?
@@ -664,7 +670,7 @@ pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()
         // HEAD/refs — a shim-specific destructive operation — so it fails
         // closed with the shared anchor-or-disable remediation rather than a
         // bare internal error.
-        return Err(CliError::StaleBaseline {
+        return Err(ShimError::StaleBaseline {
             report: format!(
                 "agent view selection on an enrolled but unanchored Git shim: {}",
                 atomic_repository::UnanchoredWorkspace::MissingCheckpoint
@@ -675,18 +681,18 @@ pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()
     };
     let old = repo
         .view_identity(&before.view)
-        .map_err(CliError::Repository)?;
-    let new = repo.view_identity(view).map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
+    let new = repo.view_identity(view).map_err(ShimError::Repository)?;
     if old.set_id != new.set_id
         || old.closure_len != new.closure_len
         || old.merkle.to_base32() != before.atomic_state
     {
         drop(repo);
-        return crate::commands::view::switch::finish_service_switch(root, view);
+        return crate::commands::shadow::finish_service_switch(root, view);
     }
     let common = repo
         .try_lock_shadow_commit()
-        .map_err(CliError::Repository)?
+        .map_err(ShimError::Repository)?
         .ok_or_else(|| git_error("another Git projection is in flight; retry agent startup"))?;
     let head = git
         .head()
@@ -739,7 +745,7 @@ pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()
     )?;
     let working_copy = repo
         .require_working_copy_id()
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     super::ref_mapping::refresh_mapping_observation(
         &repo,
         working_copy,
@@ -751,7 +757,7 @@ pub(crate) fn sync_inherited_agent_view(root: &Path, view: &str) -> CliResult<()
     // A pending snapshot remains a separate recovery object on the same
     // canonical baseline; reparenting is allowed only after closure equality.
     repo.ensure_snapshot_view(working_copy)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     Ok(())
 }
 
@@ -764,8 +770,8 @@ pub(crate) fn refresh_checkpoint_from_live_handle(
     repo: &Repository,
     repo_root: &Path,
     view: &str,
-) -> CliResult<()> {
-    let info = repo.get_view_info(view).map_err(CliError::Repository)?;
+) -> ShimResult<()> {
+    let info = repo.get_view_info(view).map_err(ShimError::Repository)?;
     let state = info.state_base32();
     let git_repo = GitRepository::discover(repo_root)
         .map_err(|error| git_error(format!("cannot discover Git repository: {error}")))?;
@@ -778,9 +784,9 @@ pub(crate) fn refresh_checkpoint_from_live_handle(
     let commit = git_repo
         .find_commit(oid)
         .map_err(|error| git_error(format!("cannot read Git HEAD commit: {error}")))?;
-    crate::commands::git::checkpoint::write_verified_checkpoint(
+    crate::commands::checkpoint::write_verified_checkpoint(
         repo_root,
-        crate::commands::git::checkpoint::VerifiedCheckpointInput {
+        crate::commands::checkpoint::VerifiedCheckpointInput {
             view,
             atomic_state: &state,
             git_head: &oid.to_string(),
@@ -791,8 +797,8 @@ pub(crate) fn refresh_checkpoint_from_live_handle(
     .map_err(checkpoint_error_of)
 }
 
-fn checkpoint_error_of(error: crate::commands::git::checkpoint::CheckpointError) -> CliError {
-    CliError::GitError {
+fn checkpoint_error_of(error: crate::commands::checkpoint::CheckpointError) -> ShimError {
+    ShimError::GitError {
         message: error.to_string(),
     }
 }
@@ -805,11 +811,11 @@ fn checkpoint_error_of(error: crate::commands::git::checkpoint::CheckpointError)
 /// remain visible, so when the Git index describes anything other than the
 /// current HEAD tree the projection is skipped instead of overwritten.
 /// Failures inside the pipeline still fail closed and restore Git state.
-pub(crate) fn sync_git_projection_after_record(
+pub fn sync_git_projection_after_record(
     repo_root: &Path,
     view: &str,
     change_hash: &atomic_core::types::Hash,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let git_repo = match GitRepository::open(repo_root) {
         Ok(repo) => repo,
         Err(_) => return Ok(()),
@@ -817,11 +823,14 @@ pub(crate) fn sync_git_projection_after_record(
     if !shadow_sync_active(&git_repo) {
         return Ok(());
     }
-    let repo = Repository::open(repo_root).map_err(CliError::Repository)?;
+    let repo = Repository::open(repo_root).map_err(ShimError::Repository)?;
     // A retained shadow exclude line is not enrollment (RFC §2 / CB-13C):
     // a colocated-but-unenrolled repository never projects its records into
     // Git and never anchors a shim implicitly. Native records stand alone.
-    if !repo.shim_workspace_active().map_err(CliError::Repository)? {
+    if !repo
+        .shim_workspace_active()
+        .map_err(ShimError::Repository)?
+    {
         return Ok(());
     }
     // An enrolled workspace without a verified checkpoint is unanchored. The
@@ -851,10 +860,10 @@ pub(crate) fn sync_git_projection_after_record(
     }
     let working_copy = repo
         .require_working_copy_id()
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     let desired_view = repo
         .desired_view_name(working_copy)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     if desired_view != view {
         return Ok(());
     }
@@ -873,7 +882,7 @@ pub(crate) fn sync_git_projection_after_record(
     // projection waits until the conflict is resolved.
     if repo
         .first_working_copy_conflict_marker(working_copy)
-        .map_err(CliError::Repository)?
+        .map_err(ShimError::Repository)?
         .is_some()
     {
         print_warning(
@@ -897,7 +906,7 @@ pub(crate) fn sync_git_projection_after_record(
     // CB-10A mapping observation below is recorded.
     let shadow_lock = match repo
         .try_lock_shadow_commit()
-        .map_err(CliError::Repository)?
+        .map_err(ShimError::Repository)?
     {
         Some(guard) => guard,
         None => {
@@ -920,7 +929,7 @@ pub(crate) fn sync_git_projection_after_record(
         // verified tip is the live mapped ref tip read under the held lock.
         let working_copy = repo
             .require_working_copy_id()
-            .map_err(CliError::Repository)?;
+            .map_err(ShimError::Repository)?;
         let verified_tip = super::ref_mapping::mapped_ref_tip(&git_repo, &repo, view);
         super::ref_mapping::refresh_mapping_observation(
             &repo,
@@ -935,7 +944,7 @@ pub(crate) fn sync_git_projection_after_record(
     drop(repo);
     // The projection moved Git HEAD; refresh the verified checkpoint so the
     // next workspace entry sees the post-transition baseline (RFC §7.2).
-    crate::commands::git::shim::refresh_checkpoint_if_aligned(repo_root)?;
+    crate::commands::shim::refresh_checkpoint_if_aligned(repo_root)?;
     Ok(())
 }
 
@@ -985,7 +994,7 @@ pub(crate) fn project_view_to_git(
     git_repo: &GitRepository,
     view: &str,
     record_metadata: Option<RecordProjectionMetadata>,
-) -> CliResult<ShadowSwitchReceipt> {
+) -> ShimResult<ShadowSwitchReceipt> {
     project_view_to_git_with_conflicts(
         repo,
         repo_root,
@@ -1008,7 +1017,7 @@ pub(crate) fn project_view_to_git_under_shadow_lock(
     view: &str,
     record_metadata: Option<RecordProjectionMetadata>,
     common: &atomic_repository::RepositoryCommonLockGuard,
-) -> CliResult<ShadowSwitchReceipt> {
+) -> ShimResult<ShadowSwitchReceipt> {
     project_view_to_git_with_conflicts(
         repo,
         repo_root,
@@ -1045,19 +1054,19 @@ fn resolve_conflict_export(
     view: &str,
     policy: &ConversionPolicy,
     allow_conflicts: bool,
-) -> CliResult<ConflictExport> {
+) -> ShimResult<ConflictExport> {
     let captured = repo
         .capture_view_conflict_set(view)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     let Some(object) = captured else {
         return Ok(ConflictExport::Clean);
     };
     let scope = repo
         .get_view_info(view)
-        .map_err(CliError::Repository)?
+        .map_err(ShimError::Repository)?
         .scope;
     if scope.is_shared() && !allow_conflicts {
-        return Err(CliError::Repository(
+        return Err(ShimError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: format!(
                     "view '{view}' has {} unresolved Atomic conflict(s); Shared/remote export \
@@ -1072,7 +1081,7 @@ fn resolve_conflict_export(
     let projection = repo
         .prepare_conflict_snapshot_projection(view, policy)
         .map_err(|error| {
-            CliError::Repository(atomic_repository::RepositoryError::InvalidOperation {
+            ShimError::Repository(atomic_repository::RepositoryError::InvalidOperation {
                 message: error.to_string(),
             })
         })?;
@@ -1097,7 +1106,7 @@ pub(crate) fn project_view_to_git_with_conflicts(
     record_metadata: Option<RecordProjectionMetadata>,
     allow_conflicts: bool,
     held_common: Option<&atomic_repository::RepositoryCommonLockGuard>,
-) -> CliResult<ShadowSwitchReceipt> {
+) -> ShimResult<ShadowSwitchReceipt> {
     let head_policy = resolve_head_policy(repo, git_repo, view)?;
     // An ephemeral `git/<oid>` view retains its adopted commit only while the
     // view's projected tree is unchanged from that commit; that decision needs
@@ -1122,7 +1131,7 @@ pub(crate) fn project_view_to_git_with_conflicts(
     // to the operation's lease recovery: the legacy snapshot rollback must
     // not move them behind the journal's back.
     let mut journaled_publish = false;
-    let sync_result = (|| -> CliResult<()> {
+    let sync_result = (|| -> ShimResult<()> {
         // V1 must run before even content-addressed object writes. A clean
         // state must not carry raw marker text; a conflicted state projects
         // markers deliberately and is resolved below.
@@ -1401,7 +1410,7 @@ fn resolve_head_policy(
     repo: &Repository,
     git_repo: &GitRepository,
     view: &str,
-) -> CliResult<HeadPolicy> {
+) -> ShimResult<HeadPolicy> {
     let scope = repo
         .get_view_info(view)
         .map(|info| info.scope)
@@ -1476,7 +1485,7 @@ fn build_switch_projection(
     publication: &VerifiedPublication,
     record_metadata: Option<&RecordProjectionMetadata>,
     conflict_set_hash: Option<atomic_core::Hash>,
-) -> CliResult<(
+) -> ShimResult<(
     atomic_core::operation::GitObjectId,
     Option<(atomic_core::operation::GitObjectId, Vec<u8>)>,
 )> {
@@ -1586,7 +1595,7 @@ fn build_switch_projection(
             })?
         }
     };
-    let set_id = repo.view_set_id(view).map_err(CliError::Repository)?;
+    let set_id = repo.view_set_id(view).map_err(ShimError::Repository)?;
     let state_merkle =
         atomic_core::types::Base32::from_base32(state.as_bytes()).ok_or_else(|| {
             git_error(format!(
@@ -1667,10 +1676,10 @@ fn journal_projection_publication(
     intended_index_tree: Option<git2::Oid>,
     checkpoint_plan: Option<atomic_repository::ProjectionCheckpointPlan>,
     held_common: Option<&atomic_repository::RepositoryCommonLockGuard>,
-) -> CliResult<Option<atomic_core::OperationId>> {
+) -> ShimResult<Option<atomic_core::OperationId>> {
     let working_copy = repo
         .require_working_copy_id()
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     let evidence =
         atomic_core::Hash::of(format!("atomic:projection-publish:{view}:{ref_name}").as_bytes());
     let prepared = repo
@@ -1686,16 +1695,16 @@ fn journal_projection_publication(
             checkpoint_plan,
             evidence,
         )
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     if prepared.operation_id == atomic_core::OperationId::from_bytes([0u8; 32]) {
         // Every lease already held the intended value: an idempotent no-op.
         return Ok(None);
     }
     let operation_id = prepared.operation_id;
     repo.execute_projection_publish(&prepared, git_repo)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     repo.finalize_projection_publish(prepared, git_repo)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     Ok(Some(operation_id))
 }
 
@@ -1742,7 +1751,7 @@ fn local_utc_offset_minutes() -> i32 {
     chrono::Local::now().offset().local_minus_utc() / 60
 }
 
-fn to_git2_oid(oid: &atomic_core::operation::GitObjectId) -> CliResult<git2::Oid> {
+fn to_git2_oid(oid: &atomic_core::operation::GitObjectId) -> ShimResult<git2::Oid> {
     use atomic_core::operation::GitHashAlgorithm;
     if oid.algorithm() != GitHashAlgorithm::Sha1 {
         return Err(git_error(format!(
@@ -1755,7 +1764,7 @@ fn to_git2_oid(oid: &atomic_core::operation::GitObjectId) -> CliResult<git2::Oid
 }
 
 /// The algorithm-tagged core identity of a libgit2 object id.
-fn to_core_oid(oid: git2::Oid) -> CliResult<atomic_core::operation::GitObjectId> {
+fn to_core_oid(oid: git2::Oid) -> ShimResult<atomic_core::operation::GitObjectId> {
     atomic_core::operation::GitObjectId::new(
         atomic_core::operation::GitHashAlgorithm::Sha1,
         oid.as_bytes().to_vec(),
@@ -1769,7 +1778,7 @@ fn to_core_oid(oid: git2::Oid) -> CliResult<atomic_core::operation::GitObjectId>
 /// so recovery can be exercised before and after every journaled effect.
 /// Shipping builds compile the no-op stub: no environment value can alter
 /// projection behavior.
-fn projection_failpoint(name: &str) -> CliResult<()> {
+fn projection_failpoint(name: &str) -> ShimResult<()> {
     #[cfg(feature = "adoption-test-injection")]
     {
         if std::env::var_os(name).is_some() {
@@ -1787,7 +1796,7 @@ fn align_index_to_tree(
     git_repo: &GitRepository,
     tree_oid: git2::Oid,
     publication: &VerifiedPublication,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     if publication.git_tree_oid()? != tree_oid {
         return Err(git_error("refusing to align index to an unverified tree"));
     }
@@ -1811,7 +1820,7 @@ fn align_index_to_tree(
         })
 }
 
-fn snapshot_reference(git_repo: &GitRepository, name: &str) -> CliResult<ReferenceSnapshot> {
+fn snapshot_reference(git_repo: &GitRepository, name: &str) -> ShimResult<ReferenceSnapshot> {
     match git_repo.find_reference(name) {
         Ok(reference) => {
             if let Some(target) = reference.target() {
@@ -1875,8 +1884,8 @@ fn restore_index(git_repo: &GitRepository, bytes: Option<&[u8]>) -> std::io::Res
     }
 }
 
-fn git_error(message: impl Into<String>) -> CliError {
-    CliError::GitError {
+fn git_error(message: impl Into<String>) -> ShimError {
+    ShimError::GitError {
         message: message.into(),
     }
 }
@@ -1899,9 +1908,9 @@ fn shadow_sync_active(git_repo: &GitRepository) -> bool {
 /// the explicit `[git.shim] enabled` opt-in (RFC §2 / CB-13C). A `.git`
 /// directory next to `.atomic` — with or without a retained shadow exclude
 /// line — is not consent.
-pub(crate) fn shim_workspace_enrolled(root: &Path) -> CliResult<bool> {
-    let repo = Repository::open_readonly(root).map_err(CliError::Repository)?;
-    repo.shim_workspace_active().map_err(CliError::Repository)
+pub fn shim_workspace_enrolled(root: &Path) -> ShimResult<bool> {
+    let repo = Repository::open_readonly(root).map_err(ShimError::Repository)?;
+    repo.shim_workspace_active().map_err(ShimError::Repository)
 }
 
 /// Acquire the repo-scoped shadow-commit lock, or return `None` (a no-op skip)
@@ -1916,10 +1925,10 @@ pub(crate) fn acquire_shadow_lock(
     repo: &Repository,
     repo_root: &Path,
     view: &str,
-) -> CliResult<Option<atomic_repository::RepositoryCommonLockGuard>> {
+) -> ShimResult<Option<atomic_repository::RepositoryCommonLockGuard>> {
     match repo
         .try_lock_shadow_commit()
-        .map_err(CliError::Repository)?
+        .map_err(ShimError::Repository)?
     {
         Some(guard) => Ok(Some(guard)),
         None => {
@@ -1950,11 +1959,11 @@ pub(crate) fn stage_and_validate_tree(
     repo_root: &Path,
     publication: &VerifiedPublication,
     conflict_markers: ConflictMarkerPolicy,
-) -> CliResult<git2::Oid> {
+) -> ShimResult<git2::Oid> {
     let view = publication.view();
     let working_copy = repo
         .require_working_copy_id()
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
 
     // ── Rule V1 — no unresolved conflict markers ────────────────────────────
     // Shares `atomic record`'s detector so the two paths cannot disagree.
@@ -1970,7 +1979,7 @@ pub(crate) fn stage_and_validate_tree(
     // CB-4B already proved that the read-only index exactly represents the
     // Atomic project tree. Do not restage or write an ODB tree here: doing so
     // would turn validation itself into a mutation and reopen a TOCTOU window.
-    let index = git_repo.index().map_err(|e| CliError::GitError {
+    let index = git_repo.index().map_err(|e| ShimError::GitError {
         message: format!("Failed to open git index: {}", e),
     })?;
 
@@ -1983,7 +1992,7 @@ pub(crate) fn stage_and_validate_tree(
             "Refusing to shadow-commit: provenance/excluded path '{}' was staged.",
             bad
         ));
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: format!(
                 "'{}' is a git-excluded Atomic shadow path (.atomic/, .vault/, \
                  .atomicignore) and must never be committed to git. Aborting; no \
@@ -2011,13 +2020,13 @@ fn refuse_conflict_markers(
     baseline_ref: Option<&str>,
     repo_root: &Path,
     view: &str,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let working_copy = repo
         .require_working_copy_id()
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     let marker = repo
         .first_working_copy_conflict_marker(working_copy)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     // Review ::26 R5: the status-filtered scan above cannot see a file whose
     // RECORDED state carries markers (a record made with
     // --allow-conflict-markers leaves the status clean while the view's
@@ -2038,7 +2047,7 @@ fn refuse_conflict_markers(
                 .as_ref()
                 .is_some_and(|tree| tree_holds_bytes(git_repo, tree, path, content))
         })
-        .map_err(CliError::Repository)
+        .map_err(ShimError::Repository)
         .ok()
         .flatten()
     });
@@ -2057,7 +2066,7 @@ fn refuse_conflict_markers(
         "Refusing to commit '{}': unresolved conflict marker at line {}.",
         path, line
     ));
-    Err(CliError::GitError {
+    Err(ShimError::GitError {
         message: format!(
             "'{}' still contains conflict markers at line {} — resolve the conflict \
              (remove the >>>>>>> / ======= / <<<<<<< lines), or pass \
@@ -2101,7 +2110,7 @@ fn tree_holds_bytes(git: &GitRepository, tree: &git2::Tree<'_>, path: &str, byte
     found
 }
 
-fn write_project_tree(git: &GitRepository, project: &ProjectTree) -> CliResult<git2::Oid> {
+fn write_project_tree(git: &GitRepository, project: &ProjectTree) -> ShimResult<git2::Oid> {
     if project.git.algorithm != GitHashAlgorithm::Sha1 {
         return Err(git_error(format!(
             "libgit2 cannot safely publish {:?} Atomic projections",
@@ -2183,6 +2192,60 @@ fn first_forbidden_shadow_path(index: &git2::Index) -> Option<String> {
 /// provenance path that Rule V4 forbids from any shadow commit.
 fn is_forbidden_shadow_path(path: &str) -> bool {
     path == ".atomicignore" || path.starts_with(".atomic/") || path.starts_with(".vault/")
+}
+
+pub fn checkpoint_shadow_switch(
+    shadow_sync: crate::commands::shadow::ShadowSwitchSync,
+    repo_root: &std::path::Path,
+    view: &str,
+) -> ShimResult<()> {
+    let shadow_was_synchronized = shadow_sync.is_synchronized();
+    // A native (unenrolled) colocated repository must neither fail its view
+    // switch on Git observation errors nor bootstrap the first shim
+    // checkpoint: `.git` beside `.atomic` is not shim consent. Only an
+    // enrolled workspace refreshes; import anchors explicitly.
+    if !shadow_was_synchronized && !crate::commands::shadow::shim_workspace_enrolled(repo_root)? {
+        return Ok(());
+    }
+    let checkpoint = match crate::commands::shim::refresh_checkpoint_if_aligned(repo_root) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return match shadow_sync.rollback(repo_root) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(ShimError::GitError {
+                    message: format!("{error}; {rollback_error}"),
+                }),
+            };
+        }
+    };
+    if shadow_was_synchronized && checkpoint != crate::commands::shim::CheckpointRefresh::Refreshed
+    {
+        let error = ShimError::GitError {
+            message: format!(
+                "Git shadow synchronization for view '{view}' completed, but the shim verifier did not refresh its checkpoint ({checkpoint:?}); run `atomic git shim verify` for details"
+            ),
+        };
+        return match shadow_sync.rollback(repo_root) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(ShimError::GitError {
+                message: format!("{error}; {rollback_error}"),
+            }),
+        };
+    }
+    Ok(())
+}
+
+/// Finish the existing Git boundary after a successful service-owned native
+/// switch. The service has released its workspace lease and database handle.
+pub fn finish_service_switch(repo_root: &std::path::Path, view: &str) -> ShimResult<()> {
+    let repo = Repository::open_for_workspace_transaction_wait(
+        repo_root,
+        atomic_repository::database_lock_wait(),
+    )
+    .map_err(ShimError::Repository)?;
+    let shadow_sync = crate::commands::shadow::sync_git_head_to_view(&repo, repo_root, view)?;
+    drop(repo);
+    checkpoint_shadow_switch(shadow_sync, repo_root, view)
 }
 
 #[cfg(test)]
@@ -2276,10 +2339,10 @@ mod tests {
     fn write_aligned_checkpoint(root: &Path, git: &GitRepository) {
         let head = git.head().unwrap().target().unwrap();
         let tree = git.find_commit(head).unwrap().tree_id();
-        let atomic = crate::commands::git::checkpoint::observe_current_atomic(root).unwrap();
-        crate::commands::git::checkpoint::write_verified_checkpoint(
+        let atomic = crate::commands::checkpoint::observe_current_atomic(root).unwrap();
+        crate::commands::checkpoint::write_verified_checkpoint(
             root,
-            crate::commands::git::checkpoint::VerifiedCheckpointInput {
+            crate::commands::checkpoint::VerifiedCheckpointInput {
                 view: &atomic.view,
                 atomic_state: &atomic.state,
                 git_head: &head.to_string(),
@@ -2316,7 +2379,7 @@ mod tests {
         enroll_via_config(root);
         let error = sync_inherited_agent_view(root, &current_view(root)).unwrap_err();
         match error {
-            CliError::StaleBaseline { report } => {
+            ShimError::StaleBaseline { report } => {
                 assert!(report.contains("atomic git shim reconcile"), "{report}");
                 assert!(report.contains("atomic git shim disable"), "{report}");
             }
@@ -2336,7 +2399,7 @@ mod tests {
         drop(git);
         let error = sync_inherited_agent_view(root, &current_view(root)).unwrap_err();
         match error {
-            CliError::GitError { message } => {
+            ShimError::GitError { message } => {
                 assert!(
                     message.contains("Git HEAD changed during agent view selection"),
                     "{message}"

@@ -10,9 +10,9 @@ const CB5C_ROUTED_ENTRYPOINTS: &[&str] = &[
     "src/commands/pull/command.rs",
     "src/commands/push/command.rs",
     "src/commands/clone/command.rs",
-    "src/commands/git/import.rs",
-    "src/commands/git/push.rs",
-    "src/commands/git/shim.rs",
+    "../atomic-git-shim/src/commands/import.rs",
+    "../atomic-git-shim/src/commands/push.rs",
+    "../atomic-git-shim/src/commands/shim.rs",
     "src/commands/agent/hooks.rs",
 ];
 

@@ -37,14 +37,14 @@ use atomic_repository::{GitShaResolution, Repository};
 
 use git2::Repository as GitRepository;
 
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
 use crate::output::{print_hint, print_info, print_success, print_warning};
 
 use super::binding::load_signing_key;
 use super::shim::open_git;
 
 /// The outcome of a bound bootstrap attempt.
-pub(crate) enum BootstrapOutcome {
+pub enum BootstrapOutcome {
     /// A verified binding was resurrected exactly; `anchored` reports the
     /// CB-7A anchor id when a signing key was supplied.
     Bound {
@@ -64,7 +64,7 @@ pub(crate) enum BootstrapOutcome {
 /// `git@host:path` forms, `ssh://` URLs, or an existing local Git
 /// repository (worktree or bare). A plain HTTPS URL that is not a Git
 /// repository stays on the atomic-api path.
-pub(crate) fn is_git_url(url: &str, _target: &Path) -> bool {
+pub fn is_git_url(url: &str, _target: &Path) -> bool {
     let url = url.trim();
     if url.ends_with(".git") || url.starts_with("git@") || url.starts_with("ssh://") {
         return true;
@@ -86,16 +86,16 @@ pub(crate) fn is_git_url(url: &str, _target: &Path) -> bool {
 
 /// Run `git clone <url> <path>` with inherited stdio (the user's auth
 /// config, agents, and askpass prompts behave exactly like plain Git).
-pub(crate) fn git_clone(url: &str, target: &Path) -> CliResult<()> {
+pub fn git_clone(url: &str, target: &Path) -> ShimResult<()> {
     let status = Command::new("git")
         .args(["clone", url])
         .arg(target)
         .status()
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: format!("cannot run git clone: {error}"),
         })?;
     if !status.success() {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: format!("git clone of '{url}' exited with {status}"),
         });
     }
@@ -110,8 +110,8 @@ pub(crate) fn fetch_binding_refs(
     git: &GitRepository,
     remote: &str,
     include_degraded: bool,
-) -> CliResult<()> {
-    let workdir = git.workdir().ok_or_else(|| CliError::GitError {
+) -> ShimResult<()> {
+    let workdir = git.workdir().ok_or_else(|| ShimError::GitError {
         message: "Git repository has no working directory".to_string(),
     })?;
     let mut spec = vec![
@@ -133,11 +133,11 @@ pub(crate) fn fetch_binding_refs(
         .args(&spec)
         .current_dir(workdir)
         .status()
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: format!("cannot run git fetch for binding refs: {error}"),
         })?;
     if !status.success() {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: format!(
                 "fetching binding refs from '{remote}' failed (exit {status}); the clone \
                  cannot claim exact restoration without the binding namespace"
@@ -154,9 +154,12 @@ pub(crate) fn fetch_binding_refs(
 /// undecodable, whose signature fails, or whose bound commit/tree OIDs do
 /// not match the live Git ODB **aborts the whole installation** — no
 /// partial install, no silent skip of a tampered binding.
-pub(crate) fn install_fetched_bindings(repo: &Repository, git: &GitRepository) -> CliResult<usize> {
+pub(crate) fn install_fetched_bindings(
+    repo: &Repository,
+    git: &GitRepository,
+) -> ShimResult<usize> {
     let refs = atomic_repository::git_binding::transferable_binding_refs(git)
-        .map_err(|error| CliError::GitError { message: error })?;
+        .map_err(|error| ShimError::GitError { message: error })?;
     install_binding_refs(repo, git, refs)
 }
 
@@ -168,13 +171,13 @@ pub(crate) fn install_fetched_bindings(repo: &Repository, git: &GitRepository) -
 pub(crate) fn install_degraded_bindings(
     repo: &Repository,
     git: &GitRepository,
-) -> CliResult<usize> {
+) -> ShimResult<usize> {
     use atomic_repository::git_binding::DEGRADED_HEAD_BINDING_PREFIX;
     let mut names = Vec::new();
-    for reference in git.references().map_err(|error| CliError::GitError {
+    for reference in git.references().map_err(|error| ShimError::GitError {
         message: format!("cannot enumerate refs: {error}"),
     })? {
-        let reference = reference.map_err(|error| CliError::GitError {
+        let reference = reference.map_err(|error| ShimError::GitError {
             message: format!("cannot read ref: {error}"),
         })?;
         if let Some(name) = reference.name() {
@@ -197,20 +200,20 @@ fn install_binding_refs(
     repo: &Repository,
     git: &GitRepository,
     refs: Vec<String>,
-) -> CliResult<usize> {
+) -> ShimResult<usize> {
     let mut installed = 0;
     for ref_name in refs {
         let target = git
             .find_reference(&ref_name)
-            .map_err(|error| CliError::GitError {
+            .map_err(|error| ShimError::GitError {
                 message: format!("fetched binding ref '{ref_name}' is unreadable: {error}"),
             })?
             .target()
-            .ok_or_else(|| CliError::GitError {
+            .ok_or_else(|| ShimError::GitError {
                 message: format!("fetched binding ref '{ref_name}' has no direct target"),
             })?;
         let binding =
-            load_binding_at_ref(git, &ref_name, target).map_err(|error| CliError::GitError {
+            load_binding_at_ref(git, &ref_name, target).map_err(|error| ShimError::GitError {
                 message: format!(
                     "fetched binding on '{ref_name}' is refused before installation: {error}"
                 ),
@@ -230,14 +233,14 @@ fn install_binding_refs(
             } else {
                 atomic_repository::git_binding::binding_id_from_ref_name(&ref_name)
             }
-            .ok_or_else(|| CliError::GitError {
+            .ok_or_else(|| ShimError::GitError {
                 message: format!(
                     "fetched binding ref '{ref_name}' does not carry a binding id in a canonical \
                  <shard>/<id> layout and is refused before installation"
                 ),
             })?;
         if id_from_ref != binding.id() {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!(
                     "fetched binding ref '{ref_name}' carries binding {} but its ref name \
                      claims {id_from_ref}; mismatched ref ids are refused before installation",
@@ -249,7 +252,7 @@ fn install_binding_refs(
         // verification before anything is stored: a tampered or malicious
         // binding never reaches the immutable store.
         atomic_repository::git_binding::verify_binding_cryptography(&binding).map_err(|error| {
-            CliError::GitError {
+            ShimError::GitError {
                 message: format!(
                     "fetched binding on '{ref_name}' fails signature/structure verification \
                      and is refused before installation: {error}"
@@ -257,7 +260,7 @@ fn install_binding_refs(
             }
         })?;
         atomic_repository::git_binding::verify_binding_content(git, &binding).map_err(|error| {
-            CliError::GitError {
+            ShimError::GitError {
                 message: format!(
                     "fetched binding on '{ref_name}' does not match the Git object database \
                      and is refused before installation: {error}"
@@ -270,30 +273,33 @@ fn install_binding_refs(
         // parentage, extra tree entries, or tampered payloads never installs.
         let verified = repo
             .verify_published_binding_carrier(git, &binding.id())
-            .map_err(|error| CliError::GitError {
+            .map_err(|error| ShimError::GitError {
                 message: format!(
                     "fetched binding on '{ref_name}' is not an exact immutable published \
                      carrier and is refused before installation: {error}"
                 ),
             })?
-            .ok_or_else(|| CliError::GitError {
+            .ok_or_else(|| ShimError::GitError {
                 message: format!("fetched binding ref '{ref_name}' vanished during validation"),
             })?;
         let verified_oid =
             git2::Oid::from_bytes(verified.carrier_oid.as_bytes()).map_err(|error| {
-                CliError::GitError {
+                ShimError::GitError {
                     message: format!("fetched binding carrier oid is invalid: {error}"),
                 }
             })?;
         if verified_oid != target {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!(
                     "fetched binding ref '{ref_name}' moved during validation and is refused \
                      before installation"
                 ),
             });
         }
-        match repo.store_binding(&binding).map_err(CliError::Repository)? {
+        match repo
+            .store_binding(&binding)
+            .map_err(ShimError::Repository)?
+        {
             atomic_core::pristine::BindingStoreOutcome::Stored => installed += 1,
             atomic_core::pristine::BindingStoreOutcome::Idempotent => {}
         }
@@ -308,31 +314,31 @@ fn load_binding_at_ref(
     git: &GitRepository,
     ref_name: &str,
     target: git2::Oid,
-) -> CliResult<GitStateBinding> {
+) -> ShimResult<GitStateBinding> {
     let commit = git
         .find_commit(target)
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: format!("binding ref '{ref_name}' points at a missing commit: {error}"),
         })?;
-    let tree = commit.tree().map_err(|error| CliError::GitError {
+    let tree = commit.tree().map_err(|error| ShimError::GitError {
         message: format!("binding ref '{ref_name}' commit has no tree: {error}"),
     })?;
     let entry = tree
         .get_name(BINDING_BLOB_NAME)
-        .ok_or_else(|| CliError::GitError {
+        .ok_or_else(|| ShimError::GitError {
             message: format!("binding ref '{ref_name}' tree does not contain {BINDING_BLOB_NAME}"),
         })?;
     if entry.filemode() != i32::from(git2::FileMode::Blob) {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: format!("binding ref '{ref_name}' entry is not a regular blob"),
         });
     }
     let blob = git
         .find_blob(entry.id())
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: format!("binding ref '{ref_name}' blob is missing: {error}"),
         })?;
-    GitStateBinding::decode(blob.content()).map_err(|error| CliError::GitError {
+    GitStateBinding::decode(blob.content()).map_err(|error| ShimError::GitError {
         message: format!("binding ref '{ref_name}' carries undecodable binding bytes: {error}"),
     })
 }
@@ -344,21 +350,21 @@ fn load_binding_at_ref(
 /// Refuses active Git sequences (merge/rebase in progress) and dirty
 /// bootstraps rather than silently merging: the worktree must be clean
 /// relative to HEAD, matching the §7.3 clean-adoption gate.
-pub(crate) fn adopt_git_checkout(
+pub fn adopt_git_checkout(
     root: &Path,
     key_file: Option<&Path>,
     remote_name: &str,
     include_degraded: bool,
-) -> CliResult<BootstrapOutcome> {
-    let mut repo = Repository::open(root).map_err(CliError::Repository)?;
+) -> ShimResult<BootstrapOutcome> {
+    let mut repo = Repository::open(root).map_err(ShimError::Repository)?;
     let git = open_git(root)?;
 
     // Active Git sequences are Git-owned transactions: the bootstrap refuses
     // instead of modeling half-applied state (RFC §7.4).
-    let head = git.head().map_err(|error| CliError::GitError {
+    let head = git.head().map_err(|error| ShimError::GitError {
         message: format!("cannot resolve Git HEAD: {error}"),
     })?;
-    let head_oid = head.target().ok_or_else(|| CliError::GitError {
+    let head_oid = head.target().ok_or_else(|| ShimError::GitError {
         message: "Git HEAD does not point directly at a commit".to_string(),
     })?;
     let head_hex = head_oid.to_string();
@@ -369,14 +375,14 @@ pub(crate) fn adopt_git_checkout(
     // or anchoring runs. A partially dirty adoption would model half-applied
     // state the §7.3 clean-adoption gate never verified.
     if git.path().join("MERGE_HEAD").exists() {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: "refusing to bootstrap: a Git merge is in progress (MERGE_HEAD exists);                      complete or abort the merge, then re-run the bootstrap"
                 .to_string(),
         });
     }
     for sequence_dir in ["rebase-merge", "rebase-apply"] {
         if git.path().join(sequence_dir).exists() {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!(
                     "refusing to bootstrap: a Git rebase is in progress ({sequence_dir} exists); \
                      complete or abort the rebase, then re-run the bootstrap"
@@ -385,7 +391,7 @@ pub(crate) fn adopt_git_checkout(
         }
     }
     {
-        let mut statuses = git.statuses(None).map_err(|error| CliError::GitError {
+        let mut statuses = git.statuses(None).map_err(|error| ShimError::GitError {
             message: format!("cannot inspect the worktree: {error}"),
         })?;
         let dirty: Vec<String> = statuses
@@ -399,7 +405,7 @@ pub(crate) fn adopt_git_checkout(
             .map(|entry| entry.path().unwrap_or("<unknown>").to_string())
             .collect();
         if !dirty.is_empty() {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!(
                     "refusing to bootstrap: the worktree has uncommitted tracked state ({}); \
                      commit or stash it, then re-run the bootstrap — a partial dirty adoption \
@@ -434,19 +440,19 @@ pub(crate) fn adopt_git_checkout(
         40 => GitHashAlgorithm::Sha1,
         64 => GitHashAlgorithm::Sha256,
         other => {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: format!("unsupported Git OID width {other}"),
             })
         }
     };
     let tagged = GitObjectId::new(algorithm, head_oid.as_bytes().to_vec()).map_err(|error| {
-        CliError::GitError {
+        ShimError::GitError {
             message: error.to_string(),
         }
     })?;
     let resolution = repo
         .resolve_git_sha(&git, &tagged)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     let binding = match resolution {
         GitShaResolution::VerifiedBinding { binding, .. } => binding,
         GitShaResolution::Cold => {
@@ -476,9 +482,9 @@ pub(crate) fn adopt_git_checkout(
     let view = {
         let working_copy = repo
             .require_working_copy_id()
-            .map_err(CliError::Repository)?;
+            .map_err(ShimError::Repository)?;
         repo.desired_view_name(working_copy)
-            .map_err(CliError::Repository)?
+            .map_err(ShimError::Repository)?
     };
     print_info(&format!(
         "Resurrecting binding {} ({} ordered change(s)) into view '{view}'",
@@ -491,7 +497,7 @@ pub(crate) fn adopt_git_checkout(
     // fallback inherited underneath.
     let mut remote_source =
         super::transport::HttpBindingChangeSource::for_configured_remote(&repo, remote_name)
-            .map_err(CliError::Repository)?;
+            .map_err(ShimError::Repository)?;
     let outcome = repo
         .resurrect_binding_exact(
             &git,
@@ -501,9 +507,9 @@ pub(crate) fn adopt_git_checkout(
                 .as_mut()
                 .map(|source| source as &mut dyn atomic_repository::BindingChangeSource),
         )
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     if outcome.proof.projected_tree != outcome.proof.bound_tree {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: format!(
                 "recomputed projection {} does not match the bound tree {} before adoption; \
                  refusing (no false exact label)",
@@ -547,7 +553,7 @@ pub(crate) fn adopt_git_checkout(
                     None
                 }
                 Err(error) => {
-                    return Err(CliError::GitError {
+                    return Err(ShimError::GitError {
                         message: format!("shim anchoring failed: {error}"),
                     })
                 }
@@ -574,20 +580,20 @@ pub(crate) fn adopt_git_checkout(
 /// cloned worktree must stay byte-identical to the bound Git tree so the
 /// pre-adoption projection proof compares like with like. Local ignore
 /// configuration is an ordinary post-bootstrap untracked path.
-pub(crate) fn clone_git_url(
+pub fn clone_git_url(
     target: &Path,
     view_name: &str,
     key_file: Option<&Path>,
     include_degraded: bool,
-) -> CliResult<BootstrapOutcome> {
-    let mut repo = Repository::init(target).map_err(CliError::Repository)?;
+) -> ShimResult<BootstrapOutcome> {
+    let mut repo = Repository::init(target).map_err(ShimError::Repository)?;
     let working_copy = repo
         .require_working_copy_id()
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     if view_name != atomic_repository::DEFAULT_VIEW {
-        repo.create_view(view_name).map_err(CliError::Repository)?;
+        repo.create_view(view_name).map_err(ShimError::Repository)?;
         repo.align_to_view(working_copy, view_name)
-            .map_err(CliError::Repository)?;
+            .map_err(ShimError::Repository)?;
     }
     drop(repo);
     adopt_git_checkout(target, key_file, "origin", include_degraded)

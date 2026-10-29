@@ -54,23 +54,34 @@
 //! $ atomic git import --incremental
 //! ```
 
+// Preserve the existing command adapter lint policy during extraction.
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_mut,
+    unused_variables,
+    unused_assignments
+)]
+
 mod agent_mode;
 pub mod anchor;
 pub mod binding;
-pub(crate) mod bootstrap;
+pub mod bootstrap;
 pub mod census;
-pub(crate) mod checkpoint;
+pub mod checkpoint;
 pub(crate) mod guard;
 pub(crate) mod hook_dispatchers;
+pub use hook_dispatchers::{inspect_dispatchers, DispatcherHook, DispatcherReport, HookState};
 pub mod hooks;
 pub mod import;
-pub(crate) mod linked_worktree;
-pub(crate) mod observation;
+pub mod linked_worktree;
+pub mod observation;
 pub mod parallel;
 pub(crate) mod push;
-pub(crate) mod ref_mapping;
-pub(crate) mod shadow;
+pub mod ref_mapping;
+pub mod shadow;
 pub mod shim;
+pub mod status;
 pub(crate) mod transport;
 pub(crate) mod verify_receive;
 pub(crate) mod watch;
@@ -87,8 +98,7 @@ pub use wip::{
     WipCapture, WipCaptureError, WipCaptureRequest, WIP_REF_PREFIX,
 };
 
-use crate::commands::Command;
-use crate::error::CliResult;
+use crate::error::ShimResult;
 
 /// Subcommands for Git interoperability.
 #[derive(Subcommand, Debug)]
@@ -162,8 +172,8 @@ pub struct Git {
     pub command: GitCommands,
 }
 
-impl Command for Git {
-    fn run(&self) -> CliResult<()> {
+impl Git {
+    pub fn run(&self) -> ShimResult<()> {
         match &self.command {
             GitCommands::Shim(cmd) => cmd.run(),
             GitCommands::Import(cmd) => cmd.run(),

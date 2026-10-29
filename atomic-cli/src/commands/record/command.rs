@@ -193,11 +193,14 @@ impl Command for Record {
         // status` are both clean afterwards. Partial user staging is
         // intentionally preserved (never staged over) and skips only the
         // projection, never the record itself.
+        #[cfg(feature = "git-shim")]
         let recorded_something =
             !outcome.recorded_files().is_empty() || !outcome.deleted_files().is_empty();
+        #[cfg(feature = "git-shim")]
         let recorded_hash = recorded_something.then(|| *outcome.hash());
         drop(workspace);
         drop(repo);
+        #[cfg(feature = "git-shim")]
         if let Some(hash) = recorded_hash {
             crate::commands::git::shadow::sync_git_projection_after_record(
                 &repo_root, &view_name, &hash,

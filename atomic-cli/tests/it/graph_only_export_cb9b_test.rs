@@ -166,8 +166,8 @@ fn assert_export_matches(root: &Path, view: &str, expected: &[(&str, Vec<u8>)], 
 }
 
 const SCALAR_FILES: [&str; 13] = [
-    "atomic-cli/src/commands/git/parallel.rs",
-    "atomic-cli/src/commands/git/hooks.rs",
+    "atomic-git-shim/src/commands/parallel.rs",
+    "atomic-git-shim/src/commands/hooks.rs",
     "atomic-cli/tests/git_import_cb9b_test.rs",
     "atomic-cli/tests/git_conflict_cb8b_test.rs",
     "atomic-core/src/operation/mod.rs",

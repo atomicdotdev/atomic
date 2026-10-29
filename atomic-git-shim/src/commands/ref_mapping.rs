@@ -6,10 +6,8 @@
 //! classify the three-way matrix, and expose the status/publish lifecycle
 //! surfaces.
 
-use crate::commands::git::shim::{
-    journal_and_create_branch_cas_with_mapping, journal_and_move_branch,
-};
-use crate::commands::workspace_txn::enter_workspace;
+use crate::commands::shim::{journal_and_create_branch_cas_with_mapping, journal_and_move_branch};
+use crate::workspace_txn::enter_workspace;
 use atomic_core::pristine::{RefMapping, RefSyncStatus, ViewScope, ViewTxnT, REF_MAPPING_VERSION};
 use atomic_core::types::Base32;
 use atomic_core::WorkingCopyId;
@@ -21,36 +19,36 @@ pub(crate) use atomic_repository::repository::ref_mapping::{Containment, ThreeWa
 use atomic_repository::{Repository, WorkspaceTxnMode};
 use git2::Repository as GitRepository;
 
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
 
 /// The mapped local ref for `view` under the §8.1 scope policy.
 ///
 /// Shared → `refs/heads/<name>` (symbolic HEAD), Draft →
 /// `refs/atomic/views/<name>` (detached HEAD), ephemeral `git/<oid>` →
 /// `None` (no extra ref beyond the original commit).
-pub(crate) fn mapped_ref_for_view(repo: &Repository, view: &str) -> CliResult<Option<String>> {
+pub(crate) fn mapped_ref_for_view(repo: &Repository, view: &str) -> ShimResult<Option<String>> {
     if is_ephemeral_view_name(view) {
         return Ok(None);
     }
-    let scope = repo.get_view_info(view).map_err(CliError::from)?.scope;
+    let scope = repo.get_view_info(view).map_err(ShimError::from)?.scope;
     Ok(mapped_local_ref(scope, view))
 }
 
 /// The durable internal view id for `view` (mapping key identity).
-fn durable_view_id(repo: &Repository, view: &str) -> CliResult<u64> {
+fn durable_view_id(repo: &Repository, view: &str) -> ShimResult<u64> {
     let txn = repo.pristine().read_txn().map_err(|error| {
-        CliError::Repository(atomic_repository::RepositoryError::Database(
+        ShimError::Repository(atomic_repository::RepositoryError::Database(
             error.to_string(),
         ))
     })?;
     txn.get_view(view)
         .map_err(|error| {
-            CliError::Repository(atomic_repository::RepositoryError::Database(
+            ShimError::Repository(atomic_repository::RepositoryError::Database(
                 error.to_string(),
             ))
         })?
         .map(|view_state| view_state.id)
-        .ok_or(CliError::ViewNotFound {
+        .ok_or(ShimError::ViewNotFound {
             name: view.to_string(),
         })
 }
@@ -90,11 +88,11 @@ pub(crate) fn ensure_baseline_mapping(
     working_copy: WorkingCopyId,
     git: &GitRepository,
     view: &str,
-) -> CliResult<(RefMapping, bool)> {
-    if let Some(existing) = repo.get_ref_mapping(view).map_err(CliError::from)? {
+) -> ShimResult<(RefMapping, bool)> {
+    if let Some(existing) = repo.get_ref_mapping(view).map_err(ShimError::from)? {
         return Ok((existing, false));
     }
-    let info = repo.get_view_info(view).map_err(CliError::from)?;
+    let info = repo.get_view_info(view).map_err(ShimError::from)?;
     let local_ref = if is_ephemeral_view_name(view) {
         None
     } else {
@@ -124,7 +122,7 @@ pub(crate) fn ensure_baseline_mapping(
     // lease — a row another working copy wrote between the read above and
     // this write refuses closed instead of storing a stale baseline over it.
     repo.create_ref_mapping_expected_absent(working_copy, view, mapping.clone())
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     // CB-13C F3: the caller must know the run JOURNALED a mapping (a
     // mutation) so no later `Refused` terminal outcome is emitted after a
     // mutation — `Refused` promises before-any-mutation.
@@ -151,14 +149,14 @@ pub(crate) fn refresh_mapping_observation(
     view: &str,
     exported_tip: Option<&str>,
     common: Option<&atomic_repository::RepositoryCommonLockGuard>,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let held;
     let common = match common {
         Some(common) => common,
         None => {
             let Some(acquired) = repo
                 .try_lock_ref_mapping_observation()
-                .map_err(CliError::from)?
+                .map_err(ShimError::from)?
             else {
                 return Err(git_error(
                     "another atomic git operation holds the repository lock; retry the reconcile",
@@ -168,8 +166,8 @@ pub(crate) fn refresh_mapping_observation(
             &held
         }
     };
-    let previous = repo.get_ref_mapping(view).map_err(CliError::from)?;
-    let info = repo.get_view_info(view).map_err(CliError::from)?;
+    let previous = repo.get_ref_mapping(view).map_err(ShimError::from)?;
+    let info = repo.get_view_info(view).map_err(ShimError::from)?;
     // CB-10A: an existing mapping's local ref is authoritative (explicit
     // publish/rename reconciled it); only a fresh row falls back to the pure
     // scope policy.
@@ -222,7 +220,7 @@ pub(crate) fn refresh_mapping_observation(
         Some(mapping),
         Some(common),
     )
-    .map_err(CliError::from)?;
+    .map_err(ShimError::from)?;
     Ok(())
 }
 
@@ -240,14 +238,14 @@ pub(crate) fn record_remote_push_observation(
     remote_ref: &str,
     new_remote_tip: &str,
     common: Option<&atomic_repository::RepositoryCommonLockGuard>,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let held;
     let common = match common {
         Some(common) => common,
         None => {
             let Some(acquired) = repo
                 .try_lock_ref_mapping_observation()
-                .map_err(CliError::from)?
+                .map_err(ShimError::from)?
             else {
                 return Err(git_error(
                     "another atomic git operation holds the repository lock; retry the push to record the remote observation",
@@ -257,8 +255,8 @@ pub(crate) fn record_remote_push_observation(
             &held
         }
     };
-    let previous = repo.get_ref_mapping(view).map_err(CliError::from)?;
-    let info = repo.get_view_info(view).map_err(CliError::from)?;
+    let previous = repo.get_ref_mapping(view).map_err(ShimError::from)?;
+    let info = repo.get_view_info(view).map_err(ShimError::from)?;
     let mapping = RefMapping {
         version: REF_MAPPING_VERSION,
         view_id: durable_view_id(repo, view)?,
@@ -289,7 +287,7 @@ pub(crate) fn record_remote_push_observation(
         Some(mapping),
         Some(common),
     )
-    .map_err(CliError::from)?;
+    .map_err(ShimError::from)?;
     Ok(())
 }
 
@@ -299,7 +297,7 @@ pub(crate) fn classify_mapping_direction(
     git: &GitRepository,
     view: &str,
     mapping: &RefMapping,
-) -> CliResult<RefMappingDecision> {
+) -> ShimResult<RefMappingDecision> {
     let tip = mapping.local_ref.as_deref().and_then(|reference| {
         git.find_reference(reference)
             .ok()
@@ -308,7 +306,7 @@ pub(crate) fn classify_mapping_direction(
     });
     let current_atomic = repo
         .get_view_info(view)
-        .map_err(CliError::from)?
+        .map_err(ShimError::from)?
         .state
         .to_base32();
     // `git branch -D` on the mapped branch leaves no ref to reconcile: the
@@ -345,7 +343,7 @@ pub(crate) fn classify_mapping_direction(
     };
     let atomic_contains_git = if walk_complete {
         repo.atomic_contains_git_closure(view, added_set)
-            .map_err(CliError::from)?
+            .map_err(ShimError::from)?
     } else {
         None
     };
@@ -398,7 +396,7 @@ pub(crate) fn persist_diverged_status(
     repo: &Repository,
     working_copy: WorkingCopyId,
     mapping: &RefMapping,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let mut diverged = mapping.clone();
     diverged.status = RefSyncStatus::Diverged;
     // Pinned to the classified row: a concurrent mapping move must not be
@@ -409,7 +407,7 @@ pub(crate) fn persist_diverged_status(
         Some(mapping),
         Some(diverged),
     )
-    .map_err(CliError::from)?;
+    .map_err(ShimError::from)?;
     Ok(())
 }
 
@@ -435,15 +433,15 @@ pub(crate) fn remediation_for(status: RefSyncStatus) -> &'static str {
 /// Surface persisted ref-mapping divergence in `atomic status` (CB-10A AC-2):
 /// an actionable Diverged/Unrepresentable warning with explicit insert/merge
 /// remediation. Read-only; it never materializes and never moves a ref.
-pub(crate) fn print_divergence_notices(repo: &Repository) -> CliResult<()> {
-    for mapping in repo.list_ref_mappings().map_err(CliError::from)? {
+pub fn print_divergence_notices(repo: &Repository) -> ShimResult<()> {
+    for mapping in repo.list_ref_mappings().map_err(ShimError::from)? {
         let diverged = mapping.status == RefSyncStatus::Diverged;
         // A deleted-view tombstone is reported by view existence alone; the
         // persisted local ref (CB-10A review R5: tombstones keep the ref
         // name) is preserved in the diagnostic instead of being erased.
         let orphaned = !repo
             .view_exists(&mapping.view_name)
-            .map_err(CliError::from)?;
+            .map_err(ShimError::from)?;
         if diverged {
             crate::output::print_warning(&format!(
                 "ref mapping for view '{}' is Diverged: Git and Atomic both moved beyond the last \
@@ -466,16 +464,16 @@ pub(crate) fn print_divergence_notices(repo: &Repository) -> CliResult<()> {
 
 /// `atomic git shim status`: read-only per-view ref-mapping reconciliation
 /// report (CB-10A AC-2). Never materializes; never moves a ref.
-pub(crate) fn run_status() -> CliResult<()> {
-    let root = crate::commands::find_repository_root()?;
-    let repo = Repository::open(&root).map_err(CliError::from)?;
-    let mappings = repo.list_ref_mappings().map_err(CliError::from)?;
+pub(crate) fn run_status() -> ShimResult<()> {
+    let root = crate::find_repository_root()?;
+    let repo = Repository::open(&root).map_err(ShimError::from)?;
+    let mappings = repo.list_ref_mappings().map_err(ShimError::from)?;
 
     // Also report the current workspace view when it has no mapping yet.
-    let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+    let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
     let current_view = repo
         .desired_view_name(working_copy)
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
     let mut rows: Vec<(RefMapping, bool)> = mappings
         .into_iter()
         .map(|mapping| (mapping, true))
@@ -483,7 +481,7 @@ pub(crate) fn run_status() -> CliResult<()> {
     if !rows
         .iter()
         .any(|(mapping, _)| mapping.view_name == current_view)
-        && repo.view_exists(&current_view).map_err(CliError::from)?
+        && repo.view_exists(&current_view).map_err(ShimError::from)?
     {
         rows.push((unpersisted_mapping(&repo, &current_view)?, false));
     }
@@ -492,13 +490,13 @@ pub(crate) fn run_status() -> CliResult<()> {
         println!("no ref mappings (run 'atomic git shim reconcile' to establish one)");
         return Ok(());
     }
-    let git = GitRepository::open(&root).map_err(|error| CliError::GitError {
+    let git = GitRepository::open(&root).map_err(|error| ShimError::GitError {
         message: format!("cannot open Git repository: {error}"),
     })?;
     for (mapping, persisted) in rows {
         let view_exists = repo
             .view_exists(&mapping.view_name)
-            .map_err(CliError::from)?;
+            .map_err(ShimError::from)?;
         let (display_status, remediation) = if !view_exists {
             (
                 RefSyncStatus::Unrepresentable,
@@ -561,8 +559,8 @@ pub(crate) fn run_status() -> CliResult<()> {
 
 /// Build the display-only mapping for a workspace view without a persisted
 /// row (read-only; `view_id` 0 marks it unpersisted).
-fn unpersisted_mapping(repo: &Repository, view: &str) -> CliResult<RefMapping> {
-    let info = repo.get_view_info(view).map_err(CliError::from)?;
+fn unpersisted_mapping(repo: &Repository, view: &str) -> ShimResult<RefMapping> {
+    let info = repo.get_view_info(view).map_err(ShimError::from)?;
     Ok(RefMapping {
         version: REF_MAPPING_VERSION,
         view_id: 0,
@@ -593,12 +591,12 @@ fn unpersisted_mapping(repo: &Repository, view: &str) -> CliResult<RefMapping> {
 /// ref write goes through a real Git reference transaction — the ref is
 /// locked and re-compared under Git's own ref lock — behind a journaled
 /// expected-absent operation with leased receipts.
-pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
-    let root = crate::commands::find_repository_root()?;
-    let mut repo = Repository::open(&root).map_err(CliError::from)?;
-    let info = repo.get_view_info(view).map_err(CliError::from)?;
+pub(crate) fn run_publish(view: &str, branch: &str) -> ShimResult<()> {
+    let root = crate::find_repository_root()?;
+    let mut repo = Repository::open(&root).map_err(ShimError::from)?;
+    let info = repo.get_view_info(view).map_err(ShimError::from)?;
     if !matches!(info.scope, ViewScope::Draft) {
-        return Err(CliError::GitError {
+        return Err(ShimError::GitError {
             message: format!(
                 "view '{view}' is {} and already maps to a Git ref; publish applies to Draft views",
                 if info.scope == ViewScope::Shared {
@@ -618,10 +616,10 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
     // mutation; a refused publication mutates nothing.
     let workspace = enter_workspace(&mut repo, WorkspaceTxnMode::Reconcile)?;
     let working_copy = workspace.working_copy();
-    let git = GitRepository::open(&root).map_err(|error| CliError::GitError {
+    let git = GitRepository::open(&root).map_err(|error| ShimError::GitError {
         message: format!("cannot open Git repository: {error}"),
     })?;
-    crate::commands::git::shim::require_clean_git_worktree(&git)?;
+    crate::commands::shim::require_clean_git_worktree(&git)?;
 
     let target_ref = format!("refs/heads/{branch}");
     // Review R3: publication is create-only. An occupied target is never a
@@ -653,7 +651,7 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
             super::shadow::ephemeral_original_commit(&git, view)
                 .and_then(|hex| git2::Oid::from_str(&hex).ok())
         })
-        .ok_or_else(|| CliError::GitError {
+        .ok_or_else(|| ShimError::GitError {
             message: format!(
                 "view '{view}' has no projection commit to publish; run 'atomic git shim reconcile' or record first"
             ),
@@ -669,7 +667,7 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
     // `Synchronized` for it. The stale-source probe — external
     // `git update-ref refs/atomic/views/topic refs/heads/main`, then
     // `git shim publish topic --branch …` — refuses here instead.
-    let checkpoint = crate::commands::git::shim::read_workspace_metadata(&root)?;
+    let checkpoint = crate::commands::shim::read_workspace_metadata(&root)?;
     let checkpoint = checkpoint.ok_or_else(|| {
         git_error(format!(
             "refusing to publish view '{view}': there is no verified shim checkpoint; \
@@ -749,8 +747,8 @@ pub(crate) fn run_publish(view: &str, branch: &str) -> CliResult<()> {
     Ok(())
 }
 
-fn git_error(message: impl Into<String>) -> CliError {
-    CliError::GitError {
+fn git_error(message: impl Into<String>) -> ShimError {
+    ShimError::GitError {
         message: message.into(),
     }
 }

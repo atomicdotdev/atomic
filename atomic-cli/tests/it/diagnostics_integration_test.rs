@@ -1289,11 +1289,19 @@ fn inside_a_git_backed_workspace_the_shim_is_reported_and_nothing_changes() {
     let report = fixture.json();
     assert_eq!(report["workspace"]["status"], "found");
     assert_eq!(report["git_shim"]["status"], "disabled");
-    let dispatchers = report["git_shim"]["hooks"]["dispatchers"]
-        .as_array()
-        .unwrap();
-    assert_eq!(dispatchers.len(), 5);
-    assert!(dispatchers.iter().all(|d| d["state"] == "not_installed"));
+    if cfg!(feature = "git-shim") {
+        let dispatchers = report["git_shim"]["hooks"]["dispatchers"]
+            .as_array()
+            .unwrap();
+        assert_eq!(dispatchers.len(), 5);
+        assert!(dispatchers.iter().all(|d| d["state"] == "not_installed"));
+    } else {
+        assert_eq!(report["git_shim"]["hooks"]["status"], "unreadable");
+        assert!(report["git_shim"]["hooks"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("without the `git-shim` feature"));
+    }
     fixture.ok(&["diagnostics"]);
 
     assert_eq!(
@@ -1301,6 +1309,35 @@ fn inside_a_git_backed_workspace_the_shim_is_reported_and_nothing_changes() {
         snapshot(fixture.work.path()),
         "diagnostics is read-only"
     );
+}
+
+#[test]
+fn diagnostics_remains_read_only_when_enrollment_blocks_native_commands() {
+    let fixture = Fixture::new();
+    fixture.ok(&["init", "--no-vault", "--view", "main"]);
+    let config_path = fixture.work.path().join(".atomic/config.toml");
+    let mut config = atomic_config::RepoConfig::load(&config_path).unwrap();
+    config.git.shim.enabled = true;
+    config.save(&config_path).unwrap();
+    let checkpoint = fixture.work.path().join(".atomic/bridge/workspace.json");
+    std::fs::create_dir_all(checkpoint.parent().unwrap()).unwrap();
+    std::fs::write(&checkpoint, b"incomplete checkpoint").unwrap();
+    let before = snapshot(fixture.work.path());
+
+    let report = fixture.json();
+    assert_eq!(report["git_shim"]["status"], "enabled");
+    fixture.ok(&["diagnostics"]);
+    if !cfg!(feature = "git-shim") {
+        assert!(report["git_shim"]["hooks"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("without the `git-shim` feature"));
+        let refused = fixture.run(&["record", "-am", "must refuse"]);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("built without `git-shim`"));
+    }
+    assert_eq!(before, snapshot(fixture.work.path()));
+    assert_eq!(std::fs::read(checkpoint).unwrap(), b"incomplete checkpoint");
 }
 
 /// Every file under `root` with its length and modification time.

@@ -9,6 +9,8 @@
 //!
 //! Configuration is merged with later levels overriding earlier ones.
 
+pub mod ignore_templates;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;

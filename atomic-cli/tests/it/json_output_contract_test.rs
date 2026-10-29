@@ -83,6 +83,7 @@ impl Fixture {
         ]);
     }
 
+    #[cfg(feature = "git-shim")]
     fn git(&self, args: &[&str]) {
         let output = Command::new("git")
             .args(["-c", "core.hooksPath=/dev/null"])
@@ -238,6 +239,7 @@ fn adoption_json_has_no_replacement_notice_on_stdout() {
 }
 
 #[test]
+#[cfg(feature = "git-shim")]
 fn git_diff_json_covers_clean_unstaged_and_staged_layers() {
     let fixture = Fixture::empty();
     fixture.git(&["init", "-q", "-b", "main"]);

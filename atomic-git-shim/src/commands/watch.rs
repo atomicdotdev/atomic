@@ -37,8 +37,7 @@ use atomic_repository::repository::{observe_git_metadata, GitQuiescence, Reconci
 
 use super::observation::{observe_git, GitObservation, HeadObservation};
 use super::shim::{reconcile_transaction_budgeted, shim_config, WatchNoticeKind, WatchNoticeSink};
-use crate::commands::Command;
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
 use crate::output::{print_info, print_warning};
 
 /// Bounded metadata re-observation interval for the hint loop. Polling is
@@ -104,7 +103,7 @@ impl MetadataHint {
     /// digest is sampled fresh: the metadata-only daemon never moves refs,
     /// so the checkpoint cannot bind it, and an external ref movement must
     /// still fire.
-    pub(crate) fn verified_baseline(root: &Path) -> CliResult<Self> {
+    pub(crate) fn verified_baseline(root: &Path) -> ShimResult<Self> {
         let fresh = Self::observe(root)?;
         let verified = super::shim::read_workspace_metadata(root).ok().flatten();
         Ok(match verified {
@@ -121,8 +120,8 @@ impl MetadataHint {
     }
 
     /// Observe the current Git metadata truth through Git's own APIs.
-    pub(crate) fn observe(root: &Path) -> CliResult<Self> {
-        let observation = observe_git(root).map_err(|error| CliError::StaleBaseline {
+    pub(crate) fn observe(root: &Path) -> ShimResult<Self> {
+        let observation = observe_git(root).map_err(|error| ShimError::StaleBaseline {
             report: format!("shim watch cannot observe Git metadata truth: {error}"),
         })?;
         let base = match observation {
@@ -142,7 +141,7 @@ impl MetadataHint {
         // The Git-owned transaction state is truth the digests cannot see:
         // a lock or marker file's presence changes what the shim may do
         // even when every digest is unchanged (review R6).
-        let metadata = observe_git_metadata(root).map_err(|error| CliError::StaleBaseline {
+        let metadata = observe_git_metadata(root).map_err(|error| ShimError::StaleBaseline {
             report: format!("shim watch cannot observe Git state for the hint: {error}"),
         })?;
         Ok(Self {
@@ -162,9 +161,9 @@ impl MetadataHint {
     }
 }
 
-impl Command for Watch {
-    fn run(&self) -> CliResult<()> {
-        let root = crate::commands::find_repository_root()?;
+impl Watch {
+    pub fn run(&self) -> ShimResult<()> {
+        let root = crate::find_repository_root()?;
         run_watch(&root, self.once, self.poll_ms)
     }
 }
@@ -183,13 +182,13 @@ impl Command for Watch {
 /// repository head, and a diverged head set must defer too.
 pub(crate) fn head_operation_in_flight(
     repository: &atomic_repository::Repository,
-) -> CliResult<Option<String>> {
+) -> ShimResult<Option<String>> {
     use atomic_core::operation::OperationScope;
     use atomic_repository::repository::OperationVerificationState;
 
     let repository_log = repository
         .operation_log(OperationScope::Repository, Some(1), false)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     let in_flight = repository_log
         .entries
         .iter()
@@ -203,10 +202,10 @@ pub(crate) fn head_operation_in_flight(
     // own prior pass's operation (crashed before verification) lives here.
     let working_copy = repository
         .require_working_copy_id()
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     let working_copy_log = repository
         .operation_log(OperationScope::WorkingCopy(working_copy), Some(1), false)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     Ok(working_copy_log
         .entries
         .iter()
@@ -224,13 +223,13 @@ pub(crate) fn wait_for_quiescence(
     quiet: Duration,
     poll: Duration,
     deadline: Option<Instant>,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let mut last_change = Instant::now();
     let mut stable = MetadataHint::observe(root)?;
     loop {
         if let Some(deadline) = deadline {
             if Instant::now() >= deadline {
-                return Err(CliError::StaleBaseline {
+                return Err(ShimError::StaleBaseline {
                     report: "shim watch: quiescence deadline reached while a Git-owned \
                              transaction was still in flight; deferring to the next command \
                              boundary"
@@ -238,7 +237,7 @@ pub(crate) fn wait_for_quiescence(
                 });
             }
         }
-        let observation = observe_git_metadata(root).map_err(|error| CliError::StaleBaseline {
+        let observation = observe_git_metadata(root).map_err(|error| ShimError::StaleBaseline {
             report: format!("shim watch cannot observe Git state for quiescence: {error}"),
         })?;
         match GitQuiescence::evaluate(&observation) {
@@ -302,7 +301,7 @@ fn reactive_pass(
     quiet: Duration,
     poll: Duration,
     sessions: &SessionStore,
-) -> CliResult<PassOutcome> {
+) -> ShimResult<PassOutcome> {
     let current = MetadataHint::observe(root)?;
     if let Some(baseline) = hint_baseline {
         if !current.differs_from(baseline) {
@@ -312,7 +311,7 @@ fn reactive_pass(
     // The hint fired. Unsafe states surface, never act (RFC §11.2 rule 6):
     // an evaluation that is not quiescent right now becomes a notice and
     // the daemon waits instead of repairing.
-    let observation = observe_git_metadata(root).map_err(|error| CliError::StaleBaseline {
+    let observation = observe_git_metadata(root).map_err(|error| ShimError::StaleBaseline {
         report: format!("shim watch cannot observe Git state: {error}"),
     })?;
     if let GitQuiescence::Busy { reason, detail } = GitQuiescence::evaluate(&observation) {
@@ -351,7 +350,7 @@ fn reactive_pass(
             }
             return Ok(PassOutcome::Deferred);
         }
-        Err(error) => return Err(CliError::Repository(error)),
+        Err(error) => return Err(ShimError::Repository(error)),
     };
     if let Some(operation) = head_operation_in_flight(&repo)? {
         drop(repo);
@@ -374,7 +373,7 @@ fn reactive_pass(
     // with the balanced atomic-bridge state enter/leave (Watchman) so the
     // the shim's own writes are suppressed from watchers.
     let sessions_for_notice =
-        SessionStore::for_repo(root).map_err(|error| CliError::InvalidRepository {
+        SessionStore::for_repo(root).map_err(|error| ShimError::InvalidRepository {
             reason: format!("cannot open the session store: {error}"),
         })?;
     let sink = move |kind: WatchNoticeKind, detail: &str| {
@@ -411,7 +410,7 @@ fn reactive_pass(
 
 /// Run one metadata-only reconcile pass inside the balanced atomic-bridge
 /// watcher bracket.
-fn bracket_pass(root: &Path, sink: &(dyn Fn(WatchNoticeKind, &str) + '_)) -> CliResult<()> {
+fn bracket_pass(root: &Path, sink: &(dyn Fn(WatchNoticeKind, &str) + '_)) -> ShimResult<()> {
     let sink_ref: &WatchNoticeSink<'_> = sink;
     let operation = format!("shim-watch:{}", std::process::id());
     let root_owned = root.to_path_buf();
@@ -474,10 +473,10 @@ fn notify_active_sessions(
 }
 
 /// The daemon entry point: consent, then the hint loop (or a single pass).
-pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> {
+pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> ShimResult<()> {
     let config = shim_config(root)?;
     if !config.git.shim.enabled {
-        return Err(CliError::InvalidRepository {
+        return Err(ShimError::InvalidRepository {
             reason: "the shim is not enabled for this repository (set [git.shim] \
                      enabled = true); the watch daemon is an optional accelerator on top of \
                      command-boundary reconciliation"
@@ -485,7 +484,7 @@ pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> 
         });
     }
     if let Some(refusal) = config.git.shim.watch.startup_refusal() {
-        return Err(CliError::InvalidRepository {
+        return Err(ShimError::InvalidRepository {
             reason: refusal.to_string(),
         });
     }
@@ -493,7 +492,7 @@ pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> 
     // overrides the shim-watch consent. The daemon is a tier accelerator,
     // not an independent consent surface — the explicit off wins.
     if config.git.watch == atomic_config::GitWatch::Off {
-        return Err(CliError::InvalidRepository {
+        return Err(ShimError::InvalidRepository {
             reason: "the shim watch daemon is disabled by [git] watch = \"off\"; \
                      command-boundary reconciliation remains the correctness guarantee"
                 .to_string(),
@@ -511,7 +510,7 @@ pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> 
     }
     let quiet = Duration::from_millis(config.git.shim.watch.effective_quiet_ms());
     let poll = Duration::from_millis(poll_ms.max(MIN_POLL_INTERVAL_MS));
-    let sessions = SessionStore::for_repo(root).map_err(|error| CliError::InvalidRepository {
+    let sessions = SessionStore::for_repo(root).map_err(|error| ShimError::InvalidRepository {
         reason: format!("cannot open the session store: {error}"),
     })?;
 
@@ -530,7 +529,7 @@ pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> 
         match reactive_pass(root, None, None, quiet, poll, &sessions)? {
             PassOutcome::Attempted { .. } | PassOutcome::NoChange => return Ok(()),
             PassOutcome::Deferred => {
-                return Err(CliError::StaleBaseline {
+                return Err(ShimError::StaleBaseline {
                     report: "shim watch: the external transition was noticed but the \
                              reconcile was deferred (unsafe state, pending recovery, or \
                              in-flight shim operation); the notice names the remediation"
@@ -613,7 +612,7 @@ pub(crate) fn run_watch(root: &Path, once: bool, poll_ms: u64) -> CliResult<()> 
                 // noise); the next truth change re-detects divergence.
                 let retryable = matches!(
                     &error,
-                    CliError::Repository(repository_error) if repository_error.is_lock_contended()
+                    ShimError::Repository(repository_error) if repository_error.is_lock_contended()
                 );
                 log::warn!("shim watch: reactive reconcile failed: {error}");
                 notice_gate = Some(current.clone());

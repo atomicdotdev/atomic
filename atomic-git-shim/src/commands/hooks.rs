@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::observation::{observe_git, GitObservation, HeadObservation};
-use crate::commands::{find_repository_root, Command};
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
+use crate::find_repository_root;
 use crate::output::{print_info, print_warning};
 
 use atomic_repository::repository::{
@@ -54,8 +54,8 @@ pub enum HookCommands {
     Status,
 }
 
-impl Command for Hooks {
-    fn run(&self) -> CliResult<()> {
+impl Hooks {
+    pub fn run(&self) -> ShimResult<()> {
         let root = find_repository_root()?;
         match &self.command {
             HookCommands::Install => enable_shim(&root, false),
@@ -83,7 +83,7 @@ enum DispatcherInstall {
 /// Only a missing hook or an exact Atomic-owned dispatcher is written. A
 /// custom `core.hooksPath`, symlink, binary, or unmanaged hook is reported with
 /// an integration command and left byte-for-byte untouched.
-pub(crate) fn enable_shim(root: &Path, mirror_ignores: bool) -> CliResult<()> {
+pub(crate) fn enable_shim(root: &Path, mirror_ignores: bool) -> ShimResult<()> {
     let root = canonical_root(root)?;
     let binary = std::env::current_exe()
         .map_err(|error| git_error(format!("cannot resolve the Atomic binary path: {error}")))?;
@@ -236,7 +236,7 @@ pub(crate) fn enable_shim(root: &Path, mirror_ignores: bool) -> CliResult<()> {
 /// CB-11A: mirror unrepresented `.atomicignore` patterns into the managed
 /// `.git/info/exclude` block. This is the explicit-consent operation (RFC
 /// §9.4); it is only ever run when the user passes `--mirror-ignores`.
-pub(crate) fn mirror_ignores_with_consent(root: &Path) -> CliResult<()> {
+pub(crate) fn mirror_ignores_with_consent(root: &Path) -> ShimResult<()> {
     let root = canonical_root(root)?;
     let before = atomic_repository::check_ignore_policy(&root)
         .map_err(|error| git_error(format!("cannot inspect ignore policy: {error}")))?;
@@ -260,7 +260,7 @@ pub(crate) fn mirror_ignores_with_consent(root: &Path) -> CliResult<()> {
     Ok(())
 }
 
-pub(super) fn git_hook_context(root: &Path) -> CliResult<GitHookContext> {
+pub(super) fn git_hook_context(root: &Path) -> ShimResult<GitHookContext> {
     let common_dir = match observe_git(root)
         .map_err(|error| git_error(format!("cannot resolve Git administrative paths: {error}")))?
     {
@@ -370,7 +370,7 @@ fn shell_quote(path: &Path) -> io::Result<String> {
     Ok(format!("'{}'", value.replace('\'', "'\\''")))
 }
 
-pub(super) fn print_unmanaged_instructions(reason: &str, binary: &Path) -> CliResult<()> {
+pub(super) fn print_unmanaged_instructions(reason: &str, binary: &Path) -> ShimResult<()> {
     let command = integration_command(binary).map_err(|error| {
         git_error(format!(
             "cannot format hook integration instructions: {error}"
@@ -442,7 +442,7 @@ pub(super) fn is_legacy_atomic_only(content: &[u8]) -> bool {
     saw_begin && saw_end && !in_atomic_section
 }
 
-fn migrate_legacy_import_hooks(hooks_dir: &Path, binary: &Path) -> CliResult<()> {
+fn migrate_legacy_import_hooks(hooks_dir: &Path, binary: &Path) -> ShimResult<()> {
     for hook_name in ["post-commit", "post-merge", "post-rewrite"] {
         let path = hooks_dir.join(hook_name);
         let metadata = match fs::symlink_metadata(&path) {
@@ -649,7 +649,7 @@ pub(crate) fn record_post_checkout(
     old_head: &str,
     new_head: &str,
     checkout_flag: &str,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let scheduled = persist_checkout_event(root, old_head, new_head, checkout_flag)?;
     warn_if_view_mismatch(root);
     spawn_deferred_observer(root, &scheduled)
@@ -684,7 +684,7 @@ pub(crate) fn record_post_checkout(
 /// verified projection commit (the mapped-ref tip the shadow publication
 /// verification proves), so the gate's verdict covers precisely the objects
 /// this push proposes — never a mutable HEAD reread after the fact.
-pub(crate) fn run_pre_push_verification(root: &Path) -> CliResult<()> {
+pub(crate) fn run_pre_push_verification(root: &Path) -> ShimResult<()> {
     // Read the proposed refs/OIDs; Git blocks on a broken-pipe writer
     // otherwise. The local OIDs bind the verdict (see the bound entry
     // point).
@@ -699,7 +699,7 @@ pub(crate) fn run_pre_push_verification(root: &Path) -> CliResult<()> {
 /// The exact-OID-bound pre-push verification over caller-supplied stdin
 /// lines (the hook entry point drains the real stdin; tests inject).
 #[tracing::instrument(name = "pre_push", skip_all, fields(proposed = input.lines().count()))]
-pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> CliResult<()> {
+pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> ShimResult<()> {
     let root = canonical_root(root)?;
 
     let mut proposed_oids: Vec<String> = Vec::new();
@@ -720,13 +720,14 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
         }
     }
 
-    let repo = atomic_repository::Repository::open_readonly(&root).map_err(CliError::Repository)?;
+    let repo =
+        atomic_repository::Repository::open_readonly(&root).map_err(ShimError::Repository)?;
     let working_copy = repo
         .require_working_copy_id()
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
     let current_view = repo
         .desired_view_name(working_copy)
-        .map_err(CliError::Repository)?;
+        .map_err(ShimError::Repository)?;
 
     // Reuse the shadow publication verification: manifest/tree equivalence
     // and content correctness stay independent of the provenance gate.
@@ -749,7 +750,7 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
         // carrying any other content is unverified — refuse before anything
         // leaves the machine.
         {
-            let git = git2::Repository::open(&root).map_err(|e| CliError::GitError {
+            let git = git2::Repository::open(&root).map_err(|e| ShimError::GitError {
                 message: format!("cannot open the Git repository for pre-push binding: {e}"),
             })?;
             let policy = super::parallel::conversion_policy(&git)?;
@@ -774,15 +775,15 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                 // the `main` view, a renamed branch) still binds to the
                 // current view's verified tree exactly as before.
                 let (view, expected_tree) = if branch != current_view
-                    && repo.view_exists(branch).map_err(CliError::Repository)?
+                    && repo.view_exists(branch).map_err(ShimError::Repository)?
                 {
-                    let project =
-                        repo.project_tree(branch, &policy)
-                            .map_err(|error| CliError::GitError {
-                                message: format!(
-                                    "pre-push refused: cannot project view '{branch}': {error}"
-                                ),
-                            })?;
+                    let project = repo.project_tree(branch, &policy).map_err(|error| {
+                        ShimError::GitError {
+                            message: format!(
+                                "pre-push refused: cannot project view '{branch}': {error}"
+                            ),
+                        }
+                    })?;
                     (branch.to_string(), project.git.root.clone())
                 } else {
                     (current_view.clone(), verified.git_tree.clone())
@@ -797,7 +798,7 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                     .map(|expected| expected.as_bytes() == expected_tree.as_bytes())
                     .unwrap_or(false);
                 if !binds {
-                    return Err(CliError::GitError {
+                    return Err(ShimError::GitError {
                         message: format!(
                             "pre-push refused: the proposed OID {oid} does not carry the verified manifest state of view '{view}' under the active conversion policy; the local gate's verdict covers only the exact proposed objects, and this push proposes objects it did not verify (RFC §10.4 exact-OID binding)"
                         ),
@@ -810,13 +811,13 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
     // Trusted provenance gate over the complete reachable closure.
     let view_changes: Vec<atomic_core::types::Hash> = repo
         .get_view_changes(Some(&current_view))
-        .map_err(CliError::Repository)?
+        .map_err(ShimError::Repository)?
         .into_iter()
         .map(|(_seq, hash)| hash)
         .collect();
     let closure =
         atomic_repository::repository::provenance_gate::reachable_closure(&repo, &view_changes)
-            .map_err(CliError::Repository)?;
+            .map_err(ShimError::Repository)?;
     let provider =
         atomic_repository::repository::provenance_gate::local_session_mac_key_provider(&repo);
     let did_provider =
@@ -850,7 +851,7 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
             // counts provenance blocks/changes (review R5: accurate units).
             atomic_repository::repository::observability::BridgeEventJournal::new(
                 &atomic_repository::Repository::canonical_dot_dir(&root)
-                    .map_err(CliError::Repository)?,
+                    .map_err(ShimError::Repository)?,
                 None,
             )
             .emit_lossy(
@@ -862,7 +863,7 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                     unit: atomic_repository::repository::observability::PublicationUnit::Changes,
                 },
             );
-            Err(CliError::Repository(
+            Err(ShimError::Repository(
                 atomic_repository::RepositoryError::PublicationGateRefused {
                     boundary: "local pre-push hook (advisory)".to_string(),
                     report: verdict.refusal_report(),
@@ -871,7 +872,7 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
                 },
             ))
         }
-        Err(error) => Err(CliError::Repository(error)),
+        Err(error) => Err(ShimError::Repository(error)),
     }
 }
 
@@ -887,7 +888,7 @@ fn gate_config(
         )
 }
 
-pub(crate) fn record_pre_commit(root: &Path) -> CliResult<()> {
+pub(crate) fn record_pre_commit(root: &Path) -> ShimResult<()> {
     let root = canonical_root(root)?;
     let sessions_dir = match atomic_repository::Repository::canonical_dot_dir(&root) {
         Ok(dot_dir) => dot_dir.join("sessions"),
@@ -966,7 +967,7 @@ pub(crate) fn record_pre_commit(root: &Path) -> CliResult<()> {
 /// the executor exports `ATOMIC_SHIM_CAPTURE_TOKEN` for the duration of
 /// the operation; a capture produced inside that context is the only one
 /// that can bind to the operation, and never to a later unrelated one).
-pub(crate) fn record_post_rewrite(root: &Path) -> CliResult<()> {
+pub(crate) fn record_post_rewrite(root: &Path) -> ShimResult<()> {
     let root = canonical_root(root)?;
     let mut stdin = io::stdin().lock();
     let mut input = String::new();
@@ -1049,8 +1050,8 @@ pub(crate) fn record_post_rewrite(root: &Path) -> CliResult<()> {
 /// repository) leaves the event journal-only, which downstream readers
 /// honestly treat as unauthenticated rather than operation linkage. The
 /// advisory hook must never break Git, so failures become warnings.
-fn capture_event_bytes(root: &Path, event_bytes: &[u8]) -> CliResult<()> {
-    if let Err(error) = (|| -> Result<(), CliError> {
+fn capture_event_bytes(root: &Path, event_bytes: &[u8]) -> ShimResult<()> {
+    if let Err(error) = (|| -> Result<(), ShimError> {
         let repo = atomic_repository::Repository::open(root)
             .map_err(|error| git_error(format!("cannot open the Atomic repository: {error}")))?;
         repo.capture_shim_event(event_bytes)
@@ -1075,7 +1076,7 @@ fn capture_event_bytes(root: &Path, event_bytes: &[u8]) -> CliResult<()> {
 /// import or reconciliation. `preparing`, `prepared`, and `aborted` records
 /// are journal evidence that a transaction ran, but they are NOT proof of
 /// movement.
-pub(crate) fn record_reference_transaction(root: &Path, state: &str) -> CliResult<()> {
+pub(crate) fn record_reference_transaction(root: &Path, state: &str) -> ShimResult<()> {
     let root = canonical_root(root)?;
     let state = state.to_ascii_lowercase();
     // Git ≥2.55 invokes the hook with four states: `preparing` and
@@ -1129,7 +1130,7 @@ pub(crate) fn record_reference_transaction(root: &Path, state: &str) -> CliResul
 /// is skipped instead of failing the advisory hook with a misleading
 /// validation error. Zero OIDs stay legal for create/delete; every other
 /// recorded value must be a real object-ID shape.
-fn reference_transaction_entries(input: &str) -> CliResult<Vec<RefTransactionEntry>> {
+fn reference_transaction_entries(input: &str) -> ShimResult<Vec<RefTransactionEntry>> {
     let value_is_object_id = |value: &str| {
         value.bytes().all(|byte| byte == b'0')
             || (matches!(value.len(), 40 | 64)
@@ -1188,7 +1189,7 @@ pub(crate) const REF_INTERPRETATION: &str = REF_INTERPRETATION_COMMITTED;
 /// merge resolutions, and empty-commit interpretations with the evidence
 /// that links them to Git operations, stating each evidence class's exact
 /// identity limit (RFC §5.4).
-pub(crate) fn run_shim_review(root: &Path, view: Option<&str>) -> CliResult<()> {
+pub(crate) fn run_shim_review(root: &Path, view: Option<&str>) -> ShimResult<()> {
     let root = canonical_root(root)?;
     let repo = atomic_repository::Repository::open(&root)
         .map_err(|error| git_error(format!("cannot open the Atomic repository: {error}")))?;
@@ -1440,7 +1441,7 @@ fn persist_checkout_event(
     old_head: &str,
     new_head: &str,
     checkout_flag: &str,
-) -> CliResult<ScheduledObservation> {
+) -> ShimResult<ScheduledObservation> {
     validate_hook_oid("old HEAD", old_head)?;
     validate_hook_oid("new HEAD", new_head)?;
     let checkout_kind = match checkout_flag {
@@ -1491,7 +1492,7 @@ fn persist_checkout_event(
     })
 }
 
-fn validate_hook_oid(label: &str, value: &str) -> CliResult<()> {
+fn validate_hook_oid(label: &str, value: &str) -> ShimResult<()> {
     if !matches!(value.len(), 40 | 64) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(git_error(format!(
             "{label} from post-checkout is not a hexadecimal Git object ID"
@@ -1500,7 +1501,7 @@ fn validate_hook_oid(label: &str, value: &str) -> CliResult<()> {
     Ok(())
 }
 
-fn append_journal_record<T: Serialize>(root: &Path, record: &T) -> CliResult<()> {
+fn append_journal_record<T: Serialize>(root: &Path, record: &T) -> ShimResult<()> {
     let path = root.join(EVENT_JOURNAL_RELATIVE);
     let parent = path
         .parent()
@@ -1588,7 +1589,7 @@ fn loggable_evidence(
     fields
 }
 
-fn write_immutable_json<T: Serialize>(path: &Path, value: &T) -> CliResult<()> {
+fn write_immutable_json<T: Serialize>(path: &Path, value: &T) -> ShimResult<()> {
     let mut bytes = serde_json::to_vec(value)
         .map_err(|error| git_error(format!("cannot encode deferred request: {error}")))?;
     bytes.push(b'\n');
@@ -1617,7 +1618,7 @@ fn write_immutable_json<T: Serialize>(path: &Path, value: &T) -> CliResult<()> {
     Ok(())
 }
 
-fn spawn_deferred_observer(root: &Path, scheduled: &ScheduledObservation) -> CliResult<()> {
+fn spawn_deferred_observer(root: &Path, scheduled: &ScheduledObservation) -> ShimResult<()> {
     let binary = std::env::current_exe()
         .map_err(|error| git_error(format!("cannot resolve the Atomic binary path: {error}")))?;
     ProcessCommand::new(binary)
@@ -1643,7 +1644,7 @@ fn spawn_deferred_observer(root: &Path, scheduled: &ScheduledObservation) -> Cli
 }
 
 /// Execute one deferred request using the existing strictly read-only observer.
-pub(crate) fn run_deferred_observation(root: &Path, request_path: &Path) -> CliResult<()> {
+pub(crate) fn run_deferred_observation(root: &Path, request_path: &Path) -> ShimResult<()> {
     thread::sleep(Duration::from_millis(DEFERRED_DELAY_MS));
 
     let root = canonical_root(root)?;
@@ -1790,7 +1791,7 @@ fn warn_if_view_mismatch(root: &Path) {
     }
 }
 
-pub(super) fn canonical_root(root: &Path) -> CliResult<PathBuf> {
+pub(super) fn canonical_root(root: &Path) -> ShimResult<PathBuf> {
     fs::canonicalize(root).map_err(|error| {
         git_error(format!(
             "cannot resolve repository root '{}': {error}",
@@ -1799,8 +1800,8 @@ pub(super) fn canonical_root(root: &Path) -> CliResult<PathBuf> {
     })
 }
 
-pub(super) fn git_error(message: impl Into<String>) -> CliError {
-    CliError::GitError {
+pub(super) fn git_error(message: impl Into<String>) -> ShimError {
+    ShimError::GitError {
         message: message.into(),
     }
 }
@@ -2252,7 +2253,7 @@ mod pre_push_tests {
 
         let error = run_pre_push_verification(&root).expect_err("managed work refuses");
         match &error {
-            CliError::Repository(atomic_repository::RepositoryError::PublicationGateRefused {
+            ShimError::Repository(atomic_repository::RepositoryError::PublicationGateRefused {
                 boundary,
                 ..
             }) => assert!(boundary.contains("advisory"), "{boundary}"),

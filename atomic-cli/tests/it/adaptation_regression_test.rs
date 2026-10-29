@@ -28,6 +28,7 @@ fn init() -> tempfile::TempDir {
 }
 
 #[cfg(unix)]
+#[cfg(feature = "git-shim")]
 fn commit_git_paths(root: &Path, message: &str, paths: &[&str]) {
     let git = git2::Repository::open(root).unwrap();
     let mut index = git.index().unwrap();
@@ -47,6 +48,7 @@ fn commit_git_paths(root: &Path, message: &str, paths: &[&str]) {
 // Git shim integration currently requires Unix raw-byte path support.
 #[cfg(unix)]
 #[test]
+#[cfg(feature = "git-shim")]
 fn git_import_retires_empty_parent_directories_and_recreates_them() {
     let root = tempfile::tempdir().unwrap();
     git2::Repository::init(root.path()).unwrap();
@@ -270,6 +272,7 @@ fn diff_and_restore_include_content_permissions_and_symlink_types() {
 
 #[cfg(unix)]
 #[test]
+#[cfg(feature = "git-shim")]
 fn remove_preview_does_not_capture_pending_shim_edits() {
     use std::collections::BTreeMap;
     fn snapshot(root: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {

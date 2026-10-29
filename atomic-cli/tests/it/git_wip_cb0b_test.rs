@@ -1,5 +1,4 @@
-#[path = "../../src/commands/git/wip.rs"]
-mod wip;
+use atomic_repository::wip;
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -12,6 +11,7 @@ use wip::{
     WIP_REF_PREFIX,
 };
 
+#[cfg(feature = "git-shim")]
 const ATOMIC_BIN: &str = env!("CARGO_BIN_EXE_atomic");
 
 fn git(root: &Path, args: &[&str]) -> Output {
@@ -61,6 +61,7 @@ fn git_object(root: &Path, spec: &str) -> Option<Vec<u8>> {
     output.status.success().then_some(output.stdout)
 }
 
+#[cfg(feature = "git-shim")]
 fn parse_forensic_digest(output: &[u8]) -> String {
     let text = String::from_utf8_lossy(output);
     let line = text
@@ -74,6 +75,7 @@ fn parse_forensic_digest(output: &[u8]) -> String {
         .to_string()
 }
 
+#[cfg(feature = "git-shim")]
 fn atomic(root: &Path, home: &Path, args: &[&str]) -> Output {
     Command::new(ATOMIC_BIN)
         .args(args)
@@ -259,6 +261,7 @@ fn capture_preserves_tracked_repository_bytes_and_live_state() {
 }
 
 #[test]
+#[cfg(feature = "git-shim")]
 fn wip_ref_is_forensic_but_does_not_change_canonical_refs_digest() {
     let repository = TempDir::new().expect("repository tempdir");
     let home = TempDir::new().expect("home tempdir");

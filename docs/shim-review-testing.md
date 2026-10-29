@@ -322,7 +322,7 @@ with an earlier edit. They are now verified by the `Atomic-View` /
 `Atomic-State` they name. A fast-forward merge of the branch back into `main`
 is also covered: the incremental marker set is per target view, so the
 already-interpreted commits are referenced into `main`'s view. Both flows
-are exercised by `atomic-cli/tests/git_shim_branch_reconcile_regression.rs`.
+are exercised by `atomic-cli/tests/it/git_shim_branch_reconcile_regression.rs`.
 
 ## 10. Evidence and reporting
 

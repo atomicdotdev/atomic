@@ -512,6 +512,7 @@ impl Push {
         // first HTTP `/code` negotiation POST. Plain Atomic repositories retain
         // their original writable-open/recovery behavior.
         let repo_root = find_repository_root()?;
+        #[cfg(feature = "git-shim")]
         let preflight = if crate::commands::git::shadow::shim_publication_required(&repo_root) {
             let readonly_repo =
                 Repository::open_readonly(&repo_root).map_err(CliError::Repository)?;
@@ -542,6 +543,7 @@ impl Push {
         }
         .map_err(CliError::Repository)?;
         let workspace = enter_workspace(&mut repo, boundary_mode(self.dry_run))?;
+        #[cfg(feature = "git-shim")]
         let (local_view, publication) = match preflight {
             Some((local_view, publication)) => {
                 publication.reobserve(&repo, &repo_root)?;
@@ -549,6 +551,9 @@ impl Push {
             }
             None => (self.get_local_view_from_txn(&workspace)?, None),
         };
+
+        #[cfg(not(feature = "git-shim"))]
+        let local_view = self.get_local_view_from_txn(&workspace)?;
 
         // Resolve remote name, URL, and identity hint
         let (remote_name, remote_url, identity_hint) = self.resolve_remote_url(&repo)?;
@@ -1004,6 +1009,7 @@ impl Push {
                     error
                 ))
             })?;
+        #[cfg(feature = "git-shim")]
         if let Some(publication) = &publication {
             publication.reobserve(&repo, &repo_root)?;
         }
@@ -1028,6 +1034,7 @@ impl Push {
         if !pack.is_empty() {
             // Close the local observation-to-remote-CAS window after operation
             // preparation but immediately before the publication POST.
+            #[cfg(feature = "git-shim")]
             if let Some(publication) = &publication {
                 publication.reobserve(&repo, &repo_root)?;
             }

@@ -65,6 +65,9 @@ mod service;
 
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
+#[cfg(feature = "git-shim")]
+use commands::{Git, Stage, Unstage};
+
 use commands::{
     Add,
     Agent,
@@ -78,7 +81,6 @@ use commands::{
     Diagnostics,
     Diff,
     Doctor,
-    Git,
     Identity,
     Init,
     Insert,
@@ -102,13 +104,11 @@ use commands::{
     ServerCmd,
     Session,
     Split,
-    Stage,
     Stash,
     Status,
     Tag,
     Triage,
     Unrecord,
-    Unstage,
     Update,
     Vault,
     View,
@@ -259,9 +259,15 @@ enum Commands {
     ///
     /// Stages content of tracked or intent-to-add paths. Staging never
     /// creates durable tracking; run `atomic add` for that.
+    /// This is a Git interoperability command; native Atomic recording
+    /// does not require staging.
+    #[cfg(feature = "git-shim")]
     Stage(Stage),
 
     /// Move Git index entries back to the baseline without touching the worktree.
+    ///
+    /// This is a Git interoperability command for colocated repositories.
+    #[cfg(feature = "git-shim")]
     Unstage(Unstage),
 
     /// Remove files from tracking.
@@ -532,6 +538,7 @@ enum Commands {
     /// # Preview without creating repository
     /// atomic git import --dry-run
     /// ```
+    #[cfg(feature = "git-shim")]
     Git(Git),
 
     /// Manage views (perspectives on the graph).
@@ -963,6 +970,16 @@ fn main() {
 
     // Initialize logging
     logging::init();
+    #[cfg(feature = "git-shim")]
+    atomic_git_shim::output::set_reporter(|kind, message| {
+        use atomic_git_shim::output::Notice;
+        match kind {
+            Notice::Success => output::print_success(message),
+            Notice::Info => output::print_info(message),
+            Notice::Warning => output::print_warning(message),
+            Notice::Hint => output::print_hint(message),
+        }
+    });
 
     // Dynamic shell completion. When invoked in completion mode (the `COMPLETE`
     // env var is set by the installed shell hook), this emits candidates —
@@ -1020,6 +1037,16 @@ fn main() {
         }
     }
 
+    #[cfg(not(feature = "git-shim"))]
+    if !matches!(&cli.command, Commands::Diagnostics(_)) {
+        // Diagnostics collects read-only support evidence even when enrollment
+        // or configuration prevents normal workspace operations.
+        if let Err(error) = commands::git_support::ensure_current_workspace_supported() {
+            print_error(&error.to_string());
+            std::process::exit(error.exit_code());
+        }
+    }
+
     // Execute the command and handle errors
     let result = match cli.command {
         Commands::Agent(agent) => agent.run(),
@@ -1043,7 +1070,9 @@ fn main() {
         Commands::Session(session) => session.run(),
 
         Commands::Split(split) => split.run(),
+        #[cfg(feature = "git-shim")]
         Commands::Stage(stage) => stage.run(),
+        #[cfg(feature = "git-shim")]
         Commands::Unstage(unstage) => unstage.run(),
 
         Commands::Record(record) => record.run(),
@@ -1064,7 +1093,8 @@ fn main() {
         Commands::Diagnostics(diagnostics) => diagnostics.run(),
         Commands::Compact(compact) => compact.run(),
 
-        Commands::Git(git) => git.run(),
+        #[cfg(feature = "git-shim")]
+        Commands::Git(git) => git.run().map_err(Into::into),
 
         Commands::Insert(insert) => insert.run(),
 

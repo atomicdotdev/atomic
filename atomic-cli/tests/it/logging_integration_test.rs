@@ -31,6 +31,7 @@ fn atomic(dir: &Path, home: &Path, envs: &[(&str, &OsStr)], args: &[&str]) -> Ou
     command.output().expect("run atomic")
 }
 
+#[cfg(feature = "git-shim")]
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -250,6 +251,7 @@ fn stderr_has_debug(output: &Output) -> bool {
     not(unix),
     ignore = "temporary Unix-only Git shim (PR #207); see RFC temporary platform policy"
 )]
+#[cfg(feature = "git-shim")]
 fn git_import_logs_each_commit_inside_its_span() {
     let root = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();

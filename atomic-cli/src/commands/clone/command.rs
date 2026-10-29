@@ -348,6 +348,7 @@ impl Clone {
     /// the exact state; an unbound history is an explicit typed refusal
     /// naming the supported foreign-synthesis path — never a silent merge or
     /// a false exact label.
+    #[cfg(feature = "git-shim")]
     fn run_git_bootstrap(&self, target_path: &Path) -> CliResult<()> {
         // The view name for the scaffold: the checked-out branch when Git is
         // already present (`--into-existing`), else the remote HEAD branch —
@@ -951,7 +952,19 @@ impl Clone {
         // local Git repositories clone via Git and bootstrap through the
         // shared binding-first anchoring; everything else stays on the
         // atomic-api path below.
+        #[cfg(not(feature = "git-shim"))]
+        if self.git
+            || self.into_existing
+            || self.url.trim().ends_with(".git")
+            || self.url.trim().starts_with("git@")
+            || self.url.trim().starts_with("ssh://")
+            || git2::Repository::open(self.url.trim()).is_ok()
+        {
+            return Err(crate::commands::git_support::unavailable_error());
+        }
+        #[cfg(feature = "git-shim")]
         let provisional_target = resolve_target_path(&self.url, self.path.clone());
+        #[cfg(feature = "git-shim")]
         if self.git || crate::commands::git::bootstrap::is_git_url(&self.url, &provisional_target) {
             return self.run_git_bootstrap(&provisional_target);
         }

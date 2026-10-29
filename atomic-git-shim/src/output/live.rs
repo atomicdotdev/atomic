@@ -1,5 +1,8 @@
 //! Scoped terminal-output capture for an import visual. Full diagnostic events
 //! still go to the existing logger; important console messages are replayed.
+//!
+//! The shim visuals and an embedding CLI must share this module's state.
+//! Reporters should log each event before calling [`capture`].
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -8,7 +11,8 @@ static ACTIVE: Mutex<Option<State>> = Mutex::new(None);
 const MAX_DIAGNOSTICS: usize = 64;
 
 #[derive(Clone, Copy)]
-pub(crate) enum Kind {
+/// How a notice is retained and replayed by the active visual.
+pub enum Kind {
     Info,
     Success,
     Warning,
@@ -44,11 +48,12 @@ impl State {
     }
 }
 
-pub(crate) fn is_active() -> bool {
+pub fn is_active() -> bool {
     ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
-pub(crate) fn latest() -> String {
+/// Latest notice for the visual, stripped of ANSI codes and bounded in length.
+pub fn latest() -> String {
     ACTIVE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -57,7 +62,9 @@ pub(crate) fn latest() -> String {
         .unwrap_or_default()
 }
 
-pub(crate) fn capture(kind: Kind, message: &str) -> bool {
+/// Capture a notice when a visual is active. A true result tells the caller
+/// to suppress immediate console output, after recording its diagnostic log.
+pub fn capture(kind: Kind, message: &str) -> bool {
     let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(state) = active.as_mut() {
         state.capture(kind, message);
@@ -67,10 +74,13 @@ pub(crate) fn capture(kind: Kind, message: &str) -> bool {
     }
 }
 
-pub(crate) struct LiveOutput;
+/// Process-wide capture scope. Drop after restoring the terminal to replay
+/// retained warnings/errors and the final success message.
+pub struct LiveOutput;
 
 impl LiveOutput {
-    pub(crate) fn start() -> Option<Self> {
+    /// Start capture, or return `None` if another visual already owns it.
+    pub fn start() -> Option<Self> {
         let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
         if active.is_some() {
             return None;

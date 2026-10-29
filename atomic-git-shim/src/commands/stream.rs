@@ -36,7 +36,7 @@ impl Drop for RecorderGuard {
     }
 }
 
-fn input_budget(git: &GitRepository, commit: &git2::Commit<'_>, limit: usize) -> CliResult<()> {
+fn input_budget(git: &GitRepository, commit: &git2::Commit<'_>, limit: usize) -> ShimResult<()> {
     let bytes = input_blob_bytes(git, commit)?;
     if bytes > limit {
         return Err(git_error(format!("direct stream commit {} needs {bytes} input bytes, above {limit}; increase the explicit bound", commit.id())));
@@ -44,7 +44,7 @@ fn input_budget(git: &GitRepository, commit: &git2::Commit<'_>, limit: usize) ->
     Ok(())
 }
 
-fn input_blob_bytes(git: &GitRepository, commit: &git2::Commit<'_>) -> CliResult<usize> {
+fn input_blob_bytes(git: &GitRepository, commit: &git2::Commit<'_>) -> ShimResult<usize> {
     let tree = commit.tree().map_err(|e| git_error(e.to_string()))?;
     let parent = if commit.parent_count() == 0 {
         None
@@ -95,7 +95,7 @@ impl Compiler {
         policy: &ConversionPolicy,
         boundaries: &[&'static str],
         mut provenance: serde_json::Value,
-    ) -> CliResult<PreparedGitGraphChange> {
+    ) -> ShimResult<PreparedGitGraphChange> {
         let mut lowered = parsed.clone();
         lowered.files.clear();
         let mut losses = Vec::new();
@@ -338,7 +338,7 @@ impl Compiler {
             .parent_oids
             .iter()
             .map(|oid| git_object_id(algorithm, *oid))
-            .collect::<CliResult<Vec<_>>>()?;
+            .collect::<ShimResult<Vec<_>>>()?;
         let derivation = if parents.is_empty() {
             GitDerivation::Root
         } else if parents.len() > 1 {
@@ -356,7 +356,7 @@ impl Compiler {
             parents,
             derivation,
         )
-        .map_err(CliError::from)?;
+        .map_err(ShimError::from)?;
         provenance["git"]["stream"] = serde_json::json!({"semantics":"graph-only; derived, not native token provenance","history":"first-parent; side legs not separately imported","rename_identity_loss":losses});
         let unhashed = git_synthesis_metadata(&origin, boundaries, Some(provenance));
         let mut facts = foreign_commit_facts(parsed)?;
@@ -368,7 +368,7 @@ impl Compiler {
             facts = serde_json::to_vec(&record).map_err(|error| git_error(error.to_string()))?;
         }
         let prepared = PreparedGitGraphChange::new(compiled, origin, facts, unhashed)
-            .map_err(CliError::from)?;
+            .map_err(ShimError::from)?;
         let hash = prepared.hash();
         self.last_hash = Some(hash);
         apply_line_index_updates(&mut self.index, hash, pending);
@@ -419,7 +419,7 @@ impl ParallelImporter {
         branch: &str,
         tip: Oid,
         limits: GitStreamLimits,
-    ) -> CliResult<ProspectiveImportPlan> {
+    ) -> ShimResult<ProspectiveImportPlan> {
         let (git, policy, ordered) = self.graph_stream_inputs(tip)?;
         let positions: HashMap<_, _> = ordered
             .iter()
@@ -476,7 +476,7 @@ impl ParallelImporter {
         repo: &mut Repository,
         plan: ProspectiveImportPlan,
         limits: GitStreamLimits,
-    ) -> CliResult<ImportStats> {
+    ) -> ShimResult<ImportStats> {
         let stream = plan
             .stream
             .ok_or_else(|| git_error("missing compact stream preflight"))?;
@@ -500,9 +500,9 @@ impl ParallelImporter {
     fn graph_stream_inputs(
         &self,
         tip: Oid,
-    ) -> CliResult<(GitRepository, ConversionPolicy, Vec<Oid>)> {
+    ) -> ShimResult<(GitRepository, ConversionPolicy, Vec<Oid>)> {
         let git = self.open_git_repo()?;
-        if crate::commands::git::import::has_binding_transport(&git)? {
+        if crate::commands::import::has_binding_transport(&git)? {
             return Err(git_error("direct stream does not restore Atomic binding transport; use --no-stream for the ordinary importer"));
         }
         if !detect_git_boundaries(&git)?.is_empty() {
@@ -540,7 +540,7 @@ impl ParallelImporter {
         tip: Oid,
         limits: GitStreamLimits,
         expected_order: &[Oid],
-    ) -> CliResult<GitStreamOutcome> {
+    ) -> ShimResult<GitStreamOutcome> {
         use std::collections::VecDeque;
         use std::io::IsTerminal;
         #[cfg(test)]
@@ -565,7 +565,7 @@ impl ParallelImporter {
             .enumerate()
             .map(|(index, oid)| (oid, index))
             .collect();
-        let mut session = GitGraphImportSession::begin(repo, limits).map_err(CliError::from)?;
+        let mut session = GitGraphImportSession::begin(repo, limits).map_err(ShimError::from)?;
         let enabled = std::io::stderr().is_terminal()
             && std::env::var_os("TERM").is_some_and(|term| term != "dumb");
         let mut dashboard = rolling_dashboard::Dashboard::start(500, limits.bytes(), enabled);
@@ -619,7 +619,7 @@ impl ParallelImporter {
                 }
                 if !batch.is_empty() && prepared.payload_bytes() > limits.bytes() - bytes {
                     dashboard.update(|state| state.phase = "publishing batch");
-                    session.publish(&batch).map_err(CliError::from)?;
+                    session.publish(&batch).map_err(ShimError::from)?;
                     flushed += batch.len();
                     dashboard.update(|state| {
                         state.published = processed + flushed;
@@ -633,7 +633,7 @@ impl ParallelImporter {
             }
             if !batch.is_empty() {
                 dashboard.update(|state| state.phase = "publishing batch");
-                session.publish(&batch).map_err(CliError::from)?;
+                session.publish(&batch).map_err(ShimError::from)?;
             }
             processed = next - pending.len();
             dashboard.update(|state| {
@@ -660,7 +660,7 @@ impl ParallelImporter {
         repo: &mut Repository,
         tip: Oid,
         limits: GitStreamLimits,
-    ) -> CliResult<GitStreamOutcome> {
+    ) -> ShimResult<GitStreamOutcome> {
         #[cfg(test)]
         let _recorder_guard = RecorderGuard::new();
         if !self.options.graph_only
@@ -678,7 +678,7 @@ impl ParallelImporter {
             .enumerate()
             .map(|(index, oid)| (oid, index))
             .collect();
-        let mut session = GitGraphImportSession::begin(repo, limits).map_err(CliError::from)?;
+        let mut session = GitGraphImportSession::begin(repo, limits).map_err(ShimError::from)?;
         let mut compiler = Compiler::default();
         let mut batch = Vec::new();
         let mut bytes = 0usize;
@@ -699,7 +699,7 @@ impl ParallelImporter {
                 && (batch.len() == limits.commits()
                     || bytes + prepared.payload_bytes() > limits.bytes())
             {
-                session.publish(&batch).map_err(CliError::from)?;
+                session.publish(&batch).map_err(ShimError::from)?;
                 staged += batch.len();
                 print_info(&format!(
                     "Direct stream staged {staged}/{} commits privately ({:.2}s)",
@@ -713,7 +713,7 @@ impl ParallelImporter {
             batch.push(prepared);
         }
         if !batch.is_empty() {
-            session.publish(&batch).map_err(CliError::from)?;
+            session.publish(&batch).map_err(ShimError::from)?;
             staged += batch.len();
             print_info(&format!(
                 "Direct stream staged {staged}/{} commits privately ({:.2}s)",
@@ -730,7 +730,7 @@ fn finish_graph_stream(
     git: &GitRepository,
     policy: &ConversionPolicy,
     tip: Oid,
-) -> CliResult<GitStreamOutcome> {
+) -> ShimResult<GitStreamOutcome> {
     let tree = git
         .find_commit(tip)
         .and_then(|commit| commit.tree())
@@ -747,7 +747,7 @@ fn finish_graph_stream(
     let expected = import_expected_tree_oid(git, tree.id(), policy)?;
     let proof = verify_prospective_equivalence(&project, &expected)
         .map_err(|error| git_error(error.to_string()))?;
-    session.finish(&project, &proof).map_err(CliError::from)
+    session.finish(&project, &proof).map_err(ShimError::from)
 }
 
 #[cfg(test)]
@@ -765,7 +765,7 @@ mod tests {
         loaded: usize,
         queued: usize,
         reserved: usize,
-    ) -> CliResult<()> {
+    ) -> ShimResult<()> {
         let Some(path) = std::env::var_os("ATOMIC_ROLLING_MEMORY_LOG") else {
             return Ok(());
         };
@@ -820,7 +820,7 @@ mod tests {
         _loaded: usize,
         _queued: usize,
         _reserved: usize,
-    ) -> CliResult<()> {
+    ) -> ShimResult<()> {
         if std::env::var_os("ATOMIC_ROLLING_MEMORY_LOG").is_some() {
             return Err(git_error("rolling memory samples require macOS or Linux"));
         }
@@ -837,7 +837,7 @@ mod tests {
         window_size: usize,
         batch_size: usize,
         window_blob_limit: usize,
-    ) -> CliResult<(GitStreamOutcome, usize, usize, usize, usize, f64)> {
+    ) -> ShimResult<(GitStreamOutcome, usize, usize, usize, usize, f64)> {
         assert!(window_size > 0 && batch_size > 0 && batch_size <= window_size);
         let _recorder_guard = RecorderGuard::new();
         let mut dashboard = rolling_dashboard::Dashboard::start(
@@ -855,7 +855,7 @@ mod tests {
             .enumerate()
             .map(|(index, oid)| (oid, index))
             .collect();
-        let limits = GitStreamLimits::new(batch_size, 32 * 1024 * 1024).map_err(CliError::from)?;
+        let limits = GitStreamLimits::new(batch_size, 32 * 1024 * 1024).map_err(ShimError::from)?;
 
         // Retain only the immediately preceding prospective project. For a
         // different parent, apply_commit reloads its tree from the ODB.
@@ -879,7 +879,7 @@ mod tests {
         let preflight_seconds = preflight_start.elapsed().as_secs_f64();
         rolling_memory_sample("after_preflight", 0, 0, 0, 0)?;
 
-        let mut session = GitGraphImportSession::begin(repo, limits).map_err(CliError::from)?;
+        let mut session = GitGraphImportSession::begin(repo, limits).map_err(ShimError::from)?;
         let mut compiler = Compiler::default();
         let mut pending = VecDeque::new();
         let mut next = 0usize;
@@ -955,7 +955,7 @@ mod tests {
                 }
                 if !batch.is_empty() && bytes + prepared.payload_bytes() > limits.bytes() {
                     dashboard.update(|state| state.phase = "publishing batch");
-                    session.publish(&batch).map_err(CliError::from)?;
+                    session.publish(&batch).map_err(ShimError::from)?;
                     flushed += batch.len();
                     dashboard.update(|state| {
                         state.published = processed + flushed;
@@ -971,7 +971,7 @@ mod tests {
             // is the number removed from the window, not the last sub-batch.
             if !batch.is_empty() {
                 dashboard.update(|state| state.phase = "publishing batch");
-                session.publish(&batch).map_err(CliError::from)?;
+                session.publish(&batch).map_err(ShimError::from)?;
             }
             drop(batch);
             processed = next - pending.len();
@@ -1006,7 +1006,7 @@ mod tests {
         let proof = verify_prospective_equivalence(&project, &expected)
             .map_err(|error| git_error(error.to_string()))?;
         rolling_memory_sample("before_final_proof", processed, next, 0, 0)?;
-        let outcome = session.finish(&project, &proof).map_err(CliError::from)?;
+        let outcome = session.finish(&project, &proof).map_err(ShimError::from)?;
         rolling_memory_sample("after_final_proof", processed, next, 0, 0)?;
         dashboard.finish();
         Ok((

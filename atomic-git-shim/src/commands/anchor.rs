@@ -14,7 +14,7 @@ use atomic_repository::{Repository, ShimAnchorError, ShimAnchorRefusal};
 
 use super::binding::load_signing_key;
 use super::shim::{current_heads, project_atomic_to_git};
-use crate::error::{CliError, CliResult};
+use crate::error::{ShimError, ShimResult};
 use crate::output::{print_info, print_success, print_warning};
 
 /// Options for the anchoring phase of `shim enable`.
@@ -48,14 +48,14 @@ pub(crate) enum EnableAnchorOutcome {
 }
 
 /// Typed refusal for explicitly requested, explicitly unavailable behavior.
-pub(crate) fn adopt_git_refusal() -> CliError {
-    CliError::GitError {
+pub(crate) fn adopt_git_refusal() -> ShimError {
+    ShimError::GitError {
         message: ShimAnchorRefusal::AdoptGitUnavailable.to_string(),
     }
 }
 
 /// Run the CB-7A anchoring phase for `shim enable`.
-pub(crate) fn run_enable_anchor(root: &Path, options: &EnableAnchorOptions) -> CliResult<()> {
+pub(crate) fn run_enable_anchor(root: &Path, options: &EnableAnchorOptions) -> ShimResult<()> {
     if options.adopt_git {
         return Err(adopt_git_refusal());
     }
@@ -89,7 +89,7 @@ pub(crate) fn run_enable_anchor(root: &Path, options: &EnableAnchorOptions) -> C
 fn enable_anchor_inner(
     root: &Path,
     options: &EnableAnchorOptions,
-) -> CliResult<EnableAnchorOutcome> {
+) -> ShimResult<EnableAnchorOutcome> {
     let Some(key_file) = options.binding_key_file.as_ref() else {
         return Ok(EnableAnchorOutcome::NotAnchored {
             refusal: ShimAnchorRefusal::DirtyState {
@@ -102,17 +102,17 @@ fn enable_anchor_inner(
     };
     let signer = load_signing_key(key_file)?;
 
-    let mut repo = Repository::open(root).map_err(CliError::from)?;
+    let mut repo = Repository::open(root).map_err(ShimError::from)?;
     let git = super::shim::open_git(root)?;
 
     if options.adopt_atomic {
         // Explicit remediation: project the Atomic state onto Git through the
         // safe Atomic-origin path (journaled ref move), then re-prove
         // equivalence. Pending work is preserved by refusing dirty inputs.
-        let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+        let working_copy = repo.require_working_copy_id().map_err(ShimError::from)?;
         let current = current_heads(&repo, working_copy, &git)?;
         project_atomic_to_git(root, &repo, working_copy, &git, &current).map_err(|error| {
-            CliError::GitError {
+            ShimError::GitError {
                 message: format!(
                     "adopt-atomic remediation refused: {error}; pending work is preserved \
                      until CB-7B — commit or record it, then retry"
@@ -128,11 +128,11 @@ fn enable_anchor_inner(
     // repository's own hash-verified change store before the anchor publishes.
     let changes_pack = if options.with_changes_pack {
         let view = repo
-            .desired_view_name(repo.require_working_copy_id().map_err(CliError::from)?)
-            .map_err(CliError::from)?;
+            .desired_view_name(repo.require_working_copy_id().map_err(ShimError::from)?)
+            .map_err(ShimError::from)?;
         let ordered: Vec<atomic_core::Hash> = repo
             .effective_history(Some(&view))
-            .map_err(CliError::from)?
+            .map_err(ShimError::from)?
             .iter()
             .map(|entry| entry.hash)
             .collect();
@@ -159,7 +159,7 @@ fn enable_anchor_inner(
             ),
         }),
         Err(ShimAnchorError::Refusal(refusal)) => Ok(EnableAnchorOutcome::NotAnchored { refusal }),
-        Err(error) => Err(CliError::Repository(
+        Err(error) => Err(ShimError::Repository(
             atomic_repository::RepositoryError::InvalidOperation {
                 message: format!("shim anchoring failed: {error}"),
             },

@@ -43,13 +43,13 @@ use super::parallel::{
     forecast_commit_kind, incremental_import_skips, trace_git_import, ForecastKind, ImportStats,
     ParallelImportOptions, ParallelImporter, ProspectiveImportPlan,
 };
-use crate::commands::workspace_txn::{
+use crate::error::{ShimError, ShimResult};
+use crate::find_repository_root;
+use crate::output::{emphasis, print_hint, print_info, print_success, print_warning};
+use crate::workspace_txn::{
     enter_remediation_workspace, enter_remediation_workspace_budgeted, observe_workspace,
     remediation_error,
 };
-use crate::commands::{find_repository_root, Command};
-use crate::error::{CliError, CliResult};
-use crate::output::{emphasis, print_hint, print_info, print_success, print_warning};
 
 /// Import a Git repository into Atomic.
 ///
@@ -176,16 +176,16 @@ fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
 
 /// Binding transport requires the ordinary importer. Presence selects the
 /// route only; it is not evidence that any binding is valid or trusted.
-pub(super) fn has_binding_transport(git_repo: &GitRepository) -> CliResult<bool> {
+pub(super) fn has_binding_transport(git_repo: &GitRepository) -> ShimResult<bool> {
     git_repo
         .references_glob("refs/atomic/bindings/*")
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: error.to_string(),
         })?
         .next()
         .transpose()
         .map(|reference| reference.is_some())
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: error.to_string(),
         })
 }
@@ -198,7 +198,7 @@ struct BranchImportMode {
     preserve_working_copy: bool,
 }
 
-pub(crate) fn ensure_git_shadow_excludes(git_dir: &Path) -> CliResult<bool> {
+pub(crate) fn ensure_git_shadow_excludes(git_dir: &Path) -> ShimResult<bool> {
     let info_dir = git_dir.join("info");
     std::fs::create_dir_all(&info_dir)?;
 
@@ -239,7 +239,7 @@ pub(crate) fn ensure_git_shadow_excludes(git_dir: &Path) -> CliResult<bool> {
 /// Git exclude file is missing any shadow-exclude pattern, without writing
 /// anything (CB-13D review R1: the metadata-only watch path must never edit
 /// Git administrative files; it defers instead).
-fn ensure_git_shadow_excludes_needed(git_dir: &Path) -> CliResult<bool> {
+fn ensure_git_shadow_excludes_needed(git_dir: &Path) -> ShimResult<bool> {
     let exclude_path = git_dir.join("info").join("exclude");
     let content = match std::fs::read_to_string(&exclude_path) {
         Ok(content) => content,
@@ -274,9 +274,9 @@ impl Import {
                     && self.reactive_budget.is_none()))
     }
 
-    fn stream_limits(&self) -> CliResult<atomic_repository::GitStreamLimits> {
+    fn stream_limits(&self) -> ShimResult<atomic_repository::GitStreamLimits> {
         let mib = usize::from(self.stream_window_mib.unwrap_or(32));
-        atomic_repository::GitStreamLimits::new(100, mib * 1024 * 1024).map_err(CliError::from)
+        atomic_repository::GitStreamLimits::new(100, mib * 1024 * 1024).map_err(ShimError::from)
     }
 
     /// Import a single branch into an Atomic view using parallel processing.
@@ -290,7 +290,7 @@ impl Import {
         known_states: &HashSet<atomic_core::types::Merkle>,
         mode: BranchImportMode,
         plan: ProspectiveImportPlan,
-    ) -> CliResult<ImportStats> {
+    ) -> ShimResult<ImportStats> {
         // Get repository name from remote URL or working directory
         let repo_name = self.get_repo_name(git_repo);
 
@@ -338,8 +338,8 @@ impl Import {
         repo: &mut Repository,
         git_repo: &GitRepository,
         branch_name: &str,
-    ) -> CliResult<()> {
-        if repo.view_exists(branch_name).map_err(CliError::from)? {
+    ) -> ShimResult<()> {
+        if repo.view_exists(branch_name).map_err(ShimError::from)? {
             return Ok(());
         }
         let Some(tip) = git_repo
@@ -349,7 +349,7 @@ impl Import {
         else {
             return Ok(());
         };
-        let walk_error = |error: git2::Error| CliError::GitError {
+        let walk_error = |error: git2::Error| ShimError::GitError {
             message: format!("cannot walk branch '{branch_name}': {error}"),
         };
         let mut walk = git_repo.revwalk().map_err(walk_error)?;
@@ -358,7 +358,7 @@ impl Import {
         let mut ahead = 0usize;
         for oid in walk {
             let sha = oid.map_err(walk_error)?.to_string();
-            let Some(hash) = repo.checked_git_sha(&sha).map_err(CliError::from)? else {
+            let Some(hash) = repo.checked_git_sha(&sha).map_err(ShimError::from)? else {
                 ahead += 1;
                 continue;
             };
@@ -366,13 +366,13 @@ impl Import {
                 return Ok(());
             };
             repo.create_shared_view(branch_name)
-                .map_err(|error| CliError::Internal(error.into()))?;
+                .map_err(|error| ShimError::Internal(error.into()))?;
             for member in &prefix {
                 repo.insert_change(
                     member,
                     atomic_repository::InsertOptions::with_dependencies().view(branch_name),
                 )
-                .map_err(CliError::from)?;
+                .map_err(ShimError::from)?;
             }
             print_info(&format!(
                 "Seeded view '{branch_name}' from view '{source_view}' at interpreted ancestor {} ({} changes); {ahead} commit(s) ahead to import",
@@ -391,21 +391,21 @@ impl Import {
         &self,
         repo: &Repository,
         hash: &atomic_core::types::Hash,
-    ) -> CliResult<Option<(String, Vec<atomic_core::types::Hash>)>> {
+    ) -> ShimResult<Option<(String, Vec<atomic_core::types::Hash>)>> {
         let mut candidates: Vec<String> = Vec::new();
         candidates.extend(self.seed_source_view.iter().cloned());
-        for view in repo.list_views().map_err(CliError::from)? {
+        for view in repo.list_views().map_err(ShimError::from)? {
             if !candidates.contains(&view) {
                 candidates.push(view);
             }
         }
         for view in candidates {
-            if !repo.view_exists(&view).map_err(CliError::from)? {
+            if !repo.view_exists(&view).map_err(ShimError::from)? {
                 continue;
             }
             let entries = repo
                 .effective_history(Some(&view))
-                .map_err(CliError::from)?;
+                .map_err(ShimError::from)?;
             if let Some(position) = entries.iter().position(|entry| entry.hash == *hash) {
                 let mut prefix: Vec<atomic_core::types::Hash> = entries[..=position]
                     .iter()
@@ -467,7 +467,7 @@ impl Import {
         repo: &Repository,
         view_name: &str,
         repair_index: bool,
-    ) -> CliResult<(HashSet<String>, HashSet<atomic_core::types::Merkle>)> {
+    ) -> ShimResult<(HashSet<String>, HashSet<atomic_core::types::Merkle>)> {
         let started = std::time::Instant::now();
         // CB-6C: the GIT_SHA_INDEX is a checked cache, never authority. Every
         // row is validated against hash-authoritative change bytes before it
@@ -476,7 +476,7 @@ impl Import {
         // skip decisions as a cold cache (the legacy backfill below).
         let (indexed, dropped) = repo
             .checked_git_sha_marker_hashes()
-            .map_err(|error| CliError::Internal(error.into()))?;
+            .map_err(|error| ShimError::Internal(error.into()))?;
         for sha in dropped.iter().take(3) {
             log::warn!(
                 "Dropped unverifiable GIT_SHA_INDEX row for {} (same treatment as a cold cache)",
@@ -492,7 +492,7 @@ impl Import {
         // repositories with no index rows take the legacy backfill path.
         let entries = repo
             .effective_history(Some(view_name))
-            .map_err(|error| CliError::Internal(error.into()))?;
+            .map_err(|error| ShimError::Internal(error.into()))?;
         let needs_legacy_backfill = indexed.is_empty() && !entries.is_empty();
         // The index is repository-wide, but a marker only skips a commit for
         // THIS view when the commit's change is a member of this view. A
@@ -514,7 +514,7 @@ impl Import {
             }
             let change = repo
                 .load_change(&entry.hash)
-                .map_err(|error| CliError::Internal(error.into()))?;
+                .map_err(|error| ShimError::Internal(error.into()))?;
             if let Some(ref unhashed) = change.unhashed {
                 if let Some(git) = unhashed.get("git") {
                     if let Some(sha) = git.get("sha").and_then(|v| v.as_str()) {
@@ -569,16 +569,16 @@ impl Import {
     }
 
     /// Get all local branch names.
-    fn get_all_branches(&self, git_repo: &GitRepository) -> CliResult<Vec<String>> {
+    fn get_all_branches(&self, git_repo: &GitRepository) -> ShimResult<Vec<String>> {
         let branches = git_repo
             .branches(Some(git2::BranchType::Local))
-            .map_err(|e| CliError::GitError {
+            .map_err(|e| ShimError::GitError {
                 message: format!("Failed to list branches: {}", e),
             })?;
 
         let mut names = Vec::new();
         for branch_result in branches {
-            let (branch, _) = branch_result.map_err(|e| CliError::GitError {
+            let (branch, _) = branch_result.map_err(|e| ShimError::GitError {
                 message: format!("Failed to get branch: {}", e),
             })?;
             if let Some(name) = branch.name().ok().flatten() {
@@ -590,7 +590,7 @@ impl Import {
     }
 
     /// Get the default branch name.
-    fn get_default_branch(&self, git_repo: &GitRepository) -> CliResult<String> {
+    fn get_default_branch(&self, git_repo: &GitRepository) -> ShimResult<String> {
         // Try HEAD first (current branch)
         if let Some(name) = current_git_branch(git_repo) {
             return Ok(name);
@@ -603,7 +603,7 @@ impl Import {
             }
         }
 
-        Err(CliError::GitError {
+        Err(ShimError::GitError {
             message: "Could not determine default branch".to_string(),
         })
     }
@@ -622,38 +622,38 @@ impl Import {
         known_states: &HashSet<atomic_core::types::Merkle>,
         target_view: &str,
         mainline_only: bool,
-    ) -> CliResult<usize> {
-        let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
+    ) -> ShimResult<usize> {
+        let mut revwalk = git_repo.revwalk().map_err(|e| ShimError::GitError {
             message: format!("Failed to create revwalk: {}", e),
         })?;
 
-        revwalk.push(head_oid).map_err(|e| CliError::GitError {
+        revwalk.push(head_oid).map_err(|e| ShimError::GitError {
             message: format!("Failed to push HEAD to revwalk: {}", e),
         })?;
 
         if mainline_only {
             revwalk
                 .simplify_first_parent()
-                .map_err(|e| CliError::GitError {
+                .map_err(|e| ShimError::GitError {
                     message: format!("Failed to simplify revwalk to first-parent history: {}", e),
                 })?;
         }
 
         revwalk
             .set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)
-            .map_err(|e| CliError::GitError {
+            .map_err(|e| ShimError::GitError {
                 message: format!("Failed to set sorting: {}", e),
             })?;
 
         let mut count = 0;
         for oid_result in revwalk {
-            let oid = oid_result.map_err(|e| CliError::GitError {
+            let oid = oid_result.map_err(|e| ShimError::GitError {
                 message: format!("Revwalk error: {}", e),
             })?;
 
             if self.incremental {
                 let sha = oid.to_string();
-                let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
+                let commit = git_repo.find_commit(oid).map_err(|e| ShimError::GitError {
                     message: format!("Failed to load commit {}: {}", sha, e),
                 })?;
                 let message = commit.message().unwrap_or("");
@@ -679,25 +679,25 @@ impl Import {
         known_states: &HashSet<atomic_core::types::Merkle>,
         target_view: &str,
         repo: Option<&Repository>,
-    ) -> CliResult<()> {
+    ) -> ShimResult<()> {
         use atomic_core::types::{Base32, Hash};
 
-        let mut revwalk = git_repo.revwalk().map_err(|e| CliError::GitError {
+        let mut revwalk = git_repo.revwalk().map_err(|e| ShimError::GitError {
             message: format!("Failed to create revwalk: {}", e),
         })?;
-        revwalk.push(head_oid).map_err(|e| CliError::GitError {
+        revwalk.push(head_oid).map_err(|e| ShimError::GitError {
             message: format!("Failed to push HEAD to revwalk: {}", e),
         })?;
         if !self.all_branches {
             revwalk
                 .simplify_first_parent()
-                .map_err(|e| CliError::GitError {
+                .map_err(|e| ShimError::GitError {
                     message: format!("Failed to simplify revwalk: {}", e),
                 })?;
         }
         revwalk
             .set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)
-            .map_err(|e| CliError::GitError {
+            .map_err(|e| ShimError::GitError {
                 message: format!("Failed to set sorting: {}", e),
             })?;
 
@@ -707,11 +707,11 @@ impl Import {
         let mut normal = 0usize;
 
         for oid_result in revwalk {
-            let oid = oid_result.map_err(|e| CliError::GitError {
+            let oid = oid_result.map_err(|e| ShimError::GitError {
                 message: format!("Revwalk error: {}", e),
             })?;
             let sha = oid.to_string();
-            let commit = git_repo.find_commit(oid).map_err(|e| CliError::GitError {
+            let commit = git_repo.find_commit(oid).map_err(|e| ShimError::GitError {
                 message: format!("Failed to load commit {}: {}", sha, e),
             })?;
             let message = commit.message().unwrap_or("");
@@ -767,8 +767,8 @@ impl Import {
     }
 }
 
-impl Command for Import {
-    fn run(&self) -> CliResult<()> {
+impl Import {
+    pub fn run(&self) -> ShimResult<()> {
         let mut animation =
             super::agent_mode::AgentAnimation::start(self.agent_mode && !self.dry_run);
         let result = self.run_import();
@@ -778,22 +778,22 @@ impl Command for Import {
 }
 
 impl Import {
-    fn run_import(&self) -> CliResult<()> {
+    fn run_import(&self) -> ShimResult<()> {
         let run_start = std::time::Instant::now();
         if self.stream || self.stream_window_mib.is_some() {
             self.stream_limits()?;
         }
         if self.no_stream && self.stream {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: "--stream and --no-stream cannot be combined".into(),
             });
         }
         // Open Git repository
-        let git_repo = GitRepository::discover(".").map_err(|_| CliError::GitError {
+        let git_repo = GitRepository::discover(".").map_err(|_| ShimError::GitError {
             message: "Not a git repository (or any parent up to mount point)".to_string(),
         })?;
 
-        let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
+        let workdir = git_repo.workdir().ok_or_else(|| ShimError::GitError {
             message: "Git repository has no working directory (bare repository?)".to_string(),
         })?;
         trace_git_import(format!(
@@ -825,7 +825,7 @@ impl Import {
                     .join(atomic_repository::LEGACY_PRISTINE_FILE)
                     .is_file()
             {
-                return Err(CliError::GitError {
+                return Err(ShimError::GitError {
                     message: "Incremental dry run requires database migration first; run `atomic view list` to migrate the repository, then retry".to_string(),
                 });
             }
@@ -899,10 +899,10 @@ impl Import {
             print_info("Atomic binding refs detected; using the ordinary importer.");
         }
         if self.stream_window_mib.is_some() && !stream {
-            return Err(CliError::GitError { message: "--stream-window-mib requires a fresh streaming import; use --stream to request streaming explicitly".into() });
+            return Err(ShimError::GitError { message: "--stream-window-mib requires a fresh streaming import; use --stream to request streaming explicitly".into() });
         }
         if stream && !cfg!(unix) {
-            return Err(CliError::GitError { message: "--stream requires lossless native path verification, which is unsupported on this platform; no import was started".into() });
+            return Err(ShimError::GitError { message: "--stream requires lossless native path verification, which is unsupported on this platform; no import was started".into() });
         }
 
         // Validate the complete prospective import before Git excludes, Atomic
@@ -915,7 +915,7 @@ impl Import {
         let detached_tip = match self.detached_tip.as_deref() {
             None => None,
             Some(hex) => Some(
-                git2::Oid::from_str(hex).map_err(|error| CliError::GitError {
+                git2::Oid::from_str(hex).map_err(|error| ShimError::GitError {
                     message: format!(
                         "detached import tip '{hex}' is not a valid object ID: {error}"
                     ),
@@ -923,7 +923,7 @@ impl Import {
             ),
         };
         if detached_tip.is_some() && self.branch.is_none() {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: "a detached import tip requires an explicit target view name".to_string(),
             });
         }
@@ -938,7 +938,7 @@ impl Import {
                 || self.reactive_budget.is_some()
                 || current_git_branch(&git_repo).as_deref() != Some(selected)
             {
-                return Err(CliError::GitError { message: "Streaming import requires a fresh Atomic repository and the checked-out first-parent branch; eager CRDT, incremental, --all and internal reactive/detached imports are unsupported. Use --no-stream for the ordinary importer.".into() });
+                return Err(ShimError::GitError { message: "Streaming import requires a fresh Atomic repository and the checked-out first-parent branch; eager CRDT, incremental, --all and internal reactive/detached imports are unsupported. Use --no-stream for the ordinary importer.".into() });
             }
         }
         // CB-13D review R1: the metadata-only watch path never bootstraps a
@@ -948,7 +948,7 @@ impl Import {
             .reactive_budget
             .is_some_and(|budget| budget.is_metadata_only());
         if metadata_only && !repo_exists {
-            return Err(CliError::GitError {
+            return Err(ShimError::GitError {
                 message: "the shim watch daemon imports metadata only and never bootstraps \
                           an Atomic repository; run 'atomic git import' explicitly"
                     .to_string(),
@@ -964,13 +964,13 @@ impl Import {
             } else {
                 Repository::open(workdir)
             };
-            Some(open_result.map_err(CliError::from)?)
+            Some(open_result.map_err(ShimError::from)?)
         } else {
             None
         };
         let prospective_branches = if self.all_branches {
             if detached_tip.is_some() {
-                return Err(CliError::GitError {
+                return Err(ShimError::GitError {
                     message: "a detached import tip cannot be combined with --all".to_string(),
                 });
             }
@@ -996,7 +996,7 @@ impl Import {
                 }
             }
             let (imported_shas, known_states) = match preopened_repo.as_ref() {
-                Some(repo) if repo.view_exists(branch_name).map_err(CliError::from)? => {
+                Some(repo) if repo.view_exists(branch_name).map_err(ShimError::from)? => {
                     self.get_incremental_markers(repo, branch_name, false)?
                 }
                 _ => (HashSet::new(), HashSet::new()),
@@ -1019,7 +1019,7 @@ impl Import {
                     .find_branch(branch_name, git2::BranchType::Local)
                     .ok()
                     .and_then(|branch| branch.get().target())
-                    .ok_or_else(|| CliError::GitError {
+                    .ok_or_else(|| ShimError::GitError {
                         message: "missing direct-stream branch tip".into(),
                     })?;
                 importer.validate_graph_stream_prospectively(
@@ -1042,7 +1042,7 @@ impl Import {
         // to the explicit command instead of writing it.
         if metadata_only {
             if ensure_git_shadow_excludes_needed(git_repo.path())? {
-                return Err(CliError::GitError {
+                return Err(ShimError::GitError {
                     message: "the shim watch daemon never edits Git administrative files; \
                               the Git shadow exclude line is missing — run 'atomic git import' \
                               or 'atomic git shim reconcile' explicitly once"
@@ -1065,7 +1065,7 @@ impl Import {
             Some(
                 atomic_repository::ExclusionPolicy::resolve_for_git(&git_repo).map_err(
                     |error| {
-                        CliError::Internal(anyhow::anyhow!(
+                        ShimError::Internal(anyhow::anyhow!(
                             "cannot resolve the shim vault policy: {error}"
                         ))
                     },
@@ -1088,9 +1088,9 @@ impl Import {
             // Seed the default view with Git's default branch name so Atomic's
             // shared view matches the project's Git default branch.
             let repo = Repository::init_with_view(workdir, &default_branch)
-                .map_err(|e| CliError::Internal(e.into()))?;
+                .map_err(|e| ShimError::Internal(e.into()))?;
             repo.ensure_project_identity(atomic_core::kg::project_id::MintReason::Created)
-                .map_err(CliError::Repository)?;
+                .map_err(ShimError::Repository)?;
             repo
         };
 
@@ -1151,7 +1151,7 @@ impl Import {
                     preserve_current_view && original_view != branch_name;
                 let (plan, imported_shas, known_states) =
                     prospective_plans.remove(&branch_name).ok_or_else(|| {
-                        CliError::Internal(anyhow::anyhow!(
+                        ShimError::Internal(anyhow::anyhow!(
                             "missing prevalidated import plan for '{branch_name}'"
                         ))
                     })?;
@@ -1166,10 +1166,10 @@ impl Import {
                 // Ensure the view exists
                 if !repo
                     .view_exists(&branch_name)
-                    .map_err(|e| CliError::Internal(e.into()))?
+                    .map_err(|e| ShimError::Internal(e.into()))?
                 {
                     repo.create_shared_view(&branch_name)
-                        .map_err(|e| CliError::Internal(e.into()))?;
+                        .map_err(|e| ShimError::Internal(e.into()))?;
                 }
 
                 // Existing incremental imports are background bookkeeping.
@@ -1179,7 +1179,7 @@ impl Import {
                     repo.set_current_view_in_memory(&branch_name);
                 } else {
                     repo.align_to_view(working_copy, &branch_name)
-                        .map_err(|e| CliError::Internal(e.into()))?;
+                        .map_err(|e| ShimError::Internal(e.into()))?;
                 }
 
                 // Import the branch. A foreign target is selected only on
@@ -1234,7 +1234,7 @@ impl Import {
                 // tree has passed the same preflight and publication checks as
                 // single-branch import, so adopt Git's existing materialization.
                 repo.align_to_view(working_copy, &checked_out)
-                    .map_err(|e| CliError::Internal(e.into()))?;
+                    .map_err(|e| ShimError::Internal(e.into()))?;
                 print_info("Using Git working copy as imported materialization.");
                 reindex_working_copy(&repo, working_copy);
             } else {
@@ -1310,14 +1310,14 @@ impl Import {
             if detached_tip.is_none() {
                 git_repo
                     .find_branch(&branch_name, git2::BranchType::Local)
-                    .map_err(|_| CliError::GitError {
+                    .map_err(|_| ShimError::GitError {
                         message: format!("Branch '{}' not found", branch_name),
                     })?;
             }
 
             let (plan, imported_shas, known_states) =
                 prospective_plans.remove(&branch_name).ok_or_else(|| {
-                    CliError::Internal(anyhow::anyhow!(
+                    ShimError::Internal(anyhow::anyhow!(
                         "missing prevalidated import plan for '{branch_name}'"
                     ))
                 })?;
@@ -1331,17 +1331,17 @@ impl Import {
             // one as Shared behind the caller's back.
             if !repo
                 .view_exists(&branch_name)
-                .map_err(|e| CliError::Internal(e.into()))?
+                .map_err(|e| ShimError::Internal(e.into()))?
             {
                 if detached_tip.is_some() {
-                    return Err(CliError::GitError {
+                    return Err(ShimError::GitError {
                         message: format!(
                             "detached import refused: target view '{branch_name}' does not exist; resolve the §7.5 mapping first"
                         ),
                     });
                 }
                 repo.create_shared_view(&branch_name)
-                    .map_err(|e| CliError::Internal(e.into()))?;
+                    .map_err(|e| ShimError::Internal(e.into()))?;
             }
 
             let restore_original_view = preserve_current_view && original_view != branch_name;
@@ -1352,7 +1352,7 @@ impl Import {
                 // User-facing/new imports still publish the selected branch;
                 // materialization or reindexing below makes disk match it.
                 repo.align_to_view(working_copy, &branch_name)
-                    .map_err(|e| CliError::Internal(e.into()))?;
+                    .map_err(|e| ShimError::Internal(e.into()))?;
             }
 
             // Import
@@ -1389,14 +1389,14 @@ impl Import {
                     reindex_working_copy(&repo, working_copy);
                 }
             } else if stream {
-                return Err(CliError::GitError { message: "Git checkout changed during --stream import; refusing filesystem materialization. Imported graph remains at the pinned tip; inspect before retrying.".into() });
+                return Err(ShimError::GitError { message: "Git checkout changed during --stream import; refusing filesystem materialization. Imported graph remains at the pinned tip; inspect before retrying.".into() });
             } else {
                 // Importing a non-checked-out branch must update disk from Atomic.
                 // CB-13D review R1: the metadata-only watch path never
                 // materializes — materializing a non-checked-out target is a
                 // command-boundary filesystem effect.
                 if metadata_only {
-                    return Err(CliError::GitError {
+                    return Err(ShimError::GitError {
                         message: "the shim watch daemon reconciles metadata only and never \
                                   materializes a non-checked-out target; run 'atomic git import' \
                                   explicitly to materialize"
@@ -1587,7 +1587,7 @@ impl MaterializationTarget<'_> {
     }
 
     /// Every repository path the materialization writes.
-    fn paths(&self, git_repo: &GitRepository) -> CliResult<HashSet<String>> {
+    fn paths(&self, git_repo: &GitRepository) -> ShimResult<HashSet<String>> {
         let mut paths = HashSet::new();
         match self {
             Self::Branch(branch) => {
@@ -1598,31 +1598,32 @@ impl MaterializationTarget<'_> {
                     Ok(found) => found,
                     Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(paths),
                     Err(error) => {
-                        return Err(CliError::GitError {
+                        return Err(ShimError::GitError {
                             message: format!("cannot read branch '{branch}': {error}"),
                         })
                     }
                 };
-                let tree = branch_ref
-                    .get()
-                    .peel_to_tree()
-                    .map_err(|error| CliError::GitError {
-                        message: format!("cannot read the tree of branch '{branch}': {error}"),
-                    })?;
+                let tree =
+                    branch_ref
+                        .get()
+                        .peel_to_tree()
+                        .map_err(|error| ShimError::GitError {
+                            message: format!("cannot read the tree of branch '{branch}': {error}"),
+                        })?;
                 tree.walk(git2::TreeWalkMode::PreOrder, |directory, entry| {
                     if let Some(name) = entry.name() {
                         paths.insert(format!("{directory}{name}"));
                     }
                     git2::TreeWalkResult::Ok
                 })
-                .map_err(|error| CliError::GitError {
+                .map_err(|error| ShimError::GitError {
                     message: format!("cannot walk the tree of branch '{branch}': {error}"),
                 })?;
             }
             Self::CurrentView(repo) => {
                 for file in repo
                     .list_tracked_files()
-                    .map_err(|error| CliError::Internal(error.into()))?
+                    .map_err(|error| ShimError::Internal(error.into()))?
                 {
                     let canonical = file.path.to_string_lossy();
                     paths.insert(
@@ -1646,9 +1647,9 @@ impl MaterializationTarget<'_> {
 fn require_materializable_worktree(
     git_repo: &GitRepository,
     target: MaterializationTarget<'_>,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     let what = target.describe();
-    super::shim::require_clean_git_worktree(git_repo).map_err(|error| CliError::GitError {
+    super::shim::require_clean_git_worktree(git_repo).map_err(|error| ShimError::GitError {
         message: format!(
             "cannot materialize {what} over unrecorded work: {error}; commit, stash or \
              discard the changes (or check the branch out) first"
@@ -1659,7 +1660,7 @@ fn require_materializable_worktree(
     options.include_untracked(true).recurse_untracked_dirs(true);
     let statuses = git_repo
         .statuses(Some(&mut options))
-        .map_err(|error| CliError::GitError {
+        .map_err(|error| ShimError::GitError {
             message: format!("cannot inspect Git status: {error}"),
         })?;
     let mut colliding: Vec<String> = statuses
@@ -1679,7 +1680,7 @@ fn require_materializable_worktree(
         .collect::<Vec<_>>()
         .join(", ");
     let more = colliding.len().saturating_sub(5);
-    Err(CliError::GitError {
+    Err(ShimError::GitError {
         message: format!(
             "cannot materialize {what}: untracked file(s) would be overwritten: {shown}{}; \
              move or remove them (or check the branch out) first",
@@ -1744,22 +1745,26 @@ fn init_atomicignore_and_vault(
     kind: Option<&str>,
     no_vault: bool,
     working_copy: WorkingCopyId,
-) -> CliResult<()> {
+) -> ShimResult<()> {
     // Step 1: .atomicignore
     {
         let ignore_path = workdir.join(".atomicignore");
         if !ignore_path.exists() {
             // Use explicit --kind if provided, otherwise auto-detect from project files
             let ignore_content = if let Some(k) = kind {
-                super::super::init::get_ignore_template(k).unwrap_or(".atomic\n.git\n")
+                atomic_config::ignore_templates::get_ignore_template(k).unwrap_or(".atomic\n.git\n")
             } else if workdir.join("Cargo.toml").exists() {
-                super::super::init::get_ignore_template("rust").unwrap_or(".atomic\n.git\n")
+                atomic_config::ignore_templates::get_ignore_template("rust")
+                    .unwrap_or(".atomic\n.git\n")
             } else if workdir.join("package.json").exists() {
-                super::super::init::get_ignore_template("node").unwrap_or(".atomic\n.git\n")
+                atomic_config::ignore_templates::get_ignore_template("node")
+                    .unwrap_or(".atomic\n.git\n")
             } else if workdir.join("go.mod").exists() {
-                super::super::init::get_ignore_template("go").unwrap_or(".atomic\n.git\n")
+                atomic_config::ignore_templates::get_ignore_template("go")
+                    .unwrap_or(".atomic\n.git\n")
             } else if workdir.join("setup.py").exists() || workdir.join("pyproject.toml").exists() {
-                super::super::init::get_ignore_template("python").unwrap_or(".atomic\n.git\n")
+                atomic_config::ignore_templates::get_ignore_template("python")
+                    .unwrap_or(".atomic\n.git\n")
             } else {
                 ".atomic\n.git\n"
             };
@@ -2769,10 +2774,16 @@ mod tests {
             super::super::checkpoint::CHECKPOINT_VERSION
         );
         assert_eq!(checkpoint.view, "main");
-        crate::commands::status::Status::new()
-            .with_short(true)
-            .run()
-            .expect("guarded status must pass immediately after import");
+        let mut repo = Repository::open_for_workspace_transaction(root.path()).unwrap();
+        let workspace = crate::workspace_txn::enter_workspace(
+            &mut repo,
+            atomic_repository::WorkspaceTxnMode::Reconcile,
+        )
+        .expect("guarded status boundary must pass immediately after import");
+        assert!(repo
+            .status(workspace.working_copy(), Default::default())
+            .unwrap()
+            .is_clean());
     }
 
     #[test]

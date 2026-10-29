@@ -26,6 +26,11 @@ invocation appends to.
 | Enabled agents | Whether supported settings contain recognizable active Atomic hooks, with the evidence and inspection limitations |
 | Git shim | `[git.shim] enabled` in `.atomic/config.toml`, plus the state of each Atomic hook dispatcher (as `atomic git hooks status` reports them) |
 
+In a build without the `git-shim` feature, diagnostics still reports the
+repository's configured shim status, but marks Git hook inspection unavailable
+with a build-feature explanation. The read-only report is available even when
+enrollment or malformed configuration prevents normal workspace commands.
+
 **Installed is not the same as enabled.** An integration is *installed* when it
 has a receipt. An agent is *enabled* when Atomic's hook commands are present in
 its live configuration. Hooks can exist without a receipt (built-in hooks), and a

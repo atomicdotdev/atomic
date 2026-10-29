@@ -267,6 +267,7 @@ dependencies = [
  "atomic-client",
  "atomic-config",
  "atomic-core",
+ "atomic-git-shim",
  "atomic-identity",
  "atomic-objects",
  "atomic-remote",
@@ -280,7 +281,6 @@ dependencies = [
  "clap",
  "clap_complete",
  "console",
- "crossterm",
  "data-encoding",
  "dialoguer",
  "dirs",
@@ -294,7 +294,6 @@ dependencies = [
  "log",
  "open",
  "prost-types",
- "ratatui",
  "rayon",
  "redb 4.4.0",
  "reqwest",
@@ -377,6 +376,40 @@ dependencies = [
  "ulid",
  "xxhash-rust",
  "zstd",
+]
+
+[[package]]
+name = "atomic-git-shim"
+version = "0.20.0"
+dependencies = [
+ "anyhow",
+ "atomic-agent",
+ "atomic-canonical",
+ "atomic-config",
+ "atomic-core",
+ "atomic-identity",
+ "atomic-objects",
+ "atomic-remote",
+ "atomic-repository",
+ "blake3",
+ "chrono",
+ "clap",
+ "console",
+ "crossterm",
+ "dirs",
+ "git2",
+ "libc",
+ "log",
+ "ratatui",
+ "rayon",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

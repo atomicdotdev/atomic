@@ -53,7 +53,8 @@
 //! ```
 
 pub mod colors;
-pub(crate) mod live;
+#[cfg(feature = "git-shim")]
+pub(crate) use atomic_git_shim::output::live;
 pub mod progress;
 pub mod table;
 
@@ -108,6 +109,7 @@ pub fn truncate_bytes(s: &str, max: usize) -> String {
 /// ```
 pub fn print_success(message: &str) {
     crate::logging::printed(crate::logging::Printed::Success, message);
+    #[cfg(feature = "git-shim")]
     if live::capture(live::Kind::Success, message) {
         return;
     }
@@ -130,6 +132,7 @@ pub fn print_success(message: &str) {
 /// ```
 pub fn print_error(message: &str) {
     crate::logging::printed(crate::logging::Printed::Error, message);
+    #[cfg(feature = "git-shim")]
     if live::capture(live::Kind::Error, message) {
         return;
     }
@@ -152,6 +155,7 @@ pub fn print_error(message: &str) {
 /// ```
 pub fn print_warning(message: &str) {
     crate::logging::printed(crate::logging::Printed::Warning, message);
+    #[cfg(feature = "git-shim")]
     if live::capture(live::Kind::Warning, message) {
         return;
     }
@@ -174,6 +178,7 @@ pub fn print_warning(message: &str) {
 /// ```
 pub fn print_info(message: &str) {
     crate::logging::printed(crate::logging::Printed::Info, message);
+    #[cfg(feature = "git-shim")]
     if live::capture(live::Kind::Info, message) {
         return;
     }
@@ -195,6 +200,7 @@ pub fn print_info(message: &str) {
 /// print_hint("Run 'atomic add <file>' to track new files");
 /// ```
 pub fn print_hint(message: &str) {
+    #[cfg(feature = "git-shim")]
     if live::capture(live::Kind::Info, message) {
         return;
     }

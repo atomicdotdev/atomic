@@ -16,7 +16,7 @@ use super::hooks::{
     print_unmanaged_instructions, GitHookContext,
 };
 use super::observation::{observe_git, GitObservation};
-use crate::error::CliResult;
+use crate::error::ShimResult;
 use crate::output::{print_info, print_warning};
 
 /// Every hook `enable_shim` installs as an Atomic-owned dispatcher.
@@ -43,7 +43,7 @@ enum HookRemoval {
 
 /// Remove every Atomic-owned dispatcher `enable_shim` installed, reporting
 /// each hook removed or kept.
-pub(crate) fn uninstall_shim(root: &Path) -> CliResult<()> {
+pub(crate) fn uninstall_shim(root: &Path) -> ShimResult<()> {
     let root = canonical_root(root)?;
     let binary = std::env::current_exe()
         .map_err(|error| git_error(format!("cannot resolve the Atomic binary path: {error}")))?;
@@ -63,11 +63,11 @@ pub(crate) fn uninstall_shim(root: &Path) -> CliResult<()> {
     let dispatchers = ATOMIC_DISPATCHER_HOOKS
         .iter()
         .map(|hook_name| report_dispatcher_removal(&hooks_dir, hook_name))
-        .collect::<CliResult<Vec<bool>>>()?;
+        .collect::<ShimResult<Vec<bool>>>()?;
     let legacy = LEGACY_IMPORT_HOOKS
         .iter()
         .map(|hook_name| report_legacy_removal(&hooks_dir, hook_name))
-        .collect::<CliResult<Vec<bool>>>()?;
+        .collect::<ShimResult<Vec<bool>>>()?;
     if !dispatchers
         .iter()
         .chain(legacy.iter())
@@ -80,7 +80,7 @@ pub(crate) fn uninstall_shim(root: &Path) -> CliResult<()> {
 
 /// Remove one advisory dispatcher when Atomic owns it; returns whether a
 /// file was removed.
-fn report_dispatcher_removal(hooks_dir: &Path, hook_name: &str) -> CliResult<bool> {
+fn report_dispatcher_removal(hooks_dir: &Path, hook_name: &str) -> ShimResult<bool> {
     let path = hooks_dir.join(hook_name);
     match remove_owned_hook(&path)? {
         HookRemoval::Removed => {
@@ -102,7 +102,7 @@ fn report_dispatcher_removal(hooks_dir: &Path, hook_name: &str) -> CliResult<boo
 }
 
 /// Remove one legacy synchronous import hook when it is Atomic-only.
-fn report_legacy_removal(hooks_dir: &Path, hook_name: &str) -> CliResult<bool> {
+fn report_legacy_removal(hooks_dir: &Path, hook_name: &str) -> ShimResult<bool> {
     let path = hooks_dir.join(hook_name);
     match remove_owned_hook(&path)? {
         HookRemoval::Removed => {
@@ -117,7 +117,7 @@ fn report_legacy_removal(hooks_dir: &Path, hook_name: &str) -> CliResult<bool> {
 }
 
 /// Remove `path` only when it is a regular file whose content Atomic owns.
-fn remove_owned_hook(path: &Path) -> CliResult<HookRemoval> {
+fn remove_owned_hook(path: &Path) -> ShimResult<HookRemoval> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(HookRemoval::Absent),
@@ -145,7 +145,7 @@ fn remove_owned_hook(path: &Path) -> CliResult<HookRemoval> {
 }
 
 /// Report the state of every advisory dispatcher.
-pub(crate) fn show_status(root: &Path) -> CliResult<()> {
+pub(crate) fn show_status(root: &Path) -> ShimResult<()> {
     let root = canonical_root(root)?;
     let context = git_hook_context(&root)?;
     match dispatcher_states(&context)? {
@@ -173,23 +173,24 @@ pub(crate) fn show_status(root: &Path) -> CliResult<()> {
 
 /// Where the shim's dispatchers live, and the state of each one.
 #[derive(Debug)]
-pub(crate) enum DispatcherReport {
+pub enum DispatcherReport {
     /// A custom `core.hooksPath` is set; Atomic never manages hooks there.
     External { hooks_path: PathBuf },
-    /// One entry per hook in [`ATOMIC_DISPATCHER_HOOKS`], in that order.
+    /// One entry per supported Atomic hook, in dispatcher installation order.
     Inspected(Vec<DispatcherHook>),
 }
 
+/// Read-only inspection of one hook path.
 #[derive(Debug)]
-pub(crate) struct DispatcherHook {
-    pub(crate) name: &'static str,
-    pub(crate) path: PathBuf,
-    pub(crate) state: HookState,
+pub struct DispatcherHook {
+    pub name: &'static str,
+    pub path: PathBuf,
+    pub state: HookState,
 }
 
 /// What occupies one hook path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum HookState {
+pub enum HookState {
     NotInstalled,
     AtomicOwned,
     UnmanagedSymlink,
@@ -200,7 +201,7 @@ pub(crate) enum HookState {
 
 impl HookState {
     /// The wording `atomic git hooks status` prints.
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::NotInstalled => "not installed",
             Self::AtomicOwned => "Atomic-owned dispatcher installed",
@@ -212,7 +213,7 @@ impl HookState {
     }
 
     /// Stable machine-readable key.
-    pub(crate) fn code(self) -> &'static str {
+    pub fn code(self) -> &'static str {
         match self {
             Self::NotInstalled => "not_installed",
             Self::AtomicOwned => "atomic_owned",
@@ -226,7 +227,7 @@ impl HookState {
 
 /// Inspect the dispatchers of the Git repository colocated with `root`, or
 /// `None` when there is no Git repository there. Read-only.
-pub(crate) fn inspect_dispatchers(root: &Path) -> CliResult<Option<DispatcherReport>> {
+pub fn inspect_dispatchers(root: &Path) -> ShimResult<Option<DispatcherReport>> {
     let root = canonical_root(root)?;
     match observe_git(&root) {
         Ok(GitObservation::NoGit { .. }) => return Ok(None),
@@ -241,7 +242,7 @@ pub(crate) fn inspect_dispatchers(root: &Path) -> CliResult<Option<DispatcherRep
 }
 
 /// Inspect every dispatcher path without changing anything.
-fn dispatcher_states(context: &GitHookContext) -> CliResult<DispatcherReport> {
+fn dispatcher_states(context: &GitHookContext) -> ShimResult<DispatcherReport> {
     if let Some(hooks_path) = &context.custom_hooks_path {
         return Ok(DispatcherReport::External {
             hooks_path: hooks_path.clone(),
@@ -258,11 +259,11 @@ fn dispatcher_states(context: &GitHookContext) -> CliResult<DispatcherReport> {
                 path,
             })
         })
-        .collect::<CliResult<_>>()
+        .collect::<ShimResult<_>>()
         .map(DispatcherReport::Inspected)
 }
 
-fn hook_status(path: &Path) -> CliResult<HookState> {
+fn hook_status(path: &Path) -> ShimResult<HookState> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(HookState::NotInstalled),
         Err(error) => Err(git_error(format!(

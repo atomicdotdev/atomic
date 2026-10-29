@@ -1,0 +1,47 @@
+[package]
+name = "atomic-git-shim"
+description = "Git import, reconciliation, and publication adapters for Atomic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+adoption-test-injection = ["atomic-repository/adoption-test-injection"]
+
+[dependencies]
+atomic-agent = { workspace = true }
+atomic-canonical = { workspace = true }
+atomic-config = { workspace = true }
+atomic-core = { workspace = true }
+atomic-identity = { workspace = true }
+atomic-objects = { workspace = true }
+atomic-remote = { workspace = true }
+atomic-repository = { workspace = true }
+anyhow = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+console = { workspace = true }
+dirs = { workspace = true }
+git2 = { workspace = true }
+log = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.29", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+serial_test = { workspace = true }
+tempfile = { workspace = true }

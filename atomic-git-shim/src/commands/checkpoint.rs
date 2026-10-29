@@ -10,14 +10,14 @@ use atomic_repository::Repository;
 
 use super::observation::{observe_git, GitObservation, HeadObservation, ObservationError};
 
-pub(crate) const CHECKPOINT_VERSION: u32 = 2;
+pub const CHECKPOINT_VERSION: u32 = 2;
 const ATOMIC_MANIFEST_DOMAIN: &[u8] = b"atomic:bridge:atomic-visible-regular-files:v1\0";
 const CHECKPOINT_RELATIVE_PATH: &str = ".atomic/bridge/workspace.json";
 
 /// A manifest root carried as evidence rather than as a claim of full RFC
 /// repository-manifest equivalence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ManifestRootEvidence {
+pub struct ManifestRootEvidence {
     pub kind: ManifestRootKind,
     pub value: String,
     /// `true` means the root covers only the explicitly named subset.
@@ -60,7 +60,7 @@ impl std::fmt::Display for ManifestRootEvidence {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum ManifestRootKind {
+pub enum ManifestRootKind {
     /// Exact Git tree object identity.
     GitTreeOid,
     /// Domain-separated digest over Atomic's UTF-8 visible regular-file paths
@@ -80,7 +80,7 @@ impl std::fmt::Display for ManifestRootKind {
 
 /// Git administrative identity resolved by the read-only observer.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct GitAdminIdentity {
+pub struct GitAdminIdentity {
     pub worktree_root: Option<PathBuf>,
     pub worktree_git_dir: PathBuf,
     pub common_dir: PathBuf,
@@ -100,7 +100,7 @@ pub(crate) struct CheckpointAtomicState {
 /// Fields remain flat so the experimental shim can upgrade the version-1
 /// JSON without changing its existing direction-classification call sites.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct ShimCheckpoint {
+pub struct ShimCheckpoint {
     pub version: u32,
     pub view: String,
     pub atomic_state: String,
@@ -150,7 +150,7 @@ impl ShimCheckpoint {
 
 /// State already verified by the shim before a checkpoint is published.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct VerifiedCheckpointInput<'a> {
+pub struct VerifiedCheckpointInput<'a> {
     pub view: &'a str,
     pub atomic_state: &'a str,
     pub git_head: &'a str,
@@ -158,7 +158,7 @@ pub(crate) struct VerifiedCheckpointInput<'a> {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CheckpointError {
+pub enum CheckpointError {
     #[error("cannot read shim checkpoint '{path}': {source}")]
     Read {
         path: PathBuf,
@@ -223,7 +223,7 @@ pub(crate) fn checkpoint_path(root: &Path) -> PathBuf {
 }
 
 /// Read and upgrade a local checkpoint without rewriting it.
-pub(crate) fn read_checkpoint(root: &Path) -> Result<Option<ShimCheckpoint>, CheckpointError> {
+pub fn read_checkpoint(root: &Path) -> Result<Option<ShimCheckpoint>, CheckpointError> {
     let path = checkpoint_path(root);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -376,7 +376,7 @@ fn observe_atomic_on_handle(
 }
 
 /// Re-observe the verified shim state and publish it as a version-2 checkpoint.
-pub(crate) fn write_verified_checkpoint(
+pub fn write_verified_checkpoint(
     root: &Path,
     input: VerifiedCheckpointInput<'_>,
 ) -> Result<ShimCheckpoint, CheckpointError> {
