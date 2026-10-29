@@ -706,6 +706,7 @@ pub fn build_report(
         candidate_hashes.dedup();
         if !candidate_hashes.is_empty() {
             let provider = crate::repository::provenance_gate::local_session_mac_key_provider(repo);
+            let did_provider = crate::repository::provenance_gate::local_did_key_provider(repo);
             match repo.evaluate_publication_gate(
                 &candidate_hashes,
                 &crate::repository::provenance_gate::PublicationGateConfig::from_repo(repo)
@@ -714,6 +715,7 @@ pub fn build_report(
                         repository_identity: None,
                     }),
                 Some(&provider),
+                Some(&did_provider),
             ) {
                 Ok(verdict) => {
                     for blocker in &verdict.blocks {

@@ -49,6 +49,9 @@ remain available. An already enrolled workspace requires a shim-enabled
 binary: the native-only CLI refuses before command execution, including RPC
 dispatch, instead of updating Atomic without its Git publication adapter.
 Use a shim-enabled binary to continue or to explicitly disable enrollment.
+Read-only `atomic diagnostics` remains available for support, including in
+enrolled or misconfigured workspaces. Without the feature, its report preserves
+the repository's configured shim status and marks Git hook inspection unavailable.
 
 `atomic stage` and `atomic unstage` are Git interoperability commands for
 colocated repositories. Stage writes file content to the Git index; unstage

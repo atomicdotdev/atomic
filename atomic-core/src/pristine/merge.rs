@@ -153,6 +153,7 @@ impl LegacyDatabases {
                 meta.insert(key.as_str(), digest.as_slice())?;
             }
         }
+        super::build_metadata::record_migration(&write)?;
         write.commit()?;
         Ok(report)
     }

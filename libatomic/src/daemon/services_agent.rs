@@ -3795,8 +3795,12 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                 let changes_per_seed = graph.changes_per_seed.unwrap_or(5) as usize;
                 let cap_changes = changes_per_seed > 0;
                 // 1. Seed: search, filtered to allowed kinds, take limit.
+                // Scoped to the requested (or working-copy) view so the seed
+                // reads recorded bytes through the same closure the content
+                // and callers branches use.
+                let view = query_view_name(&repo, requested_view.as_ref())?;
                 let seed_nodes: Vec<atomic_core::pristine::vault::KgNode> = repo
-                    .vault_kg_search(&query, limit * 3, None)
+                    .vault_kg_search_on_view(&view, &query, limit * 3, None)
                     .map_err(repository_error)?
                     .into_iter()
                     .filter(|node| node.types.iter().any(|class| kind_allowed(class)))
@@ -3940,8 +3944,11 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                 let repo = handle.repository()?;
                 let plan_json = String::from_utf8_lossy(&plan.plan_json).into_owned();
                 let parsed = atomic_repository::parse_plan(&plan_json).map_err(repository_error)?;
-                let result =
-                    atomic_repository::execute_plan(&repo, &parsed).map_err(repository_error)?;
+                // The plan's kg_search step reads the requested (or
+                // working-copy) view's closure, matching the other branches.
+                let view = query_view_name(&repo, requested_view.as_ref())?;
+                let result = atomic_repository::execute_plan_on_view(&repo, &view, &parsed)
+                    .map_err(repository_error)?;
                 let payload = serde_json::to_vec(&result)
                     .map_err(|error| Status::internal(format!("plan encode: {error}")))?;
                 Ok(QueryGraphResponse {

@@ -78,6 +78,7 @@ use commands::{
     Compact,
     Completions,
     Conflicts,
+    Diagnostics,
     Diff,
     Doctor,
     Identity,
@@ -498,6 +499,21 @@ enum Commands {
     /// Use this for explicit maintenance tasks that may scan stored changes,
     /// such as backfilling the dependency index for legacy repositories.
     Doctor(Doctor),
+
+    /// Print a read-only support report.
+    ///
+    /// Reports the Atomic version, installed agent integrations and skills
+    /// with their versions, which agents have Atomic hooks enabled, and
+    /// whether the Git shim is enabled. Changes nothing, needs no network,
+    /// and works outside a workspace.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic diagnostics
+    /// atomic diagnostics --json
+    /// ```
+    Diagnostics(Diagnostics),
 
     /// Reclaim unused space in the repository database.
     Compact(Compact),
@@ -1022,9 +1038,13 @@ fn main() {
     }
 
     #[cfg(not(feature = "git-shim"))]
-    if let Err(error) = commands::git_support::ensure_current_workspace_supported() {
-        print_error(&error.to_string());
-        std::process::exit(error.exit_code());
+    if !matches!(&cli.command, Commands::Diagnostics(_)) {
+        // Diagnostics collects read-only support evidence even when enrollment
+        // or configuration prevents normal workspace operations.
+        if let Err(error) = commands::git_support::ensure_current_workspace_supported() {
+            print_error(&error.to_string());
+            std::process::exit(error.exit_code());
+        }
     }
 
     // Execute the command and handle errors
@@ -1070,6 +1090,7 @@ fn main() {
         Commands::Blame(blame) => blame.run(),
 
         Commands::Doctor(doctor) => doctor.run(),
+        Commands::Diagnostics(diagnostics) => diagnostics.run(),
         Commands::Compact(compact) => compact.run(),
 
         #[cfg(feature = "git-shim")]

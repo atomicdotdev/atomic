@@ -71,6 +71,7 @@ pub mod census;
 pub mod checkpoint;
 pub(crate) mod guard;
 pub(crate) mod hook_dispatchers;
+pub use hook_dispatchers::{inspect_dispatchers, DispatcherHook, DispatcherReport, HookState};
 pub mod hooks;
 pub mod import;
 pub mod linked_worktree;

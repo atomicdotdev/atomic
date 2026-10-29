@@ -729,8 +729,15 @@ impl Push {
                     atomic_repository::repository::provenance_gate::local_session_mac_key_provider(
                         &repo,
                     );
-                repo.enforce_publication_gate("Atomic push", &push_closure, Some(&provider))
-                    .map_err(CliError::Repository)?;
+                let did_provider =
+                    atomic_repository::repository::provenance_gate::local_did_key_provider(&repo);
+                repo.enforce_publication_gate(
+                    "Atomic push",
+                    &push_closure,
+                    Some(&provider),
+                    Some(&did_provider),
+                )
+                .map_err(CliError::Repository)?;
             }
         }
 

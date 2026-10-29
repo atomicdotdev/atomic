@@ -155,9 +155,8 @@ impl AgentHook for ClaudeCodeHook {
             return false;
         };
 
-        // Check if any hook command starts with our prefix
-        let json_str = raw.to_string();
-        json_str.contains(ATOMIC_HOOK_PREFIX)
+        super::live::json_hooks_active("claude-code", &raw, "hooks", ATOMIC_HOOK_PREFIX)
+            .unwrap_or(false)
     }
 
     fn supported_hooks(&self) -> Vec<HookType> {

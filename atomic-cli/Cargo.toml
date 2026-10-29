@@ -92,6 +92,9 @@ uuid = { version = "1.0", features = ["serde", "v4"] }
 # Utilities
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml_ng = "0.10"
+toml = { workspace = true }
+redb = { workspace = true }
 bytes = { workspace = true }
 fs2 = "0.4"
 url = { workspace = true }

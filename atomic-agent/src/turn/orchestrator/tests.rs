@@ -2172,3 +2172,162 @@ fn mac_signed_attestation_is_never_trusted_evidence() {
         "session-MAC signers must be refused as trusted evidence, got {err:?}"
     );
 }
+
+// CB-12B: a resumed expedition round starts a FRESH local session — the
+// previous round ran in a different (since-destroyed) sandbox, so the
+// session JSON never carried over — and must adopt the durable history
+// from the repository's session ledger before numbering or attesting
+// anything: the turn count so the next turn numbers past the previous
+// round's published journal turn (a colliding reservation fails the
+// previous checkpoint with `ProvenanceCheckpointConflict` and the
+// turn-end hook dies before its session save), and the recorded change
+// hashes so the resumed round's session-end attestation covers ONLY the
+// new round's change and chains to the session's previous attestation.
+#[tokio::test]
+async fn a_resumed_session_adopts_its_durable_ledger_and_chains_its_attestation() {
+    use atomic_core::change::attestation::{AttestAgent, Attestation};
+    use atomic_core::change::provenance_graph::{
+        ProvenanceGraphBuilder, ProvenanceNode, ProvenanceNodeKind,
+    };
+    use atomic_core::change::session::SessionTurn;
+
+    let dir = TempDir::new().unwrap();
+    Repository::init(dir.path()).unwrap();
+    let sid = "sess-resumed";
+
+    // Round 1, as its durable owner sees it: a recorded change, a
+    // published ledger turn explaining it, and a same-session
+    // attestation covering it.
+    let round_one_change = {
+        let repo = Repository::open(dir.path()).unwrap();
+        let working_copy = repo.require_working_copy_id().unwrap();
+        fs::write(dir.path().join("round-one.txt"), "round one\n").unwrap();
+        repo.add(
+            working_copy,
+            "round-one.txt",
+            atomic_repository::tracking::TrackingOptions::default(),
+        )
+        .unwrap();
+        let outcome = repo
+            .record(
+                working_copy,
+                atomic_core::change::ChangeHeader::new("round one"),
+                atomic_repository::record::RecordOptions::new().with_all(true),
+            )
+            .unwrap();
+        *outcome.hash()
+    };
+    let round_one_attestation = {
+        let repo = Repository::open(dir.path()).unwrap();
+        repo.upsert_session_lifecycle(sid, Some("dev".into()), None, None)
+            .unwrap();
+        let graph = ProvenanceGraphBuilder::new(sid, "sherpa")
+            .nodes(vec![ProvenanceNode {
+                id: "goal-1".into(),
+                kind: ProvenanceNodeKind::Goal,
+                timestamp: 1000,
+                summary: "round one".into(),
+                detail: None,
+                change_hash: None,
+                tool_name: None,
+                tool_call_id: None,
+                duration_ms: None,
+                classified: false,
+                confidence: None,
+                consolidated_from: Vec::new(),
+            }])
+            .changes_explained(vec![round_one_change])
+            .build();
+        let provenance_hash = repo.change_store().save_provenance_graph(&graph).unwrap();
+        let turn = SessionTurn {
+            session_id: sid.to_string(),
+            turn_number: 0,
+            goal: Some("round one".into()),
+            provenance_hash,
+            change_hashes: vec![round_one_change],
+            previous_provenance: None,
+            timestamp: 1000,
+            plan_id: None,
+            todos: Vec::new(),
+            boundary_start: None,
+            boundary_end: None,
+            outcome: None,
+        };
+        repo.publish_provenance_checkpoint(&graph, turn).unwrap();
+        drop(repo);
+
+        let repo = Repository::open(dir.path()).unwrap();
+        let mut attestation =
+            Attestation::builder(sid, AttestAgent::new("sherpa", "Sherpa", "openai"))
+                .changes_covered(vec![round_one_change])
+                .build();
+        attestation.sign_with_mac("resumed-session-mac-key-0123456789abcdef");
+        repo.save_attestation(&attestation).unwrap()
+    };
+
+    // Round 2 — the resumed dispatch: a fresh local state (no session
+    // JSON, exactly like a newly forked sandbox), same session id.
+    let mut orch = make_orchestrator(&dir);
+    orch.set_agent("sherpa", "Sherpa");
+
+    orch.dispatch(session_start_event(sid)).await.unwrap();
+
+    // The fresh session adopted the durable history: the previous
+    // round's turn count and its recorded change hashes.
+    let session = orch.session_store.load(sid).unwrap().unwrap();
+    assert_eq!(
+        session.turn_count, 1,
+        "a resumed session must adopt the durable ledger's turn count",
+    );
+    assert_eq!(
+        session.recorded_change_hashes,
+        vec![round_one_change],
+        "a resumed session must adopt the changes its earlier rounds recorded",
+    );
+
+    // The resumed round's turn records past the durable history...
+    orch.dispatch(turn_start_event(sid, "round two"))
+        .await
+        .unwrap();
+    fs::write(dir.path().join("round-two.txt"), "round two\n").unwrap();
+    let turn_result = orch.dispatch(turn_end_event(sid)).await.unwrap();
+    assert!(turn_result.was_recorded(), "the resumed round must record");
+    let round_two_change = turn_result
+        .change_recorded
+        .as_ref()
+        .expect("the resumed round recorded a change")
+        .hash;
+    assert_ne!(round_two_change, round_one_change);
+
+    // ...and its session-end attestation covers ONLY the new round's
+    // change, chained to the session's round-1 attestation.
+    orch.dispatch(session_end_event(sid)).await.unwrap();
+
+    let repo = Repository::open(dir.path()).unwrap();
+    let attestation_hashes: Vec<_> = repo
+        .change_store()
+        .iter_attestations()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert_eq!(
+        attestation_hashes.len(),
+        2,
+        "the resumed round must add exactly one attestation",
+    );
+    let round_two_attestation = *attestation_hashes
+        .iter()
+        .find(|hash| **hash != round_one_attestation)
+        .expect("the resumed round's attestation exists");
+    let attest = repo.load_attestation(&round_two_attestation).unwrap();
+    assert_eq!(
+        attest.changes_covered,
+        vec![round_two_change],
+        "the resumed round's attestation covers only the new round's change",
+    );
+    assert_eq!(
+        attest.previous_attestation,
+        Some(round_one_attestation),
+        "the resumed round's attestation chains to the session's previous one",
+    );
+    assert_eq!(attest.session_id, sid);
+}

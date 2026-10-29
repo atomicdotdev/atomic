@@ -75,6 +75,7 @@ pub mod compact;
 pub mod complete;
 pub mod completions;
 pub mod conflicts;
+pub mod diagnostics;
 pub mod diff;
 pub mod doctor;
 pub mod init;
@@ -154,6 +155,7 @@ pub use clone::Clone;
 pub use compact::Compact;
 pub use completions::Completions;
 pub use conflicts::Conflicts;
+pub use diagnostics::Diagnostics;
 pub use diff::Diff;
 pub use doctor::Doctor;
 #[cfg(feature = "git-shim")]

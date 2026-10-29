@@ -161,8 +161,30 @@ pub struct StepStat {
 
 // ── Executor ────────────────────────────────────────────────────
 
-/// Execute a query plan against a repository.
+/// Execute a query plan against this working copy's registered desired view.
+///
+/// The `kg_search` step reads VCS nodes and source content through that
+/// view's closure; other steps keep their existing scope.
 pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, RepositoryError> {
+    let working_copy = repo.require_working_copy_id()?;
+    let view = repo.desired_view_name(working_copy)?;
+    execute_plan_on_view(repo, &view, plan)
+}
+
+/// Execute a query plan against a specific view's recorded closure.
+pub fn execute_plan_on_view(
+    repo: &Repository,
+    view_name: &str,
+    plan: &QueryPlan,
+) -> Result<PlanResult, RepositoryError> {
+    execute_plan_inner(repo, view_name, plan)
+}
+
+fn execute_plan_inner(
+    repo: &Repository,
+    view_name: &str,
+    plan: &QueryPlan,
+) -> Result<PlanResult, RepositoryError> {
     if plan.schema_version != 1 {
         return Err(RepositoryError::Serialization(
             "unsupported query plan schema version".into(),
@@ -204,7 +226,7 @@ pub fn execute_plan(repo: &Repository, plan: &QueryPlan) -> Result<PlanResult, R
                 });
             }
             QueryStep::KgSearch { query, limit, bind } => {
-                let nodes = repo.vault_kg_search(query, *limit, None)?;
+                let nodes = repo.vault_kg_search_on_view(view_name, query, *limit, None)?;
                 let count = nodes.len();
 
                 if let Some(var) = bind {

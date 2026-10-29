@@ -252,10 +252,11 @@ fn verify_ref_update(
 
     // Trusted provenance gate over the complete delta (transitive
     // dependencies included). Receiving boundaries hold no local session
-    // MAC keys: managed attestations verify as unverifiable and fail closed.
+    // MAC keys and no DID resolver: managed attestations verify as
+    // unverifiable and fail closed.
     let closure = atomic_repository::repository::provenance_gate::reachable_closure(repo, &delta)
         .map_err(|error| format!("cannot compute the reachable closure: {error}"))?;
-    match repo.evaluate_publication_gate(&closure, &gate_config(repo), None) {
+    match repo.evaluate_publication_gate(&closure, &gate_config(repo), None, None) {
         Ok(verdict) if verdict.allowed() => Ok(verdict.managed_changes),
         Ok(verdict) => Err(format!(
             "managed provenance gate refused ({}/{} managed of {} checked):\n{}",

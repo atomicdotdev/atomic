@@ -399,10 +399,12 @@ ranking and limits; no working-copy content index or checkout is required. Calle
 use request-scoped tree-sitter parsing, not persisted KG code edges. This
 correctness-first path renders/scans the selected view per query. RPC clients can
 select a view explicitly; omitting it uses the working copy's registered desired
-view. Other query verbs retain their existing scope semantics. The separate
-working-copy content index is still available to its existing consumers. Existing
-ambient ignore rules still suppress ignored paths, including recorded files; that
-policy is intentional and unchanged.
+view. Other query verbs retain their existing scope semantics. The agent tool
+loop's `code_search` and `kg_search` read the same recorded view. The separate
+working-copy content index remains only for its maintenance consumers — Git
+import refresh and post-record index updates — and no search path consults it.
+Existing ambient ignore rules still suppress ignored paths, including recorded
+files; that policy is intentional and unchanged.
 
 Recorded code search applies path/type filters **before reading file contents**,
 then scans eligible files one at a time. It keeps at most the requested number of
@@ -592,6 +594,7 @@ Every change stores two parallel representations:
 | `atomic agent status` | Show sessions, hook liveness, and failures (`--json` for tooling) |
 | `atomic agent explain <id>` | Generate AI reasoning summary for a session |
 | `atomic agent attest` | List and inspect attestations |
+| `atomic diagnostics` | Read-only support report: version, integrations, skills, hooks, Git shim, repository counts and selected redb table statistics (`--json`) |
 
 Hook health is computed from session-scoped logs, so concurrent agents retain
 their own outcomes and a child's success cannot hide a parent's failure. See
@@ -684,7 +687,8 @@ crate. To build the CLI without that adapter, use
 `cargo build -p atomic-cli --no-default-features --features teams` (omit
 `--features teams` to disable both). Such builds retain native Atomic workflows
 and refuse operations in shim-enrolled working copies until enrollment is
-explicitly disabled with a shim-enabled build.
+explicitly disabled with a shim-enabled build. Read-only `atomic diagnostics`
+remains available to inspect those workspaces.
 
 Local builds include their source commit in the version output, for example
 `atomic 0.19.1 (dev 4b143dfbcad2)`, with `-dirty` appended for tracked changes.

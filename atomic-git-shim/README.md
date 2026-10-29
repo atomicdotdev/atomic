@@ -60,6 +60,9 @@ operations remain available.
 An enrolled workspace (including one with a verified checkpoint) refuses
 operations before writable repository access or RPC dispatch. Use an enabled
 build to continue or explicitly disable enrollment with that build first.
+Read-only `atomic diagnostics` remains available, including in enrolled or
+misconfigured workspaces; it reports Git hook inspection as unavailable when
+the adapter is not compiled in.
 
 `atomic stage` and `atomic unstage` are Git interoperability commands. They
 write the colocated repository's Git index or restore its entries to Git HEAD,

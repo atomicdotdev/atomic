@@ -28,6 +28,8 @@ pub const PROVENANCE_GRAPH_SCHEMA: &str = "atomic.prov.graph.v1";
 pub const SESSION_TURN_SCHEMA: &str = "atomic.session.turn.v1";
 /// A [`SessionCheckpointPublication`] as JSON.
 pub const PUBLICATION_SCHEMA: &str = "atomic.session.checkpoint-publication.v1";
+/// A serialized attestation (`Attestation::serialize`: ATST magic + postcard).
+pub const ATTESTATION_SCHEMA: &str = "atomic.attestation.v1";
 
 /// `ErrorInfo.context` key naming a [`SubmitRejection`] variant.
 pub const REJECTION_REASON: &str = "reason";
@@ -368,6 +370,18 @@ pub fn publication_from(
         .map_err(|e| e.to_string())
 }
 
+/// An attestation's serialized bytes (`Attestation::serialize`) on the wire.
+/// What travels is exactly what the sending side saved, so the hash the
+/// owner computes over it is the hash the sender did.
+pub fn attestation_bytes(attestation: Vec<u8>) -> pb::VersionedBytes {
+    versioned(ATTESTATION_SCHEMA, attestation)
+}
+
+/// The serialized attestation a [`pb::SubmitAttestationRequest`] carries.
+pub fn attestation_from(bytes: Option<&pb::VersionedBytes>) -> Result<Vec<u8>, String> {
+    Ok(payload(bytes, ATTESTATION_SCHEMA)?.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +412,21 @@ mod tests {
             assert_eq!(published.nanos, nanos);
             assert_eq!(publication_from(&wire).unwrap(), publication);
         }
+    }
+
+    #[test]
+    fn an_attestation_survives_the_wire_untouched() {
+        let bytes = b"ATST\x04payload".to_vec();
+        let carried = attestation_bytes(bytes.clone());
+        let back = attestation_from(Some(&carried)).unwrap();
+        assert_eq!(back, bytes);
+        // Another schema never reads as an attestation.
+        let foreign = pb::VersionedBytes {
+            schema: SESSION_TURN_SCHEMA.to_string(),
+            payload: bytes,
+        };
+        assert!(attestation_from(Some(&foreign)).is_err());
+        assert!(attestation_from(None).is_err());
     }
 
     #[test]

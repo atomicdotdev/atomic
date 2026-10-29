@@ -22,6 +22,7 @@ mod compact_service_integration_test;
 mod concurrent_intent_reads_test;
 #[cfg(feature = "git-shim")]
 mod cross_stream_matrix_test;
+mod diagnostics_integration_test;
 #[cfg(feature = "git-shim")]
 mod git_adoption_cb7b_test;
 #[cfg(feature = "git-shim")]

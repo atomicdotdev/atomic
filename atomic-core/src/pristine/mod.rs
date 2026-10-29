@@ -152,6 +152,7 @@
 mod applied_changes;
 mod attribute;
 mod bindings;
+pub mod build_metadata;
 mod capability;
 mod error;
 pub(crate) mod inode_graph;

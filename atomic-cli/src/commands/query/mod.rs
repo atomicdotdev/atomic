@@ -305,9 +305,17 @@ impl Command for QueryGraph {
         };
         let kind_allowed = |kind: &str| -> bool { allow_all || allowed_kinds.contains(kind) };
 
-        // 1. Seed: search the KG, filtered to allowed kinds
+        // 1. Seed: search the KG in this working copy's desired view,
+        //    filtered to allowed kinds. VCS nodes and source content come
+        //    from the view's recorded closure; vault-only nodes stay shared.
+        let working_copy = repo
+            .require_working_copy_id()
+            .map_err(CliError::Repository)?;
+        let view = repo
+            .desired_view_name(working_copy)
+            .map_err(CliError::Repository)?;
         let seed_nodes: Vec<KgNode> = repo
-            .vault_kg_search(&self.query, self.limit * 3, None) // fetch extra, then filter
+            .vault_kg_search_on_view(&view, &self.query, self.limit * 3, None) // fetch extra, then filter
             .map_err(CliError::Repository)?
             .into_iter()
             .filter(|n| n.types.iter().any(|class| kind_allowed(class)))

@@ -820,7 +820,14 @@ pub(crate) fn run_pre_push_verification_with_input(root: &Path, input: &str) -> 
             .map_err(ShimError::Repository)?;
     let provider =
         atomic_repository::repository::provenance_gate::local_session_mac_key_provider(&repo);
-    match repo.evaluate_publication_gate(&closure, &gate_config(&repo), Some(&provider)) {
+    let did_provider =
+        atomic_repository::repository::provenance_gate::local_did_key_provider(&repo);
+    match repo.evaluate_publication_gate(
+        &closure,
+        &gate_config(&repo),
+        Some(&provider),
+        Some(&did_provider),
+    ) {
         Ok(verdict) if verdict.allowed() => {
             print_info(&format!(
                 "pre-push (local, advisory): {current_view} passed local verification \

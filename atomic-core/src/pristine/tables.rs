@@ -874,7 +874,8 @@ pub const EMBEDDINGS: TableDefinition<&str, &[u8]> = TableDefinition::new("embed
 /// Holds the schema version (`SCHEMA_VERSION_KEY`, little-endian u64) and, for
 /// databases merged from the legacy `pristine.redb` + `changes.redb` layout,
 /// the `.atomic/legacy/` directory the old files were moved to
-/// (`LEGACY_DIR_KEY`, UTF-8).
+/// (`LEGACY_DIR_KEY`, UTF-8). Build identities are UTF-8 values under the
+/// keys in [`super::build_metadata`]; absent historical values remain unknown.
 pub const ATOMIC_META: TableDefinition<&str, &[u8]> = TableDefinition::new("atomic_meta");
 
 // KG Edge Key / FTS Helpers
