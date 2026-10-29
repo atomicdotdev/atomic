@@ -765,11 +765,18 @@ fn collect_git_shim(workspace: &Result<Option<PathBuf>, String>, home: Option<&P
 }
 
 /// `path` with the home directory shown as `~`, so a pasted report does not
-/// carry the user's account name.
+/// carry the user's account name. The part after `~` is joined with `/` on
+/// every platform, so Windows never renders a mixed `~/.x\settings.json`.
 fn display_path(path: &Path, home: Option<&Path>) -> String {
     match home.and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-        Some(rest) => format!("~/{}", rest.display()),
+        Some(rest) => {
+            let parts: Vec<_> = rest
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect();
+            format!("~/{}", parts.join("/"))
+        }
         None => path.display().to_string(),
     }
 }
@@ -1302,6 +1309,11 @@ mod tests {
             "~/.claude/settings.json"
         );
         assert_eq!(display_path(home, Some(home)), "~");
+        assert_eq!(
+            display_path(&home.join(".x").join("settings.json"), Some(home)),
+            "~/.x/settings.json",
+            "separators after ~ are always /"
+        );
         assert_eq!(display_path(Path::new("/opt/x"), Some(home)), "/opt/x");
         assert_eq!(display_path(Path::new("/opt/x"), None), "/opt/x");
     }
