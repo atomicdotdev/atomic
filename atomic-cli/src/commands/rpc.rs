@@ -999,6 +999,11 @@ pub fn intent_list(args: &super::intent::list::IntentList) -> CliResult<bool> {
     if let Some(kind) = &filter {
         rows.retain(|row| &row.kind == kind);
     }
+    // This request is unbudgeted and returns the full intent listing. Keep the
+    // existing wire ID order for older services, then apply the new CLI sort.
+    if args.sort == super::intent::list::IntentSort::HumanKey {
+        super::intent::list::sort_rows(&mut rows, args.sort, args.reverse);
+    }
     super::intent::list::IntentList::render(&rows, args.json);
     Ok(true)
 }

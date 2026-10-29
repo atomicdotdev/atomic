@@ -80,7 +80,11 @@ pub struct IntentList {
 /// `atomic intent list --sort` keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum IntentSort {
+    /// Sort by the human key (the existing default).
     Id,
+    /// Sort human keys by prefix and numeric sequence (2 before 10).
+    #[value(alias = "humanKey")]
+    HumanKey,
     Title,
     Status,
     Kind,
@@ -94,7 +98,7 @@ impl IntentSort {
     pub(crate) fn wire(self) -> atomic_client::proto::VaultListSort {
         use atomic_client::proto::VaultListSort as W;
         match self {
-            IntentSort::Id => W::Id,
+            IntentSort::Id | IntentSort::HumanKey => W::Id,
             IntentSort::Title => W::Title,
             IntentSort::Status => W::Status,
             IntentSort::Kind => W::Kind,
@@ -111,6 +115,7 @@ pub(crate) fn sort_rows(rows: &mut [Row], key: IntentSort, reverse: bool) {
     rows.sort_by(|a, b| {
         let ord = match key {
             IntentSort::Id => a.human_key.cmp(&b.human_key),
+            IntentSort::HumanKey => compare_human_keys(&a.human_key, &b.human_key),
             IntentSort::Title => a.title.cmp(&b.title),
             IntentSort::Status => a.status.cmp(&b.status),
             IntentSort::Kind => a.kind.cmp(&b.kind),
@@ -119,6 +124,41 @@ pub(crate) fn sort_rows(rows: &mut [Row], key: IntentSort, reverse: bool) {
         };
         if reverse { ord.reverse() } else { ord }.then_with(|| a.human_key.cmp(&b.human_key))
     });
+}
+
+/// Compare the last key component numerically without imposing an integer limit.
+/// Invalid suffixes remain deterministic and group with their own prefix.
+fn compare_human_keys(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parts(key: &str) -> (&str, Option<&str>) {
+        let split = key
+            .rfind("::")
+            .map(|i| i + 2)
+            .or_else(|| key.rfind('-').map(|i| i + 1));
+        match split {
+            Some(i) => (&key[..i], Some(&key[i..])),
+            None => (key, None),
+        }
+    }
+    fn numeric(s: &str) -> Option<&str> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(s.trim_start_matches('0'))
+    }
+
+    let (a_prefix, a_suffix) = parts(a);
+    let (b_prefix, b_suffix) = parts(b);
+    a_prefix
+        .cmp(b_prefix)
+        .then_with(
+            || match (a_suffix.and_then(numeric), b_suffix.and_then(numeric)) {
+                (Some(a), Some(b)) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a_suffix.cmp(&b_suffix),
+            },
+        )
+        .then_with(|| a.cmp(b))
 }
 
 impl IntentList {
@@ -829,6 +869,47 @@ mod tests {
         assert_eq!(keys(&rows), ["A-1", "A-2", "A-3"]);
         sort_rows(&mut rows, IntentSort::Id, true);
         assert_eq!(keys(&rows), ["A-3", "A-2", "A-1"]);
+    }
+
+    #[test]
+    fn human_key_sort_is_natural_and_deterministic() {
+        for spelling in ["human-key", "humanKey"] {
+            let key = IntentSort::from_str(spelling, false).expect("human key sort spelling");
+            assert_eq!(key.wire(), atomic_client::proto::VaultListSort::Id);
+            let expected = [
+                "A-1",
+                "A-2",
+                "A-10",
+                "A::alice::001",
+                "A::alice::1",
+                "A::alice::2",
+                "A::alice::10",
+                "A::alice::999999999999999999999999999999",
+                "A::alice::1000000000000000000000000000000",
+                "A::alice::oops",
+                "A::bob::1",
+                "B-1",
+            ];
+            for reverse in [false, true] {
+                let mut actual: Vec<_> = expected
+                    .iter()
+                    .rev()
+                    .map(|id| sort_row(id, "title", "bug", Attested::None))
+                    .collect();
+                sort_rows(&mut actual, key, reverse);
+                let mut wanted = expected.to_vec();
+                if reverse {
+                    wanted.reverse();
+                }
+                assert_eq!(keys(&actual), wanted, "{spelling}, reverse={reverse}");
+            }
+        }
+        let mut lexical = vec![
+            sort_row("A-2", "", "", Attested::None),
+            sort_row("A-10", "", "", Attested::None),
+        ];
+        sort_rows(&mut lexical, IntentSort::Id, false);
+        assert_eq!(keys(&lexical), ["A-10", "A-2"]);
     }
 
     #[test]
