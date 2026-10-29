@@ -1213,6 +1213,21 @@ impl vault_service_server::VaultService for VaultImpl {
         let response = match kind {
             Kind::Intent => {
                 let title = request.title.clone();
+                let intent_kind = if request.review_target.is_some() {
+                    "review".to_string()
+                } else {
+                    request
+                        .intent_kind
+                        .clone()
+                        .unwrap_or_else(|| "feature".into())
+                };
+                if !atomic_canonical::vocab::is_known_intent_kind(&intent_kind) {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown intent kind '{intent_kind}'"
+                    )));
+                }
+                let review_target = request.review_target.clone();
+                let created_kind = intent_kind.clone();
                 let handle_for_task = handle.clone();
                 let result = tokio::task::spawn_blocking({
                     let handle = handle_for_task;
@@ -1226,15 +1241,25 @@ impl vault_service_server::VaultService for VaultImpl {
                                 labels: Vec::new(),
                                 session_id: None,
                                 turn_id: None,
-                                kind: None,
+                                kind: (intent_kind != "feature").then_some(intent_kind),
                             })
                             .map_err(repository_error)?;
                         // The CLI's `intent new` overwrites the legacy
                         // positional scaffold with the directive scaffold
                         // through the same update path — the daemon must
                         // produce the identical artifact.
-                        let scaffold =
-                            atomic_repository::FEATURE_SCAFFOLD.replace("{id}", &created.uid);
+                        let scaffold = if let Some(target) = review_target {
+                            let target = target.trim();
+                            let target = if target.starts_with("urn:") {
+                                target.to_string()
+                            } else {
+                                format!("urn:atomic:intent:{target}")
+                            };
+                            atomic_repository::REVIEW_SCAFFOLD.replace("{target}", &target)
+                        } else {
+                            atomic_repository::FEATURE_SCAFFOLD.to_string()
+                        }
+                        .replace("{id}", &created.uid);
                         repo.vault_intent_update(
                             &created.id,
                             IntentUpdateOptions {
@@ -1261,6 +1286,7 @@ impl vault_service_server::VaultService for VaultImpl {
                         linked: Vec::new(),
                         vault_path: Some(format!(".vault/{}", result.intent_file)),
                         priority: Some("medium".to_string()),
+                        manifest_kind: Some(created_kind),
                         ..Default::default()
                     }),
                     meta: response_meta(&meta),
@@ -1926,13 +1952,17 @@ impl vault_service_server::VaultService for VaultImpl {
                     let mut entries = infos
                         .into_iter()
                         .map(|info| {
-                            // The manifest kind tag (a manifest read, never a
-                            // lift); a row missing from the manifest degrades
-                            // to the default "feature".
+                            // Prefer the stored intent's explicit kind over a
+                            // stale manifest; missing data falls back to feature.
                             let manifest_kind = manifest
                                 .intents
                                 .get(&info.id)
-                                .map(|summary| summary.kind.clone())
+                                .map(|summary| {
+                                    repo.vault_intent_effective_kind(
+                                        &summary.vault_path,
+                                        &summary.kind,
+                                    )
+                                })
                                 .unwrap_or_else(|| "feature".to_string());
                             // The attestation columns: a read/attestation
                             // failure for a SINGLE intent degrades that row's

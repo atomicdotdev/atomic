@@ -244,6 +244,9 @@ message CreateVaultEntityRequest {
   optional string developer = 9;
   optional string intent = 10;
   optional string model = 11;
+  // Intent classification and optional reviewed target (add-only).
+  optional string intent_kind = 12;
+  optional string review_target = 13;
   ViewRef view = 20;
   ViewSnapshot expected_snapshot = 21;
 }

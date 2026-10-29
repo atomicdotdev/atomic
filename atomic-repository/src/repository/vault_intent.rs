@@ -336,15 +336,14 @@ impl Repository {
         })
     }
 
-    /// Rebuild missing `manifest.intents` summaries from stored intent entries.
+    /// Rebuild missing summaries and reconcile explicit intent classifications.
     ///
     /// Intent entries can reach the vault without `vault_intent_create` ever
     /// running: clone bootstrap and `vault sync` deflate inherited
     /// `.vault/intents/**` files straight into redb, and
     /// `update_manifest_for_store` deliberately leaves intent summaries to
     /// "higher-level methods". This is that higher-level method for the
-    /// ingestion path. Existing summaries are never overwritten — the
-    /// authoring path stays the source of truth for intents it created.
+    /// ingestion path. Existing summaries retain their other fields.
     ///
     /// Also adopts the authoring repo's intent prefix when the local one is
     /// unset, and advances the per-author sequence allocator past inherited
@@ -369,18 +368,9 @@ impl Repository {
             .get_vault_manifest()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         let mut added = 0usize;
+        let mut changed = false;
 
         for meta in &entries {
-            // Already indexed (the authoring path stores vault_path on every
-            // summary) — leave it alone.
-            if manifest
-                .intents
-                .values()
-                .any(|summary| summary.vault_path == meta.path)
-            {
-                continue;
-            }
-
             let Some(entry) = txn
                 .get_vault_entry(&meta.path)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
@@ -394,6 +384,19 @@ impl Repository {
                 );
                 continue;
             };
+            if let Some(summary) = manifest
+                .intents
+                .values_mut()
+                .find(|s| s.vault_path == meta.path)
+            {
+                if let Some(kind) = fm.get("kind").and_then(|v| v.as_str()) {
+                    if summary.kind != kind {
+                        summary.kind = kind.to_owned();
+                        changed = true;
+                    }
+                }
+                continue;
+            }
             // `id` is the human key; an entry without one is not a canonical
             // intent scaffold and has nothing to index.
             let Some(human_key) = fm.get("id").and_then(|v| v.as_str()).map(str::to_owned) else {
@@ -456,7 +459,7 @@ impl Repository {
             added += 1;
         }
 
-        if added > 0 {
+        if added > 0 || changed {
             manifest.updated_at = chrono::Utc::now().to_rfc3339();
             txn.put_vault_manifest(&manifest)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -464,6 +467,19 @@ impl Repository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
         }
         Ok(added)
+    }
+
+    /// Prefer an explicit stored classification over a stale manifest summary.
+    /// Legacy entries without a kind continue to use their manifest value.
+    pub fn vault_intent_effective_kind(&self, path: &str, fallback: &str) -> String {
+        self.vault_retrieve(path)
+            .ok()
+            .flatten()
+            .and_then(|entry| {
+                serde_json::from_str::<serde_json::Value>(&entry.frontmatter_json).ok()
+            })
+            .and_then(|fm| fm.get("kind").and_then(|v| v.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| fallback.to_owned())
     }
 
     /// List vault intents.
@@ -1514,6 +1530,31 @@ mod tests {
             serde_json::from_str(&repo.vault_intent_show(&review.id).unwrap().frontmatter_json)
                 .unwrap();
         assert_eq!(rev_fm["kind"], "review");
+    }
+
+    #[test]
+    fn sync_mirrors_edited_kind_and_preserves_legacy_fallback() {
+        let dir = tempdir().unwrap();
+        let repo = init_repo_with_vault(dir.path());
+        let created = repo
+            .vault_intent_create(create_opts_manual("Kind edit"))
+            .unwrap();
+        assert_eq!(
+            repo.vault_intent_effective_kind(&created.intent_file, "review"),
+            "review"
+        );
+        let path = repo.vault_dir().join(&created.intent_file);
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, content.replacen("---\n", "---\nkind: bug\n", 1)).unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert_eq!(
+            repo.vault_manifest().unwrap().intents[&created.id].kind,
+            "bug"
+        );
+        assert_eq!(
+            repo.vault_intent_effective_kind(&created.intent_file, "feature"),
+            "bug"
+        );
     }
 
     /// Reproduces the clone-inheritance gap: an intent file that arrives as

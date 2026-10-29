@@ -879,6 +879,9 @@ impl Repository {
             if let Some(status) = fm.get("status").and_then(|v| v.as_str()) {
                 summary.status = status.to_string();
             }
+            if let Some(kind) = fm.get("kind").and_then(|v| v.as_str()) {
+                summary.kind = kind.to_string();
+            }
             // Same story as status: the title lives in the frontmatter, and
             // the summary is what `intent list` and the intents API render.
             // Unmirrored, an intent that plainly has a title listed with none.

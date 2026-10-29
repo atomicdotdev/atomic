@@ -112,6 +112,100 @@ fn intent_list_json_carries_attestation_columns_over_the_wire() {
 }
 
 #[test]
+fn intent_kind_is_preserved_and_stale_summaries_are_reconciled() {
+    let (repo, home) = fixture("intent-kind");
+    let (root, home_dir) = (repo.path(), home.path());
+    let create = |args: &[&str]| {
+        let output = run(root, home_dir, args);
+        output
+            .lines()
+            .find_map(|s| s.strip_prefix("Created intent: "))
+            .unwrap()
+            .to_owned()
+    };
+    let feature = create(&["intent", "new", "Feature"]);
+    let bug = create(&["intent", "new", "Bug", "--kind", "bug"]);
+    let review = create(&["intent", "new", "Review", "--review", &bug]);
+    let bug_show = run(root, home_dir, &["intent", "show", &bug]);
+    assert!(bug_show.contains("Kind: bug"), "{bug_show}");
+    let review_show = run(root, home_dir, &["intent", "show", &review]);
+    assert!(
+        review_show.contains("Kind: review") && review_show.contains(&bug),
+        "{review_show}"
+    );
+    for args in [
+        vec!["intent", "new", "bad", "--kind", "nonsense"],
+        vec!["intent", "new", "bad", "--template", "nonsense"],
+    ] {
+        assert!(!atomic(root, home_dir, &args).status.success(), "{args:?}");
+    }
+    let rows = |args: &[&str]| -> Vec<serde_json::Value> {
+        serde_json::from_str(&run(root, home_dir, args)).unwrap()
+    };
+    let all = rows(&["intent", "list", "--json"]);
+    assert_eq!(all.len(), 3, "invalid requests must not create intents");
+    assert!(all
+        .iter()
+        .any(|row| row["id"] == feature && row["kind"] == "feature"));
+    assert!(all
+        .iter()
+        .any(|row| row["id"] == review && row["kind"] == "review"));
+    let bugs = rows(&["intent", "list", "--kind", "bug", "--json"]);
+    assert_eq!(bugs.len(), 1);
+    assert_eq!(bugs[0]["id"], bug);
+
+    // Simulate an already-stored corrected document with a stale manifest,
+    // without rewriting the document during listing or reconciliation.
+    {
+        let repository = atomic_repository::Repository::open_existing(root).unwrap();
+        let summary = repository.vault_manifest().unwrap().intents[&feature].clone();
+        let entry = repository
+            .vault_retrieve(&summary.vault_path)
+            .unwrap()
+            .unwrap();
+        let mut fm: serde_json::Value = serde_json::from_str(&entry.frontmatter_json).unwrap();
+        fm["kind"] = "bug".into();
+        repository
+            .vault_store(
+                &summary.vault_path,
+                atomic_core::pristine::VaultEntryType::Intent,
+                entry.content_bytes,
+                serde_json::to_string(&fm).unwrap(),
+            )
+            .unwrap();
+        repository.vault_materialize(&summary.vault_path).unwrap();
+        assert_eq!(
+            repository.vault_manifest().unwrap().intents[&feature].kind,
+            "feature"
+        );
+    }
+    let bugs = rows(&["intent", "list", "--kind", "bug", "--json"]);
+    assert_eq!(bugs.len(), 2);
+    assert!(bugs.iter().any(|row| row["id"] == feature));
+    let path = {
+        let repository = atomic_repository::Repository::open_existing(root).unwrap();
+        repository.vault_manifest().unwrap().intents[&feature]
+            .vault_path
+            .clone()
+    };
+    let before = std::fs::read(root.join(".vault").join(path)).unwrap();
+    run(root, home_dir, &["vault", "sync"]);
+    let repository = atomic_repository::Repository::open_existing(root).unwrap();
+    assert_eq!(
+        repository.vault_manifest().unwrap().intents[&feature].kind,
+        "bug"
+    );
+    assert_eq!(
+        before,
+        std::fs::read(
+            root.join(".vault")
+                .join(&repository.vault_manifest().unwrap().intents[&feature].vault_path)
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn intent_human_key_sort_is_natural_in_service_output() {
     let repo = TempDir::new().unwrap();
     let home = TempDir::new().unwrap();
