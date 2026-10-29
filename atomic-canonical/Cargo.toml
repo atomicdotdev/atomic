@@ -8,7 +8,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+dsse-export = ["dep:dsse"]
+
 [dependencies]
+dsse = { version = "=0.1.1", default-features = false, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["unbounded_depth"] }
 jcs-admit = { workspace = true }

@@ -1,6 +1,7 @@
 [features]
 default = ["teams"]
 remote = []
+dsse-export = ["atomic-canonical/dsse-export"]
 teams = ["atomic-teams"]
 # Forwards the atomic-repository opt-in test instrumentation (R8): the CLI
 # test suite builds the binary with the deterministic adoption seams. The
