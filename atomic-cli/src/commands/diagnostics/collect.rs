@@ -7,6 +7,7 @@
 //! the network. A value that cannot be read is reported with the reason,
 //! never filled in by inference.
 
+use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,6 @@ use serde::Serialize;
 
 use crate::commands::find_repository_root;
 use crate::commands::git::hook_dispatchers::{inspect_dispatchers, DispatcherReport};
-use crate::commands::git::shim::shim_config;
 use crate::commands::update::{detect_source, StdEnv};
 use crate::error::CliError;
 use crate::logging::redact;
@@ -241,28 +241,84 @@ pub(crate) struct NotCollected {
 /// tests point every location at temporary directories.
 pub(crate) struct Sources {
     pub home: Option<PathBuf>,
-    pub integrations_root: Result<PathBuf, String>,
+    pub integrations_root: Result<PathBuf, SourceError>,
     pub integrations_root_overridden: bool,
     /// The enclosing Atomic workspace; `Ok(None)` outside one.
-    pub workspace: Result<Option<PathBuf>, String>,
+    pub workspace: Result<Option<PathBuf>, SourceError>,
     pub install_source: String,
+}
+
+/// Only these fixed summaries may cross the boundary into a support report.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SourceError {
+    WorkspaceLookup,
+    IntegrationsHome,
+}
+
+impl fmt::Display for SourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::WorkspaceLookup => "cannot determine the current workspace",
+            Self::IntegrationsHome => "cannot resolve home directory",
+        })
+    }
+}
+
+/// ErrorKind is safe to classify; arbitrary OS error messages are not.
+fn io_summary(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::NotFound => "not found",
+        ErrorKind::PermissionDenied => "permission denied",
+        ErrorKind::InvalidData => "invalid data or encoding",
+        ErrorKind::IsADirectory => "is a directory",
+        ErrorKind::NotADirectory => "a path component is not a directory",
+        _ => "I/O error",
+    }
+}
+
+// A dangling symlink or a concurrent replacement is not proof of absence.
+fn demonstrably_missing(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return false,
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+    for ancestor in path.ancestors().skip(1) {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return std::fs::metadata(ancestor).is_ok();
+            }
+            Ok(_) => return true,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 impl Sources {
     pub(crate) fn from_process() -> Self {
-        let workspace = match find_repository_root() {
+        let home = dirs::home_dir();
+        let workspace = match workspace_search_readable(home.as_deref())
+            .map_err(Some)
+            .and_then(|()| {
+                find_repository_root().map_err(|error| match error {
+                    CliError::RepositoryNotFound { .. } => None,
+                    _ => Some(SourceError::WorkspaceLookup),
+                })
+            }) {
             Ok(root) => Ok(Some(root)),
-            Err(CliError::RepositoryNotFound { .. }) => Ok(None),
-            Err(error) => Err(error.to_string()),
+            Err(None) => linked_git_search_readable(home.as_deref()).map(|()| None),
+            Err(Some(error)) => Err(error),
         };
         let install_source = std::env::current_exe()
             .map(|exe| detect_source(&exe, &StdEnv).short_label())
             .unwrap_or("unknown")
             .to_string();
         Self {
-            home: dirs::home_dir(),
+            home,
             integrations_root: atomic_agent::integrations::integrations_root()
-                .map_err(|error| error.to_string()),
+                .map_err(|_| SourceError::IntegrationsHome),
             integrations_root_overridden: std::env::var_os("ATOMIC_INTEGRATIONS_HOME").is_some(),
             workspace,
             install_source,
@@ -270,13 +326,142 @@ impl Sources {
     }
 }
 
+// The shared discovery helper uses boolean file checks; preflight their
+// filesystem errors so an inaccessible ancestor is not reported as absent.
+fn workspace_search_readable(home: Option<&Path>) -> Result<(), SourceError> {
+    let cwd = std::env::current_dir().map_err(|_| SourceError::WorkspaceLookup)?;
+    let mut current = cwd
+        .canonicalize()
+        .map_err(|_| SourceError::WorkspaceLookup)?;
+    let home = home.and_then(|path| path.canonicalize().ok());
+    loop {
+        let dot = current.join(".atomic");
+        for path in [
+            dot.clone(),
+            dot.join("atomic.redb"),
+            dot.join("pristine.redb"),
+            current.join(".atomic-sandbox"),
+        ] {
+            match std::fs::metadata(&path) {
+                Ok(_) => {}
+                Err(error)
+                    if error.kind() == ErrorKind::NotFound && demonstrably_missing(&path) => {}
+                Err(error)
+                    if error.kind() == ErrorKind::NotADirectory && path.starts_with(&dot) => {}
+                Err(_) => return Err(SourceError::WorkspaceLookup),
+            }
+        }
+        if (dot.is_dir() && atomic_repository::has_database(&dot))
+            || current.join(".atomic-sandbox").is_file()
+        {
+            break;
+        }
+        if home.as_deref() == Some(current.as_path()) || !current.pop() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+// Only called after ordinary discovery found no Atomic parent. Git's shared
+// resolver treats a failed rev-parse as absence, even for a broken gitfile.
+fn linked_git_search_readable(home: Option<&Path>) -> Result<(), SourceError> {
+    let cwd = std::env::current_dir().map_err(|_| SourceError::WorkspaceLookup)?;
+    let mut current = cwd
+        .canonicalize()
+        .map_err(|_| SourceError::WorkspaceLookup)?;
+    let home = home.and_then(|path| path.canonicalize().ok());
+    loop {
+        let git = current.join(".git");
+        match std::fs::metadata(&git) {
+            Ok(metadata) if metadata.is_file() => return inspect_linked_git(&current),
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::NotFound && demonstrably_missing(&git) => {}
+            Err(_) => return Err(SourceError::WorkspaceLookup),
+        }
+        if home.as_deref() == Some(current.as_path()) || !current.pop() {
+            return Ok(());
+        }
+    }
+}
+
+fn inspect_linked_git(root: &Path) -> Result<(), SourceError> {
+    use std::process::{Command, Stdio};
+
+    let output = Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "rev-parse",
+            "--show-toplevel",
+            "--git-common-dir",
+            "--git-dir",
+            "--git-path",
+            "index",
+        ])
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| SourceError::WorkspaceLookup)?;
+    if !output.status.success() {
+        return Err(SourceError::WorkspaceLookup);
+    }
+    let lines: Vec<&[u8]> = output
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .collect();
+    let [worktree, common, gitdir, _index] = lines.as_slice() else {
+        return Err(SourceError::WorkspaceLookup);
+    };
+    let resolve = |bytes: &[u8]| -> Result<PathBuf, SourceError> {
+        if bytes.is_empty() || bytes.contains(&0) || bytes.contains(&b'\r') {
+            return Err(SourceError::WorkspaceLookup);
+        }
+        #[cfg(unix)]
+        let path = {
+            use std::os::unix::ffi::OsStringExt;
+            PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()))
+        };
+        #[cfg(not(unix))]
+        let path =
+            PathBuf::from(std::str::from_utf8(bytes).map_err(|_| SourceError::WorkspaceLookup)?);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        };
+        path.canonicalize()
+            .map_err(|_| SourceError::WorkspaceLookup)
+    };
+    let worktree = resolve(worktree)?;
+    let common = resolve(common)?;
+    let gitdir = resolve(gitdir)?;
+    if worktree != root || !common.is_dir() || !gitdir.is_dir() {
+        return Err(SourceError::WorkspaceLookup);
+    }
+    let atomic = common
+        .parent()
+        .ok_or(SourceError::WorkspaceLookup)?
+        .join(".atomic");
+    match std::fs::metadata(&atomic) {
+        Ok(metadata) if metadata.is_dir() => Err(SourceError::WorkspaceLookup),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound && demonstrably_missing(&atomic) => {
+            Ok(())
+        }
+        Err(_) => Err(SourceError::WorkspaceLookup),
+    }
+}
+
 /// One agent adapter, reduced to what the report needs from it.
-pub(crate) struct AgentProbe<'a> {
+pub(crate) struct AgentProbe {
     pub name: String,
     pub display_name: String,
-    /// The adapter's own "are Atomic hooks installed?" check, run against a
-    /// base directory — the check `atomic agent status` uses.
-    pub hooks_installed: Box<dyn Fn(&Path) -> bool + 'a>,
 }
 
 /// Collect the report from the real environment.
@@ -287,7 +472,6 @@ pub(crate) fn collect() -> Report {
         .map(|agent| AgentProbe {
             name: agent.name().to_string(),
             display_name: agent.display_name().to_string(),
-            hooks_installed: Box::new(move |base| agent.is_installed(base)),
         })
         .collect::<Vec<_>>();
     let packaged = atomic_agent::integrations::registered_integrations();
@@ -298,7 +482,7 @@ pub(crate) fn collect() -> Report {
 /// adapters, `packaged` the agents with an integration package.
 pub(crate) fn collect_from(
     sources: &Sources,
-    probes: &[AgentProbe<'_>],
+    probes: &[AgentProbe],
     packaged: &[String],
 ) -> Report {
     let home = sources.home.as_deref();
@@ -330,9 +514,7 @@ pub(crate) fn collect_from(
         .map(|agent| {
             let lookup = match &sources.integrations_root {
                 Ok(root) => read_receipt(&root.join(&agent).join(RECEIPT_FILE)),
-                Err(reason) => ReceiptLookup::Unreadable(format!(
-                    "integrations directory unresolved: {reason}"
-                )),
+                Err(_) => ReceiptLookup::Unreadable(ReceiptError::IntegrationsHome),
             };
             (agent, lookup)
         })
@@ -362,7 +544,7 @@ pub(crate) fn collect_from(
             let state = match lookup {
                 ReceiptLookup::Absent => IntegrationState::NotInstalled,
                 ReceiptLookup::Unreadable(reason) => IntegrationState::Unreadable {
-                    reason: reason.clone(),
+                    reason: reason.to_string(),
                 },
                 ReceiptLookup::Found(receipt) => {
                     let mut files = FileCounts {
@@ -415,23 +597,83 @@ pub(crate) fn collect_from(
     let mut agents: Vec<AgentState> = probes
         .iter()
         .map(|probe| {
-            let adapter = AdapterCheck {
-                workspace: workspace_root.map(|root| (probe.hooks_installed)(root)),
-                home: home.map(|home| (probe.hooks_installed)(home)),
-            };
             let receipt = receipt_for(&probe.name);
-            let settings = match receipt {
+            let mut settings: Vec<SettingsProbe> = match receipt {
                 Some(ReceiptLookup::Found(receipt)) => receipt
                     .settings
                     .iter()
                     .map(|entry| SettingsProbe {
-                        path: display_path(&entry.target, home),
-                        hooks: settings_hooks(&entry.target, &entry.command_prefix),
+                        path: "receipt-listed settings".to_string(),
+                        hooks: if known_settings_location(
+                            &probe.name,
+                            &entry.target,
+                            home,
+                            workspace_root,
+                        ) {
+                            settings_hooks(
+                                &probe.name,
+                                &entry.target,
+                                &entry.hooks_key,
+                                &entry.command_prefix,
+                            )
+                        } else {
+                            HookPresence::Unreadable(HookError::Invalid(
+                                "receipt settings location cannot be verified",
+                            ))
+                        },
                     })
                     .collect(),
                 _ => Vec::new(),
             };
-            let (enabled, evidence) = classify_enabled(&probe.name, adapter, receipt, &settings);
+            // Built-in adapters can install without a receipt. Inspect the
+            // actual configuration instead of trusting their boolean checks.
+            let builtin_path = match probe.name.as_str() {
+                "claude-code" => Some(".claude/settings.json"),
+                "gemini-cli" => Some(".gemini/settings.json"),
+                "codex" => Some(".codex/hooks.json"),
+                _ => None,
+            };
+            if let Some(relative) = builtin_path {
+                let prefix = format!("atomic agent hooks {}", probe.name);
+                for base in [workspace_root, home].into_iter().flatten() {
+                    let path = base.join(relative);
+                    settings.push(SettingsProbe {
+                        path: display_path(&path, home),
+                        hooks: settings_hooks(&probe.name, &path, "hooks", &prefix),
+                    });
+                }
+                if probe.name == "claude-code" {
+                    if let Some(root) = workspace_root {
+                        let path = root.join(".claude/settings.local.json");
+                        settings.push(SettingsProbe {
+                            path: display_path(&path, home),
+                            hooks: settings_hooks(&probe.name, &path, "hooks", &prefix),
+                        });
+                    }
+                }
+                if home.is_none() {
+                    settings.push(SettingsProbe {
+                        path: "home settings".to_string(),
+                        hooks: HookPresence::Unreadable(HookError::Invalid(
+                            "home directory is unavailable",
+                        )),
+                    });
+                }
+                if sources.workspace.is_err() {
+                    settings.push(SettingsProbe {
+                        path: "workspace settings".to_string(),
+                        hooks: HookPresence::Unreadable(HookError::Invalid(
+                            "workspace is unavailable",
+                        )),
+                    });
+                }
+            }
+            let (mut enabled, mut evidence) = classify_enabled(receipt, &settings);
+            if builtin_path.is_none() && enabled == Enabled::No {
+                enabled = Enabled::Unknown;
+                evidence =
+                    vec!["active hook or plugin configuration cannot be verified".to_string()];
+            }
             AgentState {
                 name: probe.name.clone(),
                 display_name: probe.display_name.clone(),
@@ -457,7 +699,7 @@ pub(crate) fn collect_from(
             },
             Ok(None) => Workspace::NotFound,
             Err(reason) => Workspace::Unreadable {
-                reason: reason.clone(),
+                reason: reason.to_string(),
             },
         },
         integrations: Integrations {
@@ -467,7 +709,11 @@ pub(crate) fn collect_from(
                 .ok()
                 .map(|root| display_path(root, home)),
             root_overridden: sources.integrations_root_overridden,
-            root_error: sources.integrations_root.as_ref().err().cloned(),
+            root_error: sources
+                .integrations_root
+                .as_ref()
+                .err()
+                .map(ToString::to_string),
             packages: integrations,
         },
         skills: Skills {
@@ -489,17 +735,49 @@ pub(crate) fn collect_from(
 enum ReceiptLookup {
     Found(Receipt),
     Absent,
-    Unreadable(String),
+    Unreadable(ReceiptError),
+}
+
+#[derive(Debug)]
+enum ReceiptError {
+    IntegrationsHome,
+    Read(ErrorKind),
+    Parse(serde_json::error::Category),
+}
+
+impl fmt::Display for ReceiptError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IntegrationsHome => write!(
+                f,
+                "integrations directory unresolved: {}",
+                SourceError::IntegrationsHome
+            ),
+            Self::Read(kind) => write!(f, "cannot read receipt: {}", io_summary(*kind)),
+            Self::Parse(category) => write!(
+                f,
+                "corrupt receipt: {}",
+                match category {
+                    serde_json::error::Category::Io => "I/O error",
+                    serde_json::error::Category::Syntax => "invalid JSON syntax",
+                    serde_json::error::Category::Data => "invalid receipt data",
+                    serde_json::error::Category::Eof => "incomplete JSON",
+                }
+            ),
+        }
+    }
 }
 
 fn read_receipt(path: &Path) -> ReceiptLookup {
     match std::fs::read_to_string(path) {
         Ok(text) => match serde_json::from_str::<Receipt>(&text) {
             Ok(receipt) => ReceiptLookup::Found(receipt),
-            Err(error) => ReceiptLookup::Unreadable(format!("corrupt receipt: {error}")),
+            Err(error) => ReceiptLookup::Unreadable(ReceiptError::Parse(error.classify())),
         },
-        Err(error) if error.kind() == ErrorKind::NotFound => ReceiptLookup::Absent,
-        Err(error) => ReceiptLookup::Unreadable(format!("cannot read receipt: {error}")),
+        Err(error) if error.kind() == ErrorKind::NotFound && demonstrably_missing(path) => {
+            ReceiptLookup::Absent
+        }
+        Err(error) => ReceiptLookup::Unreadable(ReceiptError::Read(error.kind())),
     }
 }
 
@@ -531,7 +809,24 @@ fn file_state(path: &Path, recorded_blake3: &str) -> FileState {
 enum HookPresence {
     Present,
     Absent,
-    Unreadable(String),
+    Disabled,
+    Restricted,
+    Unreadable(HookError),
+}
+
+#[derive(Debug)]
+enum HookError {
+    Read(ErrorKind),
+    Invalid(&'static str),
+}
+
+impl fmt::Display for HookError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(kind) => write!(f, "settings could not be read: {}", io_summary(*kind)),
+            Self::Invalid(reason) => f.write_str(reason),
+        }
+    }
 }
 
 struct SettingsProbe {
@@ -539,12 +834,75 @@ struct SettingsProbe {
     hooks: HookPresence,
 }
 
-fn settings_hooks(path: &Path, command_prefix: &str) -> HookPresence {
+fn known_settings_location(
+    agent: &str,
+    path: &Path,
+    home: Option<&Path>,
+    workspace: Option<&Path>,
+) -> bool {
+    let relative = match agent {
+        "claude-code" => ".claude/settings.json",
+        "gemini-cli" => ".gemini/settings.json",
+        "codex" => ".codex/hooks.json",
+        _ => return false,
+    };
+    [home, workspace]
+        .into_iter()
+        .flatten()
+        .any(|base| base.join(relative) == path)
+        || (agent == "claude-code"
+            && workspace.is_some_and(|base| base.join(".claude/settings.local.json") == path))
+}
+
+fn settings_hooks(agent: &str, path: &Path, hooks_key: &str, command_prefix: &str) -> HookPresence {
     match std::fs::read_to_string(path) {
-        Ok(text) if text.contains(command_prefix) => HookPresence::Present,
-        Ok(_) => HookPresence::Absent,
-        Err(error) if error.kind() == ErrorKind::NotFound => HookPresence::Absent,
-        Err(error) => HookPresence::Unreadable(error.to_string()),
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(root) => match atomic_agent::hooks::live::json_hooks_active(
+                agent,
+                &root,
+                hooks_key,
+                command_prefix,
+            ) {
+                Ok(active) => {
+                    // Named Gemini exclusions can also mask a hook declared in
+                    // another settings scope, so don't infer the merged state.
+                    let restricted = root.get("hooks").is_some_and(has_disabled_entry)
+                        || (agent == "gemini-cli"
+                            && root
+                                .get("hooksConfig")
+                                .and_then(|v| v.get("disabled"))
+                                .and_then(serde_json::Value::as_array)
+                                .is_some_and(|names| !names.is_empty()));
+                    let disabled = root.as_object().is_some_and(|object| {
+                        atomic_agent::hooks::live::globally_disabled(agent, object)
+                    });
+                    match (active, restricted || disabled) {
+                        (true, true) => HookPresence::Restricted,
+                        (true, false) => HookPresence::Present,
+                        (false, true) => HookPresence::Disabled,
+                        (false, false) => HookPresence::Absent,
+                    }
+                }
+                Err(reason) => HookPresence::Unreadable(HookError::Invalid(reason)),
+            },
+            Err(_) => HookPresence::Unreadable(HookError::Invalid("settings could not be parsed")),
+        },
+        Err(error) if error.kind() == ErrorKind::NotFound && demonstrably_missing(path) => {
+            HookPresence::Absent
+        }
+        Err(error) => HookPresence::Unreadable(HookError::Read(error.kind())),
+    }
+}
+
+fn has_disabled_entry(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.get("disabled") == Some(&serde_json::Value::Bool(true))
+                || object.get("enabled") == Some(&serde_json::Value::Bool(false))
+                || object.values().any(has_disabled_entry)
+        }
+        serde_json::Value::Array(values) => values.iter().any(has_disabled_entry),
+        _ => false,
     }
 }
 
@@ -564,17 +922,31 @@ fn describe_source(source: &str, agent: &str, home: Option<&Path>) -> (&'static 
 // Skills
 
 fn read_skills_package(cache: &Path) -> SkillsPackage {
-    if !cache
-        .join(atomic_agent::integrations::MANIFEST_FILE)
-        .exists()
-    {
-        return SkillsPackage::NotFound {
-            reason: "no synced atomic-skills package (it is synced by `atomic agent enable`; \
+    let manifest_path = cache.join(atomic_agent::integrations::MANIFEST_FILE);
+    let text = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(error)
+            if error.kind() == ErrorKind::NotFound && demonstrably_missing(&manifest_path) =>
+        {
+            return SkillsPackage::NotFound {
+                reason: "no synced atomic-skills package (it is synced by `atomic agent enable`; \
                      `--from-skills` installs leave no cache)"
-                .to_string(),
-        };
-    }
-    match IntegrationManifest::load(cache) {
+                    .to_string(),
+            }
+        }
+        Err(error) => {
+            return SkillsPackage::Unreadable {
+                reason: format!(
+                    "cannot read skills package manifest: {}",
+                    io_summary(error.kind())
+                ),
+            }
+        }
+    };
+    match toml::from_str::<IntegrationManifest>(&text) {
+        Ok(manifest) if manifest.check_schema().is_err() => SkillsPackage::Unreadable {
+            reason: "unsupported skills package manifest schema".to_string(),
+        },
         Ok(manifest) => SkillsPackage::Available {
             name: SKILLS_PACKAGE,
             version: manifest.version,
@@ -584,8 +956,8 @@ fn read_skills_package(cache: &Path) -> SkillsPackage {
                 .map(|skill| skill.name)
                 .collect(),
         },
-        Err(error) => SkillsPackage::Unreadable {
-            reason: error.to_string(),
+        Err(_) => SkillsPackage::Unreadable {
+            reason: "skills package manifest could not be parsed".to_string(),
         },
     }
 }
@@ -631,90 +1003,126 @@ fn frontmatter_version(text: &str) -> Option<String> {
 
 // Agents
 
-/// The adapter's hook check, run from the workspace and from the home
-/// directory; `None` where that base does not exist.
-#[derive(Clone, Copy)]
-struct AdapterCheck {
-    workspace: Option<bool>,
-    home: Option<bool>,
-}
-
 /// Decide whether an agent's Atomic hooks are active, and on what evidence.
 ///
 /// "Installed" (a receipt exists) and "enabled" (hooks are in the agent's
 /// live configuration) are separate questions: a receipt survives a user
 /// deleting the hooks by hand, and the built-in hooks need no receipt.
 fn classify_enabled(
-    agent: &str,
-    adapter: AdapterCheck,
     receipt: Option<&ReceiptLookup>,
     settings: &[SettingsProbe],
 ) -> (Enabled, Vec<String>) {
     let mut evidence = Vec::new();
-    match (adapter.workspace, adapter.home) {
-        (Some(true), Some(true)) => {
-            evidence.push(format!("the {agent} adapter finds Atomic hooks installed"))
-        }
-        (Some(true), _) => evidence.push(format!(
-            "the {agent} adapter finds Atomic hooks in the workspace configuration"
-        )),
-        (_, Some(true)) => evidence.push(format!(
-            "the {agent} adapter finds Atomic hooks in the home-directory configuration"
-        )),
-        _ => {}
-    }
     for probe in settings {
-        if matches!(probe.hooks, HookPresence::Present) {
+        if matches!(
+            probe.hooks,
+            HookPresence::Present | HookPresence::Restricted
+        ) {
             evidence.push(format!("Atomic hook commands present in {}", probe.path));
         }
     }
+    let unreadable: Vec<String> = settings
+        .iter()
+        .filter_map(|probe| match &probe.hooks {
+            HookPresence::Unreadable(reason) => {
+                Some(format!("cannot inspect {}: {reason}", probe.path))
+            }
+            _ => None,
+        })
+        .collect();
+    if !unreadable.is_empty() {
+        return (Enabled::Unknown, unreadable);
+    }
     if !evidence.is_empty() {
+        if settings.iter().any(|probe| {
+            matches!(
+                probe.hooks,
+                HookPresence::Disabled | HookPresence::Restricted
+            )
+        }) {
+            return (
+                Enabled::Unknown,
+                vec![
+                    "a settings scope disables hooks; effective enablement cannot be verified"
+                        .to_string(),
+                ],
+            );
+        }
         return (Enabled::Yes, evidence);
     }
-
     match receipt {
         None | Some(ReceiptLookup::Absent) => (Enabled::No, evidence),
         Some(ReceiptLookup::Unreadable(reason)) => (
             Enabled::Unknown,
             vec![format!("integration receipt unreadable: {reason}")],
         ),
-        Some(ReceiptLookup::Found(_)) if settings.is_empty() => (
-            Enabled::Unknown,
-            vec![
-                "the integration is installed, but its hooks are not in a settings file \
-                 Atomic can inspect, and the adapter reports none"
-                    .to_string(),
-            ],
-        ),
+        Some(ReceiptLookup::Found(receipt))
+            if receipt.settings.is_empty() || settings.is_empty() =>
+        {
+            (
+                Enabled::Unknown,
+                vec![
+                    "the integration is installed, but its hooks are not in a settings file \
+                 Atomic can inspect"
+                        .to_string(),
+                ],
+            )
+        }
         Some(ReceiptLookup::Found(_)) => {
-            let unreadable: Vec<String> = settings
-                .iter()
-                .filter_map(|probe| match &probe.hooks {
-                    HookPresence::Unreadable(error) => {
-                        Some(format!("cannot read {}: {error}", probe.path))
-                    }
-                    _ => None,
-                })
-                .collect();
-            if unreadable.is_empty() {
-                let paths: Vec<&str> = settings.iter().map(|probe| probe.path.as_str()).collect();
-                (
-                    Enabled::No,
-                    vec![format!(
-                        "the integration receipt lists {}, but no Atomic hook commands remain there",
-                        paths.join(", ")
-                    )],
-                )
-            } else {
-                (Enabled::Unknown, unreadable)
-            }
+            let paths: Vec<&str> = settings.iter().map(|probe| probe.path.as_str()).collect();
+            (
+                Enabled::No,
+                vec![format!(
+                    "the inspected settings {} contain no active Atomic hook commands",
+                    paths.join(", ")
+                )],
+            )
         }
     }
 }
 
 // Git shim
 
-fn collect_git_shim(workspace: &Result<Option<PathBuf>, String>, home: Option<&Path>) -> GitShim {
+#[derive(Debug)]
+enum ShimConfigError {
+    Location,
+    Read(ErrorKind),
+    Parse,
+}
+
+impl fmt::Display for ShimConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Location => f.write_str("cannot resolve repository configuration location"),
+            Self::Read(kind) => write!(
+                f,
+                "cannot read repository configuration: {}",
+                io_summary(*kind)
+            ),
+            Self::Parse => f.write_str("repository configuration could not be parsed"),
+        }
+    }
+}
+
+fn read_shim_config(root: &Path) -> Result<atomic_config::RepoConfig, ShimConfigError> {
+    let dir = atomic_repository::Repository::canonical_dot_dir(root)
+        .map_err(|_| ShimConfigError::Location)?;
+    // Reading directly avoids `Path::exists` treating access errors as an
+    // absent config, while preserving the default for a genuinely missing file.
+    let path = dir.join("config.toml");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => toml::from_str(&text).map_err(|_| ShimConfigError::Parse),
+        Err(error) if error.kind() == ErrorKind::NotFound && demonstrably_missing(&path) => {
+            Ok(Default::default())
+        }
+        Err(error) => Err(ShimConfigError::Read(error.kind())),
+    }
+}
+
+fn collect_git_shim(
+    workspace: &Result<Option<PathBuf>, SourceError>,
+    home: Option<&Path>,
+) -> GitShim {
     let root = match workspace {
         Ok(Some(root)) => root,
         Ok(None) => {
@@ -733,10 +1141,10 @@ fn collect_git_shim(workspace: &Result<Option<PathBuf>, String>, home: Option<&P
         }
     };
 
-    let (status, reason) = match shim_config(root) {
+    let (status, reason) = match read_shim_config(root) {
         Ok(config) if config.git.shim.enabled => (ShimStatus::Enabled, None),
         Ok(_) => (ShimStatus::Disabled, None),
-        Err(error) => (ShimStatus::Unknown, Some(error.to_string())),
+        Err(reason) => (ShimStatus::Unknown, Some(reason.to_string())),
     };
     let hooks = match inspect_dispatchers(root) {
         Ok(None) => GitHooks::NoGitRepository,
@@ -753,8 +1161,8 @@ fn collect_git_shim(workspace: &Result<Option<PathBuf>, String>, home: Option<&P
                 })
                 .collect(),
         },
-        Err(error) => GitHooks::Unreadable {
-            reason: error.to_string(),
+        Err(_) => GitHooks::Unreadable {
+            reason: "cannot inspect Git repository hooks or administrative paths".to_string(),
         },
     };
     GitShim {
@@ -768,7 +1176,15 @@ fn collect_git_shim(workspace: &Result<Option<PathBuf>, String>, home: Option<&P
 /// carry the user's account name. The part after `~` is joined with `/` on
 /// every platform, so Windows never renders a mixed `~/.x\settings.json`.
 fn display_path(path: &Path, home: Option<&Path>) -> String {
-    match home.and_then(|home| path.strip_prefix(home).ok()) {
+    let canonical_home = home.and_then(|home| home.canonicalize().ok());
+    let relative = home
+        .and_then(|home| path.strip_prefix(home).ok())
+        .or_else(|| {
+            canonical_home
+                .as_deref()
+                .and_then(|home| path.strip_prefix(home).ok())
+        });
+    match relative {
         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
         Some(rest) => {
             let parts: Vec<_> = rest
@@ -862,11 +1278,10 @@ mod tests {
         }
     }
 
-    fn probe(name: &str, installed: bool) -> AgentProbe<'static> {
+    fn probe(name: &str) -> AgentProbe {
         AgentProbe {
             name: name.to_string(),
             display_name: name.to_uppercase(),
-            hooks_installed: Box::new(move |_| installed),
         }
     }
 
@@ -889,7 +1304,7 @@ mod tests {
         let fixture = Fixture::new();
         let report = collect_from(
             &fixture.sources(None),
-            &[probe("claude-code", false)],
+            &[probe("claude-code")],
             &["claude-code".to_string(), SKILLS_PACKAGE.to_string()],
         );
 
@@ -934,7 +1349,7 @@ mod tests {
 
         let report = collect_from(
             &fixture.sources(None),
-            &[probe("opencode", false)],
+            &[probe("opencode")],
             &["opencode".to_string()],
         );
 
@@ -965,7 +1380,7 @@ mod tests {
 
         let report = collect_from(
             &fixture.sources(None),
-            &[probe("cline", false)],
+            &[probe("cline")],
             &["cline".to_string()],
         );
 
@@ -995,9 +1410,9 @@ mod tests {
     fn an_unresolvable_integrations_directory_is_reported_not_treated_as_empty() {
         let fixture = Fixture::new();
         let mut sources = fixture.sources(None);
-        sources.integrations_root = Err("cannot resolve home directory".to_string());
+        sources.integrations_root = Err(SourceError::IntegrationsHome);
 
-        let report = collect_from(&sources, &[probe("cline", false)], &["cline".to_string()]);
+        let report = collect_from(&sources, &[probe("cline")], &["cline".to_string()]);
 
         assert_eq!(
             report.integrations.root_error.as_deref(),
@@ -1012,6 +1427,33 @@ mod tests {
             SkillsPackage::Unreadable { .. }
         ));
         assert_eq!(agent(&report, "cline").enabled, Enabled::Unknown);
+    }
+
+    #[test]
+    fn failed_workspace_lookup_stays_unknown_in_both_report_fields() {
+        let fixture = Fixture::new();
+        let mut sources = fixture.sources(None);
+        sources.workspace = Err(SourceError::WorkspaceLookup);
+
+        let report = collect_from(&sources, &[], &[]);
+        assert!(matches!(report.workspace, Workspace::Unreadable { .. }));
+        assert_eq!(report.git_shim.status, ShimStatus::Unknown);
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("cannot determine the current workspace"));
+        assert!(!json.contains(&fixture.home.path().display().to_string()));
+    }
+
+    #[test]
+    fn unsupported_manifest_schema_does_not_echo_the_agent_name() {
+        let fixture = Fixture::new();
+        fixture.skills_cache("schema = 2\nagent = \"SYNTHETIC_SCHEMA_SECRET\"\nversion = \"1\"\n");
+        let package =
+            read_skills_package(&fixture.integrations().join(SKILLS_PACKAGE).join("repo"));
+        let SkillsPackage::Unreadable { reason } = package else {
+            panic!("unsupported manifest must be unreadable");
+        };
+        assert!(reason.contains("schema"));
+        assert!(!reason.contains("SYNTHETIC_SCHEMA_SECRET"));
     }
 
     #[test]
@@ -1043,7 +1485,7 @@ mod tests {
 
         let report = collect_from(
             &fixture.sources(None),
-            &[probe("claude-code", false), probe("cline", false)],
+            &[probe("claude-code"), probe("cline")],
             &["claude-code".to_string(), "cline".to_string()],
         );
 
@@ -1113,32 +1555,24 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "schema": 1, "agent": "x", "version": "1", "cli_version": "1",
                 "installed_at": "t", "source": "s", "files": [],
+                "settings": [{"target":"/tmp/x", "hooks_key":"hooks", "command_prefix":"atomic agent hooks x"}],
             }))
             .unwrap(),
         )
     }
 
-    const NOTHING: AdapterCheck = AdapterCheck {
-        workspace: Some(false),
-        home: Some(false),
-    };
-
     #[test]
     fn enabled_rests_on_live_hooks_not_on_the_receipt() {
         // Installed, but the user removed the hooks from settings by hand.
         let (enabled, evidence) = classify_enabled(
-            "x",
-            NOTHING,
             Some(&receipt()),
             &[settings("~/.x/settings.json", HookPresence::Absent)],
         );
         assert_eq!(enabled, Enabled::No);
-        assert!(evidence[0].contains("no Atomic hook commands remain"));
+        assert!(evidence[0].contains("no active Atomic hook commands"));
 
         // Installed, and the settings file still carries the hooks.
         let (enabled, evidence) = classify_enabled(
-            "x",
-            NOTHING,
             Some(&receipt()),
             &[settings("~/.x/settings.json", HookPresence::Present)],
         );
@@ -1147,94 +1581,130 @@ mod tests {
             evidence,
             ["Atomic hook commands present in ~/.x/settings.json"]
         );
-
-        // Built-in hooks need no receipt at all.
-        let (enabled, evidence) = classify_enabled(
-            "x",
-            AdapterCheck {
-                workspace: Some(true),
-                home: Some(false),
-            },
-            None,
-            &[],
-        );
-        assert_eq!(enabled, Enabled::Yes);
-        assert!(evidence[0].contains("workspace configuration"));
     }
 
     #[test]
     fn enabled_is_unknown_when_the_evidence_cannot_be_read() {
         let (enabled, evidence) = classify_enabled(
-            "x",
-            NOTHING,
             Some(&receipt()),
             &[settings(
                 "~/.x/settings.json",
-                HookPresence::Unreadable("permission denied".into()),
+                HookPresence::Unreadable(HookError::Read(ErrorKind::PermissionDenied)),
             )],
         );
         assert_eq!(enabled, Enabled::Unknown);
         assert!(evidence[0].contains("permission denied"));
 
         // A package whose hooks live outside any settings file.
-        let (enabled, _) = classify_enabled("x", NOTHING, Some(&receipt()), &[]);
+        let (enabled, _) = classify_enabled(Some(&receipt()), &[]);
         assert_eq!(enabled, Enabled::Unknown);
 
-        // Outside a workspace with no adapter hit and no receipt: no.
-        let (enabled, evidence) = classify_enabled(
-            "x",
-            AdapterCheck {
-                workspace: None,
-                home: Some(false),
-            },
-            None,
-            &[],
-        );
+        // No receipt and no hooks in the inspected settings: no.
+        let (enabled, evidence) = classify_enabled(None, &[]);
         assert_eq!(enabled, Enabled::No);
         assert!(evidence.is_empty());
+
+        let (enabled, _) = classify_enabled(
+            None,
+            &[settings(
+                "home",
+                HookPresence::Unreadable(HookError::Invalid("bad settings")),
+            )],
+        );
+        assert_eq!(enabled, Enabled::Unknown);
+
+        let (enabled, _) = classify_enabled(
+            None,
+            &[
+                settings("workspace", HookPresence::Present),
+                settings("home", HookPresence::Disabled),
+            ],
+        );
+        assert_eq!(enabled, Enabled::Unknown);
+    }
+
+    #[test]
+    fn missing_home_and_failed_workspace_lookup_are_unknown() {
+        let fixture = Fixture::new();
+        let mut sources = fixture.sources(None);
+        sources.home = None;
+        let report = collect_from(&sources, &[probe("claude-code")], &[]);
+        assert_eq!(agent(&report, "claude-code").enabled, Enabled::Unknown);
+
+        let mut sources = fixture.sources(None);
+        sources.workspace = Err(SourceError::WorkspaceLookup);
+        let report = collect_from(&sources, &[probe("claude-code")], &[]);
+        assert_eq!(agent(&report, "claude-code").enabled, Enabled::Unknown);
     }
 
     #[test]
     fn receipt_settings_are_checked_against_the_live_file() {
         let fixture = Fixture::new();
-        let settings_path = fixture.home.path().join(".x").join("settings.json");
+        let settings_path = fixture.home.path().join(".claude").join("settings.json");
         fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
         fs::write(
             &settings_path,
-            r#"{"hooks":{"Stop":[{"command":"atomic agent hooks x stop"}]}}"#,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"atomic agent hooks claude-code stop"}]}]}}"#,
         )
         .unwrap();
         fixture.write_receipt(
-            "x",
+            "claude-code",
             &serde_json::json!({
-                "schema": 1, "agent": "x", "version": "3.0.0", "cli_version": "0.19.0",
+                "schema": 1, "agent": "claude-code", "version": "3.0.0", "cli_version": "0.19.0",
                 "installed_at": "t", "source": "https://alice:s3cret@example.com/pkg?token=1",
                 "files": [],
                 "settings": [{
                     "target": settings_path,
                     "hooks_key": "hooks",
-                    "command_prefix": "atomic agent hooks x",
+                    "command_prefix": "atomic agent hooks claude-code",
                 }],
             }),
         );
 
         let report = collect_from(
             &fixture.sources(None),
-            &[probe("x", false)],
-            &["x".to_string()],
+            &[probe("claude-code")],
+            &["claude-code".to_string()],
         );
-        let x = agent(&report, "x");
+        let x = agent(&report, "claude-code");
         assert_eq!(x.enabled, Enabled::Yes);
-        assert_eq!(
-            x.evidence,
-            ["Atomic hook commands present in ~/.x/settings.json"]
-        );
+        assert!(x
+            .evidence
+            .iter()
+            .any(|e| e == "Atomic hook commands present in ~/.claude/settings.json"));
 
-        let IntegrationState::Installed(installed) = integration(&report, "x") else {
+        let IntegrationState::Installed(installed) = integration(&report, "claude-code") else {
             panic!("x is installed");
         };
         assert_eq!(installed.source_kind, "url");
         assert_eq!(installed.source, "https://***@example.com/pkg");
+    }
+
+    #[test]
+    fn gemini_disabled_names_do_not_prove_other_scopes_active() {
+        let home = TempDir::new().unwrap();
+        let path = home.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"hooksConfig":{"disabled":["atomic-test"]},"hooks":{}}"#,
+        )
+        .unwrap();
+        let (enabled, _) = classify_enabled(
+            None,
+            &[
+                settings("workspace", HookPresence::Present),
+                settings(
+                    "home",
+                    settings_hooks(
+                        "gemini-cli",
+                        &path,
+                        "hooks",
+                        "atomic agent hooks gemini-cli",
+                    ),
+                ),
+            ],
+        );
+        assert_eq!(enabled, Enabled::Unknown);
     }
 
     #[test]
@@ -1316,5 +1786,19 @@ mod tests {
         );
         assert_eq!(display_path(Path::new("/opt/x"), Some(home)), "/opt/x");
         assert_eq!(display_path(Path::new("/opt/x"), None), "/opt/x");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canonical_paths_under_a_symlinked_home_are_normalized() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let alias = temp.path().join("home-alias");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        assert_eq!(
+            display_path(&home.canonicalize().unwrap().join("project"), Some(&alias)),
+            "~/project"
+        );
     }
 }

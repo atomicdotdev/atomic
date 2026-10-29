@@ -5,11 +5,11 @@
 //! agent integration packages and their versions, installed skills, which
 //! agents have Atomic hooks enabled, and whether the Git shim is enabled.
 //!
-//! Nothing is written, repaired, or fetched. Values that cannot be read are
-//! reported as unknown with the reason. The report never includes
-//! credentials, tokens, file contents, or configuration values beyond the
-//! booleans and versions listed above; paths under the home directory are
-//! shown as `~`.
+//! Values that cannot be read are reported as unknown with a safe reason.
+//! No configuration is written, repaired, or fetched; normal command logging
+//! still applies. Parser errors do not include source text, and paths under a
+//! known home directory are shown as `~`. Review metadata and paths before
+//! sharing the report, since user-controlled values may contain secrets.
 //!
 //! # Examples
 //!
