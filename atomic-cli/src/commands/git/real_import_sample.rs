@@ -120,7 +120,7 @@ fn prepare_hyperfine_publication_sample() {
     assert_ne!(
         git.head()
             .ok()
-            .and_then(|head| head.shorthand().map(str::to_owned))
+            .and_then(|head| head.shorthand().ok().map(str::to_owned))
             .as_deref(),
         Some(view.as_str()),
         "this ODB-only sample must not claim to import the source's checked-out branch"

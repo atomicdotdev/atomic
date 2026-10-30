@@ -63,7 +63,7 @@ serde_json = "1.0"
 # a sequence of Unicode scalar values, a number outside the profile -- are
 # refused with a named error rather than collapsed or rounded.
 jcs-admit = "0.1"
-postcard = { version = "1.0", features = ["alloc"] }
+postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 toml = "0.8"
 semver = "1"
 
@@ -76,11 +76,11 @@ fastcdc = "3.1"
 # Hashing & Crypto
 bs58 = "0.5"
 blake3 = "1.5"
-ed25519-dalek = { version = "2.1", features = ["serde"] }
+ed25519-dalek = { version = "3.0", features = ["serde"] }
 rand = "0.8"
 
 # Compression
-zstd = "0.13"
+zstd = "0.14"
 
 # Database
 # SnapshotBackend forwards the locking API introduced after redb 4.2.
@@ -93,7 +93,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # CLI
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
-indicatif = "0.17"
+indicatif = "0.18"
 dialoguer = "0.11"
 console = "0.15"
 
@@ -141,7 +141,7 @@ syntext = { version = "1.1", default-features = false, features = ["memmap2", "r
 # vendored-openssl compiles OpenSSL from source, which is required for
 # cross-compilation targets (e.g. aarch64-unknown-linux-gnu) where the
 # target architecture's OpenSSL system libraries are not available.
-git2 = { version = "0.19", features = ["vendored-openssl"] }
+git2 = { version = "0.21", features = ["vendored-openssl", "https", "ssh"] }
 
 # Testing
 quickcheck = "1.0"

@@ -237,9 +237,8 @@ fn wip_census_class(repo: &Repository, root: &Path) -> CensusClass {
             .map_err(|e| e.to_string())?
         {
             let reference = reference.map_err(|e| e.to_string())?;
-            if let Some(name) = reference.name() {
-                refs.push(name.to_string());
-            }
+            let name = reference.name().map_err(|error| error.to_string())?;
+            refs.push(name.to_string());
         }
         if refs.is_empty() {
             return Ok(CensusClass {

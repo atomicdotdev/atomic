@@ -2110,7 +2110,7 @@ pub(crate) fn refresh_checkpoint_after_verified_import(
     let head = git
         .head()
         .map_err(|error| git_error(format!("Git HEAD is unavailable: {error}")))?;
-    if head.shorthand() != Some(view) {
+    if head.shorthand().ok() != Some(view) {
         return Ok(CheckpointRefresh::SkippedViewMismatch);
     }
     let commit = head
@@ -2915,7 +2915,7 @@ pub(crate) fn project_atomic_to_git(
     }
     let branch = head
         .shorthand()
-        .ok_or_else(|| git_error("Git branch name is not valid UTF-8"))?;
+        .map_err(|error| git_error(format!("Git branch name is not valid UTF-8: {error}")))?;
     let desired_view = repo
         .desired_view_name(working_copy)
         .map_err(CliError::from)?;
@@ -3209,7 +3209,7 @@ fn collect_git_tree(
     for entry in tree.iter() {
         let name = entry
             .name()
-            .ok_or_else(|| git_error("Git tree contains a non-UTF-8 path"))?;
+            .map_err(|error| git_error(format!("Git tree contains a non-UTF-8 path: {error}")))?;
         let path = if prefix.is_empty() {
             name.to_string()
         } else {

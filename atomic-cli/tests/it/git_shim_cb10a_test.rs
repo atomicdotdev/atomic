@@ -852,7 +852,7 @@ fn stale_bookkeeping_heals_but_an_unreachable_baseline_fails_closed() {
             .expect("read")
             .expect("mapping")
             .clone();
-        garbage.last_observed_local = Some(git2::Oid::zero().to_string());
+        garbage.last_observed_local = Some(git2::Oid::ZERO_SHA1.to_string());
         txn.put_ref_mapping_bytes(view.id, &garbage.encode().expect("encode"))
             .expect("garbage put");
         txn.commit().expect("commit");

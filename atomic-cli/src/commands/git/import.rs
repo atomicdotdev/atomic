@@ -171,7 +171,7 @@ fn current_git_branch(git_repo: &GitRepository) -> Option<String> {
     if !head.is_branch() {
         return None;
     }
-    head.shorthand().map(ToOwned::to_owned)
+    head.shorthand().ok().map(ToOwned::to_owned)
 }
 
 /// Binding transport requires the ordinary importer. Presence selects the
@@ -431,7 +431,7 @@ impl Import {
         git_repo
             .find_remote("origin")
             .ok()
-            .and_then(|remote| remote.url().map(|s| s.to_string()))
+            .and_then(|remote| remote.url().ok().map(|s| s.to_string()))
             .and_then(|url| {
                 // Extract repo name from URL like "https://github.com/holman/spark.git"
                 // or "git@github.com:holman/spark.git"
@@ -1533,7 +1533,7 @@ fn import_git_tags_into_view(repo: &mut Repository, git_repo: &GitRepository, vi
     let mut imported = 0usize;
     let mut refused = 0usize;
     for reference in tag_refs.flatten() {
-        let Some(name) = reference.shorthand().map(str::to_string) else {
+        let Ok(name) = reference.shorthand().map(str::to_string) else {
             continue;
         };
         match repo.import_git_tag_from_git(view, git_repo, &name) {
@@ -1610,7 +1610,7 @@ impl MaterializationTarget<'_> {
                         message: format!("cannot read the tree of branch '{branch}': {error}"),
                     })?;
                 tree.walk(git2::TreeWalkMode::PreOrder, |directory, entry| {
-                    if let Some(name) = entry.name() {
+                    if let Ok(name) = entry.name() {
                         paths.insert(format!("{directory}{name}"));
                     }
                     git2::TreeWalkResult::Ok
@@ -1665,7 +1665,7 @@ fn require_materializable_worktree(
     let mut colliding: Vec<String> = statuses
         .iter()
         .filter(|entry| entry.status().contains(git2::Status::WT_NEW))
-        .filter_map(|entry| entry.path().map(str::to_string))
+        .filter_map(|entry| entry.path().ok().map(str::to_string))
         .filter(|path| target_paths.contains(path))
         .collect();
     colliding.sort();

@@ -177,14 +177,15 @@ pub(crate) fn install_degraded_bindings(
         let reference = reference.map_err(|error| CliError::GitError {
             message: format!("cannot read ref: {error}"),
         })?;
-        if let Some(name) = reference.name() {
-            if let Some(rest) = name.strip_prefix(DEGRADED_HEAD_BINDING_PREFIX) {
-                let mut parts = rest.split('/');
-                let shard = parts.next().unwrap_or("");
-                let id_hex = parts.next().unwrap_or("");
-                if parts.next().is_none() && shard.len() == 2 && id_hex.len() == 64 {
-                    names.push(name.to_string());
-                }
+        let name = reference.name().map_err(|error| CliError::GitError {
+            message: format!("cannot read ref name: {error}"),
+        })?;
+        if let Some(rest) = name.strip_prefix(DEGRADED_HEAD_BINDING_PREFIX) {
+            let mut parts = rest.split('/');
+            let shard = parts.next().unwrap_or("");
+            let id_hex = parts.next().unwrap_or("");
+            if parts.next().is_none() && shard.len() == 2 && id_hex.len() == 64 {
+                names.push(name.to_string());
             }
         }
     }

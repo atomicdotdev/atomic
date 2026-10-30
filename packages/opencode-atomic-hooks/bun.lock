@@ -14,6 +14,9 @@
       },
     },
   },
+  "overrides": {
+    "zod": "^4.6.7",
+  },
   "packages": {
     "@opencode-ai/plugin": ["@opencode-ai/plugin@1.2.6", "", { "dependencies": { "@opencode-ai/sdk": "1.2.6", "zod": "4.1.8" } }, "sha512-CJEp3k17yWsjyfivm3zQof8L42pdze3a7iTqMOyesHgJplSuLiBYAMndbBYMDuJkyAh0dHYjw8v10vVw7Kfl4Q=="],
 
@@ -29,6 +32,6 @@
 
     "undici-types": ["undici-types@7.18.2", "", {}, "sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w=="],
 
-    "zod": ["zod@4.1.8", "", {}, "sha512-5R1P+WwQqmmMIEACyzSvo4JXHY5WiAFHRMg+zBZKgKS+Q1viRa0C1hmUKtHltoIFKtIdki3pRxkmpP74jnNYHQ=="],
+    "zod": ["zod@4.6.7", "", {}, "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg=="],
   }
 }

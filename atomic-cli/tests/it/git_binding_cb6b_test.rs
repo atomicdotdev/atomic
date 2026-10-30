@@ -242,7 +242,7 @@ fn imported_history_refuses_private_packs_and_fresh_clone_fetch_is_explicitly_in
             .references()
             .expect("refs")
             .filter_map(|r| r.ok())
-            .filter_map(|r| r.name().map(|n| n.to_string()))
+            .filter_map(|r| r.name().ok().map(|n| n.to_string()))
             .collect();
         assert!(
             refs.iter()
@@ -457,7 +457,7 @@ fn private_sidecars_never_enter_a_pack_and_sentinels_stay_out_of_git() {
             .references()
             .expect("refs")
             .filter_map(|r| r.ok())
-            .filter_map(|r| r.name().map(|n| n.to_string()))
+            .filter_map(|r| r.name().ok().map(|n| n.to_string()))
             .collect();
         assert!(
             refs.iter()
