@@ -845,7 +845,7 @@ impl Push {
                 git_repo
                     .head()
                     .ok()
-                    .and_then(|head| head.shorthand().map(str::to_string))
+                    .and_then(|head| head.shorthand().ok().map(str::to_string))
                     .unwrap_or_else(|| "master".to_string())
             );
             let verified = publication.git_head.ok_or_else(|| CliError::GitError {
