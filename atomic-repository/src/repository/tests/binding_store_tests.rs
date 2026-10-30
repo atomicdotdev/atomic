@@ -481,7 +481,7 @@ fn publication_with_a_signed_summary_carries_only_the_allowlisted_summary() {
     let tree = commit.tree().unwrap();
     let mut names: Vec<String> = tree
         .iter()
-        .filter_map(|entry| entry.name().map(|name| name.to_string()))
+        .filter_map(|entry| entry.name().ok().map(|name| name.to_string()))
         .collect();
     names.sort();
     assert_eq!(

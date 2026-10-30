@@ -296,7 +296,7 @@ fn transfer_to_client(publisher_root: &std::path::Path, binding: &GitStateBindin
     let head_branch = publisher_git
         .head()
         .ok()
-        .and_then(|head| head.shorthand().map(|s| s.to_string()));
+        .and_then(|head| head.shorthand().ok().map(|s| s.to_string()));
     let mut push_specs: Vec<String> = vec![binding_refspec];
     if let Some(branch) = &head_branch {
         push_specs.push(format!("refs/heads/{branch}:refs/heads/{branch}"));

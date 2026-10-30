@@ -376,7 +376,7 @@ fn renamed_branch_target(git: &GitRepository, old_ref: &str) -> Option<String> {
     let needle = format!("renamed {old_ref} to ");
     let branches = git.branches(Some(git2::BranchType::Local)).ok()?;
     for (branch, _) in branches.flatten() {
-        let Some(name) = branch.get().name() else {
+        let Ok(name) = branch.get().name() else {
             continue;
         };
         let Ok(reflog) = git.reflog(name) else {
@@ -385,7 +385,7 @@ fn renamed_branch_target(git: &GitRepository, old_ref: &str) -> Option<String> {
         if reflog.iter().any(|entry| {
             entry
                 .message()
-                .is_some_and(|message| message.contains(&needle))
+                .is_ok_and(|message| message.is_some_and(|message| message.contains(&needle)))
         }) {
             return Some(name.to_string());
         }

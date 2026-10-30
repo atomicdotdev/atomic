@@ -428,7 +428,7 @@ fn incomplete_walks_and_stale_exports_never_prove_containment() {
     );
     // An unreachable (garbage) baseline is unprovable — never an empty set
     // read as positive containment (CB-10A review R2).
-    let zero = git2::Oid::zero().to_string();
+    let zero = git2::Oid::ZERO_SHA1.to_string();
     assert!(matches!(
         commits_added_since(&git, Some(&zero), Some(&child.to_string())),
         AddedCommits::Unprovable(_)

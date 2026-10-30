@@ -408,9 +408,9 @@ impl Repository {
         let mut changes_pack: Option<Vec<u8>> = None;
         let mut conflicts_pack: Option<Vec<u8>> = None;
         for entry in tree.iter() {
-            let name = entry.name().ok_or_else(|| {
+            let name = entry.name().map_err(|error| {
                 git_map(format!(
-                    "binding ref '{ref_name}' tree holds a non-UTF-8 entry name"
+                    "binding ref '{ref_name}' tree holds a non-UTF-8 entry name: {error}"
                 ))
             })?;
             let allowlisted = matches!(
@@ -658,9 +658,9 @@ impl Repository {
 
         let mut pack: Option<Vec<u8>> = None;
         for entry in tree.iter() {
-            let name = entry.name().ok_or_else(|| {
+            let name = entry.name().map_err(|error| {
                 git_map(format!(
-                    "binding ref '{ref_name}' tree holds a non-UTF-8 entry name"
+                    "binding ref '{ref_name}' tree holds a non-UTF-8 entry name: {error}"
                 ))
             })?;
             let allowlisted = matches!(
@@ -728,9 +728,9 @@ impl Repository {
 
         let mut pack: Option<Vec<u8>> = None;
         for entry in tree.iter() {
-            let name = entry.name().ok_or_else(|| {
+            let name = entry.name().map_err(|error| {
                 git_map(format!(
-                    "binding ref '{ref_name}' tree holds a non-UTF-8 entry name"
+                    "binding ref '{ref_name}' tree holds a non-UTF-8 entry name: {error}"
                 ))
             })?;
             let allowlisted = matches!(

@@ -44,6 +44,30 @@ fn checked_path(root: &Path, path: &str) -> Result<std::path::PathBuf, String> {
     Ok(full)
 }
 
+/// Lowercase hex of a digest. `digest` 0.11 dropped the `LowerHex` output.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// `digest` 0.11 dropped the `std::io::Write` impl, so streaming file bytes
+/// into a hasher needs this adapter.
+struct DigestWriter<'a, D>(&'a mut D);
+
+impl<D: Digest> std::io::Write for DigestWriter<'_, D> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Fingerprint a file without following its final symlink. `None` means deleted.
 /// Reject directories and paths outside the working tree.
 pub fn fingerprint(root: &Path, path: &str) -> Result<Option<String>, String> {
@@ -56,8 +80,8 @@ pub fn fingerprint(root: &Path, path: &str) -> Result<Option<String>, String> {
     if meta.file_type().is_symlink() {
         let target = std::fs::read_link(full).map_err(|e| e.to_string())?;
         return Ok(Some(format!(
-            "link:{:x}",
-            Sha256::digest(target.as_os_str().as_encoded_bytes())
+            "link:{}",
+            hex(&Sha256::digest(target.as_os_str().as_encoded_bytes()))
         )));
     }
     if !meta.is_file() {
@@ -72,11 +96,8 @@ pub fn fingerprint(root: &Path, path: &str) -> Result<Option<String>, String> {
     let executable = false;
     let mut file = std::fs::File::open(full).map_err(|e| e.to_string())?;
     let mut hash = Sha256::new();
-    std::io::copy(&mut file, &mut hash).map_err(|e| e.to_string())?;
-    Ok(Some(format!(
-        "file:{hash:x}:{executable}",
-        hash = hash.finalize()
-    )))
+    std::io::copy(&mut file, &mut DigestWriter(&mut hash)).map_err(|e| e.to_string())?;
+    Ok(Some(format!("file:{}:{executable}", hex(&hash.finalize()))))
 }
 
 /// Return fingerprints for dirty files and explicitly requested prior candidates.
@@ -193,4 +214,22 @@ pub(super) fn filter(status: RepositoryStatus, files: Option<&FileManifest>) -> 
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fingerprints persist in session manifests and are compared across
+    /// binaries, so the encoding must stay the lowercase SHA-256 hex that the
+    /// pre-`digest`-0.11 `{:x}` formatting produced.
+    #[test]
+    fn fingerprints_are_lowercase_sha256_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), b"hi\n").unwrap();
+        assert_eq!(
+            fingerprint(dir.path(), "f.txt").unwrap().unwrap(),
+            "file:98ea6e4f216f2fb4b69fff9b3a44842c38686ca685f3f55dc48c5d3fb1107be4:false"
+        );
+    }
 }

@@ -36,6 +36,9 @@
     "version-control",
     "code-attribution"
   ],
+  "overrides": {
+    "zod": "^4.6.7"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",

@@ -1779,7 +1779,7 @@ fn warn_if_view_mismatch(root: &Path) {
         repository
             .head()
             .ok()
-            .and_then(|head| head.shorthand().map(str::to_string))
+            .and_then(|head| head.shorthand().ok().map(str::to_string))
     });
     if let Some(git_branch) = git_branch {
         if !atomic_view.is_empty() && git_branch != atomic_view {

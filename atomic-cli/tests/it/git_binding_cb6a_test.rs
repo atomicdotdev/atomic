@@ -99,10 +99,11 @@ fn binding_ref_names(git_dir: &Path) -> Vec<String> {
     let mut refs = Vec::new();
     for reference in git.references().expect("list refs") {
         let reference = reference.expect("reference");
-        if let Some(name) = reference.name() {
-            if name.starts_with("refs/atomic/bindings/") {
-                refs.push(name.to_string());
-            }
+        let Ok(name) = reference.name() else {
+            continue;
+        };
+        if name.starts_with("refs/atomic/bindings/") {
+            refs.push(name.to_string());
         }
     }
     refs.sort();
