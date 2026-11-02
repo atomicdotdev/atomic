@@ -1603,7 +1603,12 @@ fn build_switch_projection(
         tree_oid.as_bytes().to_vec(),
     )
     .map_err(|error| git_error(error.to_string()))?;
-    let author = projection_author(repo, repo_root, signature.name(), signature.email());
+    let author = projection_author(
+        repo,
+        repo_root,
+        signature.name().ok(),
+        signature.email().ok(),
+    );
     let _ = &tree;
     let (commit_oid, commit_bytes) = atomic_repository::build_projected_commit(
         git_repo,
@@ -1615,7 +1620,12 @@ fn build_switch_projection(
             state: state_merkle,
             binding_id: None,
             conflict_set_hash,
-            author: projection_author(repo, repo_root, signature.name(), signature.email()),
+            author: projection_author(
+                repo,
+                repo_root,
+                signature.name().ok(),
+                signature.email().ok(),
+            ),
             timestamp: chrono::Utc::now().timestamp(),
             timestamp_offset: local_utc_offset_minutes(),
         },
@@ -1816,7 +1826,9 @@ fn snapshot_reference(git_repo: &GitRepository, name: &str) -> CliResult<Referen
         Ok(reference) => {
             if let Some(target) = reference.target() {
                 Ok(ReferenceSnapshot::Direct(target))
-            } else if let Some(target) = reference.symbolic_target() {
+            } else if let Some(target) = reference.symbolic_target().map_err(|error| {
+                git_error(format!("cannot read Git reference '{name}': {error}"))
+            })? {
                 Ok(ReferenceSnapshot::Symbolic(target.to_string()))
             } else {
                 Err(git_error(format!(
