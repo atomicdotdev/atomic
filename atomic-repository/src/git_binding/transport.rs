@@ -82,9 +82,11 @@ pub fn transferable_binding_refs(git: &git2::Repository) -> Result<Vec<String>, 
         .map_err(|error| format!("cannot enumerate refs: {error}"))?
     {
         let reference = reference.map_err(|error| format!("cannot read ref: {error}"))?;
-        let name = reference
-            .name()
-            .map_err(|error| format!("cannot read ref name: {error}"))?;
+        // Git permits ref names that are not valid UTF-8; such a name cannot
+        // appear in a transferable name list, so it is skipped, not fatal.
+        let Ok(name) = reference.name() else {
+            continue;
+        };
         if !is_transferable_ref(name) {
             continue;
         }

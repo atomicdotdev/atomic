@@ -46,9 +46,12 @@ fn checked_path(root: &Path, path: &str) -> Result<std::path::PathBuf, String> {
 
 /// Lowercase hex of a digest. `digest` 0.11 dropped the `LowerHex` output.
 fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
+        // Writing to a `String` cannot fail.
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }

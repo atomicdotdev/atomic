@@ -677,9 +677,10 @@ fn resolve_published_binding(git: &GitRepository, id: &str) -> CliResult<GitStat
         .map_err(|error| git_map(format!("cannot enumerate binding refs: {error}")))?
     {
         let reference = reference.map_err(|error| git_map(error.to_string()))?;
-        let name = reference
-            .name()
-            .map_err(|error| git_map(format!("cannot read a binding ref name: {error}")))?;
+        // A non-UTF-8 ref name cannot carry a hexadecimal binding id.
+        let Ok(name) = reference.name() else {
+            continue;
+        };
         let Some(target) = reference.target() else {
             continue;
         };

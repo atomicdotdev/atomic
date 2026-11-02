@@ -385,7 +385,7 @@ fn renamed_branch_target(git: &GitRepository, old_ref: &str) -> Option<String> {
         if reflog.iter().any(|entry| {
             entry
                 .message()
-                .is_ok_and(|message| message.is_some_and(|message| message.contains(&needle)))
+                .is_ok_and(|message| message.is_some_and(|text| text.contains(&needle)))
         }) {
             return Some(name.to_string());
         }

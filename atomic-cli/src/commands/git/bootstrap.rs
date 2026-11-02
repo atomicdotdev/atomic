@@ -177,9 +177,9 @@ pub(crate) fn install_degraded_bindings(
         let reference = reference.map_err(|error| CliError::GitError {
             message: format!("cannot read ref: {error}"),
         })?;
-        let name = reference.name().map_err(|error| CliError::GitError {
-            message: format!("cannot read ref name: {error}"),
-        })?;
+        let Ok(name) = reference.name() else {
+            continue;
+        };
         if let Some(rest) = name.strip_prefix(DEGRADED_HEAD_BINDING_PREFIX) {
             let mut parts = rest.split('/');
             let shard = parts.next().unwrap_or("");
