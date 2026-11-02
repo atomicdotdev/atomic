@@ -677,7 +677,9 @@ fn resolve_published_binding(git: &GitRepository, id: &str) -> CliResult<GitStat
         .map_err(|error| git_map(format!("cannot enumerate binding refs: {error}")))?
     {
         let reference = reference.map_err(|error| git_map(error.to_string()))?;
-        // A non-UTF-8 ref name cannot carry a hexadecimal binding id.
+        // `name()` fails only when the name is not UTF-8. Canonical binding refs
+        // are ASCII by layout, and everything below needs a `&str`, so a stray
+        // non-UTF-8 ref in this namespace is skipped, not fatal.
         let Ok(name) = reference.name() else {
             continue;
         };
