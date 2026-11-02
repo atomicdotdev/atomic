@@ -56,8 +56,11 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// `digest` 0.11 dropped the `std::io::Write` impl, so streaming file bytes
-/// into a hasher needs this adapter.
+/// `digest` 0.11 removed its `std::io` impls and its `std` feature, moving
+/// them to the separate `digest-io` crate (RustCrypto/traits#1809), so
+/// streaming bytes into a hasher needs a wrapper again. Kept local instead of
+/// taking a dependency for one `Write` impl; equivalent to
+/// `digest_io::IoWrapper`.
 struct DigestWriter<'a, D>(&'a mut D);
 
 impl<D: Digest> std::io::Write for DigestWriter<'_, D> {
