@@ -55,7 +55,7 @@ impl Command for Materialize {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         if let Some(ref path) = self.path {
             repo.vault_materialize(path).map_err(CliError::Repository)?;

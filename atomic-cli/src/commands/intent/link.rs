@@ -35,7 +35,7 @@ impl Command for IntentLink {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         repo.vault_intent_link(&self.id, &self.goal)
             .map_err(CliError::Repository)?;

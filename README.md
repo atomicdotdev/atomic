@@ -252,6 +252,8 @@ Atomic's CRDT semantic layer (Trunk → Branch → Leaf) tracks changes at the t
 
 Every repository has a **vault** — a versioned knowledge store that persists what your team and your agents learn across sessions. Goals, decisions, architecture context, and working memory all live in `.vault/` as structured markdown with cryptographic provenance.
 
+Vault **writes** — `atomic vault goal start/stop/resume`, `atomic vault materialize`, `atomic vault sync`, `atomic intent new/update/delete/link/attest`, and `atomic memory new/write/attest` — create the vault on first use if it does not exist yet. Reads never mutate the checkout: on a repository without a vault they return empty/not-found, so read-only checkouts keep working. `atomic vault init` is only needed when you want the defaults created and recorded up front, for example after `atomic init --no-vault`.
+
 ```bash
 # Initialize the vault in your repo
 atomic vault init

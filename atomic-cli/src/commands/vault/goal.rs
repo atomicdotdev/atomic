@@ -180,7 +180,7 @@ impl Command for GoalStart {
             return Ok(());
         }
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         let result = repo
             .vault_goal_start(GoalStartOptions {
@@ -230,7 +230,7 @@ impl Command for GoalStop {
             return Ok(());
         }
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         // Find the goal to stop
         let goal_name = match &self.goal {
@@ -291,7 +291,7 @@ impl Command for GoalResume {
             return Ok(());
         }
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         let info = repo
             .vault_goal_resume(&self.goal)
@@ -387,7 +387,8 @@ impl Command for GoalList {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         let filter = if self.status == "all" {
             Some("all")
@@ -434,7 +435,8 @@ impl Command for GoalShow {
             return Ok(());
         }
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         let entry = repo
             .vault_goal_show(&self.goal)
