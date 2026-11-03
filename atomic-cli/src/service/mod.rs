@@ -844,6 +844,27 @@ impl Service {
         })
     }
 
+    pub fn replay_vault_evidence(
+        &self,
+        request: pb::ReplayVaultEvidenceRequest,
+    ) -> CliResult<pb::ReplayVaultEvidenceResponse> {
+        self.call(move |backend| async move {
+            match backend {
+                Backend::Local(state) => services_agent::VaultImpl { state }
+                    .replay_vault_evidence(Request::new(request))
+                    .await
+                    .map(|response| response.into_inner()),
+                Backend::Reactor(channel) => {
+                    let mut vault = pb::vault_service_client::VaultServiceClient::new(channel);
+                    vault
+                        .replay_vault_evidence(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            }
+        })
+    }
+
     pub fn delete_vault_entity(
         &self,
         request: pb::DeleteVaultEntityRequest,

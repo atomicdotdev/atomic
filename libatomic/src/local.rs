@@ -17,7 +17,8 @@ use crate::atomic::{
     view_service_server::ViewService, AddFilesRequest, CreateViewRequest, DeleteViewRequest,
     GetChangeRequest, GetVaultContextRequest, GetVaultEntryRequest, ListVaultEntriesRequest,
     ListViewsRequest, LogRequest, PreviewRestoreRequest, QueryGraphRequest, RecordRequest,
-    ResolveRepositoryRequest, StatusRequest, SwitchViewRequest, VerifyAttestationRequest,
+    ReplayVaultEvidenceRequest, ResolveRepositoryRequest, StatusRequest, SwitchViewRequest,
+    VerifyAttestationRequest,
 };
 use crate::daemon::{
     services::{DaemonImpl, MutationImpl, QueryImpl},
@@ -34,9 +35,9 @@ use crate::daemon::{
 ///
 /// Supports repository resolution, basic working-copy/change/view operations,
 /// read-only restore previews (including recorded file bytes),
-/// read-only knowledge queries, vault get/list/context, and attestation verification. View-scoped
-/// vault reads are not supported; unsupported methods fail explicitly with
-/// `Unimplemented`.
+/// read-only knowledge queries, vault get/list/context, attestation verification, and
+/// bounded evidence replay. View-scoped vault reads are not supported; unsupported
+/// methods fail explicitly with `Unimplemented`.
 #[derive(Clone)]
 pub struct LocalService {
     state: Arc<DaemonState>,
@@ -231,6 +232,16 @@ impl LocalService {
                     state: self.state.clone(),
                 }
                 .get_vault_context(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.VaultService/ReplayVaultEvidence" => {
+                let request = decode::<ReplayVaultEvidenceRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = VaultImpl {
+                    state: self.state.clone(),
+                }
+                .replay_vault_evidence(Request::new(request))
                 .await?;
                 Ok(response.into_inner().encode_to_vec())
             }

@@ -1,6 +1,7 @@
 //! Vault, attestation, knowledge, and turn-dispatch handlers — the
 //! agent-facing product surface of the full-turn slice.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::atomic::attestation_target::Kind as TargetKind;
@@ -25,6 +26,7 @@ use atomic_core::pristine::VaultEntryType;
 use atomic_core::types::Base32;
 use atomic_identity::signing::Signature;
 use atomic_identity::{Identity, IdentityStore};
+use atomic_repository::intent_evidence;
 use atomic_repository::IntentCreateOptions;
 use atomic_repository::IntentUpdateOptions;
 use atomic_repository::Repository;
@@ -725,6 +727,46 @@ fn fresh_attested_intent(
         Some(node)
     } else {
         None
+    }
+}
+
+/// Evidence failures are user-fixable gate refusals over the wire.
+fn evidence_status(error: intent_evidence::EvidenceError) -> Status {
+    domain_status(ErrorCode::InvalidArgument, error.to_string())
+}
+
+/// One canonical-gate violation in the message shape ordinary validation
+/// already serves.
+fn format_violation(violation: &atomic_canonical::Violation) -> String {
+    format!(
+        "[{}] {}{}: {}",
+        violation.shape,
+        violation.focus_node,
+        violation
+            .path
+            .as_ref()
+            .map(|path| format!(" ({path})"))
+            .unwrap_or_default(),
+        violation.message
+    )
+}
+
+fn evidence_context_to_proto(
+    context: &intent_evidence::EvidenceContext,
+) -> crate::atomic::EvidenceContext {
+    crate::atomic::EvidenceContext {
+        intent_id: context.intent_id.clone(),
+        intent_substance_hash: context.intent_substance_hash.clone(),
+        intent_source_hash: context.intent_source_hash.clone(),
+        view_chain: context
+            .view_chain
+            .iter()
+            .map(|pin| crate::atomic::EvidenceViewPin {
+                name: pin.name.clone(),
+                merkle: pin.merkle.clone(),
+                scope: pin.scope.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -2363,6 +2405,138 @@ impl vault_service_server::VaultService for VaultImpl {
         .await
         .map_err(|e| Status::internal(e.to_string()))??;
         Ok(Response::new(response))
+    }
+
+    async fn replay_vault_evidence(
+        &self,
+        request: Request<ReplayVaultEvidenceRequest>,
+    ) -> Result<Response<ReplayVaultEvidenceResponse>, Status> {
+        let request = request.into_inner();
+        let kind = Kind::try_from(request.kind)
+            .map_err(|_| domain_status(ErrorCode::InvalidArgument, "unknown vault entity kind"))?;
+        if kind != Kind::Intent {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                "evidence replay supports intents only",
+            ));
+        }
+        let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
+        self.state.log_rpc("ReplayVaultEvidence", Some(&handle));
+        if request.id.is_empty() {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                "evidence replay requires a stored intent ID",
+            ));
+        }
+        let wants_replay = !request.manifest.is_empty();
+        if !wants_replay && !request.evidence_context {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                "evidence context or replay manifest is required",
+            ));
+        }
+        if wants_replay != !request.checker.is_empty() {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                "evidence replay manifest and checker must be supplied together",
+            ));
+        }
+        if wants_replay && !PathBuf::from(&request.manifest_base).is_absolute() {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                "evidence replay manifest base must be an absolute service-host path",
+            ));
+        }
+
+        let id = request.id;
+        let manifest = request.manifest;
+        let manifest_base = PathBuf::from(request.manifest_base);
+        let checker = PathBuf::from(request.checker);
+
+        // Phase 1: gate and pins under the repository gate, then release it
+        // before any external checker runs. The checker can take up to its
+        // full deadline, so it must never hold a writer or owner lock.
+        let (node, context, issues) = {
+            let gate_handle = handle.clone();
+            let _gate = gate_handle.exclusive().await;
+            let task_id = id.clone();
+            let task_handle = handle.clone();
+            tokio::task::spawn_blocking(move || {
+                let repo = task_handle.repository_readonly()?;
+                let prepared =
+                    intent_evidence::prepare(&repo, &task_id).map_err(evidence_status)?;
+                let report = validate_intent(&prepared.node);
+                let issues: Vec<String> = report.results.iter().map(format_violation).collect();
+                Ok::<_, Status>((prepared.node, prepared.context, issues))
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))??
+        };
+
+        // Phase 2: bounded replay without the repository gate, followed by a
+        // fresh pin check. A checker result from another intent definition or
+        // view state must not be reused as a fresh validation result.
+        let (report, freshness_changed) = if wants_replay {
+            let replay_context = context.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                intent_evidence::replay_bytes(
+                    &manifest,
+                    &manifest_base,
+                    &checker,
+                    &replay_context,
+                    &node,
+                )
+                .map_err(evidence_status)
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))??;
+
+            let gate_handle = handle.clone();
+            let _gate = gate_handle.exclusive().await;
+            let task_id = id.clone();
+            let task_handle = handle.clone();
+            let after = tokio::task::spawn_blocking(move || {
+                let repo = task_handle.repository_readonly()?;
+                intent_evidence::read_context(&repo, &task_id).map_err(evidence_status)
+            })
+            .await
+            .map_err(|error| Status::internal(error.to_string()))??;
+            (Some(report), after != context)
+        } else {
+            (None, false)
+        };
+
+        let all_supported = report.as_ref().is_none_or(|report| {
+            report
+                .decisions
+                .iter()
+                .all(|decision| decision.decision == "supported")
+        });
+        let valid = issues.is_empty() && all_supported && !freshness_changed;
+        let evidence_replay = report.map(|report| EvidenceReplay {
+            schema_version: report.schema_version.to_string(),
+            decisions: report
+                .decisions
+                .into_iter()
+                .map(|decision| EvidenceDecision {
+                    schema_version: decision.schema_version,
+                    request_digest: decision.request_digest,
+                    criterion_id: decision.criterion_id,
+                    claim_type: decision.claim_type,
+                    decision: decision.decision,
+                    reason: decision.reason,
+                    details_json: serde_json::to_string(&decision.details)
+                        .unwrap_or_else(|_| "null".into()),
+                })
+                .collect(),
+            freshness_changed,
+        });
+        Ok(Response::new(ReplayVaultEvidenceResponse {
+            valid,
+            issues,
+            evidence_context: Some(evidence_context_to_proto(&context)),
+            evidence_replay,
+        }))
     }
 
     async fn sync_vault(
