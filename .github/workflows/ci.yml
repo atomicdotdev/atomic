@@ -117,9 +117,17 @@ jobs:
         # (cfg(unix)); Linux/macOS still run them. Keep Windows native tests on.
         # Re-enable the shim suites after Windows support is defined and its
         # path/mode/locking behavior is validated; see the RFC platform policy.
+        #
+        # Two tests per CPU. The integration tests mostly wait on git and
+        # atomic subprocesses and the filesystem: on 4 CPUs, 86 of the git
+        # shim/adoption/anchor tests used 1.5 CPUs at one test per CPU and
+        # finished 1.8x faster at two. nextest's default of one per CPU left
+        # the 3-CPU macOS runner running exactly 3 tests at a time.
+        shell: bash
         run: >-
           cargo nextest run --workspace --features atomic-cli/adoption-test-injection --profile ci
           --partition count:${{ matrix.shard }}/${{ matrix.shards }}
+          --test-threads $(( 2 * $(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc) ))
 
       # nextest does not run doctests. They exercise the same code on every
       # platform and took 4.5 minutes on Windows, so they run on Linux only.
