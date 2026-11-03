@@ -252,6 +252,11 @@ Atomic's CRDT semantic layer (Trunk → Branch → Leaf) tracks changes at the t
 
 Every repository has a **vault** — a versioned knowledge store that persists what your team and your agents learn across sessions. Goals, decisions, architecture context, and working memory all live in `.vault/` as structured markdown with cryptographic provenance.
 
+Any vault-facing command (`atomic vault …`, `atomic intent …`, `atomic memory …`)
+creates the vault on first use if it does not exist yet. `atomic vault init` is
+only needed when you want the defaults created and recorded up front, for
+example after `atomic init --no-vault`.
+
 ```bash
 # Initialize the vault in your repo
 atomic vault init

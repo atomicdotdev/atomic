@@ -417,6 +417,46 @@ pub(crate) fn open_readonly_repository(
     Repository::open_readonly_wait(path, std::time::Duration::from_secs(10))
 }
 
+/// Open the repository at `root` with a vault guaranteed to exist.
+///
+/// Vault-facing commands — the `vault`, `intent`, and `memory` families —
+/// open through this helper so a repository created without a vault
+/// (`atomic init --no-vault`, or one that never ran `atomic vault init`)
+/// serves them on first use instead of failing with
+/// "Vault not initialized".
+///
+/// The initialization is [`Repository::ensure_vault`], the same idempotent
+/// path `atomic vault init` uses. It runs at most once: an existing vault is
+/// never re-initialized.
+pub fn open_repository_with_vault(root: &Path) -> CliResult<Repository> {
+    let repo = Repository::open(root).map_err(CliError::from)?;
+    ensure_vault_exists(&repo)?;
+    Ok(repo)
+}
+
+/// Read-only variant of [`open_repository_with_vault`].
+///
+/// An already-initialized repository keeps the migration-free read-only
+/// handle. Only the absent-vault case pays the writable open needed to create
+/// and record the vault tables.
+pub(crate) fn open_readonly_repository_with_vault(root: &Path) -> CliResult<Repository> {
+    let repo = open_readonly_repository(root).map_err(CliError::from)?;
+    if repo.has_vault().map_err(CliError::from)? {
+        return Ok(repo);
+    }
+    drop(repo);
+    open_repository_with_vault(root)
+}
+
+/// One-time implicit vault initialization, announced on stderr so `--json`
+/// output stays parseable.
+fn ensure_vault_exists(repo: &Repository) -> CliResult<()> {
+    if repo.ensure_vault().map_err(CliError::from)? {
+        eprintln!("Initialized vault at {}", repo.vault_dir().display());
+    }
+    Ok(())
+}
+
 /// Open a repository or return a user-friendly error.
 ///
 /// This is a convenience wrapper around [`open_repository`] that provides

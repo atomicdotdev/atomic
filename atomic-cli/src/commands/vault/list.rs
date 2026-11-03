@@ -121,7 +121,7 @@ impl Command for List {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         let type_filter = self.r#type.as_deref().and_then(VaultEntryType::parse);
         let prefix = self.prefix.as_deref().unwrap_or("");

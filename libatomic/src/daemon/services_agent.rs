@@ -33,7 +33,7 @@ use tonic::{Request, Response, Status};
 
 use super::convert::*;
 use super::journal_sink::DirectJournalSink;
-use super::state::{domain_status, repository_error, DaemonState};
+use super::state::{domain_status, repository_error, DaemonState, RepoHandle};
 
 // ---------------------------------------------------------------------------
 // VaultService
@@ -1196,6 +1196,30 @@ pub(crate) fn response_meta(meta: &Option<RequestMeta>) -> Option<ResponseMeta> 
     })
 }
 
+/// Open the request's repository with its vault guaranteed to exist.
+///
+/// The local command bodies initialize the vault on first use; a routed
+/// request reaches the same domain methods through this handler, so it
+/// applies the same guarantee before the domain call. An existing vault is
+/// never re-initialized.
+fn vault_repository(handle: &RepoHandle) -> Result<Repository, Status> {
+    let repo = handle.repository()?;
+    repo.ensure_vault().map_err(repository_error)?;
+    Ok(repo)
+}
+
+/// Read path of [`vault_repository`]: keeps the read-concurrency handle when
+/// the vault already exists, and only takes the writable open to create it on
+/// first use.
+fn vault_repository_readonly(handle: &RepoHandle) -> Result<Repository, Status> {
+    let repo = handle.repository_readonly()?;
+    if repo.has_vault().map_err(repository_error)? {
+        return Ok(repo);
+    }
+    drop(repo);
+    vault_repository(handle)
+}
+
 #[tonic::async_trait]
 impl vault_service_server::VaultService for VaultImpl {
     async fn create_vault_entity(
@@ -1232,7 +1256,7 @@ impl vault_service_server::VaultService for VaultImpl {
                 let result = tokio::task::spawn_blocking({
                     let handle = handle_for_task;
                     move || {
-                        let repo = handle.repository()?;
+                        let repo = vault_repository(&handle)?;
                         let created = repo
                             .vault_intent_create(IntentCreateOptions {
                                 title: title.clone(),
@@ -1305,7 +1329,7 @@ impl vault_service_server::VaultService for VaultImpl {
                 let result = tokio::task::spawn_blocking({
                     let handle = handle_for_task;
                     move || {
-                        let repo = handle.repository()?;
+                        let repo = vault_repository(&handle)?;
                         repo.vault_goal_start(atomic_repository::GoalStartOptions {
                             name: (!title.is_empty()).then_some(title.clone()),
                             developer,
@@ -1362,7 +1386,7 @@ impl vault_service_server::VaultService for VaultImpl {
                     let id = id.clone();
                     let body = body_for_store;
                     move || {
-                        let repo = handle.repository()?;
+                        let repo = vault_repository(&handle)?;
                         let mut frontmatter = Map::new();
                         frontmatter.insert("uid".into(), Value::String(id));
                         frontmatter.insert("memoryKind".into(), Value::String(memory_kind));
@@ -1449,7 +1473,7 @@ impl vault_service_server::VaultService for VaultImpl {
         let id = request.id.clone();
         let response = tokio::task::spawn_blocking(move || match kind {
             Kind::Intent => {
-                let repo = handle.repository()?;
+                let repo = vault_repository(&handle)?;
                 let mut options = IntentUpdateOptions::default();
                 match update {
                     UpdateKind::Status(status) => {
@@ -1516,7 +1540,7 @@ impl vault_service_server::VaultService for VaultImpl {
             }
             Kind::Memory => match update {
                 UpdateKind::Body(body) => {
-                    let repo = handle.repository()?;
+                    let repo = vault_repository(&handle)?;
                     let vault_path = format!("memory/{id}.md");
                     let entry = repo
                         .vault_retrieve(&vault_path)
@@ -1560,7 +1584,7 @@ impl vault_service_server::VaultService for VaultImpl {
                     // `atomic memory write` — the raw store + materialize
                     // (create-or-replace at the named vault path), with the
                     // content hash riding the response.
-                    let repo = handle.repository()?;
+                    let repo = vault_repository(&handle)?;
                     let hash = repo
                         .vault_store(
                             &memory_write.path,
@@ -1592,7 +1616,7 @@ impl vault_service_server::VaultService for VaultImpl {
                 // `vault goal stop` — the goal to stop (empty = the most
                 // recent active goal) + the promote/discard options.
                 UpdateKind::GoalStop(goal_stop) => {
-                    let repo = handle.repository()?;
+                    let repo = vault_repository(&handle)?;
                     let goal_name = match &goal_stop.goal {
                         Some(name) => name.clone(),
                         None => repo
@@ -1640,7 +1664,7 @@ impl vault_service_server::VaultService for VaultImpl {
                 }
                 // `vault goal resume`.
                 UpdateKind::GoalResume(goal_resume) => {
-                    let repo = handle.repository()?;
+                    let repo = vault_repository(&handle)?;
                     let info = repo
                         .vault_goal_resume(&goal_resume.goal)
                         .map_err(repository_error)?;
@@ -1710,7 +1734,7 @@ impl vault_service_server::VaultService for VaultImpl {
             // attestation: the vault-show projection never consults one).
             if let Some(path) = path.as_deref().filter(|path| !path.is_empty()) {
                 // A query: read-only open with the read-concurrency wait.
-                let repo = handle.repository_readonly()?;
+                let repo = vault_repository_readonly(&handle)?;
                 let entry = repo
                     .vault_retrieve(path)
                     .map_err(repository_error)?
@@ -1746,7 +1770,7 @@ impl vault_service_server::VaultService for VaultImpl {
             match kind {
                 Kind::Intent => {
                     // A query: read-only open with the read-concurrency wait.
-                    let repo = handle.repository_readonly()?;
+                    let repo = vault_repository_readonly(&handle)?;
                     let entry = repo.vault_intent_show(&id).map_err(repository_error)?;
                     let frontmatter = parse_frontmatter(&entry)?;
                     let title = frontmatter
@@ -1782,7 +1806,7 @@ impl vault_service_server::VaultService for VaultImpl {
                 }
                 Kind::Memory => {
                     // A query: read-only open with the read-concurrency wait.
-                    let repo = handle.repository_readonly()?;
+                    let repo = vault_repository_readonly(&handle)?;
                     // The memory id/path resolver (no manifest lookup, no
                     // case-folding): a bare id, a `memory/<id>` path, an
                     // `<id>.md` name, or a full `memory/<id>.md` path all
@@ -1818,7 +1842,7 @@ impl vault_service_server::VaultService for VaultImpl {
                 Kind::Goal => {
                     // `atomic vault goal show <goal>` — the stored goal.md
                     // entry (content + frontmatter ride the bundle).
-                    let repo = handle.repository_readonly()?;
+                    let repo = vault_repository_readonly(&handle)?;
                     let entry = repo.vault_goal_show(&id).map_err(repository_error)?;
                     let bundle = include_bundle
                         .then(|| vault_entry_bundle(&repo, Some(Kind::Goal), &id, &entry))
@@ -1907,7 +1931,7 @@ impl vault_service_server::VaultService for VaultImpl {
                 // `atomic vault summaries` — the ToolResult entries under the
                 // prefix, each with its filename-stem id and a 200-char content
                 // preview (the local body's exact enumeration + preview).
-                let repo = handle.repository_readonly()?;
+                let repo = vault_repository_readonly(&handle)?;
                 let entries = repo
                     .vault_list(&path_prefix, Some(VaultEntryType::ToolResult))
                     .map_err(repository_error)?;
@@ -1943,7 +1967,7 @@ impl vault_service_server::VaultService for VaultImpl {
             match kind {
                 Some(Kind::Intent) => {
                     // A query: read-only open with the read-concurrency wait.
-                    let repo = handle.repository_readonly()?;
+                    let repo = vault_repository_readonly(&handle)?;
                     // The verifying identity resolved ONCE (soft-fail to "no
                     // identity"; a named-but-missing identity is a hard error).
                     let verifier = resolve_listing_verifier(&identity)?;
@@ -2015,7 +2039,7 @@ impl vault_service_server::VaultService for VaultImpl {
                 }
                 Some(Kind::Memory) => {
                     // A query: read-only open with the read-concurrency wait.
-                    let repo = handle.repository_readonly()?;
+                    let repo = vault_repository_readonly(&handle)?;
                     // The verifying identity resolved ONCE — the `verifies`
                     // column's resolver (the same soft/hard-fail rule).
                     let verifier = resolve_listing_verifier(&identity)?;
@@ -2159,7 +2183,7 @@ impl vault_service_server::VaultService for VaultImpl {
                 }
                 Some(Kind::Goal) => {
                     // A query: read-only open with the read-concurrency wait.
-                    let repo = handle.repository_readonly()?;
+                    let repo = vault_repository_readonly(&handle)?;
                     let goals = repo
                         .vault_goal_list(status_filter.as_deref())
                         .map_err(repository_error)?;
@@ -2198,7 +2222,7 @@ impl vault_service_server::VaultService for VaultImpl {
                 }
                 None => {
                     // A query: read-only open with the read-concurrency wait.
-                    let repo = handle.repository_readonly()?;
+                    let repo = vault_repository_readonly(&handle)?;
                     // `vault list`: EVERY vault entry with its type, content
                     // size, and updated-at date, filtered by the path prefix
                     // and the parsed entry type — the same enumeration the
@@ -2270,7 +2294,7 @@ impl vault_service_server::VaultService for VaultImpl {
         })?;
         let response = tokio::task::spawn_blocking(move || {
             // A query: read-only open with the read-concurrency wait.
-            let repo = handle.repository_readonly()?;
+            let repo = vault_repository_readonly(&handle)?;
             let id = match subject {
                 validate_vault_entity_request::Subject::Id(id) => id,
                 validate_vault_entity_request::Subject::Document(_) => {
@@ -2379,7 +2403,7 @@ impl vault_service_server::VaultService for VaultImpl {
         let response = tokio::task::spawn_blocking({
             let handle = handle_for_task;
             move || {
-                let repo = handle.repository()?;
+                let repo = vault_repository(&handle)?;
                 let synced = repo.vault_record_working_copy().map_err(repository_error)?;
                 Ok::<_, Status>(SyncVaultResponse {
                     entities_synced: synced.len() as u32,
@@ -2471,7 +2495,7 @@ impl vault_service_server::VaultService for VaultImpl {
         let _gate = gate_handle.exclusive().await;
         let (entries, context) = tokio::task::spawn_blocking(move || {
             // A query: read-only open with the read-concurrency wait.
-            let repo = handle_for_task.repository_readonly()?;
+            let repo = vault_repository_readonly(&handle_for_task)?;
             let mut entries = Vec::new();
             let want = |kind: Kind| kinds.is_empty() || kinds.contains(&(kind as i32));
             if want(Kind::Intent) {
@@ -2555,7 +2579,7 @@ impl vault_service_server::VaultService for VaultImpl {
         let meta = request.meta.clone();
         let path = request.path.clone().filter(|path| !path.is_empty());
         let (count, materialized_path) = tokio::task::spawn_blocking(move || {
-            let repo = handle.repository()?;
+            let repo = vault_repository(&handle)?;
             match path {
                 Some(path) => {
                     repo.vault_materialize(&path).map_err(repository_error)?;
@@ -2594,7 +2618,7 @@ impl vault_service_server::VaultService for VaultImpl {
             // domain's (vault_intent_delete); the normalized id + removed
             // file ride the response so the client prints the local report.
             Kind::Intent => {
-                let repo = handle.repository()?;
+                let repo = vault_repository(&handle)?;
                 let result = repo.vault_intent_delete(&id).map_err(repository_error)?;
                 Ok::<_, Status>((result.id, result.intent_file))
             }
@@ -2641,7 +2665,7 @@ impl vault_service_server::VaultService for VaultImpl {
         let intent_id = source.id.clone();
         let goal_name = target.id.clone();
         tokio::task::spawn_blocking(move || {
-            let repo = handle.repository()?;
+            let repo = vault_repository(&handle)?;
             repo.vault_intent_link(&intent_id, &goal_name)
                 .map_err(repository_error)?;
             Ok::<_, Status>(())

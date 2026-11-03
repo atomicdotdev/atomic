@@ -34,7 +34,7 @@ impl Command for MemoryVerify {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         let inputs = bridge::read_memory(&repo, &self.id)?;
         let node = match bridge::load_attestation(&repo, &self.id, &inputs)? {

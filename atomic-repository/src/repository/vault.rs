@@ -25,6 +25,27 @@ impl Repository {
             .map_err(|e| RepositoryError::Database(e.to_string()))
     }
 
+    /// Ensure the vault exists, initializing it on first use.
+    ///
+    /// Vault-facing entry points call this so a repository created without a
+    /// vault (`atomic init --no-vault`) still serves `atomic vault`,
+    /// `atomic intent`, and `atomic memory` without a manual
+    /// `atomic vault init`.
+    ///
+    /// Initialization is the same idempotent path as
+    /// [`init_vault`](Self::init_vault): an existing `.vault/` working copy is
+    /// hydrated from disk and default content is installed only where nothing
+    /// exists yet.
+    ///
+    /// Returns `true` when this call created the vault.
+    pub fn ensure_vault(&self) -> Result<bool, RepositoryError> {
+        if self.has_vault()? {
+            return Ok(false);
+        }
+        self.init_vault()?;
+        Ok(true)
+    }
+
     /// Initialize the vault in this repository.
     ///
     /// Creates the vault tables in the pristine database and the
@@ -1605,6 +1626,21 @@ mod tests {
         assert!(repo.vault_dir().join("skills").exists());
         assert!(repo.vault_dir().join("intents").exists());
         assert!(repo.vault_dir().join("scratch").exists());
+    }
+
+    #[test]
+    fn test_ensure_vault_initializes_once() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        assert!(!repo.has_vault().unwrap());
+
+        assert!(repo.ensure_vault().unwrap());
+        assert!(repo.has_vault().unwrap());
+        assert!(repo.vault_dir().join("memory").exists());
+
+        // Second call is the no-op path: an initialized vault is never reset.
+        assert!(!repo.ensure_vault().unwrap());
+        assert!(repo.has_vault().unwrap());
     }
 
     #[test]

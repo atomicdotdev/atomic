@@ -52,7 +52,7 @@ impl Command for IntentAttest {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         let inputs = bridge::read_intent(&repo, &self.id)?;
 

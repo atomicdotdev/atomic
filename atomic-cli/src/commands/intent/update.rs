@@ -96,8 +96,7 @@ impl IntentUpdate {
         };
         let root = find_repository_root()?;
         let uid = {
-            let repo =
-                crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
+            let repo = crate::commands::open_readonly_repository_with_vault(&root)?;
             let inputs =
                 super::bridge::read_intent(&repo, &self.id).map_err(CliError::Repository)?;
             inputs
@@ -153,7 +152,7 @@ impl Command for IntentUpdate {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         let content = self.resolve_body()?;
         if self.status.is_none()

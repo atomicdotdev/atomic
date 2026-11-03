@@ -56,7 +56,7 @@ impl Command for IntentValidate {
             })?
         } else {
             let root = find_repository_root()?;
-            let repo = Repository::open(&root).map_err(CliError::Repository)?;
+            let repo = crate::commands::open_repository_with_vault(&root)?;
             let inputs = bridge::read_intent(&repo, &self.id_or_path)?;
             match bridge::load_attestation(&repo, &self.id_or_path, &inputs)? {
                 bridge::Attestation::Fresh(node) => *node,
