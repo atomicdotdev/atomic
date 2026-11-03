@@ -3,6 +3,19 @@ name: Provenance DSSE interoperability
 on:
   pull_request:
     branches: [dev]
+    paths-ignore:
+      - '**.md'
+      - '**.markdown'
+  # Seeds the cache that pull requests restore; see ci.yml.
+  push:
+    branches: [dev]
+    paths-ignore:
+      - '**.md'
+      - '**.markdown'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,6 +32,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Cache cargo registry and dependency builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
       - name: Install independent Ed25519 verifier
         run: python -m pip install 'cryptography==50.0.0'
       - name: Feature API tests and examples
