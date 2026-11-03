@@ -28,6 +28,8 @@ pub const PROVENANCE_GRAPH_SCHEMA: &str = "atomic.prov.graph.v1";
 pub const SESSION_TURN_SCHEMA: &str = "atomic.session.turn.v1";
 /// A [`SessionCheckpointPublication`] as JSON.
 pub const PUBLICATION_SCHEMA: &str = "atomic.session.checkpoint-publication.v1";
+/// A serialized attestation (`Attestation::serialize`: ATST magic + postcard).
+pub const ATTESTATION_SCHEMA: &str = "atomic.attestation.v1";
 
 /// `ErrorInfo.context` key naming a [`SubmitRejection`] variant.
 pub const REJECTION_REASON: &str = "reason";
@@ -347,12 +349,12 @@ pub fn session_turn_from(bytes: Option<&pb::VersionedBytes>) -> Result<SessionTu
 pub fn publication_proto(
     publication: &SessionCheckpointPublication,
 ) -> Result<pb::ProvenancePublished, String> {
+    let published_at = publication.turn.timestamp_datetime().ok_or_else(|| {
+        "session publication timestamp is outside the supported range".to_string()
+    })?;
     Ok(pb::ProvenancePublished {
         provenance_hash: Some(hash_proto(&publication.turn.provenance_hash)),
-        published_at: Some(prost_types::Timestamp {
-            seconds: publication.turn.timestamp,
-            nanos: 0,
-        }),
+        published_at: Some(super::convert::timestamp_proto(published_at)),
         manifest_hash: Some(hash_proto(&publication.manifest_hash)),
         publication: Some(versioned(
             PUBLICATION_SCHEMA,
@@ -368,9 +370,64 @@ pub fn publication_from(
         .map_err(|e| e.to_string())
 }
 
+/// An attestation's serialized bytes (`Attestation::serialize`) on the wire.
+/// What travels is exactly what the sending side saved, so the hash the
+/// owner computes over it is the hash the sender did.
+pub fn attestation_bytes(attestation: Vec<u8>) -> pb::VersionedBytes {
+    versioned(ATTESTATION_SCHEMA, attestation)
+}
+
+/// The serialized attestation a [`pb::SubmitAttestationRequest`] carries.
+pub fn attestation_from(bytes: Option<&pb::VersionedBytes>) -> Result<Vec<u8>, String> {
+    Ok(payload(bytes, ATTESTATION_SCHEMA)?.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_timestamp_preserves_milliseconds_and_original_turn_payload() {
+        for (timestamp, nanos) in [(1_792_920_379, 0), (1_792_920_379_589, 589_000_000)] {
+            let publication = SessionCheckpointPublication {
+                turn: SessionTurn {
+                    session_id: "timestamp-wire".into(),
+                    turn_number: 0,
+                    goal: None,
+                    provenance_hash: Hash::of(b"provenance"),
+                    change_hashes: Vec::new(),
+                    previous_provenance: None,
+                    timestamp,
+                    plan_id: None,
+                    todos: Vec::new(),
+                    boundary_start: None,
+                    boundary_end: None,
+                    outcome: None,
+                },
+                manifest_hash: Hash::of(b"manifest"),
+            };
+            let wire = publication_proto(&publication).unwrap();
+            let published = wire.published_at.as_ref().unwrap();
+            assert_eq!(published.seconds, 1_792_920_379);
+            assert_eq!(published.nanos, nanos);
+            assert_eq!(publication_from(&wire).unwrap(), publication);
+        }
+    }
+
+    #[test]
+    fn an_attestation_survives_the_wire_untouched() {
+        let bytes = b"ATST\x04payload".to_vec();
+        let carried = attestation_bytes(bytes.clone());
+        let back = attestation_from(Some(&carried)).unwrap();
+        assert_eq!(back, bytes);
+        // Another schema never reads as an attestation.
+        let foreign = pb::VersionedBytes {
+            schema: SESSION_TURN_SCHEMA.to_string(),
+            payload: bytes,
+        };
+        assert!(attestation_from(Some(&foreign)).is_err());
+        assert!(attestation_from(None).is_err());
+    }
 
     #[test]
     fn every_rejection_survives_the_wire() {

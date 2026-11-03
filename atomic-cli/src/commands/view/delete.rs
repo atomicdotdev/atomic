@@ -291,7 +291,7 @@ impl Delete {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     fn orphan_repo() -> (tempfile::TempDir, Repository, atomic_core::types::Hash) {
         use atomic_core::pristine::{MutTxnT, ViewScope, ViewTxnT};
@@ -450,7 +450,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_delete_existing_view() {
         use tempfile::tempdir;
 
@@ -488,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_delete_nonexistent_view() {
         use tempfile::tempdir;
 
@@ -521,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_delete_current_view() {
         use tempfile::tempdir;
 
@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_delete_with_force_integration() {
         use tempfile::tempdir;
 

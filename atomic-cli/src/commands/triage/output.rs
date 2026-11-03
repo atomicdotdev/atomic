@@ -211,7 +211,11 @@ pub fn walkthrough_text(report: &TriageReport) -> String {
         let files: Vec<String> = layer
             .files
             .iter()
-            .map(|f| f.strip_prefix("file:").unwrap_or(f).to_string())
+            .map(|f| {
+                atomic_core::kg::iri::parse_file(f)
+                    .map(|(_, path)| path)
+                    .unwrap_or_else(|_| f.clone())
+            })
             .collect();
         out.push_str(&format!("   files: {}\n", capped_list(&files)));
         if !layer.criteria.is_empty() {
@@ -695,10 +699,14 @@ fn render_walkthrough(report: &TriageReport) -> String {
 
         // The layer's code: per-file diffs scoped to this chapter's files,
         // pulled from the contributing changes' canonical diffs.
-        let layer_paths: std::collections::HashSet<&str> = layer
+        let layer_paths: std::collections::HashSet<String> = layer
             .files
             .iter()
-            .map(|f| f.strip_prefix("file:").unwrap_or(f))
+            .map(|f| {
+                atomic_core::kg::iri::parse_file(f)
+                    .map(|(_, path)| path)
+                    .unwrap_or_else(|_| f.clone())
+            })
             .collect();
         for ch_id in &layer.changes {
             let Some(change) = report.changes.iter().find(|c| &c.id == ch_id) else {
@@ -850,6 +858,7 @@ mod tests {
     /// A report fixture whose finding message carries HTML/JS metacharacters,
     /// so escaping can be asserted.
     fn sample_report() -> TriageReport {
+        let project = atomic_core::kg::project_id::ProjectId::from_base32(&"A".repeat(52)).unwrap();
         TriageReport {
             reference: "urn:atomic:triage:abc123".to_string(),
             verdict: Verdict::Blocked,
@@ -888,7 +897,7 @@ mod tests {
             changes: vec![ChangeReport {
                 id: "HASH1".to_string(),
                 message: "fix <billing> & taxes".to_string(),
-                modifies: vec!["file:src/<a>.rs".to_string()],
+                modifies: vec![atomic_core::kg::iri::mint_file(&project, "src/<a>.rs")],
                 coverage: "uncovered".to_string(),
                 files: vec![FileChange {
                     symbol: "~".to_string(),
@@ -932,7 +941,7 @@ mod tests {
                     id: "layer:src".to_string(),
                     title: "src".to_string(),
                     rationale: "reads <first> & foremost".to_string(),
-                    files: vec!["file:src/<a>.rs".to_string()],
+                    files: vec![atomic_core::kg::iri::mint_file(&project, "src/<a>.rs")],
                     tasks: vec!["urn:atomic:task:T-1".to_string()],
                     criteria: vec!["urn:atomic:ac:DEMO-A-1".to_string()],
                     changes: vec!["HASH1".to_string()],
@@ -942,7 +951,7 @@ mod tests {
                     id: "layer:cli".to_string(),
                     title: "cli".to_string(),
                     rationale: "the entry point".to_string(),
-                    files: vec!["file:cli/main.rs".to_string()],
+                    files: vec![atomic_core::kg::iri::mint_file(&project, "cli/main.rs")],
                     tasks: vec![],
                     criteria: vec![],
                     changes: vec!["HASH1".to_string()],

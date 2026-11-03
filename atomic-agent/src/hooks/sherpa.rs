@@ -74,11 +74,12 @@
 
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
-use crate::hooks::AgentHook;
+use crate::hooks::{timestamp::TimestampFormat, AgentHook};
 
 /// The Sherpa sessions directory relative to home (`~/.sherpa/sessions/`).
 const SHERPA_SESSIONS_SUBDIR: &[&str] = &[".sherpa", "sessions"];
@@ -184,13 +185,15 @@ impl SherpaHook {
         agent: &str,
         hook_type: HookType,
         input: &[u8],
-    ) -> AgentResult<(SherpaHookInput, serde_json::Value)> {
+    ) -> AgentResult<(SherpaHookInput, serde_json::Value, DateTime<Utc>)> {
         let raw: serde_json::Value =
             serde_json::from_slice(input).map_err(|e| AgentError::HookParseFailed {
                 agent: agent.to_string(),
                 hook_type: hook_type.as_str().to_string(),
                 reason: e.to_string(),
             })?;
+
+        let timestamp = TimestampFormat::Rfc3339.parse(agent, hook_type, &raw)?;
 
         let parsed: SherpaHookInput =
             serde_json::from_value(raw.clone()).map_err(|e| AgentError::HookParseFailed {
@@ -199,7 +202,7 @@ impl SherpaHook {
                 reason: e.to_string(),
             })?;
 
-        Ok((parsed, raw))
+        Ok((parsed, raw, timestamp))
     }
 }
 
@@ -220,7 +223,7 @@ impl AgentHook for SherpaHook {
             });
         }
 
-        let (parsed, raw) = Self::parse_input(self.name(), hook_type, input)?;
+        let (parsed, raw, timestamp) = Self::parse_input(self.name(), hook_type, input)?;
 
         if parsed.session_id.is_empty() {
             return Err(AgentError::HookParseFailed {
@@ -326,7 +329,7 @@ impl AgentHook for SherpaHook {
             }
         }
 
-        Ok(event)
+        Ok(event.with_timestamp(timestamp))
     }
 
     /// Sherpa is self-managed — no config file to write.

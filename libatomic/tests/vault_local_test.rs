@@ -299,3 +299,72 @@ async fn verification_uses_only_a_public_key_and_preserves_the_signed_revision()
         tonic::Code::InvalidArgument
     );
 }
+
+#[tokio::test]
+async fn memory_listing_sorts_before_the_budget_and_rejects_foreign_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    repo.init_vault().unwrap();
+    for id in ["b", "c", "a"] {
+        repo.vault_store(
+            &format!("memory/{id}.md"),
+            VaultEntryType::Memory,
+            b"A fact.".to_vec(),
+            "{}".into(),
+        )
+        .unwrap();
+    }
+    drop(repo);
+    let service = LocalService::new();
+    let reference = resolve(&service, dir.path()).await;
+    let list = |sort: proto::VaultListSort, reverse: bool, limit: Option<u32>| {
+        proto::ListVaultEntriesRequest {
+            repository: Some(reference.clone()),
+            kind: Some(proto::VaultEntityKind::Memory as i32),
+            sort: Some(sort as i32),
+            reverse,
+            budget: limit.map(|max| proto::PageBudget {
+                max_items: Some(max),
+                max_bytes: None,
+            }),
+            ..Default::default()
+        }
+    };
+    let ids = |bytes: Vec<u8>| -> Vec<String> {
+        proto::ListVaultEntriesResponse::decode(bytes.as_slice())
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect()
+    };
+    let call = |request: proto::ListVaultEntriesRequest| {
+        let service = service.clone();
+        async move {
+            service
+                .call(
+                    "/atomic.VaultService/ListVaultEntries",
+                    &request.encode_to_vec(),
+                )
+                .await
+        }
+    };
+
+    let sorted = ids(call(list(proto::VaultListSort::Id, false, None))
+        .await
+        .unwrap());
+    assert_eq!(sorted, ["a", "b", "c"]);
+    // The budget keeps the first N of the requested order, not of the default.
+    let last = ids(call(list(proto::VaultListSort::Id, true, Some(2)))
+        .await
+        .unwrap());
+    assert_eq!(last, ["c", "b"]);
+    // Memories carry no title column.
+    assert_eq!(
+        call(list(proto::VaultListSort::Title, false, None))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+}

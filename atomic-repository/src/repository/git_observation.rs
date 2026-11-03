@@ -801,7 +801,12 @@ impl GitOperationMarker {
     /// authoritative; a non-`Clean` libgit2 repository state still refuses
     /// independently, as does any unmerged index stage.
     pub(crate) fn is_active_operation_evidence(self) -> bool {
-        !matches!(self, Self::AutoMerge)
+        // `REBASE_HEAD` is advisory for the same reason: Git 2.50 leaves it
+        // behind after a completed interactive rebase (`squash`, `edit`, or
+        // any `--continue`), when `git rebase --abort` already reports "no
+        // rebase in progress". A live rebase always has `rebase-merge` or
+        // `rebase-apply` and a non-`Clean` libgit2 state.
+        !matches!(self, Self::AutoMerge | Self::RebaseHead)
     }
 
     pub(crate) fn relative_path(self) -> &'static str {
@@ -1022,8 +1027,10 @@ fn observe_metadata_head(
     let head = repository
         .find_reference("HEAD")
         .map_err(|error| ObservationError::GitIndex(format!("cannot read Git HEAD: {error}")))?;
-    if let Some(symref) = head.symbolic_target() {
-        let symref = symref.to_string();
+    let symref = head.symbolic_target().map_err(|error| {
+        ObservationError::GitIndex(format!("cannot read Git HEAD symref: {error}"))
+    })?;
+    if let Some(symref) = symref.map(str::to_string) {
         match head.resolve() {
             Ok(resolved) => resolved
                 .target()
@@ -1331,7 +1338,7 @@ pub fn observe_colocated_git_readiness(root: &Path) -> ColocatedGitReadiness {
         .map(|names| {
             names
                 .iter()
-                .flatten()
+                .filter_map(|name| name.ok().flatten())
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         })
@@ -1377,5 +1384,20 @@ mod tests {
         assert!(compute_index_tree(GitHashAlgorithm::Sha1, &[intent])
             .unwrap()
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::GitOperationMarker;
+
+    #[test]
+    fn stale_rebase_head_is_advisory_but_live_rebase_state_is_not() {
+        assert!(!GitOperationMarker::RebaseHead.is_active_operation_evidence());
+        assert!(!GitOperationMarker::AutoMerge.is_active_operation_evidence());
+        assert!(GitOperationMarker::RebaseMerge.is_active_operation_evidence());
+        assert!(GitOperationMarker::RebaseApply.is_active_operation_evidence());
+        assert!(GitOperationMarker::MergeHead.is_active_operation_evidence());
+        assert!(GitOperationMarker::Sequencer.is_active_operation_evidence());
     }
 }

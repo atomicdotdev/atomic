@@ -46,6 +46,7 @@ use super::state::{domain_status, repository_error, DaemonState};
 
 /// Tuning constants, mirroring the CLI retrieval layer's documented recipe.
 mod context_ranking {
+    use atomic_core::kg::{iri, project_id::ProjectId};
     use atomic_core::pristine::tables::tokenize_for_fts;
     use atomic_core::pristine::vault::{KgNode, VaultEntry, VaultEntryType};
     use atomic_core::types::{Base32, Hasher};
@@ -128,7 +129,7 @@ mod context_ranking {
             .vault_kg_neighbors(node_id, depth)
             .map_err(repository_error)?;
         for node in subgraph.nodes {
-            if node.kind == "memory" && node.id != node_id {
+            if node.has_type(atomic_core::kg::ontology::Class::Memory) && node.id != node_id {
                 merge_candidate(
                     candidates,
                     &node.id,
@@ -216,12 +217,12 @@ mod context_ranking {
             .and_then(|path| path.as_str())
             .filter(|path| path.starts_with("memory/") && path.ends_with(".md"))
             .map(String::from)
-            .or_else(|| legacy_memory_node_id_to_path(&node.id))
+            .or_else(|| memory_node_id_to_path(&node.id))
     }
 
     /// Legacy fallback: `memory:architecture` -> `memory/architecture.md`.
-    fn legacy_memory_node_id_to_path(node_id: &str) -> Option<String> {
-        let name = node_id.strip_prefix("memory:")?;
+    fn memory_node_id_to_path(node_id: &str) -> Option<String> {
+        let (_, name) = iri::parse_memory(node_id).ok()?;
         if name.is_empty() {
             return None;
         }
@@ -229,23 +230,12 @@ mod context_ranking {
     }
 
     /// `memory/architecture.md` -> `memory:architecture`.
-    fn memory_path_to_node_id(path: &str) -> Option<String> {
+    fn memory_path_to_node_id(project: &ProjectId, path: &str) -> Option<String> {
         let name = path.strip_prefix("memory/")?.strip_suffix(".md")?;
         if name.is_empty() {
             return None;
         }
-        Some(format!("memory:{}", name))
-    }
-
-    /// `intents/pimo-1/intent.md` -> `intent:PIMO-1` (nested paths keep
-    /// their inner segments, uppercased, matching the KG indexer).
-    fn intent_path_to_node_id(path: &str) -> String {
-        let id = path
-            .strip_prefix("intents/")
-            .and_then(|s| s.strip_suffix("/intent.md"))
-            .unwrap_or(path)
-            .to_uppercase();
-        format!("intent:{}", id)
+        Some(iri::mint_memory(project, name))
     }
 
     // Frontmatter helpers (the stored entries carry JSON-object strings).
@@ -367,7 +357,10 @@ mod context_ranking {
         }
 
         for file in files {
-            let node_id = format!("file:{}", file.trim_start_matches("./"));
+            let node_id = iri::mint_file(
+                &repo.project_id().map_err(repository_error)?,
+                file.trim_start_matches("./"),
+            );
             add_memory_neighbors(repo, &node_id, 1, &mut candidates)?;
             has_explicit_seeds = true;
         }
@@ -376,7 +369,11 @@ mod context_ranking {
         if !seed_query.trim().is_empty() {
             let pool = limit.saturating_mul(SEARCH_POOL_MULTIPLIER);
             let nodes = repo
-                .vault_kg_search_by_kind(&seed_query, pool, "memory")
+                .vault_kg_search_by_kind(
+                    &seed_query,
+                    pool,
+                    atomic_core::kg::ontology::Class::Memory,
+                )
                 .map_err(repository_error)?;
             for (rank, node) in nodes.iter().enumerate() {
                 let base = rank_score(rank);
@@ -404,7 +401,10 @@ mod context_ranking {
                 if !is_eligible_memory(&entry) {
                     continue;
                 }
-                if let Some(node_id) = memory_path_to_node_id(&meta.path) {
+                if let Some(node_id) = memory_path_to_node_id(
+                    &repo.project_id().map_err(repository_error)?,
+                    &meta.path,
+                ) {
                     merge_candidate(&mut candidates, &node_id, Some(meta.path), 0.0, false);
                 }
                 if candidates.len() >= limit {
@@ -433,7 +433,9 @@ mod context_ranking {
             .vault_list("memory/", Some(VaultEntryType::Memory))
             .map_err(repository_error)?;
         for meta in metas {
-            let Some(node_id) = memory_path_to_node_id(&meta.path) else {
+            let Some(node_id) =
+                memory_path_to_node_id(&repo.project_id().map_err(repository_error)?, &meta.path)
+            else {
                 continue;
             };
             let Some(entry) = repo.vault_retrieve(&meta.path).map_err(repository_error)? else {
@@ -497,9 +499,12 @@ mod context_ranking {
             }
         }
 
-        let node_id = intent_path_to_node_id(&intent_path);
-        // Intent -> referenced file/domain -> memory is commonly two hops.
-        add_memory_neighbors(repo, &node_id, 2, candidates)?;
+        if let Ok(node_id) = iri::mint_intent(
+            &repo.project_id().map_err(repository_error)?,
+            &summary.uid.to_uppercase(),
+        ) {
+            add_memory_neighbors(repo, &node_id, 2, candidates)?;
+        }
         Ok(())
     }
 
@@ -518,7 +523,7 @@ mod context_ranking {
             let Some(path) = candidate
                 .path
                 .clone()
-                .or_else(|| legacy_memory_node_id_to_path(&node_id))
+                .or_else(|| memory_node_id_to_path(&node_id))
             else {
                 continue;
             };
@@ -537,11 +542,11 @@ mod context_ranking {
             let memory_id =
                 frontmatter_memory_id(&entry.frontmatter_json).unwrap_or_else(|| node_id.clone());
             let name = frontmatter_name(&entry.frontmatter_json).unwrap_or_else(|| {
-                node_id
-                    .rsplit_once(':')
-                    .map(|(_, n)| n)
-                    .unwrap_or(&node_id)
-                    .to_string()
+                std::path::Path::new(&path)
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
             });
             let recency = recency_score(&entry.updated_at, now);
             let body = if include_body {
@@ -774,6 +779,86 @@ fn vault_entry_bundle(
             payload,
         })
         .map_err(|error| Status::internal(error.to_string()))
+}
+
+/// Validate a `ListVaultEntries` sort against the listing it applies to and
+/// resolve UNSPECIFIED to the kind's default key (intents by id, memories by
+/// last update). Only the intent and memory listings sort, and only by
+/// columns they carry.
+fn listing_sort(kind: Option<Kind>, raw: Option<i32>) -> Result<VaultListSort, Status> {
+    use VaultListSort as S;
+    let sort = raw
+        .map(|raw| {
+            S::try_from(raw).map_err(|_| Status::invalid_argument("unknown vault list sort"))
+        })
+        .transpose()?
+        .unwrap_or(S::Unspecified);
+    match (kind, sort) {
+        (Some(Kind::Intent), S::Unspecified) => Ok(S::Id),
+        (Some(Kind::Memory), S::Unspecified) => Ok(S::Updated),
+        (_, S::Unspecified) => Ok(S::Unspecified),
+        (Some(Kind::Intent), S::Updated | S::About) | (Some(Kind::Memory), S::Title) => {
+            Err(Status::invalid_argument(format!(
+                "{} is not a sort key for this vault listing",
+                sort.as_str_name()
+            )))
+        }
+        (Some(Kind::Intent | Kind::Memory), _) => Ok(sort),
+        _ => Err(Status::invalid_argument(
+            "sort applies only to the intent and memory listings",
+        )),
+    }
+}
+
+/// Order an intent or memory listing by an already-validated key, with id as
+/// the tiebreak. `reverse` flips the key, not the tiebreak.
+fn sort_listing(entries: &mut [VaultEntry], sort: VaultListSort, reverse: bool) {
+    use VaultListSort as S;
+    fn attested_rank(entry: &VaultEntry) -> u8 {
+        match entry.attested.as_deref() {
+            Some("fresh") => 0,
+            Some("stale") => 1,
+            _ => 2,
+        }
+    }
+    fn verifies_rank(entry: &VaultEntry) -> u8 {
+        match entry.verifies.as_deref() {
+            Some("yes") => 0,
+            Some("no") => 1,
+            _ => 2,
+        }
+    }
+    // Intents carry their status and kind in `status_label`/`manifest_kind`,
+    // memories in `memory_status`/`memory_kind`; each entry has one pair.
+    fn status(entry: &VaultEntry) -> Option<&str> {
+        entry
+            .status_label
+            .as_deref()
+            .or(entry.memory_status.as_deref())
+    }
+    fn kind(entry: &VaultEntry) -> Option<&str> {
+        entry
+            .manifest_kind
+            .as_deref()
+            .or(entry.memory_kind.as_deref())
+    }
+    if sort == S::Unspecified {
+        return;
+    }
+    entries.sort_by(|a, b| {
+        let ord = match sort {
+            S::Unspecified | S::Id => a.id.cmp(&b.id),
+            // RFC 3339, so lexical == chronological; newest first.
+            S::Updated => b.updated_at_label.cmp(&a.updated_at_label),
+            S::Title => a.title.cmp(&b.title),
+            S::Status => status(a).cmp(&status(b)),
+            S::Kind => kind(a).cmp(&kind(b)),
+            S::About => a.about_count.cmp(&b.about_count),
+            S::Attested => attested_rank(a).cmp(&attested_rank(b)),
+            S::Verifies => verifies_rank(a).cmp(&verifies_rank(b)),
+        };
+        if reverse { ord.reverse() } else { ord }.then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 /// The RAW intent attestation sources (the bridge's dual-read inputs):
@@ -1128,6 +1213,21 @@ impl vault_service_server::VaultService for VaultImpl {
         let response = match kind {
             Kind::Intent => {
                 let title = request.title.clone();
+                let intent_kind = if request.review_target.is_some() {
+                    "review".to_string()
+                } else {
+                    request
+                        .intent_kind
+                        .clone()
+                        .unwrap_or_else(|| "feature".into())
+                };
+                if !atomic_canonical::vocab::is_known_intent_kind(&intent_kind) {
+                    return Err(Status::invalid_argument(format!(
+                        "unknown intent kind '{intent_kind}'"
+                    )));
+                }
+                let review_target = request.review_target.clone();
+                let created_kind = intent_kind.clone();
                 let handle_for_task = handle.clone();
                 let result = tokio::task::spawn_blocking({
                     let handle = handle_for_task;
@@ -1141,15 +1241,25 @@ impl vault_service_server::VaultService for VaultImpl {
                                 labels: Vec::new(),
                                 session_id: None,
                                 turn_id: None,
-                                kind: None,
+                                kind: (intent_kind != "feature").then_some(intent_kind),
                             })
                             .map_err(repository_error)?;
                         // The CLI's `intent new` overwrites the legacy
                         // positional scaffold with the directive scaffold
                         // through the same update path — the daemon must
                         // produce the identical artifact.
-                        let scaffold =
-                            atomic_repository::FEATURE_SCAFFOLD.replace("{id}", &created.uid);
+                        let scaffold = if let Some(target) = review_target {
+                            let target = target.trim();
+                            let target = if target.starts_with("urn:") {
+                                target.to_string()
+                            } else {
+                                format!("urn:atomic:intent:{target}")
+                            };
+                            atomic_repository::REVIEW_SCAFFOLD.replace("{target}", &target)
+                        } else {
+                            atomic_repository::FEATURE_SCAFFOLD.to_string()
+                        }
+                        .replace("{id}", &created.uid);
                         repo.vault_intent_update(
                             &created.id,
                             IntentUpdateOptions {
@@ -1176,6 +1286,7 @@ impl vault_service_server::VaultService for VaultImpl {
                         linked: Vec::new(),
                         vault_path: Some(format!(".vault/{}", result.intent_file)),
                         priority: Some("medium".to_string()),
+                        manifest_kind: Some(created_kind),
                         ..Default::default()
                     }),
                     meta: response_meta(&meta),
@@ -1772,6 +1883,8 @@ impl vault_service_server::VaultService for VaultImpl {
             raw.parse::<VaultEntryType>()
                 .map_err(|_| Status::invalid_argument("unknown vault entry type"))?;
         }
+        let sort = listing_sort(kind, request.sort)?;
+        let reverse = request.reverse;
         let reference = request
             .repository
             .as_ref()
@@ -1836,16 +1949,20 @@ impl vault_service_server::VaultService for VaultImpl {
                     let verifier = resolve_listing_verifier(&identity)?;
                     let manifest = repo.vault_manifest().map_err(repository_error)?;
                     let infos = repo.vault_intent_list(None).map_err(repository_error)?;
-                    let entries = infos
+                    let mut entries = infos
                         .into_iter()
                         .map(|info| {
-                            // The manifest kind tag (a manifest read, never a
-                            // lift); a row missing from the manifest degrades
-                            // to the default "feature".
+                            // Prefer the stored intent's explicit kind over a
+                            // stale manifest; missing data falls back to feature.
                             let manifest_kind = manifest
                                 .intents
                                 .get(&info.id)
-                                .map(|summary| summary.kind.clone())
+                                .map(|summary| {
+                                    repo.vault_intent_effective_kind(
+                                        &summary.vault_path,
+                                        &summary.kind,
+                                    )
+                                })
                                 .unwrap_or_else(|| "feature".to_string());
                             // The attestation columns: a read/attestation
                             // failure for a SINGLE intent degrades that row's
@@ -1888,7 +2005,8 @@ impl vault_service_server::VaultService for VaultImpl {
                                 ..Default::default()
                             }
                         })
-                        .collect();
+                        .collect::<Vec<_>>();
+                    sort_listing(&mut entries, sort, reverse);
                     Ok::<_, Status>(ListVaultEntriesResponse {
                         entries,
                         next_cursor: None,
@@ -1920,12 +2038,18 @@ impl vault_service_server::VaultService for VaultImpl {
                         })
                         .collect();
                     items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                    if let Some(limit) = limit {
-                        items.truncate(limit);
+                    // The default order needs only (id, updated), so the
+                    // budget cuts before the per-row attestation work; any
+                    // other key needs every row's computed columns first.
+                    let presorted = sort == VaultListSort::Updated && !reverse;
+                    if presorted {
+                        if let Some(limit) = limit {
+                            items.truncate(limit);
+                        }
                     }
-                    let entries = items
+                    let mut entries = items
                         .iter()
-                        .map(|(id, _)| {
+                        .map(|(id, updated)| {
                             // kind/status/about degrade to "–"/0 when a single
                             // memory cannot be read or lifted — never the list.
                             let degraded = (
@@ -2016,10 +2140,17 @@ impl vault_service_server::VaultService for VaultImpl {
                                 about_count: Some(about),
                                 attested: Some(attested.to_string()),
                                 verifies: Some(verifies.to_string()),
+                                updated_at_label: Some(updated.clone()),
                                 ..Default::default()
                             }
                         })
-                        .collect();
+                        .collect::<Vec<_>>();
+                    if !presorted {
+                        sort_listing(&mut entries, sort, reverse);
+                        if let Some(limit) = limit {
+                            entries.truncate(limit);
+                        }
+                    }
                     Ok(ListVaultEntriesResponse {
                         entries,
                         next_cursor: None,
@@ -3338,8 +3469,130 @@ pub struct KnowledgeImpl {
     pub state: Arc<DaemonState>,
 }
 
+fn query_view_name(
+    repo: &atomic_repository::Repository,
+    requested: Option<&ViewRef>,
+) -> Result<String, Status> {
+    let Some(requested) = requested else {
+        let working_copy = repo.require_working_copy_id().map_err(repository_error)?;
+        return repo
+            .desired_view_name(working_copy)
+            .map_err(repository_error);
+    };
+    let name = match requested.name.as_deref().filter(|name| !name.is_empty()) {
+        Some(name) => name.to_string(),
+        None if !requested.view_id.is_empty() => repo
+            .list_views()
+            .map_err(repository_error)?
+            .into_iter()
+            .find(|name| super::sandbox_grants::view_ref_id(name) == requested.view_id)
+            .ok_or_else(|| domain_status(ErrorCode::View, "unknown query view ID"))?,
+        None => {
+            return Err(domain_status(
+                ErrorCode::InvalidArgument,
+                "query view must name a view or ID",
+            ))
+        }
+    };
+    if !requested.view_id.is_empty()
+        && requested.view_id != super::sandbox_grants::view_ref_id(&name)
+    {
+        return Err(domain_status(
+            ErrorCode::InvalidArgument,
+            "query view name and ID disagree",
+        ));
+    }
+    Ok(name)
+}
+
 #[tonic::async_trait]
 impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
+    async fn get_project_identity(
+        &self,
+        request: Request<GetProjectIdentityRequest>,
+    ) -> Result<Response<GetProjectIdentityResponse>, Status> {
+        let request = request.into_inner();
+        let reference = request
+            .repository
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("repository required"))?;
+        let handle = self.state.resolve(reference)?;
+        self.state.log_rpc("GetProjectIdentity", Some(&handle));
+        let gate = handle.exclusive_owned().await;
+        let response = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            let repo = handle.repository_readonly()?;
+            let record = repo
+                .project_identity()
+                .map_err(repository_error)?
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "MissingProjectIdentity; run atomic query reindex --full",
+                    )
+                })?;
+            let project = record
+                .project_id()
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let object: serde_json::Value = serde_json::from_slice(&record.object)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let minted = serde_json::to_value(record.mint_reason)
+                .map_err(|e| Status::internal(e.to_string()))?;
+            Ok::<_, Status>(GetProjectIdentityResponse {
+                project: project.to_base32(),
+                urn: project.to_urn(),
+                created: record.created_at,
+                minted: minted.as_str().unwrap_or_default().to_owned(),
+                signed_by: object
+                    .get("atomic:issuer")
+                    .and_then(|v| v.get("@id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                hash: record.hash.to_base32(),
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        Ok(Response::new(response))
+    }
+
+    async fn get_workflow_snapshot(
+        &self,
+        request: Request<GetWorkflowSnapshotRequest>,
+    ) -> Result<Response<GetWorkflowSnapshotResponse>, Status> {
+        let request = request.into_inner();
+        let reference = request
+            .repository
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("repository required"))?;
+        let handle = self.state.resolve(reference)?;
+        self.state.log_rpc("GetWorkflowSnapshot", Some(&handle));
+        let gate = handle.exclusive_owned().await;
+        let response = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            let repo = handle.repository_readonly()?;
+            let snapshot = repo.workflow_snapshot().map_err(repository_error)?;
+            Ok::<_, Status>(GetWorkflowSnapshotResponse {
+                api_version: 1,
+                generation: snapshot.generation,
+                ontology_version: snapshot.ontology_version.to_owned(),
+                identity: snapshot.identity,
+                nodes: snapshot
+                    .nodes
+                    .into_iter()
+                    .map(super::services_query::kg_node_proto)
+                    .collect(),
+                edges: snapshot
+                    .edges
+                    .into_iter()
+                    .map(super::services_query::kg_edge_proto)
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|e| Status::internal(e.to_string()))??;
+        Ok(Response::new(response))
+    }
+
     async fn query_graph(
         &self,
         request: Request<QueryGraphRequest>,
@@ -3358,35 +3611,91 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
             request.limit as usize
         };
         let root = handle.root.clone();
+        let requested_view = request.view;
+        let content_limit = if request.limit == 0 {
+            30
+        } else {
+            request.limit as usize
+        };
         let response = tokio::task::spawn_blocking(move || match query {
+            QueryOneof::ContentSearch(search) => {
+                let repo = handle.repository_readonly()?;
+                let view = query_view_name(&repo, requested_view.as_ref())?;
+                let result = repo
+                    .search_content_paths_on_view(
+                        &view,
+                        &search.query,
+                        atomic_repository::ContentSearchOptions {
+                            path_filter: search.path_filter,
+                            file_type: search.file_type,
+                            exclude_type: search.exclude_type,
+                            max_results: Some(
+                                search
+                                    .max_results
+                                    .map(|n| n as usize)
+                                    .unwrap_or(content_limit),
+                            ),
+                            case_insensitive: search.case_insensitive,
+                        },
+                        &search.paths,
+                    )
+                    .map_err(repository_error)?;
+                Ok(QueryGraphResponse {
+                    api_version: 1,
+                    hits: result
+                        .matches
+                        .iter()
+                        .map(|m| ContentHit {
+                            path: m.path.clone(),
+                            snippet: m.line_content.clone(),
+                            line: Some(m.line_number as u64),
+                            score: None,
+                        })
+                        .collect(),
+                    content_result: Some(ContentSearchResult {
+                        matches: result
+                            .matches
+                            .into_iter()
+                            .map(|m| ContentMatch {
+                                path: m.path,
+                                line_number: m.line_number,
+                                line_content: m.line_content,
+                                byte_offset: m.byte_offset,
+                                submatch_start: m.submatch_start as u64,
+                                submatch_end: m.submatch_end as u64,
+                            })
+                            .collect(),
+                        total_matches: result.total_matches as u64,
+                        dir_facets: result
+                            .dir_facets
+                            .into_iter()
+                            .map(|(path, count)| ContentDirectoryFacet {
+                                path,
+                                count: count as u64,
+                            })
+                            .collect(),
+                    }),
+                    ..Default::default()
+                })
+            }
             QueryOneof::KgSearch(search) => {
-                let repo = handle.repository()?;
-                // The candidate pool the CLI's --pool names (default 5000)
-                // — the pool is what lets lower-scored kinds survive the
-                // diversity selection, so it rides the request.
-                let pool = search.pool.map(|pool| pool as usize).unwrap_or(5000);
-                let nodes = if let Some(kind_filter) =
-                    search.kind.clone().filter(|kind| !kind.is_empty())
-                {
-                    // The --kind form: search the full pool, keep the
-                    // kind's nodes, take the limit AFTER filtering — the
-                    // local post-filter order.
-                    let kind = kind_filter.to_lowercase();
-                    repo.vault_kg_search(&search.query, pool, Some(pool))
-                        .map_err(repository_error)?
-                        .into_iter()
-                        .filter(|node| node.kind.to_lowercase() == kind)
-                        .take(limit)
-                        .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
-                        .collect::<Vec<_>>()
-                } else {
-                    repo.vault_kg_search(&search.query, limit, Some(pool))
-                        .map_err(repository_error)?
-                        .into_iter()
-                        .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
-                        .collect()
-                };
+                let repo = handle.repository_readonly()?;
+                let view = query_view_name(&repo, requested_view.as_ref())?;
+                let nodes = repo
+                    .vault_kg_search_on_view_with_kind(
+                        &view,
+                        &search.query,
+                        limit,
+                        Some(search.pool.map(|pool| pool as usize).unwrap_or(5000)),
+                        search.kind.as_deref(),
+                    )
+                    .map_err(repository_error)?
+                    .into_iter()
+                    .map(crate::daemon::services_query::kg_node_proto)
+                    .collect();
                 Ok::<_, Status>(QueryGraphResponse {
+                    api_version: 1,
+                    callers: Vec::new(),
                     nodes,
                     edges: Vec::new(),
                     hits: Vec::new(),
@@ -3397,16 +3706,19 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     calls_present: false,
                     ask_result: None,
                     ask_elapsed_ms: None,
+                    content_result: None,
                 })
             }
             QueryOneof::Neighbors(neighbors) => {
-                let repo = handle.repository()?;
+                let repo = handle.repository_readonly()?;
                 let (nodes, edges) = crate::daemon::services_query::neighbors_impl(
                     &repo,
                     &neighbors.node_id,
                     neighbors.depth.unwrap_or(1) as u8,
                 )?;
                 Ok(QueryGraphResponse {
+                    api_version: 1,
+                    callers: Vec::new(),
                     nodes,
                     edges,
                     hits: Vec::new(),
@@ -3417,6 +3729,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     calls_present: false,
                     ask_result: None,
                     ask_elapsed_ms: None,
+                    content_result: None,
                 })
             }
             QueryOneof::Entity(entity) => {
@@ -3431,12 +3744,12 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                         )
                     })?;
                 let mut registry = atomic_semantic::ParserRegistry::new();
-                let entities = registry.extract(&source, &entity.node_id);
+                let entities = registry.extract(&entity.node_id, &source);
                 let nodes = entities
                     .into_iter()
                     .map(|entity| KgNode {
                         id: format!("entity:{}:{}:{}", entity.file, entity.name, entity.line),
-                        node_type: entity.kind.to_string(),
+                        types: Vec::new(),
                         name: Some(entity.name.clone()),
                         data: entity.signature.clone().map(String::into_bytes),
                         score: None,
@@ -3444,6 +3757,8 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     })
                     .collect();
                 Ok(QueryGraphResponse {
+                    api_version: 1,
+                    callers: Vec::new(),
                     nodes,
                     edges: Vec::new(),
                     hits: Vec::new(),
@@ -3454,57 +3769,27 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     calls_present: false,
                     ask_result: None,
                     ask_elapsed_ms: None,
+                    content_result: None,
                 })
             }
             QueryOneof::Callers(callers) => {
                 let repo = handle.repository_readonly()?;
-                // The local body's domain: the 1-hop neighbors subgraph,
-                // filtered to CALLS edges pointing at the entity.
-                let (nodes, edges) =
-                    crate::daemon::services_query::neighbors_impl(&repo, &callers.node_id, 1)?;
-                let subgraph = repo
-                    .vault_kg_neighbors(&callers.node_id, 1)
-                    .map_err(repository_error)?;
-                let calls_present = subgraph
-                    .edges
-                    .iter()
-                    .any(|edge| edge.kind.to_uppercase() == "CALLS");
-                // The caller edges + the caller nodes (their summaries ride
-                // the nodes so the CLI renders the caller lines).
-                let caller_edges: Vec<crate::atomic::KgEdge> = subgraph
-                    .edges
-                    .iter()
-                    .filter(|edge| {
-                        edge.kind.to_uppercase() == "CALLS" && edge.to_id == callers.node_id
+                let view = query_view_name(&repo, requested_view.as_ref())?;
+                let callers = repo
+                    .query_callers_on_view(&view, &callers.node_id)
+                    .map_err(repository_error)?
+                    .into_iter()
+                    .map(|caller| crate::atomic::CodeCaller {
+                        path: caller.path,
+                        name: caller.name,
+                        line: caller.line,
+                        summary: caller.summary,
                     })
-                    .map(|edge| crate::daemon::services_query::kg_edge_proto(edge.clone()))
                     .collect();
-                let caller_ids: std::collections::HashSet<&str> = subgraph
-                    .edges
-                    .iter()
-                    .filter(|edge| {
-                        edge.kind.to_uppercase() == "CALLS" && edge.to_id == callers.node_id
-                    })
-                    .map(|edge| edge.from_id.as_str())
-                    .collect();
-                let caller_nodes: Vec<crate::atomic::KgNode> = subgraph
-                    .nodes
-                    .iter()
-                    .filter(|node| caller_ids.contains(node.id.as_str()))
-                    .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
-                    .collect();
-                let _ = (nodes, edges);
                 Ok(QueryGraphResponse {
-                    nodes: caller_nodes,
-                    edges: caller_edges,
-                    hits: Vec::new(),
-                    answer: None,
-                    plan_result: None,
-                    snapshot: None,
-                    graph_collected: None,
-                    calls_present,
-                    ask_result: None,
-                    ask_elapsed_ms: None,
+                    api_version: 1,
+                    callers,
+                    ..Default::default()
                 })
             }
             QueryOneof::GraphSlice(graph) => {
@@ -3531,25 +3816,30 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                 } else {
                     kinds
                         .split(',')
-                        .map(|kind| kind.trim().to_lowercase())
+                        .map(|kind| kind.trim().to_owned())
                         .filter(|kind| !kind.is_empty())
                         .collect()
                 };
-                let kind_allowed = |kind: &str| -> bool {
-                    allow_all || allowed_kinds.contains(&kind.to_lowercase())
-                };
+                let kind_allowed =
+                    |kind: &str| -> bool { allow_all || allowed_kinds.contains(kind) };
                 let changes_per_seed = graph.changes_per_seed.unwrap_or(5) as usize;
                 let cap_changes = changes_per_seed > 0;
                 // 1. Seed: search, filtered to allowed kinds, take limit.
+                // Scoped to the requested (or working-copy) view so the seed
+                // reads recorded bytes through the same closure the content
+                // and callers branches use.
+                let view = query_view_name(&repo, requested_view.as_ref())?;
                 let seed_nodes: Vec<atomic_core::pristine::vault::KgNode> = repo
-                    .vault_kg_search(&query, limit * 3, None)
+                    .vault_kg_search_on_view(&view, &query, limit * 3, None)
                     .map_err(repository_error)?
                     .into_iter()
-                    .filter(|node| kind_allowed(&node.kind))
+                    .filter(|node| node.types.iter().any(|class| kind_allowed(class)))
                     .take(limit)
                     .collect();
                 if seed_nodes.is_empty() {
                     return Ok(QueryGraphResponse {
+                        api_version: 1,
+                        callers: Vec::new(),
                         nodes: Vec::new(),
                         edges: Vec::new(),
                         hits: Vec::new(),
@@ -3560,6 +3850,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                         calls_present: false,
                         ask_result: None,
                         ask_elapsed_ms: None,
+                        content_result: None,
                     });
                 }
                 // 2. Expand: per-seed neighbor subgraphs, kind-filtered,
@@ -3580,10 +3871,10 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                         .map_err(repository_error)?;
                     let mut changes_for_seed: usize = 0;
                     for node in subgraph.nodes {
-                        if !kind_allowed(&node.kind) {
+                        if !node.types.iter().any(|class| kind_allowed(class)) {
                             continue;
                         }
-                        if node.kind == "change" && cap_changes {
+                        if node.has_type(atomic_core::kg::ontology::Class::Change) && cap_changes {
                             if node_map.contains_key(&node.id) {
                                 continue;
                             }
@@ -3595,20 +3886,18 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                         node_map.entry(node.id.clone()).or_insert(node);
                     }
                     for edge in subgraph.edges {
-                        let from_kind_ok = allow_all || {
-                            let prefix = edge.from_id.split(':').next().unwrap_or("");
-                            kind_allowed(prefix)
-                        };
-                        let to_kind_ok = allow_all || {
-                            let prefix = edge.to_id.split(':').next().unwrap_or("");
-                            kind_allowed(prefix)
-                        };
+                        let from_kind_ok = node_map.contains_key(&edge.from_id);
+                        let to_kind_ok = node_map.contains_key(&edge.to_id);
                         if from_kind_ok
                             && to_kind_ok
                             && (node_map.contains_key(&edge.from_id)
                                 || node_map.contains_key(&edge.to_id))
                         {
-                            let key = (edge.from_id.clone(), edge.to_id.clone(), edge.kind.clone());
+                            let key = (
+                                edge.from_id.clone(),
+                                edge.to_id.clone(),
+                                edge.kind.to_string(),
+                            );
                             if edge_set.insert(key) {
                                 all_edges.push(edge);
                             }
@@ -3653,7 +3942,11 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                 let _ = &collected;
                 collected = nodes.len() as u32;
                 let _ = &collected;
+                repo.enrich_workflow_usage(&mut nodes)
+                    .map_err(repository_error)?;
                 Ok(QueryGraphResponse {
+                    api_version: 1,
+                    callers: Vec::new(),
                     nodes: nodes
                         .iter()
                         .map(|node| crate::daemon::services_query::kg_node_proto(node.clone()))
@@ -3670,6 +3963,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     calls_present: false,
                     ask_result: None,
                     ask_elapsed_ms: None,
+                    content_result: None,
                 })
             }
             QueryOneof::Plan(plan) => {
@@ -3680,11 +3974,16 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                 let repo = handle.repository()?;
                 let plan_json = String::from_utf8_lossy(&plan.plan_json).into_owned();
                 let parsed = atomic_repository::parse_plan(&plan_json).map_err(repository_error)?;
-                let result =
-                    atomic_repository::execute_plan(&repo, &parsed).map_err(repository_error)?;
+                // The plan's kg_search step reads the requested (or
+                // working-copy) view's closure, matching the other branches.
+                let view = query_view_name(&repo, requested_view.as_ref())?;
+                let result = atomic_repository::execute_plan_on_view(&repo, &view, &parsed)
+                    .map_err(repository_error)?;
                 let payload = serde_json::to_vec(&result)
                     .map_err(|error| Status::internal(format!("plan encode: {error}")))?;
                 Ok(QueryGraphResponse {
+                    api_version: 1,
+                    callers: Vec::new(),
                     nodes: Vec::new(),
                     edges: Vec::new(),
                     hits: Vec::new(),
@@ -3695,6 +3994,7 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     calls_present: false,
                     ask_result: None,
                     ask_elapsed_ms: None,
+                    content_result: None,
                 })
             }
             QueryOneof::RagAsk(ask) => {
@@ -3727,6 +4027,8 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                 let payload = serde_json::to_vec(&result)
                     .map_err(|error| Status::internal(format!("ask encode: {error}")))?;
                 Ok(QueryGraphResponse {
+                    api_version: 1,
+                    callers: Vec::new(),
                     nodes: Vec::new(),
                     edges: Vec::new(),
                     hits: Vec::new(),
@@ -3740,12 +4042,9 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                         payload,
                     }),
                     ask_elapsed_ms: Some(elapsed.as_millis() as u64),
+                    content_result: None,
                 })
             }
-            other => Err(domain_status(
-                ErrorCode::InvalidArgument,
-                format!("query kind {other:?} lands with its slice"),
-            )),
         })
         .await
         .map_err(|e| Status::internal(e.to_string()))??;
@@ -3761,10 +4060,28 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
             .unwrap_or(KnowledgeMaintainAction::Unspecified);
         let handle = self.state.resolve(request.repository.as_ref().unwrap())?;
         self.state.log_rpc("MaintainKnowledgeGraph", Some(&handle));
-        let gate_handle = handle.clone();
-        let _gate = gate_handle.exclusive().await;
+        let gate = handle.exclusive_owned().await;
+        if action == KnowledgeMaintainAction::Reindex && !request.signer_auth_headers.is_empty() {
+            let repo = handle.repository()?;
+            let (_, remote) = repo.get_default_remote().map_err(repository_error)?;
+            if request.signer_remote_url.as_deref() != Some(remote.url.as_str()) {
+                return Err(Status::failed_precondition(
+                    "signer discovery remote changed; retry reindex with fresh credentials",
+                ));
+            }
+            let mut config = atomic_remote::HttpRemoteConfig::new();
+            for (name, value) in &request.signer_auth_headers {
+                config = config.with_header(name, value);
+            }
+            if let Some(client) = crate::signer_refresh::client_for_remote(&remote.url, &config) {
+                crate::signer_refresh::refresh(&repo, &client)
+                    .await
+                    .map_err(repository_error)?;
+            }
+        }
         let meta = request.meta.clone();
         let response = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
             let (repo, workspace) =
                 handle.workspace_repository(atomic_repository::WorkspaceTxnMode::Reconcile)?;
             let working_copy = workspace.working_copy();
@@ -3797,31 +4114,16 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
                     }
                     // The CLI --rebuild flag rides the scope field ("rebuild").
                     if request.scope.as_deref() == Some("rebuild") {
-                        repo.kg_clear_derived().map_err(repository_error)?;
+                        repo.rebuild_kg(true).map_err(repository_error)?;
                     }
-                    let mut total: u64 = 0;
-                    total += repo.kg_enrich_views().map_err(repository_error)? as u64;
-                    total += repo
-                        .kg_enrich_files(working_copy)
-                        .map_err(repository_error)? as u64;
-                    total += repo
-                        .kg_enrich_modules(working_copy)
-                        .map_err(repository_error)? as u64;
-                    total += repo
-                        .kg_enrich_changes(working_copy)
-                        .map_err(repository_error)? as u64;
-                    total += repo
-                        .kg_enrich_entities(working_copy)
-                        .map_err(repository_error)? as u64;
-                    total += repo
-                        .kg_enrich_includes(working_copy)
-                        .map_err(repository_error)? as u64;
-                    total += repo
-                        .kg_enrich_calls(working_copy)
-                        .map_err(repository_error)? as u64;
-                    total
+                    repo.kg_enrich_from_vcs(working_copy)
+                        .map_err(repository_error)?
+                        .total() as u64
                 }
                 KnowledgeMaintainAction::Reindex => {
+                    if request.scope.as_deref() == Some("full") {
+                        repo.rebuild_kg(true).map_err(repository_error)?;
+                    }
                     repo.vault_reindex_kg().map_err(repository_error)? as u64
                 }
                 // `atomic query embed` — the provider resolves from the
@@ -4172,18 +4474,19 @@ impl provenance_service_server::ProvenanceService for ProvenanceImpl {
                             .unwrap_or(0)
                     };
                     intent_counts.push(intent_count as u32);
+                    let started_at =
+                        atomic_core::types::timestamp::epoch_datetime(record.started_at)
+                            .map(super::convert::timestamp_proto);
+                    let ended_at = record
+                        .ended_at
+                        .and_then(atomic_core::types::timestamp::epoch_datetime)
+                        .map(super::convert::timestamp_proto);
                     SessionSummary {
                         session_id: record.session_id,
                         view: record.view_name,
                         turn_count: record.turn_count.max(turns.len() as u32),
-                        started_at: Some(prost_types::Timestamp {
-                            seconds: record.started_at,
-                            nanos: 0,
-                        }),
-                        ended_at: record.ended_at.map(|ended| prost_types::Timestamp {
-                            seconds: ended,
-                            nanos: 0,
-                        }),
+                        started_at,
+                        ended_at,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -4715,7 +5018,9 @@ async fn export_provenance_impl(
                 ),
             ));
         }
-        graphs.sort_by_key(|(_, graph)| std::cmp::Reverse(graph.timestamp));
+        graphs.sort_by_key(|(_, graph)| {
+            std::cmp::Reverse(atomic_core::types::timestamp::epoch_millis(graph.timestamp))
+        });
         let mut bundles = Vec::with_capacity(graphs.len());
         for (graph_hash, graph) in &graphs {
             let (input, previous) = provenance_map_input(&repo, graph, &change_hash, &person_did);

@@ -52,7 +52,7 @@ pub struct ChangeCmd {
     /// Output format.
     ///
     /// Controls how change details are displayed:
-    /// - default: Full details with formatting
+    /// - default: Tree of metadata, changed paths and recorded provenance
     /// - short: Compact single-line format
     /// - json: Machine-readable JSON
     #[arg(short = 'f', long = "format", value_enum, default_value = "default")]
@@ -64,9 +64,9 @@ pub struct ChangeCmd {
     #[arg(long = "show-deps")]
     pub show_deps: bool,
 
-    /// Show graph_op details.
+    /// Expand per-path graph operation summaries in the tree.
     ///
-    /// When enabled, shows detailed information about each graph_op.
+    /// When enabled, includes coalesced graph operation details beneath each path.
     #[arg(long = "show-hunks")]
     pub show_hunks: bool,
 
@@ -313,192 +313,7 @@ impl ChangeCmd {
         sequence: Option<u64>,
         data: &ChangeRenderData,
     ) -> String {
-        let mut output = String::new();
-        let hash_len = self.get_hash_length();
-
-        // Change header
-        let hash_str = format_hash_with_length(hash, hash_len);
-        output.push_str(&format!(
-            "{} {}",
-            style_hash("change"),
-            style_hash(&hash_str)
-        ));
-        if let Some(seq) = sequence {
-            output.push_str(&format!(" {}", hint(&format!("(#{})", seq))));
-        }
-        output.push('\n');
-
-        // Authors
-        for author in &change.hashed.header.authors {
-            let author_line = format_author(author);
-            output.push_str(&format!("Author: {}\n", style_author(&author_line)));
-        }
-
-        // Timestamp
-        let time_str = format_timestamp(&change.hashed.header.timestamp);
-        output.push_str(&format!("Date:   {}\n", style_timestamp(&time_str)));
-
-        // Message
-        output.push('\n');
-        for line in change.hashed.header.message.lines() {
-            output.push_str(&format!("    {}\n", line));
-        }
-
-        // Description
-        if let Some(ref desc) = change.hashed.header.description {
-            output.push('\n');
-            for line in desc.lines() {
-                output.push_str(&format!("    {}\n", line));
-            }
-        }
-
-        // Dependencies
-        if !change.hashed.dependencies.is_empty() {
-            output.push('\n');
-            output.push_str(&format!(
-                "Dependencies: {}\n",
-                change.hashed.dependencies.len()
-            ));
-
-            for dep_hash in &change.hashed.dependencies {
-                let dep_hash_str = format_hash_with_length(dep_hash, 12);
-                let dep_msg = if self.show_deps {
-                    data.dep_messages
-                        .get(dep_hash)
-                        .cloned()
-                        .unwrap_or_else(|| "[unable to load]".to_string())
-                } else {
-                    String::new()
-                };
-
-                if self.show_deps {
-                    output.push_str(&format!("  {}... - {}\n", dep_hash_str, dep_msg));
-                } else {
-                    output.push_str(&format!("  {}...\n", dep_hash_str));
-                }
-            }
-        }
-
-        // Git import metadata (if present)
-        if let Some(ref unhashed) = change.unhashed {
-            if let Some(git) = unhashed.get("git") {
-                output.push('\n');
-                output.push_str("Git Import:\n");
-                if let Some(repo) = git.get("repository").and_then(|v| v.as_str()) {
-                    output.push_str(&format!("  Repository: {}\n", repo));
-                }
-                if let Some(sha) = git.get("sha").and_then(|v| v.as_str()) {
-                    output.push_str(&format!("  Commit: {}\n", &sha[..12.min(sha.len())]));
-                }
-                if git
-                    .get("empty_commit")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    output.push_str(&format!("  {}\n", hint("(empty commit)")));
-                }
-                if git
-                    .get("empty_merge")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    output.push_str(&format!("  {}\n", hint("(merge commit)")));
-                }
-            }
-        }
-
-        if let Ok(Some(evidence)) = extract_move_evidence(change) {
-            output.push('\n');
-            output.push_str("Move evidence:\n");
-            for moved in evidence.authoritative_moves {
-                let authority = match moved.authority {
-                    MoveAuthority::ExplicitAtomicMove => "explicit atomic move",
-                    MoveAuthority::StableInodeProjection => "stable inode projection",
-                };
-                output.push_str(&format!(
-                    "  authoritative: {} → {} ({})\n",
-                    moved.old_path, moved.new_path, authority
-                ));
-            }
-            for moved in evidence.probable_moves {
-                let basis = match moved.basis {
-                    MoveBasis::ByteIdentity => "byte identity",
-                    MoveBasis::ContentSimilarity => "content similarity",
-                };
-                output.push_str(&format!(
-                    "  probable: {} → {} ({}.{:02}%, {})\n",
-                    moved.old_path,
-                    moved.new_path,
-                    moved.score / 100,
-                    moved.score % 100,
-                    basis
-                ));
-            }
-            for loss in evidence.loss_notes {
-                match loss {
-                    LossNote::RenameUnresolved { candidates } => {
-                        output.push_str("  loss: rename unresolved; retained delete + add\n");
-                        for candidate in candidates {
-                            output.push_str(&format!(
-                                "    candidate: {} → {} ({}.{:02}%)\n",
-                                candidate.source_path,
-                                candidate.destination_path,
-                                candidate.score / 100,
-                                candidate.score % 100
-                            ));
-                        }
-                    }
-                    LossNote::EmptyDirectory { path } => {
-                        output.push_str(&format!(
-                            "  loss: empty directory '{}' omitted from Git tree projection\n",
-                            path
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Graph statistics
-        output.push('\n');
-        let (vertices, edges) = count_atoms(&change.hashed.hunks);
-        let content_bytes = change.contents.len();
-        output.push_str(&format!(
-            "Graph: +{} vertices, ~{} edges, {} bytes\n",
-            vertices, edges, content_bytes
-        ));
-
-        // Hunks summary
-        if !change.hashed.hunks.is_empty() {
-            output.push_str(&format!(
-                "Files changed: {}\n",
-                count_unique_paths(&change.hashed.hunks)
-            ));
-
-            // Show one summary row per path. Git imports and large records can
-            // legitimately contain thousands of graph ops for a small number
-            // of files; printing each op makes the change view unusable.
-            for summary in hunk_display_summaries(&change.hashed.hunks) {
-                output.push_str(&format!(
-                    "  {} {} {}\n",
-                    summary.symbol,
-                    style_path(&summary.path),
-                    hint(&summary.info)
-                ));
-            }
-        }
-
-        // Attestation (inline AI metadata from change header)
-        if change.has_provenance() {
-            output.push('\n');
-            if let Some(prov) = change.hashed.provenance.first() {
-                output.push_str(&self.format_attestation(prov));
-            }
-        }
-
-        // Change ledger (causal decision DAG from .provenance file)
-        output.push_str(&self.format_change_ledger(&data.ledger_graphs));
-
-        output
+        super::tree::render(self, change, hash, sequence, data)
     }
 
     /// Format the change for short output.
@@ -549,152 +364,6 @@ impl ChangeCmd {
         )
     }
 
-    /// Format AI attestation information for display.
-    fn format_attestation(&self, prov: &Provenance) -> String {
-        let mut output = String::new();
-
-        output.push_str(&format!("{}\n", emphasis("=== Attestation ===")));
-        output.push_str(&format!(
-            "  Vendor:  {}\n",
-            info(&format!("{:?}", prov.vendor))
-        ));
-        output.push_str(&format!("  Model:   {}\n", info(&prov.model)));
-
-        if let Some(version) = &prov.model_version {
-            output.push_str(&format!("  Version: {}\n", hint(version)));
-        }
-
-        output.push_str(&format!(
-            "  Tool:    {}\n",
-            info(&format!("{:?}", prov.tool))
-        ));
-        output.push_str(&format!(
-            "  Type:    {}\n",
-            hint(&format!("{:?}", prov.suggestion_type))
-        ));
-
-        // Token usage
-        if !prov.tokens.is_empty() {
-            output.push_str("  Tokens:\n");
-            output.push_str(&format!("    Input:  {}\n", prov.tokens.input_tokens));
-            output.push_str(&format!("    Output: {}\n", prov.tokens.output_tokens));
-            output.push_str(&format!("    Total:  {}\n", prov.tokens.total_tokens));
-        }
-
-        // Cost
-        if !prov.cost.is_zero() {
-            output.push_str(&format!("  Cost:    ${:.6} USD\n", prov.cost.usd));
-        }
-
-        // Temperature
-        if let Some(temp) = prov.temperature {
-            let temp_f = temp as f64 / 1000.0;
-            output.push_str(&format!("  Temp:    {:.2}\n", temp_f));
-        }
-
-        // Request/Session IDs
-        if let Some(req_id) = &prov.request_id {
-            output.push_str(&format!("  Request: {}\n", hint(req_id)));
-        }
-        if let Some(sess_id) = &prov.session_id {
-            output.push_str(&format!("  Session: {}\n", hint(sess_id)));
-        }
-
-        // Additional metadata (key-value pairs from agent recording)
-        if !prov.metadata.is_empty() {
-            output.push_str("  Metadata:\n");
-            for (key, value) in &prov.metadata {
-                // turn_number is recorded as 1-indexed but session ledger
-                // turns are 0-indexed; display the 0-indexed value.
-                let display_value = if key == "turn_number" {
-                    value
-                        .parse::<u32>()
-                        .ok()
-                        .and_then(|n| n.checked_sub(1))
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| value.clone())
-                } else {
-                    value.clone()
-                };
-                output.push_str(&format!("    {}: {}\n", hint(key), info(&display_value)));
-            }
-        }
-
-        output
-    }
-
-    /// Format the change ledger (causal decision DAG) for display.
-    ///
-    /// Displays the structured provenance graph stored in the `.provenance`
-    /// file: goals, tool executions, explorations, commitments, and patch
-    /// proposals that led to this change. The graphs arrive from the render
-    /// data (repository or wire — one render either way).
-    fn format_change_ledger(&self, graphs: &[(Hash, ProvenanceGraph)]) -> String {
-        let mut output = String::new();
-
-        if graphs.is_empty() {
-            output.push_str(&format!(
-                "{}\n",
-                hint("No provenance graph found for this change.")
-            ));
-            return output;
-        }
-
-        for (_graph_hash, graph) in graphs {
-            output.push_str(&format!("{}\n", emphasis("=== Change Ledger ===")));
-            output.push_str(&format!("  Session: {}\n", info(&graph.session_id)));
-            output.push_str(&format!(
-                "  Agent:   {} ({})\n",
-                info(&graph.agent_display_name),
-                hint(&graph.agent_vendor)
-            ));
-            output.push_str(&format!(
-                "  Nodes:   {}  Edges: {}  Changes: {}\n",
-                graph.node_count(),
-                graph.edge_count(),
-                graph.change_count()
-            ));
-            output.push('\n');
-
-            // Display nodes
-            for node in &graph.nodes {
-                let kind_str = format!("{}", node.kind);
-                let kind_styled = format!("{}", style(&kind_str).bold().cyan());
-                let duration = node
-                    .duration_ms
-                    .map(|ms| format!(" ({}ms)", ms))
-                    .unwrap_or_default();
-                let tool = node.tool_name.as_deref().unwrap_or("");
-                let tool_str = if tool.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", hint(&format!("[{}]", tool)))
-                };
-
-                // Extract a one-line detail string from the structured detail JSON
-                let detail_str = node
-                    .detail
-                    .as_ref()
-                    .and_then(|d| format_node_detail(d))
-                    .map(|s| format!("\n      {}", hint(&s)))
-                    .unwrap_or_default();
-
-                output.push_str(&format!(
-                    "  {} {} {}{}{}{}
-",
-                    kind_styled,
-                    hint("\u{00bb}"),
-                    node.summary,
-                    tool_str,
-                    hint(&duration),
-                    detail_str,
-                ));
-            }
-        }
-
-        output
-    }
-
     /// Format the change for JSON output.
     pub(crate) fn format_json(
         &self,
@@ -710,8 +379,8 @@ impl ChangeCmd {
     }
 
     /// Load the change ledger(s) — the causal decision graph(s) from the
-    /// `.provenance` file — for JSON output. Mirrors the `=== Change Ledger ===`
-    /// section of the default text format. Missing/corrupt provenance is
+    /// `.provenance` file — for JSON output. Mirrors the `Change Ledger`
+    /// branch of the default text format. Missing/corrupt provenance is
     /// non-fatal: the ledger simply stays empty (and is omitted from the JSON).
     fn load_json_ledger(&self, graphs: &[(Hash, ProvenanceGraph)]) -> Vec<JsonChangeLedger> {
         graphs
@@ -743,7 +412,7 @@ impl ChangeCmd {
 /// Extract a human-readable one-liner from a provenance node's detail JSON.
 ///
 /// Returns `None` if the detail is empty or has no interesting fields.
-fn format_node_detail(detail: &str) -> Option<String> {
+pub(super) fn format_node_detail(detail: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(detail).ok()?;
     let obj = v.as_object()?;
 

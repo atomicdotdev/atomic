@@ -125,7 +125,7 @@ impl ProvenanceAccumulator {
             .nodes(nodes)
             .edges(edges)
             .changes_explained(changes_explained.to_vec())
-            .timestamp(timestamp);
+            .timestamp_millis(timestamp);
         if let Some(previous) = previous {
             builder = builder.previous(previous);
         }

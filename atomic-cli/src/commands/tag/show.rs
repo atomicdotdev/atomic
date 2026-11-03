@@ -289,7 +289,7 @@ pub(crate) fn render_review_gate_records(
 mod tests {
     use super::*;
     use atomic_repository::TagKind;
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     // -------------------------------------------------------------------------
     // Command Builder Tests
@@ -351,7 +351,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_show_existing_tag() {
         use tempfile::tempdir;
 
@@ -375,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_show_annotated_tag() {
         use tempfile::tempdir;
 
@@ -400,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_show_nonexistent_tag() {
         use tempfile::tempdir;
 

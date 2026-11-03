@@ -58,6 +58,10 @@ similar.workspace = true
 quickcheck.workspace = true
 quickcheck_macros.workspace = true
 tempfile.workspace = true
+oxrdf = "=0.2.4"
+oxttl = "=0.1.8"
+proc-macro2 = "1"
+syn = "2"
 
 [features]
 default = []

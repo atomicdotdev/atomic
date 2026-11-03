@@ -296,6 +296,10 @@ impl<'a, T: ViewTxnT> ViewTxnT for ViewGraph<'a, T> {
         self.inner.iter_conflicts(view_id)
     }
 
+    fn pending_untracks(&self, view_id: u64) -> Result<Vec<String>, PristineError> {
+        self.inner.pending_untracks(view_id)
+    }
+
     fn snapshot_conflicts(&self) -> Result<Vec<(u64, Inode, Vec<StoredConflict>)>, PristineError> {
         self.inner.snapshot_conflicts()
     }

@@ -555,6 +555,23 @@ impl TypeScriptExtractor {
         let child_in_export = in_export || is_export;
 
         match node.kind() {
+            "import_statement" | "export_statement" => {
+                if let Some(module) = node.child_by_field_name("source") {
+                    if let Some(text) = self.node_text(&module, source) {
+                        entities.push(
+                            Entity::new(
+                                text.trim_matches(['\'', '"']),
+                                EntityKind::Import,
+                                file_path,
+                                node.start_position().row as u32 + 1,
+                                node.end_position().row as u32 + 1,
+                            )
+                            .with_signature(self.node_text(node, source).unwrap_or_default()),
+                        );
+                    }
+                }
+            }
+
             // Function declarations
             "function_declaration" => {
                 if let Some(entity) =
@@ -1180,6 +1197,34 @@ impl TypeScriptExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_import_and_reexport_module_sources_not_imported_symbol_names() {
+        let mut parser = TypeScriptExtractor::new();
+        let entities = parser.extract(
+            "import { changed } from './api';\nimport './startup';\nexport { value } from '../shared';\n// import './not-real';\nexport function kept() {}\n",
+            "src/ui.ts",
+        );
+        let imports: Vec<_> = entities
+            .iter()
+            .filter(|entity| entity.kind == EntityKind::Import)
+            .collect();
+        assert_eq!(
+            imports
+                .iter()
+                .map(|entity| entity.name.as_str())
+                .collect::<Vec<_>>(),
+            ["./api", "./startup", "../shared"]
+        );
+        assert_eq!(imports[0].line, 1);
+        assert_eq!(
+            imports[0].signature.as_deref(),
+            Some("import { changed } from './api';")
+        );
+        assert!(entities
+            .iter()
+            .any(|entity| entity.name == "kept" && entity.exported));
+    }
 
     #[test]
     fn test_extract_function() {

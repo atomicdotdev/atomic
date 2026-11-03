@@ -1064,8 +1064,48 @@ impl Service {
 // ---------------------------------------------------------------------------
 
 impl Service {
-    pub fn query_graph(&self, request: pb::QueryGraphRequest) -> CliResult<pb::QueryGraphResponse> {
+    pub fn get_project_identity(
+        &self,
+        request: pb::GetProjectIdentityRequest,
+    ) -> CliResult<pb::GetProjectIdentityResponse> {
         self.call(move |backend| async move {
+            match backend {
+                Backend::Local(state) => services_agent::KnowledgeImpl { state }
+                    .get_project_identity(Request::new(request))
+                    .await
+                    .map(|response| response.into_inner()),
+                Backend::Reactor(channel) => {
+                    pb::knowledge_service_client::KnowledgeServiceClient::new(channel)
+                        .get_project_identity(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            }
+        })
+    }
+
+    pub fn get_workflow_snapshot(
+        &self,
+        request: pb::GetWorkflowSnapshotRequest,
+    ) -> CliResult<pb::GetWorkflowSnapshotResponse> {
+        self.call(move |backend| async move {
+            match backend {
+                Backend::Local(state) => services_agent::KnowledgeImpl { state }
+                    .get_workflow_snapshot(Request::new(request))
+                    .await
+                    .map(|response| response.into_inner()),
+                Backend::Reactor(channel) => {
+                    pb::knowledge_service_client::KnowledgeServiceClient::new(channel)
+                        .get_workflow_snapshot(request)
+                        .await
+                        .map(|response| response.into_inner())
+                }
+            }
+        })
+    }
+
+    pub fn query_graph(&self, request: pb::QueryGraphRequest) -> CliResult<pb::QueryGraphResponse> {
+        let response = self.call(move |backend| async move {
             match backend {
                 Backend::Local(state) => services_agent::KnowledgeImpl { state }
                     .query_graph(Request::new(request))
@@ -1080,7 +1120,14 @@ impl Service {
                         .map(|response| response.into_inner())
                 }
             }
-        })
+        })?;
+        if response.api_version != 1 {
+            return Err(crate::error::CliError::Internal(anyhow::anyhow!(
+                "unsupported knowledge graph API version {}; expected 1",
+                response.api_version
+            )));
+        }
+        Ok(response)
     }
 
     pub fn maintain_knowledge_graph(

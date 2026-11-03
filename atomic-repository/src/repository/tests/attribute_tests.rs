@@ -117,6 +117,21 @@ fn concurrent_attribute_values_surface_as_status_conflict() {
         .unwrap();
     assert_eq!(entry.status(), FileStatus::Conflicted);
     assert_eq!(entry.details(), Some("inode attribute conflict"));
+    let error = repo
+        .search_content_paths_on_view(
+            "dev",
+            "content",
+            crate::ContentSearchOptions {
+                max_results: Some(0),
+                ..Default::default()
+            },
+            &["elsewhere.rs".into()],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("conflicting inode attributes"),
+        "{error}"
+    );
 }
 
 #[cfg(unix)]

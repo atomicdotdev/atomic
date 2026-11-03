@@ -8,6 +8,22 @@ mod tests {
     use crate::pristine::Pristine;
     use tempfile::tempdir;
 
+    fn seed_project_identity(txn: &mut WriteTxn<'_>) {
+        use crate::kg::project_id::{MintReason, ProjectId, ProjectIdentityRecord};
+        let object = serde_json::to_vec(
+            &serde_json::json!({"atomic:projectId": ProjectId::generate().to_base32()}),
+        )
+        .unwrap();
+        txn.put_project_identity_if_absent(&ProjectIdentityRecord {
+            hash: Hash::of(&object),
+            object,
+            mint_reason: MintReason::Upgrade,
+            created_at: "2026-10-15T00:00:00Z".into(),
+            previous: None,
+        })
+        .unwrap();
+    }
+
     #[test]
     fn test_register_change() {
         let dir = tempdir().unwrap();
@@ -1173,6 +1189,7 @@ mod tests {
         );
 
         let mut txn = pristine.write_txn().unwrap();
+        seed_project_identity(&mut txn);
         let persisted = txn
             .mark_session_incomplete(
                 "sess-incomplete",
@@ -1249,6 +1266,7 @@ mod tests {
         };
 
         let mut txn = pristine.write_txn().unwrap();
+        seed_project_identity(&mut txn);
         txn.index_session_turn(
             "sess-b",
             ".atomic/sessions/sess-b.json",

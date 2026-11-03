@@ -100,6 +100,12 @@ fn to_journal_turn_status(turn: StoredProvenanceTurn) -> JournalTurnStatus {
         provenance_id: turn.provenance_id.get(),
         generation: turn.generation,
         lifecycle,
+        checkpoint_change_hashes: turn
+            .checkpoint_attempt
+            .as_ref()
+            .map(|attempt| attempt.source.change_hashes.clone())
+            .unwrap_or_default(),
+        final_provenance_hash: turn.final_hash,
     }
 }
 

@@ -316,7 +316,8 @@ pub struct TurnEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_use_id: Option<String>,
 
-    /// When this event occurred.
+    /// Source event time, normalized to UTC without discarding subsecond precision.
+    /// Hook adapters use receipt time only when the source timestamp is absent/null.
     pub timestamp: DateTime<Utc>,
 
     /// The raw JSON input from the agent hook, preserved for debugging.

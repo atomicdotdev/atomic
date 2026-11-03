@@ -300,7 +300,13 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     }
 
     /// Write a pre-encoded frozen schema-version-2 HEADER envelope.
-    pub(crate) fn write_change_header_v2_payload(&mut self, payload: &[u8]) -> FormatResult<()> {
+    ///
+    /// Section stores use this to retain the complete hashed metadata when
+    /// exporting a change. The payload must come from a schema-version-2
+    /// HEADER section and use the same hash table passed to this writer.
+    /// Unlike [`Self::write_change_header`], this does not replace extended
+    /// metadata with native-change defaults.
+    pub fn write_change_header_v2_payload(&mut self, payload: &[u8]) -> FormatResult<()> {
         if self.state != WriterState::HashTableWritten && self.state != WriterState::WritingMetadata
         {
             return Err(FormatError::UnexpectedSection {

@@ -36,6 +36,7 @@ enum RepairAction {
   reserved 3;                                   // was CONSISTENCY_CHECK —
                                                  // split to CheckRepository
   REPAIR_ACTION_REINDEX_WORKING_COPY = 4;       // `status --reindex`
+  REPAIR_ACTION_REBUILD_NATIVE_INDEXES = 5;     // `doctor repair-native-indexes`
 }
 message RepairRequest {
   RepositoryRef repository = 1;
@@ -78,6 +79,11 @@ message RepairResponse {
   repeated string skip_samples = 16;
   // REINDEX_WORKING_COPY render data.
   uint64 reindexed = 17;
+  // REBUILD_NATIVE_INDEXES: authority is checked read-only before a writer opens.
+  bool native_already_healthy = 18;
+  uint64 native_rows_written = 19;
+  uint64 native_problems_repaired = 20;
+  optional string native_operation = 21;
   ResponseMeta meta = 100;
 }
 message CheckRepositoryRequest {

@@ -730,14 +730,19 @@ fn compare_index_to_worktree(
         return StageCode::TypeChanged;
     }
 
-    // Content: compare the index blob OID with the cleaned repository content.
+    // Content: compare the index blob OID with the cleaned repository
+    // content, or with the raw bytes when they are the indexed blob itself
+    // (Git keeps such a file clean by its stat even when a later `text=auto`
+    // attribute would normalize it on the next add).
+    let index_oid = index_entry.oid.as_ref().map(|oid| oid.as_bytes().to_vec());
+    let blob_oid = |bytes: &[u8]| {
+        git_object_id(policy.object_format, GitObjectKind::Blob, bytes)
+            .ok()
+            .map(|oid| oid.as_bytes().to_vec())
+    };
     let content_changed = match &worktree.repository_bytes_after_clean {
         Some(bytes) => {
-            let worktree_oid = git_object_id(policy.object_format, GitObjectKind::Blob, bytes)
-                .ok()
-                .map(|oid| oid.as_bytes().to_vec());
-            let index_oid = index_entry.oid.as_ref().map(|oid| oid.as_bytes().to_vec());
-            worktree_oid != index_oid
+            blob_oid(bytes) != index_oid && blob_oid(&worktree.worktree_bytes) != index_oid
         }
         None => true,
     };

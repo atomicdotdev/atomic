@@ -983,11 +983,232 @@ where
     Ok((content, conflicts, had_fork_structure))
 }
 
+/// Render into a bounded consumer buffer using the ordinary semantic renderer.
+///
+/// A missing content buffer means rendered output exceeded `max_bytes`; it is
+/// never a partial file. Graph traversal and semantic-merge scratch are separate
+/// from this consumer bound. Complete output matches the ordinary unbounded
+/// renderer, including its conflict markers and semantic-merge resolution.
+///
+/// # Examples
+///
+/// ```no_run
+/// use atomic_core::{
+///     change::ChangeStore,
+///     output::{alive::RetrieveOptions, repo::{output_file_to_buffer_bounded, OutputError}},
+///     pristine::GraphTxnT,
+///     types::{NodeId, Position},
+/// };
+/// fn preview<T: GraphTxnT, C: ChangeStore>(
+///     txn: &T, changes: &C, position: Position<NodeId>, visibility: RetrieveOptions,
+/// ) -> Result<(), OutputError> {
+///     let output = output_file_to_buffer_bounded(txn, changes, position, visibility, 1024)?;
+///     if let Some(bytes) = output.content {
+///         assert!(bytes.len() <= 1024);
+///     } // Otherwise the rendered file was too large; no truncated bytes escape.
+///     Ok(())
+/// }
+/// ```
+///
+/// # Errors
+/// Propagates graph, content-store, and renderer failures. Only the buffer's own
+/// limit rejection is classified as oversized content.
+pub fn output_file_to_buffer_bounded<T: GraphTxnT, C: ChangeStore>(
+    txn: &T,
+    changes: &C,
+    position: Position<NodeId>,
+    retrieve_options: RetrieveOptions,
+    max_bytes: usize,
+) -> Result<BoundedFileOutput, OutputError> {
+    let retrieved = retrieve_graph(txn, position, retrieve_options)
+        .map_err(|error| OutputError::Pristine(Box::new(error)))?;
+    let mut graph = retrieved.graph;
+    let order = compute_order(&mut graph);
+    let resolved = resolve_conflicts_semantically(txn, changes, &graph, &order)?;
+    let had_fork = !resolved.is_empty();
+    let mut output = BoundedOutput {
+        writer: Writer::new(BoundedBytes {
+            bytes: Vec::new(),
+            max_bytes,
+            exceeded: false,
+        }),
+    };
+    let result = output_graph_content_resolved(
+        changes,
+        |id| txn.get_external(id),
+        &graph,
+        &order,
+        &mut output,
+        &resolved,
+    );
+    if output.writer.inner().exceeded {
+        return Ok(BoundedFileOutput {
+            content: None,
+            had_fork_structure: had_fork,
+            buffer_high_water: output.writer.inner().bytes.len(),
+        });
+    }
+    result?;
+    let bytes = output.writer.into_inner().bytes;
+    Ok(BoundedFileOutput {
+        buffer_high_water: bytes.len(),
+        content: Some(bytes),
+        had_fork_structure: had_fork,
+    })
+}
+
+/// Bounded rendered bytes and consumer-buffer measurements, excluding renderer scratch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BoundedFileOutput {
+    /// `None` denotes oversized output; truncated content is never returned.
+    pub content: Option<Vec<u8>>,
+    pub had_fork_structure: bool,
+    /// Maximum retained output bytes before completion or the size rejection.
+    pub buffer_high_water: usize,
+}
+
+struct BoundedBytes {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl BoundedBytes {
+    fn reject(&mut self) -> std::io::Error {
+        self.exceeded = true;
+        std::io::Error::other("rendered output exceeds consumer limit")
+    }
+}
+
+impl Write for BoundedBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+            return Err(self.reject());
+        }
+        let required = self.bytes.len() + bytes.len();
+        if required > self.bytes.capacity() {
+            let capacity = self
+                .bytes
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(self.max_bytes);
+            self.bytes.reserve_exact(capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct BoundedOutput {
+    writer: Writer<BoundedBytes>,
+}
+
+impl crate::output::traits::VertexBuffer for BoundedOutput {
+    fn output_line<E, F>(
+        &mut self,
+        node: crate::types::GraphNode<NodeId>,
+        get_contents: F,
+    ) -> Result<(), E>
+    where
+        E: From<std::io::Error>,
+        F: FnOnce(&mut [u8]) -> Result<(), E>,
+    {
+        // Check an emitted span before Writer allocates its scratch buffer.
+        // This is a rendered-span check, never a change-payload size estimate.
+        let sink = self.writer.inner_mut();
+        if node.len() > sink.max_bytes.saturating_sub(sink.bytes.len()) {
+            return Err(sink.reject().into());
+        }
+        self.writer.output_line(node, get_contents)
+    }
+
+    fn output_conflict_marker(
+        &mut self,
+        marker: &str,
+        id: usize,
+        changes: Option<&[crate::types::Hash]>,
+    ) -> std::io::Result<()> {
+        self.writer.output_conflict_marker(marker, id, changes)
+    }
+}
+
 // TESTS
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_vertex_output_preserves_marker_bytes_and_stops_before_large_spans() {
+        use crate::output::traits::VertexBuffer;
+        use crate::types::{ChangePosition, GraphNode};
+        fn emit(buffer: &mut impl VertexBuffer) -> std::io::Result<()> {
+            let node = GraphNode::new(NodeId::ROOT, ChangePosition::new(0), ChangePosition::new(2));
+            buffer.output_line::<std::io::Error, _>(node, |bytes| {
+                bytes.copy_from_slice(b"aa");
+                Ok(())
+            })?;
+            buffer.begin_conflict(1, None)?;
+            buffer.output_line::<std::io::Error, _>(node, |bytes| {
+                bytes.copy_from_slice(b"bb");
+                Ok(())
+            })?;
+            buffer.conflict_next(1, None)?;
+            buffer.output_line::<std::io::Error, _>(node, |bytes| {
+                bytes.copy_from_slice(b"cc");
+                Ok(())
+            })?;
+            buffer.end_conflict(1)
+        }
+        let mut full = Writer::new(Vec::new());
+        emit(&mut full).unwrap();
+        let expected = full.into_inner();
+        for cap in 0..=expected.len() + 1 {
+            let mut bounded = BoundedOutput {
+                writer: Writer::new(BoundedBytes {
+                    bytes: Vec::new(),
+                    max_bytes: cap,
+                    exceeded: false,
+                }),
+            };
+            let result = emit(&mut bounded);
+            assert!(bounded.writer.inner().bytes.len() <= cap);
+            assert!(bounded.writer.inner().bytes.capacity() <= cap);
+            assert_eq!(
+                bounded.writer.inner().exceeded,
+                cap < expected.len(),
+                "cap={cap}"
+            );
+            if cap >= expected.len() {
+                result.unwrap();
+                assert_eq!(bounded.writer.into_inner().bytes, expected);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let mut bounded = BoundedOutput {
+            writer: Writer::new(BoundedBytes {
+                bytes: Vec::new(),
+                max_bytes: 10,
+                exceeded: false,
+            }),
+        };
+        let huge = GraphNode::new(
+            NodeId::ROOT,
+            ChangePosition::new(0),
+            ChangePosition::new(100_000_000),
+        );
+        assert!(bounded
+            .output_line::<std::io::Error, _>(huge, |_| panic!("oversized span must not be loaded"))
+            .is_err());
+        assert!(bounded.writer.inner().bytes.is_empty());
+    }
 
     // FileOutputOptions Tests
 

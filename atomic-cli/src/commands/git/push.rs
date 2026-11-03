@@ -130,8 +130,17 @@ impl Command for Push {
                 atomic_repository::repository::provenance_gate::local_session_mac_key_provider(
                     &readonly_repo,
                 );
+            let did_provider =
+                atomic_repository::repository::provenance_gate::local_did_key_provider(
+                    &readonly_repo,
+                );
             readonly_repo
-                .enforce_publication_gate("Git ref export", &closure, Some(&provider))
+                .enforce_publication_gate(
+                    "Git ref export",
+                    &closure,
+                    Some(&provider),
+                    Some(&did_provider),
+                )
                 .map_err(CliError::Repository)?;
         }
         // RFC §8.3 (CB-8B): remote export of a view with unresolved Atomic
@@ -314,6 +323,7 @@ impl Command for Push {
         let tree_oid = super::shadow::stage_and_validate_tree(
             &repo,
             &git_repo,
+            None,
             &repo_root,
             &publication,
             marker_policy,
@@ -343,7 +353,7 @@ impl Command for Push {
                 let branch_name = git_repo
                     .head()
                     .ok()
-                    .and_then(|h| h.shorthand().map(str::to_owned))
+                    .and_then(|h| h.shorthand().ok().map(str::to_owned))
                     .unwrap_or_else(|| "HEAD".to_string());
                 let target = target_override.unwrap_or(&branch_name);
                 let ahead = self.unpushed_commit_count(&git_repo, &branch_name, target_override);
@@ -535,8 +545,12 @@ impl Push {
         let git_sig = git_repo.signature().map_err(|e| CliError::GitError {
             message: format!("Failed to get git signature: {}", e),
         })?;
-        let author =
-            super::shadow::projection_author(repo, repo_root, git_sig.name(), git_sig.email());
+        let author = super::shadow::projection_author(
+            repo,
+            repo_root,
+            git_sig.name().ok(),
+            git_sig.email().ok(),
+        );
         msg.push_str(&format!("atomic-author {}\n", author.did));
         if let Some(agent) = &author.agent_did {
             msg.push_str(&format!("atomic-agent {agent}\n"));
@@ -658,7 +672,7 @@ impl Push {
         git_repo
             .head()
             .ok()
-            .and_then(|h| h.shorthand().map(str::to_owned))
+            .and_then(|h| h.shorthand().ok().map(str::to_owned))
             .unwrap_or_else(|| "HEAD".to_string())
     }
 
@@ -685,7 +699,7 @@ impl Push {
             None => git_repo
                 .branch_upstream_name(&local_ref)
                 .ok()
-                .and_then(|buf| buf.as_str().map(str::to_owned))
+                .and_then(|buf| buf.as_str().ok().map(str::to_owned))
                 .and_then(|name| git_repo.refname_to_id(&name).ok()),
         };
 
@@ -831,7 +845,7 @@ impl Push {
                 git_repo
                     .head()
                     .ok()
-                    .and_then(|head| head.shorthand().map(str::to_string))
+                    .and_then(|head| head.shorthand().ok().map(str::to_string))
                     .unwrap_or_else(|| "master".to_string())
             );
             let verified = publication.git_head.ok_or_else(|| CliError::GitError {

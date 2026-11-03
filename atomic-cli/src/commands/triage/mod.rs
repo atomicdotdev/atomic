@@ -296,7 +296,7 @@ pub struct TriageReview {
     pub into: Option<String>,
 
     /// Emit the full report as JSON instead of the bounded CLI dashboard.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "html")]
     pub json: bool,
 
     /// Print the guided walkthrough: the candidate changes grouped into

@@ -43,11 +43,13 @@
 //! {
 //!   "session_id": "abc-123",
 //!   "cwd": "/path/to/project",
-//!   "timestamp": "2025-01-15T10:30:00Z"
+//!   "timestamp": "2025-01-15T10:30:00.123Z"
 //! }
 //! ```
 //!
 //! Additional fields vary by verb (see struct definitions below).
+//! Supplied RFC-3339 timestamps retain their source time and fractional precision.
+//! Missing/null timestamps use receipt time; invalid supplied timestamps are errors.
 //!
 //! # Installation
 //!
@@ -65,7 +67,7 @@ use serde::Deserialize;
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
-use crate::hooks::AgentHook;
+use crate::hooks::{timestamp::TimestampFormat, AgentHook};
 
 /// The OpenCode config directory name.
 const OPENCODE_DIR: &str = ".opencode";
@@ -412,6 +414,8 @@ impl AgentHook for OpenCodeHook {
                 reason: e.to_string(),
             })?;
 
+        let timestamp = TimestampFormat::Rfc3339.parse(self.name(), hook_type, &raw_json)?;
+
         match hook_type {
             HookType::SessionStart => {
                 let parsed: SessionStartInput =
@@ -579,6 +583,7 @@ impl AgentHook for OpenCodeHook {
                 Ok(event)
             }
         }
+        .map(|event| event.with_timestamp(timestamp))
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {
@@ -736,6 +741,86 @@ mod tests {
         let hook = make_hook();
         let debug = format!("{:?}", hook);
         assert!(debug.contains("OpenCodeHook"));
+    }
+
+    // Source timestamps apply uniformly across all hook verbs.
+
+    #[test]
+    fn supplied_timestamps_are_preserved_for_every_hook_and_journal_event() {
+        let hook = make_hook();
+        for hook_type in hook.supported_hooks() {
+            for (timestamp, millis, nanos) in [
+                ("2026-10-25T09:26:19.589Z", 1_792_920_379_589, 589_000_000),
+                (
+                    "2026-10-25T11:26:19.589+02:00",
+                    1_792_920_379_589,
+                    589_000_000,
+                ),
+                (
+                    "2026-10-25T09:26:19.589123456Z",
+                    1_792_920_379_589,
+                    589_123_456,
+                ),
+                ("1970-01-01T00:00:00.001Z", 1, 1_000_000),
+                ("1970-01-01T00:00:00Z", 0, 0),
+                ("1969-12-31T23:59:59.999Z", -1, 999_000_000),
+            ] {
+                let input = serde_json::to_vec(&serde_json::json!({
+                    "session_id": "timestamp-source",
+                    "timestamp": timestamp,
+                }))
+                .unwrap();
+                let event = hook.parse_event(hook_type, &input).unwrap();
+                assert_eq!(event.timestamp.timestamp_millis(), millis);
+                assert_eq!(event.timestamp.timestamp_subsec_nanos(), nanos);
+                assert_eq!(event.raw_json.as_ref().unwrap()["timestamp"], timestamp);
+                let envelope = crate::event::ProvenanceJournalEnvelope::from_turn_event(
+                    "source-event",
+                    1,
+                    1,
+                    &event,
+                );
+                assert_eq!(envelope.timestamp_ms, millis);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_timestamps_keep_the_receipt_time_fallback() {
+        let hook = make_hook();
+        for hook_type in hook.supported_hooks() {
+            for input in [
+                br#"{"session_id":"timestamp-source"}"#.as_slice(),
+                br#"{"session_id":"timestamp-source","timestamp":null}"#.as_slice(),
+            ] {
+                let before = chrono::Utc::now();
+                let event = hook.parse_event(hook_type, input).unwrap();
+                let after = chrono::Utc::now();
+                assert!((before..=after).contains(&event.timestamp));
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_supplied_timestamps_are_not_silently_replaced() {
+        let hook = make_hook();
+        for hook_type in hook.supported_hooks() {
+            for timestamp in [
+                serde_json::json!("not a timestamp"),
+                serde_json::json!("2026-13-25T09:26:19.589Z"),
+                serde_json::json!(1_792_920_379_589_i64),
+            ] {
+                let input = serde_json::to_vec(&serde_json::json!({
+                    "session_id": "timestamp-source",
+                    "timestamp": timestamp,
+                }))
+                .unwrap();
+                assert!(matches!(
+                    hook.parse_event(hook_type, &input),
+                    Err(AgentError::HookParseFailed { .. })
+                ));
+            }
+        }
     }
 
     // parse_event tests: session-start

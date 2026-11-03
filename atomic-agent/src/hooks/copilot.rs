@@ -61,6 +61,10 @@
 //! | Command key     | `command`                    | `bash` / `powershell`         |
 //! | TurnEnd / Stop  | `Stop` event                 | No `stop` event               |
 //! | JSON fields     | snake_case                   | camelCase with snake aliases  |
+//!
+//! Source timestamps are integer epoch milliseconds in camelCase hook payloads
+//! and RFC-3339 strings in VS Code-compatible payloads. See
+//! <https://docs.github.com/en/copilot/reference/hooks-configuration#hook-event-input-payloads>.
 
 use std::path::Path;
 
@@ -68,7 +72,7 @@ use serde::Deserialize;
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
-use crate::hooks::AgentHook;
+use crate::hooks::{timestamp::TimestampFormat, AgentHook};
 
 // =============================================================================
 // Constants
@@ -88,9 +92,6 @@ const GITHUB_DIR: &str = ".github";
 #[allow(dead_code)]
 struct SessionStartInput {
     #[serde(default)]
-    timestamp: Option<u64>,
-
-    #[serde(default)]
     cwd: Option<String>,
 
     #[serde(default, alias = "sessionId")]
@@ -106,9 +107,6 @@ struct SessionStartInput {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct SessionEndInput {
-    #[serde(default)]
-    timestamp: Option<u64>,
-
     #[serde(default)]
     cwd: Option<String>,
 
@@ -129,9 +127,6 @@ struct SessionEndInput {
 #[allow(dead_code)]
 struct UserPromptInput {
     #[serde(default)]
-    timestamp: Option<u64>,
-
-    #[serde(default)]
     cwd: Option<String>,
 
     #[serde(default, alias = "sessionId")]
@@ -150,9 +145,6 @@ struct UserPromptInput {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct PreToolUseInput {
-    #[serde(default)]
-    timestamp: Option<u64>,
-
     #[serde(default)]
     cwd: Option<String>,
 
@@ -178,9 +170,6 @@ struct PreToolUseInput {
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct PostToolUseInput {
-    #[serde(default)]
-    timestamp: Option<u64>,
-
     #[serde(default)]
     cwd: Option<String>,
 
@@ -277,6 +266,9 @@ impl AgentHook for CopilotHook {
                 hook_type: hook_type.as_str().to_string(),
                 reason: e.to_string(),
             })?;
+
+        let timestamp =
+            TimestampFormat::Rfc3339OrUnixMillis.parse(self.name(), hook_type, &raw_json)?;
 
         match hook_type {
             HookType::SessionStart => {
@@ -408,6 +400,7 @@ impl AgentHook for CopilotHook {
                     .to_string(),
             }),
         }
+        .map(|event| event.with_timestamp(timestamp))
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {

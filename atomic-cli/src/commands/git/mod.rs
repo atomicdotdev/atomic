@@ -54,14 +54,17 @@
 //! $ atomic git import --incremental
 //! ```
 
+mod agent_mode;
 pub mod anchor;
 pub mod binding;
 pub(crate) mod bootstrap;
 pub mod census;
 pub(crate) mod checkpoint;
 pub(crate) mod guard;
+pub(crate) mod hook_dispatchers;
 pub mod hooks;
 pub mod import;
+pub(crate) mod linked_worktree;
 pub(crate) mod observation;
 pub mod parallel;
 pub(crate) mod push;

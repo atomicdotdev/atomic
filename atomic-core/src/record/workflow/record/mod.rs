@@ -193,6 +193,36 @@ pub struct GitDiffLine {
 // RECORDING FUNCTIONS
 // ============================================================================
 
+/// A generated file (lockfile, checksum, bundled output) that has no
+/// semantic state at all: no CRDT trunk and no bound branches. Only such a
+/// file may take the single-vertex fast path, which records no semantic
+/// ops. A tracked file always has a trunk, even when every branch is gone
+/// (an empty lockfile, or one truncated to nothing): regenerating it must
+/// emit the semantic ops the trunk's closure replays, or the file renders
+/// as zero bytes at the semantic layer.
+fn opaque_without_semantic_state(
+    path: &str,
+    existing_trunk_id: Option<TrunkId>,
+    existing_branches: Option<&[BranchId]>,
+) -> bool {
+    super::globalize::should_use_opaque_generated_vertices(path)
+        && existing_trunk_id.is_none()
+        && existing_branches.is_none_or(|branches| branches.is_empty())
+}
+
+/// A generated file whose semantic state exists: its modify is routed
+/// through the sentinel whole-file replace, which tombstones every bound
+/// branch and inserts the full content fresh on the existing trunk.
+fn opaque_with_semantic_state(
+    path: &str,
+    existing_trunk_id: Option<TrunkId>,
+    existing_branches: Option<&[BranchId]>,
+) -> bool {
+    super::globalize::should_use_opaque_generated_vertices(path)
+        && (existing_trunk_id.is_some()
+            || existing_branches.is_some_and(|branches| !branches.is_empty()))
+}
+
 /// Record a single added file from the working copy.
 ///
 /// Reads the file content and creates appropriate hunks for a new file.
@@ -280,6 +310,7 @@ where
 /// Exact restoration emits only an undelete. When bytes changed while the
 /// path was deleted, normal modification hunks are attached to the same
 /// record so graph and CRDT state advance atomically with the undelete.
+/// Pass `None` for graph-only files; their restoration emits no semantic ops.
 #[allow(clippy::too_many_arguments)]
 pub fn record_undeleted_file<W>(
     working_copy: &W,
@@ -288,7 +319,7 @@ pub fn record_undeleted_file<W>(
     old_content: &[u8],
     crdt_old_content: Option<&[u8]>,
     options: &RecordingOptions,
-    existing_trunk_id: TrunkId,
+    existing_trunk_id: Option<TrunkId>,
     existing_branches: Option<&[BranchId]>,
 ) -> Result<RecordedFile, String>
 where
@@ -332,14 +363,15 @@ where
     } else {
         let mut modified = detected.clone();
         modified.kind = DetectionKind::Modified;
-        record_modified_file(
+        record_modified_file_with_semantics(
             working_copy,
             &modified,
             old_content,
             crdt_old_content,
             options,
-            Some(existing_trunk_id),
+            existing_trunk_id,
             existing_branches,
+            existing_trunk_id.is_some(),
         )?
     };
 
@@ -347,6 +379,9 @@ where
     recorded.set_position(position);
     recorded.set_undelete_changes(deleted_by.to_vec());
 
+    let Some(existing_trunk_id) = existing_trunk_id else {
+        return Ok(recorded);
+    };
     let edit_ops = recorded.crdt_ops().cloned();
     let mut undelete_ops = FileOps::undelete(existing_trunk_id, detected.path.clone());
     if let Some(edit_ops) = edit_ops {
@@ -466,6 +501,29 @@ pub fn record_modified_file<W>(
 where
     W: WorkingCopyRead,
 {
+    record_modified_file_with_semantics(
+        working_copy,
+        detected,
+        old_content,
+        crdt_old_content,
+        options,
+        existing_trunk_id,
+        existing_branches,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_modified_file_with_semantics<W: WorkingCopyRead>(
+    working_copy: &W,
+    detected: &DetectedFile,
+    old_content: &[u8],
+    crdt_old_content: Option<&[u8]>,
+    options: &RecordingOptions,
+    existing_trunk_id: Option<TrunkId>,
+    existing_branches: Option<&[BranchId]>,
+    build_semantics: bool,
+) -> Result<RecordedFile, String> {
     let mut recorded = RecordedFile::new(&detected.path);
     recorded.set_kind(DetectionKind::Modified);
 
@@ -525,9 +583,7 @@ where
     // per-line record: the diff produces Modify ops bound to the existing
     // branches (the proven shape every plain-file modify uses), and the
     // final content fidelity is identical.
-    if super::globalize::should_use_opaque_generated_vertices(&detected.path)
-        && existing_branches.is_none_or(|branches| branches.is_empty())
-    {
+    if opaque_without_semantic_state(&detected.path, existing_trunk_id, existing_branches) {
         let mut replace_hunk = BuiltHunk::new_replace_with_lines(
             Local::new(&detected.path, 1),
             Some(encoding),
@@ -598,11 +654,17 @@ where
     // puts the edit boundary at EOF, where partial-hunk slicing is
     // fragile; route through the sentinel whole-file replace, which
     // rewrites the file byte-exactly.
-    let eof_boundary_edit = old_content.last().is_some_and(|&b| b != b'\n')
-        || new_content.last().is_some_and(|&b| b != b'\n');
+    // Identical content (a pure move of the file) is no edit at all: without
+    // this guard a moved file lacking a trailing newline took the whole-file
+    // replace below, re-inserting every line of content that never changed.
+    let content_differs = old_content != new_content.as_slice();
+    let eof_boundary_edit = content_differs
+        && (old_content.last().is_some_and(|&b| b != b'\n')
+            || new_content.last().is_some_and(|&b| b != b'\n'));
+    // A pure move of an unchanged generated file records only the move.
     let force_whole_file = options.get_force_whole_file_replace()
-        || (super::globalize::should_use_opaque_generated_vertices(&detected.path)
-            && existing_branches.is_some_and(|branches| !branches.is_empty()))
+        || (content_differs
+            && opaque_with_semantic_state(&detected.path, existing_trunk_id, existing_branches))
         || has_multi_line_deletion
         || eof_boundary_edit;
 
@@ -640,15 +702,17 @@ where
         // bound branch and inserts every line fresh. A positional diff here
         // kept unchanged lines bound to graph-deleted vertices, leaving the
         // CRDT layer unable to reconstruct the file.
-        let (crdt_ops, crdt_stats) = crdt::build_crdt_ops_for_whole_file_replace(
-            &detected.path,
-            &new_content,
-            encoding,
-            existing_trunk_id,
-            existing_branches,
-        );
-        recorded.set_crdt_ops(crdt_ops);
-        recorded.set_crdt_stats(crdt_stats);
+        if build_semantics {
+            let (crdt_ops, crdt_stats) = crdt::build_crdt_ops_for_whole_file_replace(
+                &detected.path,
+                &new_content,
+                encoding,
+                existing_trunk_id,
+                existing_branches,
+            );
+            recorded.set_crdt_ops(crdt_ops);
+            recorded.set_crdt_stats(crdt_stats);
+        }
 
         recorded.set_content(new_content);
 
@@ -689,18 +753,20 @@ where
         // CB-9B (review blocker 3): binary replaces keep the same semantic
         // contract as forced replaces — regenerate FileOps from the byte
         // diff instead of returning without a semantic layer.
-        let recipe_ctx = RecipeContext {
-            path: &detected.path,
-            old_content: crdt_old_content.unwrap_or(old_content),
-            new_content: &new_content,
-            existing_branches,
-            existing_trunk_id,
-            encoding,
-            algorithm: options.get_algorithm(),
-        };
-        let (crdt_ops, crdt_stats) = Recipe::detect(&recipe_ctx).build_ops(&recipe_ctx);
-        recorded.set_crdt_ops(crdt_ops);
-        recorded.set_crdt_stats(crdt_stats);
+        if build_semantics {
+            let recipe_ctx = RecipeContext {
+                path: &detected.path,
+                old_content: crdt_old_content.unwrap_or(old_content),
+                new_content: &new_content,
+                existing_branches,
+                existing_trunk_id,
+                encoding,
+                algorithm: options.get_algorithm(),
+            };
+            let (crdt_ops, crdt_stats) = Recipe::detect(&recipe_ctx).build_ops(&recipe_ctx);
+            recorded.set_crdt_ops(crdt_ops);
+            recorded.set_crdt_stats(crdt_stats);
+        }
 
         recorded.set_content(new_content);
 
@@ -777,18 +843,20 @@ where
     // (stale content survived modifies/deletes), so the Recipe pipeline is the
     // authoritative path.
     use crate::record::workflow::recipes::{Recipe, RecipeContext};
-    let recipe_ctx = RecipeContext {
-        path: &detected.path,
-        old_content: crdt_old_content.unwrap_or(old_content),
-        new_content: &new_content,
-        existing_branches,
-        existing_trunk_id,
-        encoding,
-        algorithm: options.get_algorithm(),
-    };
-    let (crdt_ops, crdt_stats) = Recipe::detect(&recipe_ctx).build_ops(&recipe_ctx);
-    recorded.set_crdt_ops(crdt_ops);
-    recorded.set_crdt_stats(crdt_stats);
+    if build_semantics {
+        let recipe_ctx = RecipeContext {
+            path: &detected.path,
+            old_content: crdt_old_content.unwrap_or(old_content),
+            new_content: &new_content,
+            existing_branches,
+            existing_trunk_id,
+            encoding,
+            algorithm: options.get_algorithm(),
+        };
+        let (crdt_ops, crdt_stats) = Recipe::detect(&recipe_ctx).build_ops(&recipe_ctx);
+        recorded.set_crdt_ops(crdt_ops);
+        recorded.set_crdt_stats(crdt_stats);
+    }
 
     // Store the new content
     recorded.set_content(new_content);
@@ -804,6 +872,8 @@ where
 /// position, and exact source claim, and replaces the generated semantic trunk
 /// operation with one [`crate::crdt::TrunkOp::Move`] on `existing_trunk_id`.
 /// Generated line and token operations are retained beneath that move.
+/// Pass `None` for graph-only files; the graph identity and exact source claim
+/// are still required, but no historical semantic identity is fabricated.
 #[allow(clippy::too_many_arguments)]
 pub fn record_moved_file<W>(
     working_copy: &W,
@@ -814,7 +884,7 @@ pub fn record_moved_file<W>(
     existing_inode: Inode,
     existing_position: Position<NodeId>,
     exact_source_claim: PathClaimId,
-    existing_trunk_id: TrunkId,
+    existing_trunk_id: Option<TrunkId>,
     existing_branches: Option<&[BranchId]>,
 ) -> Result<RecordedFile, String>
 where
@@ -832,14 +902,15 @@ where
     modified.kind = DetectionKind::Modified;
     modified.inode = Some(existing_inode);
     modified.position = Some(existing_position);
-    let mut recorded = record_modified_file(
+    let mut recorded = record_modified_file_with_semantics(
         working_copy,
         &modified,
         old_content,
         crdt_old_content,
         options,
-        Some(existing_trunk_id),
+        existing_trunk_id,
         existing_branches,
+        existing_trunk_id.is_some(),
     )?;
 
     recorded.set_kind(DetectionKind::Moved);
@@ -848,6 +919,9 @@ where
     recorded.set_position(existing_position);
     recorded.set_exact_source_claim(exact_source_claim);
 
+    let Some(existing_trunk_id) = existing_trunk_id else {
+        return Ok(recorded);
+    };
     // A pure move may produce no edit FileOps, while opaque/binary replacement
     // paths intentionally skip semantic tokenization. Always emit the semantic
     // move, then retain any line/token operations generated by the edit path.

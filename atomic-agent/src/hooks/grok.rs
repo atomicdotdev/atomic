@@ -35,7 +35,7 @@ use serde_json::Value;
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
-use crate::hooks::AgentHook;
+use crate::hooks::{timestamp::TimestampFormat, AgentHook};
 
 /// User-level Grok config directory name under `$HOME`.
 const GROK_DIR: &str = ".grok";
@@ -170,6 +170,7 @@ impl AgentHook for GrokHook {
 
     fn parse_event(&self, hook_type: HookType, input: &[u8]) -> AgentResult<TurnEvent> {
         let raw_json = self.parse_json(hook_type, input)?;
+        let timestamp = TimestampFormat::Rfc3339.parse(self.name(), hook_type, &raw_json)?;
         let parsed = self.parse_common(hook_type, raw_json.clone())?;
 
         let mut raw_json = with_xai_provider(raw_json);
@@ -220,7 +221,7 @@ impl AgentHook for GrokHook {
             HookType::SessionStart | HookType::SessionEnd | HookType::TurnEnd => {}
         }
 
-        Ok(event)
+        Ok(event.with_timestamp(timestamp))
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {

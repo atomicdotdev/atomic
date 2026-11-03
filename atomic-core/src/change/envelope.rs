@@ -176,13 +176,13 @@ pub struct SessionEnvelope {
     pub total_turns: Option<u32>,
 
     // Timing
-    /// When the session started (Unix epoch seconds).
+    /// When the session started (Unix epoch milliseconds; legacy values may be seconds).
     pub session_started_at: i64,
 
-    /// When this turn started (Unix epoch seconds).
+    /// When this turn started (Unix epoch milliseconds; legacy values may be seconds).
     pub turn_started_at: i64,
 
-    /// When this turn ended (Unix epoch seconds).
+    /// When this turn ended (Unix epoch milliseconds; legacy values may be seconds).
     pub turn_ended_at: i64,
 
     /// Wall clock duration of this turn in milliseconds.
@@ -423,9 +423,9 @@ impl std::fmt::Display for SessionEnvelope {
 /// let envelope = SessionEnvelope::builder("session-abc", "claude-code")
 ///     .agent_display_name("Claude Code")
 ///     .turn_number(1)
-///     .session_started_at(1737000000)
-///     .turn_started_at(1737000100)
-///     .turn_ended_at(1737000112)
+///     .session_started_at(1_737_000_000_000)
+///     .turn_started_at(1_737_000_100_000)
+///     .turn_ended_at(1_737_000_112_000)
 ///     .turn_duration_ms(12000)
 ///     .prompt_summary("Fix the bug")
 ///     .files_in_turn(vec!["src/main.rs".to_string()])
@@ -495,21 +495,21 @@ impl SessionEnvelopeBuilder {
         self
     }
 
-    /// Set when the session started (Unix epoch seconds).
+    /// Set when the session started (Unix epoch milliseconds).
     #[must_use]
     pub fn session_started_at(mut self, ts: i64) -> Self {
         self.session_started_at = ts;
         self
     }
 
-    /// Set when this turn started (Unix epoch seconds).
+    /// Set when this turn started (Unix epoch milliseconds).
     #[must_use]
     pub fn turn_started_at(mut self, ts: i64) -> Self {
         self.turn_started_at = ts;
         self
     }
 
-    /// Set when this turn ended (Unix epoch seconds).
+    /// Set when this turn ended (Unix epoch milliseconds).
     #[must_use]
     pub fn turn_ended_at(mut self, ts: i64) -> Self {
         self.turn_ended_at = ts;

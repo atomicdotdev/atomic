@@ -561,6 +561,8 @@ fn commit_migration(path: &Path, plan: MigrationPlan) -> Result<(), RepositoryEr
             .insert(PATH_CLAIM_SCHEMA_KEY, PATH_CLAIM_SCHEMA_VERSION)
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
     }
+    atomic_core::pristine::build_metadata::record_migration(&write)
+        .map_err(RepositoryError::from)?;
     write
         .commit()
         .map_err(|error| RepositoryError::Database(error.to_string()))

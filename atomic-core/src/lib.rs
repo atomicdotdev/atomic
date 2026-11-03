@@ -31,6 +31,7 @@
 pub mod change;
 pub mod crdt;
 pub mod diff;
+pub mod kg;
 pub mod operation;
 pub mod pristine;
 pub mod types;
@@ -72,7 +73,6 @@ pub use change::{
 };
 
 // Re-export pristine types
-pub use pristine::ontology;
 pub use pristine::{EmbeddingRecord, KgEdge, KgNode, KgQueryResponse, KgSubgraph, SearchResult};
 pub use pristine::{
     EmbeddingsMutTxnT, EmbeddingsTxnT, GraphTxnT, KgMutTxnT, KgTxnT, MutTxnT, OperationMutTxnT,

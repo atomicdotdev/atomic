@@ -29,7 +29,7 @@
 //! attestation entries (which live under `attestations/memory/…`), and a
 //! belt-and-suspenders `!starts_with("attestations/")` filter guards it.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use atomic_canonical::did::did_for_public_key;
 use atomic_canonical::MemoryNode;
@@ -54,17 +54,85 @@ pub struct MemoryList {
     #[arg(long)]
     pub identity: Option<String>,
 
-    /// Maximum number of memories to show (most recent first). Shows all when omitted.
+    /// Maximum number of memories to show, taken after `--sort`. Shows all when
+    /// omitted.
     #[arg(short = 'n', long)]
     pub limit: Option<usize>,
+
+    /// Column to order the listing by. `updated` is newest first; every other
+    /// key sorts ascending. Ties fall back to id order.
+    #[arg(long, value_enum, default_value_t = MemorySort::Updated)]
+    pub sort: MemorySort,
+
+    /// Reverse the `--sort` order (ties still keep id order).
+    #[arg(short = 'r', long)]
+    pub reverse: bool,
 
     /// Output as JSON (an array of {id,kind,status,about,attested,verifies}).
     #[arg(long)]
     pub json: bool,
 }
 
+/// `atomic memory list --sort` keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MemorySort {
+    /// Last update time, newest first.
+    Updated,
+    Id,
+    Kind,
+    Status,
+    /// Number of `about` edges.
+    About,
+    /// fresh, then stale, then unattested.
+    Attested,
+    /// ✓, then ✗, then –.
+    Verifies,
+}
+
+impl MemorySort {
+    pub(crate) fn wire(self) -> atomic_client::proto::VaultListSort {
+        use atomic_client::proto::VaultListSort as W;
+        match self {
+            MemorySort::Updated => W::Updated,
+            MemorySort::Id => W::Id,
+            MemorySort::Kind => W::Kind,
+            MemorySort::Status => W::Status,
+            MemorySort::About => W::About,
+            MemorySort::Attested => W::Attested,
+            MemorySort::Verifies => W::Verifies,
+        }
+    }
+}
+
+impl MemoryList {
+    /// The enumeration's own order, so `--limit` can cut before the per-row
+    /// attestation work.
+    fn is_default_sort(&self) -> bool {
+        self.sort == MemorySort::Updated && !self.reverse
+    }
+}
+
+/// Order `rows` by `key` (the local body's twin of the service's listing
+/// sort), with id as the tiebreak. `reverse` flips the key,
+/// not the tiebreak.
+pub(crate) fn sort_rows(rows: &mut [Row], key: MemorySort, reverse: bool) {
+    rows.sort_by(|a, b| {
+        let ord = match key {
+            // RFC 3339, so lexical == chronological.
+            MemorySort::Updated => b.updated.cmp(&a.updated),
+            MemorySort::Id => a.id.cmp(&b.id),
+            MemorySort::Kind => a.kind.cmp(&b.kind),
+            MemorySort::Status => a.status.cmp(&b.status),
+            MemorySort::About => a.about.cmp(&b.about),
+            MemorySort::Attested => a.attested.cmp(&b.attested),
+            MemorySort::Verifies => a.verifies.cmp(&b.verifies),
+        };
+        if reverse { ord.reverse() } else { ord }.then_with(|| a.id.cmp(&b.id))
+    });
+}
+
 /// The classification of one memory's attestation, for a table/JSON row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Attested {
     Fresh,
     Stale,
@@ -90,7 +158,7 @@ impl Attested {
 }
 
 /// The result of the DID-match-then-verify rule for one row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Verifies {
     Yes,
     No,
@@ -123,6 +191,8 @@ pub(crate) struct Row {
     pub(crate) about: usize,
     pub(crate) attested: Attested,
     pub(crate) verifies: Verifies,
+    /// RFC 3339 last-update time; only drives `--sort updated`, never rendered.
+    pub(crate) updated: String,
 }
 
 /// The verifying identity resolved ONCE for the whole list.
@@ -242,6 +312,7 @@ fn compute_row(repo: &Repository, id: &str, verifier: Option<&Verifier>) -> Row 
                 about: 0,
                 attested: Attested::None,
                 verifies: Verifies::Na,
+                updated: String::new(),
             }
         }
     };
@@ -262,6 +333,7 @@ fn compute_row(repo: &Repository, id: &str, verifier: Option<&Verifier>) -> Row 
         about,
         attested,
         verifies,
+        updated: String::new(),
     }
 }
 
@@ -339,6 +411,7 @@ pub(crate) fn wire_row(entry: &atomic_client::proto::VaultEntry) -> Row {
         about: entry.about_count.unwrap_or(0) as usize,
         attested,
         verifies,
+        updated: entry.updated_at_label.clone().unwrap_or_default(),
     }
 }
 
@@ -371,14 +444,28 @@ impl Command for MemoryList {
         // Most-recent first (`updated_at` is RFC 3339, so lexical == chronological);
         // id as a stable tiebreaker.
         items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        if let Some(limit) = self.limit {
-            items.truncate(limit);
+        // The default order needs only (id, updated), so `--limit` can cut
+        // before the per-row attestation work; any other key needs every
+        // row's computed columns first.
+        if self.is_default_sort() {
+            if let Some(limit) = self.limit {
+                items.truncate(limit);
+            }
         }
 
-        let rows: Vec<Row> = items
+        let mut rows: Vec<Row> = items
             .iter()
-            .map(|(id, _)| compute_row(&repo, id, verifier.as_ref()))
+            .map(|(id, updated)| Row {
+                updated: updated.clone(),
+                ..compute_row(&repo, id, verifier.as_ref())
+            })
             .collect();
+        if !self.is_default_sort() {
+            sort_rows(&mut rows, self.sort, self.reverse);
+            if let Some(limit) = self.limit {
+                rows.truncate(limit);
+            }
+        }
 
         if self.json {
             let json: Vec<serde_json::Value> = rows
@@ -534,6 +621,40 @@ mod tests {
             public_key: kp.public.clone(),
         });
         compute_row(repo, id, verifier.as_ref())
+    }
+
+    fn sort_row(id: &str, updated: &str, about: usize) -> Row {
+        Row {
+            id: id.to_string(),
+            kind: "lesson".to_string(),
+            status: "active".to_string(),
+            about,
+            attested: Attested::None,
+            verifies: Verifies::Na,
+            updated: updated.to_string(),
+        }
+    }
+
+    fn ids(rows: &[Row]) -> Vec<&str> {
+        rows.iter().map(|r| r.id.as_str()).collect()
+    }
+
+    #[test]
+    fn sort_orders_by_key_with_id_tiebreak() {
+        let mut rows = vec![
+            sort_row("b", "2026-01-02T00:00:00Z", 1),
+            sort_row("c", "2026-01-01T00:00:00Z", 3),
+            sort_row("a", "2026-01-02T00:00:00Z", 1),
+        ];
+        // Newest first; same timestamp falls back to id.
+        sort_rows(&mut rows, MemorySort::Updated, false);
+        assert_eq!(ids(&rows), ["a", "b", "c"]);
+        sort_rows(&mut rows, MemorySort::Updated, true);
+        assert_eq!(ids(&rows), ["c", "a", "b"]);
+        sort_rows(&mut rows, MemorySort::About, true);
+        assert_eq!(ids(&rows), ["c", "a", "b"]);
+        sort_rows(&mut rows, MemorySort::Id, false);
+        assert_eq!(ids(&rows), ["a", "b", "c"]);
     }
 
     #[test]

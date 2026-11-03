@@ -62,7 +62,7 @@ use serde::Deserialize;
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
-use crate::hooks::AgentHook;
+use crate::hooks::{timestamp::TimestampFormat, AgentHook};
 
 // =============================================================================
 // Constants
@@ -145,6 +145,7 @@ struct ClineInput {
     hook_name: Option<String>,
     #[serde(default, alias = "clineVersion")]
     cline_version: Option<String>,
+    /// Decimal epoch milliseconds (`Date.now().toString()` in Cline's hook factory).
     #[serde(default)]
     timestamp: Option<String>,
     #[serde(default, alias = "workspaceRoots")]
@@ -244,6 +245,9 @@ impl AgentHook for ClineHook {
                 hook_type: hook_type.as_str().to_string(),
                 reason: e.to_string(),
             })?;
+
+        let timestamp =
+            TimestampFormat::UnixMillisString.parse(self.name(), hook_type, &raw_json)?;
 
         let parsed: ClineInput =
             serde_json::from_value(raw_json.clone()).map_err(|e| AgentError::HookParseFailed {
@@ -416,6 +420,7 @@ impl AgentHook for ClineHook {
                 Ok(event)
             }
         }
+        .map(|event| event.with_timestamp(timestamp))
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {

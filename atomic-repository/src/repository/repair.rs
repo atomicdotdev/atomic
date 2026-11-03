@@ -157,6 +157,33 @@ where
             }
         }
     }
+
+    // The claim-authority domain is REGISTRATION, not current reachability.
+    // A change no view references right now — detached by `unrecord`, held
+    // for a pending re-insert — still globally owns its GRAPH edges and its
+    // PATH_CLAIMS events: detachment removes a view reference, not graph
+    // facts, and re-attaching is O(1) metadata precisely because those rows
+    // survived (see `reinsert_change` / the reference-only insert path).
+    // Deriving expectations from view-reachable changes alone flags that
+    // dormant authority as stale after every unrecord (wedging `doctor
+    // check` until a rebuild — which would then silently destroy the
+    // reversibility contract). Per-VIEW consumers (tree projections,
+    // conflict expectations) remain reachability-filtered downstream: they
+    // reduce these claims through each view's visibility closure.
+    let mut dormant: Vec<NodeId> = Vec::new();
+    for result in repo.change_store.iter_changes() {
+        let Ok(hash) = result else { continue };
+        let Ok(change_id) = txn.get_internal(&hash) else {
+            continue;
+        };
+        let Some(change_id) = change_id else { continue };
+        if !change_id.is_root() && reachable_set.insert(change_id) {
+            dormant.push(change_id);
+        }
+    }
+    // Stable visitation order for changes that no view anchors: by id.
+    dormant.sort_by_key(|id| id.get());
+    reachable.extend(dormant);
     let mut ordered = Vec::with_capacity(reachable.len());
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();

@@ -16,7 +16,7 @@
 //! The `log` macros the crates already use reach both outputs unchanged.
 
 mod file_format;
-mod redact;
+pub(crate) mod redact;
 mod retention;
 mod terminal;
 

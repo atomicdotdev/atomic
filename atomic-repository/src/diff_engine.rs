@@ -736,6 +736,9 @@ impl From<FileStatus> for FileChangeStatus {
             crate::status::FileStatus::TypeChanged => FileChangeStatus::TypeChanged,
             crate::status::FileStatus::Clean => FileChangeStatus::Modified, // Shouldn't happen
             crate::status::FileStatus::Untracked => FileChangeStatus::Untracked,
+            // A pending untrack is a deletion the next record lands; the diff
+            // reads as the deletion it will become, not as unchanged content.
+            crate::status::FileStatus::PendingUntrack => FileChangeStatus::Deleted,
             crate::status::FileStatus::Conflicted => FileChangeStatus::Modified,
             crate::status::FileStatus::PermissionsChanged => FileChangeStatus::Modified,
         }

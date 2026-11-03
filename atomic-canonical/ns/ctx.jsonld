@@ -45,6 +45,7 @@
 
     "to": { "@id": "atom:to", "@type": "@id" },
     "edge": "atom:edge",
+    "declarationEvidence": "http://purl.org/dc/terms/description",
 
     "memoryKind": "atom:memoryKind",
     "about": { "@id": "atom:about", "@type": "@id" },

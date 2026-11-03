@@ -43,7 +43,7 @@ pub(crate) fn build_turn_provenance(options: &TurnRecordOptions<'_>) -> Provenan
         _ => PromptContent::None,
     };
 
-    let timestamp = options.event.timestamp.timestamp();
+    let timestamp = options.event.timestamp.timestamp_millis();
 
     // Extract enriched metadata from the raw JSON payload sent by the plugin.
     // The plugin accumulates data across all events within a turn and sends
@@ -218,9 +218,10 @@ pub(crate) fn build_turn_envelope(
 
     let files_in_turn: Vec<String> = recorded_files.to_vec();
 
-    let session_started_at = options.session.started_at.timestamp();
-    let turn_ended_at = options.event.timestamp.timestamp();
-    let turn_started_at = turn_ended_at - (options.turn_duration_ms as i64 / 1000);
+    let session_started_at = options.session.started_at.timestamp_millis();
+    let turn_ended_at = options.event.timestamp.timestamp_millis();
+    let turn_started_at =
+        turn_ended_at.saturating_sub(i64::try_from(options.turn_duration_ms).unwrap_or(i64::MAX));
 
     let mut builder =
         SessionEnvelope::builder(&options.session.session_id, &options.session.agent_name)

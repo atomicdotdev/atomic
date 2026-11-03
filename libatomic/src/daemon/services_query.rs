@@ -84,6 +84,7 @@ fn compute_working_copy_diff(
             DomainFileStatus::Modified
             | DomainFileStatus::Added
             | DomainFileStatus::Deleted
+            | DomainFileStatus::PendingUntrack
             | DomainFileStatus::TypeChanged
             | DomainFileStatus::PermissionsChanged => true,
             DomainFileStatus::Untracked => include_untracked,
@@ -447,8 +448,11 @@ pub async fn get_change_impl(
             paths
                 .into_iter()
                 .map(|path| {
-                    let before_result = repo.get_file_content_before_change(&path, &hash);
-                    let after_result = repo.get_file_content_after_change(&path, &hash);
+                    let view_name = view.as_deref().unwrap_or_else(|| repo.current_view());
+                    let before_result =
+                        repo.get_file_content_before_change_on_view(&path, &hash, view_name);
+                    let after_result =
+                        repo.get_file_content_after_change_on_view(&path, &hash, view_name);
                     let before_exists =
                         before_result.as_ref().ok().map(|content| content.is_some());
                     let after_exists = after_result.as_ref().ok().map(|content| content.is_some());
@@ -473,8 +477,14 @@ pub async fn get_change_impl(
         } else {
             Vec::new()
         };
-        let blast_radius =
-            wants_blast_radius.then(|| super::change_impact::project(&repo, &change, &hash));
+        let blast_radius = wants_blast_radius.then(|| {
+            super::change_impact::project(
+                &repo,
+                &change,
+                &hash,
+                view.as_deref().unwrap_or_else(|| repo.current_view()),
+            )
+        });
         Ok::<_, Status>((
             change,
             hash,
@@ -683,6 +693,9 @@ fn vault_turn_intent(repo: &Repository, session_id: &str, turn_number: u32) -> O
 /// Map a stored session turn to the wire shape (the fields the ledger owns:
 /// turn number, provenance hash, and the turn timestamp).
 fn stored_turn_proto(turn: atomic_core::change::session::SessionTurn) -> StoredProvenanceTurn {
+    let created_at = turn
+        .timestamp_datetime()
+        .map(super::convert::timestamp_proto);
     StoredProvenanceTurn {
         schema_version: 1,
         provenance_id: 0,
@@ -691,15 +704,40 @@ fn stored_turn_proto(turn: atomic_core::change::session::SessionTurn) -> StoredP
         state: ProvenanceTurnState::Unspecified as i32,
         generation: 0,
         next_event_seq: 0,
-        created_at: Some(prost_types::Timestamp {
-            seconds: turn.timestamp,
-            nanos: 0,
-        }),
+        created_at,
         updated_at: None,
         completed_at: None,
         final_hash: Some(hash_proto(&turn.provenance_hash)),
         checkpoint_attempt: None,
         stop_state: None,
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+
+    #[test]
+    fn stored_turn_timestamp_preserves_milliseconds_and_accepts_legacy_seconds() {
+        for (timestamp, nanos) in [(1_792_920_379, 0), (1_792_920_379_589, 589_000_000)] {
+            let turn = atomic_core::change::session::SessionTurn {
+                session_id: "timestamp-wire".into(),
+                turn_number: 0,
+                goal: None,
+                provenance_hash: atomic_core::types::Hash::of(b"provenance"),
+                change_hashes: Vec::new(),
+                previous_provenance: None,
+                timestamp,
+                plan_id: None,
+                todos: Vec::new(),
+                boundary_start: None,
+                boundary_end: None,
+                outcome: None,
+            };
+            let created = stored_turn_proto(turn).created_at.unwrap();
+            assert_eq!(created.seconds, 1_792_920_379);
+            assert_eq!(created.nanos, nanos);
+        }
     }
 }
 
@@ -1141,8 +1179,10 @@ pub fn neighbors_impl(
     node_id: &str,
     depth: u8,
 ) -> Result<(Vec<KgNode>, Vec<KgEdge>), Status> {
-    let subgraph = repo
+    let mut subgraph = repo
         .vault_kg_neighbors(node_id, depth)
+        .map_err(repository_error)?;
+    repo.enrich_workflow_usage(&mut subgraph.nodes)
         .map_err(repository_error)?;
     let nodes = subgraph.nodes.into_iter().map(kg_node_proto).collect();
     let edges = subgraph.edges.into_iter().map(kg_edge_proto).collect();
@@ -1173,18 +1213,18 @@ Strategy:
    code_search first to find the exact line range you need, then read just that range.
 5. Answer concisely using what you found. Cite file paths and line numbers.
 
-The knowledge graph contains:
-- file nodes (file:path) — tracked files
-- entity nodes (entity:file:name:line) — functions, structs, classes from tree-sitter
-- change nodes (change:hash) — commit history with dates and messages
-- view nodes (view:name) — like branches
-- goal/intent/memory nodes — development sessions and work items
-- edges: MODIFIES, DEFINES, AUTHORED_BY, DEPENDS_ON, REFERENCES, ON_VIEW, etc.";
+The knowledge graph contains canonical Atomic workflow resources with absolute IRIs
+and asserted class types. Views filter membership over one common causal graph.
+Workflow predicates include atomic:modifiesFile, atomic:authoredBy,
+atomic:directlyDependsOnChange, atomic:directlyOnView, atomic:hasPlan,
+atomic:generatedChange, atomic:implements, atomic:attestedBy, and atomic:references.
+The atomic namespace is https://atomic.dev/ns/workflow#.
+Use live tree-sitter entity/reference queries for code structure.";
 
 pub(crate) fn kg_node_proto(node: atomic_core::pristine::vault::KgNode) -> KgNode {
     KgNode {
         id: node.id,
-        node_type: node.kind,
+        types: node.types,
         name: Some(node.label),
         data: node.summary.clone().map(String::into_bytes),
         score: None,
@@ -1200,7 +1240,7 @@ pub(crate) fn kg_edge_proto(edge: atomic_core::pristine::vault::KgEdge) -> KgEdg
     KgEdge {
         source: edge.from_id,
         target: edge.to_id,
-        relation: edge.kind,
+        relation: edge.kind.to_string(),
         metadata: edge
             .metadata
             .and_then(|metadata| serde_json::to_vec(&metadata).ok()),

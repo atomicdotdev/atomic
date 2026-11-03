@@ -627,7 +627,11 @@ impl Repository {
         // graph and semantic layers agree with the commit tree byte-exactly.
         let branch_line_divergence =
             existing_branches.len() != atomic_core::diff::Line::from_bytes(old_content).len();
-        let options = if force_whole_file_replace || branch_line_divergence {
+        let graph_line_divergence = self
+            .alive_graph_lines_on_view_excluding(inode, position, view_name, excluded)?
+            != atomic_core::diff::Line::from_bytes(old_content).len();
+        let options = if force_whole_file_replace || branch_line_divergence || graph_line_divergence
+        {
             atomic_core::record::workflow::RecordingOptions::new().force_whole_file_replace(true)
         } else {
             atomic_core::record::workflow::RecordingOptions::new()
@@ -645,7 +649,12 @@ impl Repository {
                 Some(existing_branches.as_slice())
             },
         )
-        .map(|recorded| complete_semantic_replacement(recorded, &observed))
+        .map(|mut recorded| {
+            if existing_trunk_id.is_none() {
+                recorded.clear_crdt_ops();
+            }
+            complete_semantic_replacement(recorded, &observed)
+        })
     }
 
     /// Record a foreign modification for a path that a Git-detected rename
@@ -697,7 +706,12 @@ impl Repository {
                 Some(existing_branches.as_slice())
             },
         )
-        .map(|recorded| complete_semantic_replacement(recorded, &observed))
+        .map(|mut recorded| {
+            if existing_trunk_id.is_none() {
+                recorded.clear_crdt_ops();
+            }
+            complete_semantic_replacement(recorded, &observed)
+        })
     }
 
     /// The exact alive structural path claim for `path` on `view_name`, or
@@ -758,10 +772,10 @@ impl Repository {
 
     /// Record a foreign Git-detected rename through the native identity-
     /// preserving move pipeline (review CB-9C R2): the OLD path's stable
-    /// inode, position, CRDT trunk and alive branches are resolved first and
+    /// inode, position, and any existing CRDT state are resolved first and
     /// the exact source claim is validated, so the synthesized change carries
-    /// a real semantic `TrunkOp::Move` (plus any destination line/token
-    /// edits beneath it) — not merely a structural graph rename.
+    /// a semantic `TrunkOp::Move` when the file has a semantic identity.
+    /// Graph-only imported files retain their graph identity without FileOps.
     ///
     /// The semantic trunk follows the inode through the move: it is resolved
     /// by the OLD path's inode, never by the new path (which cannot have a
@@ -773,7 +787,7 @@ impl Repository {
     /// # Errors
     ///
     /// Returns an error message when the old path has no inode binding, no
-    /// CRDT trunk, no uncontested source claim, or the recorded result is
+    /// uncontested source claim, inconsistent semantic state, or the recorded result is
     /// empty.
     #[allow(clippy::too_many_arguments)]
     pub fn record_foreign_moved_file(
@@ -816,10 +830,6 @@ impl Repository {
             })?;
         let (existing_trunk_id, existing_branches, observed) =
             self.resolve_existing_semantic_state(old_path, inode, view_name, excluded)?;
-        let existing_trunk_id = existing_trunk_id.ok_or_else(|| {
-            format!("path '{old_path}' has no CRDT trunk for its canonical inode")
-        })?;
-
         let memory_wc = atomic_core::output::memory::Memory::new();
         memory_wc.add_file(new_path, new_content);
         let detected = DetectedFile::moved(old_path, new_path)
@@ -847,7 +857,7 @@ impl Repository {
             },
         )
         .map_err(|message| format!("cannot record moved path '{new_path}': {message}"))?;
-        if recorded.crdt_ops().is_none() {
+        if existing_trunk_id.is_some() && recorded.crdt_ops().is_none() {
             return Err(format!(
                 "cannot record moved path '{new_path}': the native move pipeline produced \
                  no semantic FileOps"
@@ -868,8 +878,11 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns an error message when the path has no inode binding, no CRDT
-    /// trunk, or the canonical FileDel record is empty.
+    /// Graph-only imported files emit only the canonical FileDel. Existing
+    /// semantic identities are tombstoned when present.
+    ///
+    /// Returns an error message when the path has no inode binding, its
+    /// semantic state is inconsistent, or the canonical FileDel record is empty.
     pub fn record_foreign_deleted_file(
         &self,
         path: &str,
@@ -891,13 +904,6 @@ impl Repository {
             .ok_or_else(|| format!("path '{path}' is absent from view '{view_name}'"))?;
         let (existing_trunk_id, _, observed) =
             self.resolve_existing_semantic_state(path, inode, view_name, excluded)?;
-        let existing_trunk_id = existing_trunk_id.ok_or_else(|| {
-            format!(
-                "path '{path}' has no CRDT trunk; refusing a semantic deletion without \
-                     an existing semantic identity"
-            )
-        })?;
-
         let mut detected = atomic_core::record::workflow::DetectedFile::deleted(path);
         detected.inode = Some(inode);
         detected.position = Some(position);
@@ -909,6 +915,10 @@ impl Repository {
                 "cannot import deletion '{path}': canonical FileDel is empty"
             ));
         }
+        let Some(existing_trunk_id) = existing_trunk_id else {
+            recorded.clear_crdt_ops();
+            return Ok(recorded);
+        };
         // Deletion dominates every line observed in this file's closure,
         // including lines concurrently restored in the ambient table.
         let mut ops = FileOps::delete(existing_trunk_id, path.to_string());
@@ -957,6 +967,40 @@ impl Repository {
     /// canonical trunk, alive branches in closure-local file order, and all
     /// observed branch identities. The latter is the deletion domain of a
     /// whole-file resolution; it must not depend on ambient lifecycle rows.
+    /// The alive content vertices the view's graph holds for `inode`, with
+    /// `excluded` held invisible. A positional edit indexes lines by vertex:
+    /// when the two no longer line up (a maintenance-branch merge left
+    /// tox.ini with vertices that do not match its lines on markupsafe), the
+    /// per-line hunk cannot map, the graph falls back to a whole-file
+    /// rewrite and the semantic ops stay positional, so the staged check
+    /// refuses the import. The caller rewrites both layers wholesale instead.
+    fn alive_graph_lines_on_view_excluding(
+        &self,
+        inode: Inode,
+        position: Position<NodeId>,
+        view_name: &str,
+        excluded: &[Hash],
+    ) -> Result<usize, String> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| format!("cannot open pristine: {e}"))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("view '{view_name}' does not exist"))?;
+        let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)
+            .map_err(|e| e.to_string())?;
+        let view_graph = atomic_core::pristine::ViewGraph::new(&txn, visibility);
+        Ok(
+            atomic_core::record::workflow::globalize::alive_content_vertex_count(
+                &view_graph,
+                inode,
+                position,
+            ),
+        )
+    }
+
     /// Errors fail closed.
     fn resolve_existing_semantic_state(
         &self,
@@ -965,13 +1009,42 @@ impl Repository {
         view_name: &str,
         excluded: &[Hash],
     ) -> Result<ExistingSemanticState, String> {
-        use atomic_core::crdt::tables::decode_trunk_id;
-        use atomic_core::pristine::CrdtTxnT;
-
         let txn = self
             .pristine
             .read_txn()
             .map_err(|e| format!("cannot open pristine: {e}"))?;
+        let existing_trunk_id = self.canonical_semantic_trunk(&txn, path, inode)?;
+        let Some(trunk) = existing_trunk_id else {
+            return Ok((None, Vec::new(), Vec::new()));
+        };
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("view '{view_name}' does not exist"))?;
+        let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)
+            .map_err(|e| e.to_string())?;
+        let state =
+            self.semantic_closure_trunk_state(&txn, view_name, excluded, &visibility, trunk)?;
+        let observed = semantic_branch_order(&state.after)?;
+        let existing_branches = observed
+            .iter()
+            .copied()
+            .filter(|branch| state.alive.get(branch) == Some(&true))
+            .collect();
+        Ok((existing_trunk_id, existing_branches, observed))
+    }
+
+    /// Absence is valid only when the canonical FileAdd has no semantic
+    /// creation. A lost index for an existing semantic identity is corruption.
+    fn canonical_semantic_trunk(
+        &self,
+        txn: &atomic_core::pristine::ReadTxn,
+        path: &str,
+        inode: Inode,
+    ) -> Result<Option<atomic_core::crdt::TrunkId>, String> {
+        use atomic_core::crdt::tables::decode_trunk_id;
+        use atomic_core::pristine::CrdtTxnT;
+
         // The inode's canonical FileAdd fixes the trunk identity. Both path
         // and inode semantic indexes are derived and may need rebuilding.
         let position = txn
@@ -1015,7 +1088,7 @@ impl Repository {
         }
         let existing_trunk_id = trunks.into_iter().next();
         let Some(trunk) = existing_trunk_id else {
-            return Ok((None, Vec::new(), Vec::new()));
+            return Ok(None);
         };
         let indexed = txn
             .get_crdt_inode_trunk(inode.get())
@@ -1024,76 +1097,68 @@ impl Repository {
         if indexed != Some(trunk) {
             return Err(format!("semantic inode index for '{path}' disagrees with its canonical FileAdd; rebuild semantic indexes"));
         }
-        let view = txn
-            .get_view(view_name)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("view '{view_name}' does not exist"))?;
-        let visibility = super::filter::assembly_visibility_excluding(&txn, &view, excluded)
-            .map_err(|e| e.to_string())?;
-        let mut alive = std::collections::HashMap::new();
-        let mut after = std::collections::BTreeMap::new();
+        Ok(existing_trunk_id)
+    }
+
+    /// The trunk's alive branches in file order as the view's own closure
+    /// records them (the same fold the foreign record and the staged replay
+    /// use), so positional Delete/Modify ops bind the branches the view's
+    /// lines actually are.
+    fn view_alive_branches_in_order<T: atomic_core::pristine::GraphTxnT>(
+        &self,
+        txn: &T,
+        view_name: &str,
+        visibility: &atomic_core::pristine::GraphVisibilityClosure,
+        trunk: atomic_core::crdt::TrunkId,
+    ) -> Result<Vec<atomic_core::crdt::BranchId>, String> {
+        let state = self.semantic_closure_trunk_state(txn, view_name, &[], visibility, trunk)?;
+        let observed = semantic_branch_order(&state.after)?;
+        Ok(observed
+            .into_iter()
+            .filter(|branch| state.alive.get(branch) == Some(&true))
+            .collect())
+    }
+
+    /// The branch state of `trunk` in the assembly closure, folded once per
+    /// visible change through the repository's semantic closure memo (see
+    /// `semantic_closure`): every deleted path of one commit, and every
+    /// later commit, reuses the changes folded before.
+    fn semantic_closure_trunk_state<T: atomic_core::pristine::GraphTxnT>(
+        &self,
+        txn: &T,
+        view_name: &str,
+        excluded: &[Hash],
+        visibility: &atomic_core::pristine::GraphVisibilityClosure,
+        trunk: atomic_core::crdt::TrunkId,
+    ) -> Result<super::semantic_closure::TrunkBranchState, String> {
+        // The memo is a pure cache: a fold that panicked leaves nothing worth
+        // keeping, so a poisoned lock starts over instead of failing every
+        // later record in this process.
+        let mut memo = self
+            .semantic_closure_memo
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                let mut memo = poisoned.into_inner();
+                *memo = Default::default();
+                memo
+            });
+        memo.align(view_name, excluded, visibility);
         for change_id in visibility
             .iter_dependency_first()
             .copied()
             .filter(|id| !id.is_root())
         {
+            if memo.is_folded(change_id) {
+                continue;
+            }
             let hash = txn
                 .get_external(change_id)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("closure change {change_id} has no hash"))?;
             let change = self.load_change(&hash).map_err(|e| e.to_string())?;
-            for ops in change.file_ops() {
-                let raw = ops.trunk_id();
-                let resolved = if raw.change_id().is_root() {
-                    atomic_core::crdt::TrunkId::new(change_id, raw.file_idx())
-                } else {
-                    raw
-                };
-                if resolved != trunk {
-                    continue;
-                }
-                for line in ops.line_ops() {
-                    let raw = line.branch_id();
-                    let branch = if raw.change_id().is_root() {
-                        atomic_core::crdt::BranchId::new(change_id, raw.branch_idx())
-                    } else {
-                        raw
-                    };
-                    use atomic_core::crdt::BranchOp;
-                    let resolve = |id: atomic_core::crdt::BranchId| {
-                        if id.change_id().is_root() {
-                            atomic_core::crdt::BranchId::new(change_id, id.branch_idx())
-                        } else {
-                            id
-                        }
-                    };
-                    match line.operation() {
-                        BranchOp::Insert {
-                            after: predecessor, ..
-                        } => {
-                            alive.insert(branch, true);
-                            after.insert(branch, predecessor.map(resolve));
-                        }
-                        BranchOp::Modify { .. } | BranchOp::Restore { .. } => {
-                            alive.insert(branch, true);
-                        }
-                        BranchOp::Delete { .. } => {
-                            alive.insert(branch, false);
-                        }
-                        BranchOp::Reparent { new_after, .. } => {
-                            after.insert(branch, new_after.map(resolve));
-                        }
-                    }
-                }
-            }
+            memo.fold(change_id, &change);
         }
-        let observed = semantic_branch_order(&after)?;
-        let existing_branches = observed
-            .iter()
-            .copied()
-            .filter(|branch| alive.get(branch) == Some(&true))
-            .collect();
-        Ok((existing_trunk_id, existing_branches, observed))
+        Ok(memo.trunk(&trunk))
     }
 
     /// This is the main entry point for creating a change from working copy
@@ -1309,6 +1374,15 @@ impl Repository {
                     name: effective_view.clone(),
                 })
             })?;
+        // Snapshot this view's `remove --keep` markers at assembly time.
+        // A marker whose path is still live-tracked is captured by the
+        // PendingUntrack status entry and recorded as a delete; a marker whose
+        // claim has already died by other means was fulfilled by that other
+        // route. Either way it must not outlive the record it was waiting on,
+        // so the apply step below consumes or drops every one of them.
+        let markers_at_record = shared_txn
+            .pending_untracks(view.id)
+            .map_err(|e| RecordError::Database(e.to_string()))?;
         let shared_graph_visibility =
             graph_visibility_closure(&shared_txn, &view).map_err(RecordError::Repository)?;
         let tree_projection = self
@@ -1524,6 +1598,7 @@ impl Repository {
             .filter_map(|entry| {
                 let path = entry.path().to_string_lossy().to_string();
                 if entry.status() == FileStatus::Deleted
+                    || entry.status() == FileStatus::PendingUntrack
                     || entry.details() == Some("directory")
                     || renamed_from.contains(&path)
                     || renamed_to.contains(&path)
@@ -1547,6 +1622,38 @@ impl Repository {
             if projected_name_conflicts.contains_key(&path) {
                 continue;
             }
+            // An explicit `atomic add` at a recorded-deleted path is captured
+            // below as an undelete of that path's original claimant, never as
+            // a new FileAdd (unless the same record also deletes the
+            // claimant's current path — a genuine fresh start). The staged
+            // binding carries a fresh inode with no graph position, so anchor
+            // attributes to the resurrected claimant; otherwise they queue
+            // against a FileAdd this record will never create.
+            // Entry-boundary snapshots also capture untracked reappearances
+            // before `add` has staged any inode. They follow the same undelete
+            // content path and must use that claimant's attributes too.
+            let inode = match (inode, move_position) {
+                (None, None) if !fresh_additions.contains(&path) => projected_absent
+                    .get(&path)
+                    .filter(|absent| !absent.directory)
+                    .map(|absent| absent.inode),
+                (Some(current), None)
+                    if !fresh_additions.contains(&path)
+                        && shared_txn
+                            .inode_position(current)
+                            .map_err(|error| RecordError::Database(error.to_string()))?
+                            .is_none() =>
+                {
+                    Some(
+                        projected_absent
+                            .get(&path)
+                            .filter(|absent| !absent.directory)
+                            .map(|absent| absent.inode)
+                            .unwrap_or(current),
+                    )
+                }
+                (other, _) => other,
+            };
             let attrs = super::attributes::working_inode_attrs(&self.root.join(&path))
                 .map_err(RecordError::Repository)?;
             let position = match move_position {
@@ -1557,14 +1664,15 @@ impl Repository {
                     .map_err(|error| RecordError::Database(error.to_string()))?
                     .flatten(),
             };
-            use atomic_core::crdt::tables::decode_trunk_id;
-            use atomic_core::pristine::CrdtTxnT;
-            let trunk = inode
-                .map(|inode| shared_txn.get_crdt_inode_trunk(inode.get()))
-                .transpose()
-                .map_err(|error| RecordError::Database(error.to_string()))?
-                .flatten()
-                .map(|key| decode_trunk_id(&key));
+            let trunk = if position.is_some() {
+                inode
+                    .map(|inode| self.canonical_semantic_trunk(&shared_txn, &path, inode))
+                    .transpose()
+                    .map_err(RecordError::Database)?
+                    .flatten()
+            } else {
+                None
+            };
             let projected = position
                 .map(|position| {
                     atomic_core::output::project_inode_attributes(
@@ -1655,8 +1763,13 @@ impl Repository {
                     || crate::content_filter::looks_binary(&filtered.bytes));
             let moved_working_copy = Memory::new();
             moved_working_copy.add_file(&planned.new_path, &filtered.bytes);
-            let (trunk, branches) =
-                existing_crdt_identity(&shared_txn, planned.inode, &shared_graph_visibility)?;
+            let (trunk, branches) = existing_crdt_identity(
+                self,
+                &shared_txn,
+                planned.inode,
+                &effective_view,
+                &shared_graph_visibility,
+            )?;
             let detected = DetectedFile::moved(&planned.old_path, &planned.new_path)
                 .with_inode(planned.inode)
                 .with_position(planned.claimant);
@@ -1918,8 +2031,10 @@ impl Repository {
                                         })?
                                         .0;
                                     let (trunk, branches) = existing_crdt_identity(
+                                        self,
                                         &shared_txn,
                                         absent.inode,
+                                        &effective_view,
                                         &baseline,
                                     )?;
                                     record_undeleted_file(
@@ -2016,7 +2131,7 @@ impl Repository {
                     }
                 }
 
-                FileStatus::Deleted if is_directory => {
+                FileStatus::Deleted | FileStatus::PendingUntrack if is_directory => {
                     // Handle deleted directory - create DirDel graph_op
                     // Look up the directory's inode
                     let txn = self
@@ -2072,7 +2187,7 @@ impl Repository {
                     recorded_files.push(recorded);
                 }
 
-                FileStatus::Deleted => {
+                FileStatus::Deleted | FileStatus::PendingUntrack => {
                     // For deleted files, we need to look up the inode and position
                     // from the pristine so that globalization can find the content
                     // vertices to mark as deleted.
@@ -2130,7 +2245,17 @@ impl Repository {
 
                     // Record deletion (no content needed)
                     match record_deleted_file(&detected, &core_options) {
-                        Ok(recorded) => {
+                        Ok(mut recorded) => {
+                            let (trunk, _) = existing_crdt_identity(
+                                self,
+                                &shared_txn,
+                                file_inode,
+                                &effective_view,
+                                &shared_graph_visibility,
+                            )?;
+                            if trunk.is_none() {
+                                recorded.clear_crdt_ops();
+                            }
                             stats.files_recorded += 1;
                             stats.hunks_created += recorded.hunk_count();
                             // FileDel creates EdgeUpdate atoms to mark edges as deleted
@@ -2278,32 +2403,31 @@ impl Repository {
                 // real BranchIds so the old-content lines get tombstoned;
                 // without them the CRDT walker leaves stale lines alive after a
                 // modify/delete. Empty when the file has no CRDT rows yet.
-                use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
-                use atomic_core::crdt::tables::{decode_trunk_id, encode_branch_id};
-                use atomic_core::pristine::CrdtTxnT;
-                let inode_u64 = file_inode.get();
-                let existing_trunk_id = match shared_txn.get_crdt_inode_trunk(inode_u64) {
-                    Ok(Some(trunk_key)) => Some(decode_trunk_id(&trunk_key)),
-                    _ => None,
+                // The alive branches are folded from THIS view's closure, never
+                // read from the shared rows: a change outside the view (the WIP
+                // evidence snapshot in `wc/<id>`) tombstones shared branch rows,
+                // and a record indexing its old lines by the global alive rows
+                // bound its deletes to the wrong branches, which the next Git
+                // commit's staged replay then refused.
+                let existing_trunk_id = match self.canonical_semantic_trunk(&shared_txn, path, file_inode) {
+                    Ok(trunk) => trunk,
+                    Err(error) => return ModifiedResult::Error(path.clone(), error),
                 };
                 let existing_branches = match existing_trunk_id {
-                    Some(trunk_id) => {
-                        match iter_trunk_branches_in_file_order(&shared_txn, trunk_id) {
-                            Ok(all) => {
-                                let mut alive = Vec::with_capacity(all.len());
-                                for b in all {
-                                    let bk = encode_branch_id(&b);
-                                    if let Ok(Some(bd)) = shared_txn.get_crdt_branch(&bk) {
-                                        if bd.state.is_alive() {
-                                            alive.push(b);
-                                        }
-                                    }
-                                }
-                                alive
-                            }
-                            Err(_) => Vec::new(),
+                    Some(trunk_id) => match self.view_alive_branches_in_order(
+                        &shared_txn,
+                        &effective_view,
+                        &shared_graph_visibility,
+                        trunk_id,
+                    ) {
+                        Ok(alive) => alive,
+                        Err(error) => {
+                            return ModifiedResult::Error(
+                                path.clone(),
+                                format!("semantic state of '{path}' on the view: {error}"),
+                            )
                         }
-                    }
+                    },
                     None => Vec::new(),
                 };
 
@@ -2339,12 +2463,35 @@ impl Repository {
                 detected.position = Some(file_position);
                 let filtered_working_copy = Memory::new();
                 filtered_working_copy.add_file(path, &repository_bytes);
+                // The view graph's alive vertices must line up with the old
+                // content's lines for a positional edit to map; otherwise the
+                // graph falls back to a whole-file rewrite while the semantic
+                // ops stay positional, and the two layers disagree (the same
+                // divergence the foreign record guards against).
+                let graph_line_divergence = {
+                    let view_graph = atomic_core::pristine::ViewGraph::new(
+                        &shared_cached_txn,
+                        shared_graph_visibility.clone(),
+                    );
+                    atomic_core::record::workflow::globalize::alive_content_vertex_count(
+                        &view_graph,
+                        file_inode,
+                        file_position,
+                    ) != atomic_core::diff::Line::from_bytes(&old_content).len()
+                };
                 let file_options = if opaque {
                     log::warn!(
                         "record: Git-tracked '{}' is large or binary; preserving exact repository bytes as opaque content",
                         path
                     );
                     opaque_core_options.clone().force_whole_file_replace(true)
+                } else if graph_line_divergence && !had_fork_structure {
+                    log::debug!(
+                        "record: '{}' holds graph vertices that do not line up with its lines; \
+                         recording a whole-file replace",
+                        path
+                    );
+                    core_options.clone().force_whole_file_replace(true)
                 } else if had_fork_structure {
                     if conflicted_paths.contains(path.as_str()) {
                         // The fork is a surfaced conflict this record is
@@ -2382,6 +2529,9 @@ impl Repository {
                         ModifiedResult::Skipped(path.clone(), resolution)
                     }
                     Ok(mut recorded) => {
+                        if existing_trunk_id.is_none() {
+                            recorded.clear_crdt_ops();
+                        }
                         if opaque {
                             recorded.set_opaque_generated(true);
                         }
@@ -2649,13 +2799,18 @@ impl Repository {
 
             let trunk = pending
                 .trunk
-                .or_else(|| semantic_trunks.get(&pending.path).copied())
-                .ok_or_else(|| {
-                    RecordError::Database(format!(
-                        "attribute path '{}' has no semantic trunk",
-                        pending.path
-                    ))
-                })?;
+                .or_else(|| semantic_trunks.get(&pending.path).copied());
+            let Some(trunk) = trunk else {
+                // Imported graph-only files have no semantic identity to
+                // update. SetAttr above targets the authoritative graph inode.
+                if pending.position.is_some() {
+                    continue;
+                }
+                return Err(RecordError::Database(format!(
+                    "attribute path '{}' has no semantic trunk",
+                    pending.path
+                )));
+            };
             let semantic = match pending.value {
                 atomic_core::change::InodeAttr::Mode(mode) => {
                     atomic_core::change::FileOps::set_mode(trunk, pending.path, mode)
@@ -3031,6 +3186,18 @@ impl Repository {
             match apply_result {
                 Ok(apply_outcome) => {
                     outcome.set_applied(apply_outcome.new_state);
+                    // Every marker this record observed is now consumed (it
+                    // emitted its delete) or fulfilled by another route; none
+                    // may outlive the record it awaited. Best-effort: a lost
+                    // clear self-heals — status never injects an entry for a
+                    // dead claim, and the next applied record drops it too.
+                    if !markers_at_record.is_empty() {
+                        if let Err(error) =
+                            self.clear_pending_untracks(&target_view, &markers_at_record)
+                        {
+                            log::warn!("record: failed to clear pending untracks: {error}");
+                        }
+                    }
                     if target_view == desired_view {
                         self.refresh_working_copy_desired_state(working_copy)
                             .map_err(RecordError::Repository)?;
@@ -4035,41 +4202,32 @@ fn visibility_before_deletions(
 }
 
 fn existing_crdt_identity(
+    repo: &Repository,
     txn: &atomic_core::pristine::ReadTxn,
     inode: Inode,
+    view_name: &str,
     visibility: &GraphVisibilityClosure,
-) -> Result<(atomic_core::crdt::TrunkId, Vec<atomic_core::crdt::BranchId>), RecordError> {
-    use atomic_core::crdt::queries::iter_trunk_branches_in_file_order;
-    use atomic_core::crdt::tables::{decode_trunk_id, encode_branch_id};
-    use atomic_core::pristine::CrdtTxnT;
-
-    let trunk_key = txn
-        .get_crdt_inode_trunk(inode.get())
-        .map_err(|error| RecordError::Database(error.to_string()))?
-        .ok_or_else(|| {
-            RecordError::Database(format!(
-                "inode {} has no CRDT trunk identity required for identity-preserving lifecycle recording",
-                inode.get()
-            ))
-        })?;
-    let trunk = decode_trunk_id(&trunk_key);
-    let mut branches = Vec::new();
-    for branch in iter_trunk_branches_in_file_order(txn, trunk)
-        .map_err(|error| RecordError::Database(error.to_string()))?
-    {
-        if !visibility.contains(branch.change_id()) {
-            continue;
-        }
-        let key = encode_branch_id(&branch);
-        if txn
-            .get_crdt_branch(&key)
-            .map_err(|error| RecordError::Database(error.to_string()))?
-            .is_some_and(|data| data.state.is_alive())
-        {
-            branches.push(branch);
-        }
-    }
-    Ok((trunk, branches))
+) -> Result<
+    (
+        Option<atomic_core::crdt::TrunkId>,
+        Vec<atomic_core::crdt::BranchId>,
+    ),
+    RecordError,
+> {
+    let trunk = repo
+        .canonical_semantic_trunk(txn, &format!("inode {}", inode.get()), inode)
+        .map_err(RecordError::Database)?;
+    let Some(trunk) = trunk else {
+        return Ok((None, Vec::new()));
+    };
+    // Folded through the view's closure, never read from the shared rows: a
+    // WIP evidence snapshot tombstones the moved file's rows globally, and a
+    // whole-file replace built from the global alive set then tombstoned
+    // nothing, leaving the old lines alive next to the fresh ones.
+    let branches = repo
+        .view_alive_branches_in_order(txn, view_name, visibility, trunk)
+        .map_err(RecordError::Database)?;
+    Ok((Some(trunk), branches))
 }
 
 /// Look up inode + position for a path using a shared read transaction.

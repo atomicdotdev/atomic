@@ -48,6 +48,7 @@ use std::collections::{HashMap, HashSet};
 
 use clap::Parser;
 
+use atomic_core::kg::{iri, project_id::ProjectId};
 use atomic_core::pristine::tables::tokenize_for_fts;
 use atomic_core::pristine::vault::{KgNode, VaultEntry, VaultEntryType};
 use atomic_core::types::{Base32, Hash};
@@ -248,7 +249,10 @@ impl Context {
         }
 
         for file in &self.files {
-            let node_id = format!("file:{}", file.trim_start_matches("./"));
+            let node_id = iri::mint_file(
+                &repo.project_id().map_err(CliError::Repository)?,
+                file.trim_start_matches("./"),
+            );
             add_memory_neighbors(repo, &node_id, 1, &mut candidates)?;
         }
 
@@ -256,7 +260,11 @@ impl Context {
         if !seed_query.trim().is_empty() {
             let pool = limit.saturating_mul(SEARCH_POOL_MULTIPLIER);
             let nodes = repo
-                .vault_kg_search_by_kind(&seed_query, pool, "memory")
+                .vault_kg_search_by_kind(
+                    &seed_query,
+                    pool,
+                    atomic_core::kg::ontology::Class::Memory,
+                )
                 .map_err(CliError::Repository)?;
             for (rank, node) in nodes.iter().enumerate() {
                 let base = rank_score(rank);
@@ -287,7 +295,10 @@ impl Context {
                 if !is_eligible_memory(&entry) {
                     continue;
                 }
-                if let Some(node_id) = memory_path_to_node_id(&meta.path) {
+                if let Some(node_id) = memory_path_to_node_id(
+                    &repo.project_id().map_err(CliError::Repository)?,
+                    &meta.path,
+                ) {
                     merge_candidate(&mut candidates, &node_id, Some(meta.path), 0.0, false);
                 }
                 if candidates.len() >= limit {
@@ -319,7 +330,10 @@ impl Context {
             .vault_list("memory/", Some(VaultEntryType::Memory))
             .map_err(CliError::Repository)?;
         for meta in metas {
-            let Some(node_id) = memory_path_to_node_id(&meta.path) else {
+            let Some(node_id) = memory_path_to_node_id(
+                &repo.project_id().map_err(CliError::Repository)?,
+                &meta.path,
+            ) else {
                 continue;
             };
             let Some(entry) = repo
@@ -386,9 +400,13 @@ impl Context {
             }
         }
 
-        let node_id = intent_path_to_node_id(&intent_path);
-        // Intent -> referenced file/domain -> memory is commonly two hops.
-        add_memory_neighbors(repo, &node_id, 2, candidates)?;
+        if let Ok(node_id) = iri::mint_intent(
+            &repo.project_id().map_err(CliError::Repository)?,
+            &summary.uid.to_uppercase(),
+        ) {
+            // Identity comes from the manifest, including old-layout entries.
+            add_memory_neighbors(repo, &node_id, 2, candidates)?;
+        }
         Ok(())
     }
 
@@ -470,7 +488,7 @@ fn add_memory_neighbors(
         .vault_kg_neighbors(node_id, depth)
         .map_err(CliError::Repository)?;
     for node in subgraph.nodes {
-        if node.kind == "memory" && node.id != node_id {
+        if node.has_type(atomic_core::kg::ontology::Class::Memory) && node.id != node_id {
             merge_candidate(
                 candidates,
                 &node.id,
@@ -497,7 +515,7 @@ fn resolve_and_rank(
         let Some(path) = candidate
             .path
             .clone()
-            .or_else(|| legacy_memory_node_id_to_path(&node_id))
+            .or_else(|| memory_node_id_to_path(&node_id))
         else {
             continue;
         };
@@ -516,11 +534,11 @@ fn resolve_and_rank(
         let memory_id =
             frontmatter_memory_id(&entry.frontmatter_json).unwrap_or_else(|| node_id.clone());
         let name = frontmatter_name(&entry.frontmatter_json).unwrap_or_else(|| {
-            node_id
-                .rsplit_once(':')
-                .map(|(_, n)| n)
-                .unwrap_or(&node_id)
-                .to_string()
+            std::path::Path::new(&path)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
         });
         let recency = recency_score(&entry.updated_at, now);
         items.push(MemoryItem {
@@ -641,12 +659,11 @@ fn memory_path_from_node(node: &KgNode) -> Option<String> {
         .and_then(|path| path.as_str())
         .filter(|path| path.starts_with("memory/") && path.ends_with(".md"))
         .map(String::from)
-        .or_else(|| legacy_memory_node_id_to_path(&node.id))
+        .or_else(|| memory_node_id_to_path(&node.id))
 }
 
-/// Legacy fallback: `memory:architecture` -> `memory/architecture.md`.
-fn legacy_memory_node_id_to_path(node_id: &str) -> Option<String> {
-    let name = node_id.strip_prefix("memory:")?;
+fn memory_node_id_to_path(node_id: &str) -> Option<String> {
+    let (_, name) = iri::parse_memory(node_id).ok()?;
     if name.is_empty() {
         return None;
     }
@@ -654,23 +671,12 @@ fn legacy_memory_node_id_to_path(node_id: &str) -> Option<String> {
 }
 
 /// `memory/architecture.md` -> `memory:architecture`.
-fn memory_path_to_node_id(path: &str) -> Option<String> {
+fn memory_path_to_node_id(project: &ProjectId, path: &str) -> Option<String> {
     let name = path.strip_prefix("memory/")?.strip_suffix(".md")?;
     if name.is_empty() {
         return None;
     }
-    Some(format!("memory:{}", name))
-}
-
-/// `intents/pimo-1/intent.md` -> `intent:PIMO-1` (nested paths keep
-/// their inner segments, uppercased, matching the KG indexer).
-fn intent_path_to_node_id(path: &str) -> String {
-    let id = path
-        .strip_prefix("intents/")
-        .and_then(|s| s.strip_suffix("/intent.md"))
-        .unwrap_or(path)
-        .to_uppercase();
-    format!("intent:{}", id)
+    Some(iri::mint_memory(project, name))
 }
 
 // Frontmatter helpers
@@ -1061,20 +1067,24 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_memory_node_id_to_path() {
+    fn test_memory_node_id_to_path() {
+        let project = ProjectId::generate();
         assert_eq!(
-            legacy_memory_node_id_to_path("memory:architecture"),
+            memory_node_id_to_path(&iri::mint_memory(&project, "architecture")),
             Some("memory/architecture.md".to_string())
         );
-        assert_eq!(legacy_memory_node_id_to_path("memory:"), None);
-        assert_eq!(legacy_memory_node_id_to_path("file:src/main.rs"), None);
+        assert_eq!(memory_node_id_to_path("memory:"), None);
+        assert_eq!(
+            memory_node_id_to_path(&iri::mint_file(&project, "src/main.rs")),
+            None
+        );
     }
 
     #[test]
     fn test_memory_path_from_node_prefers_metadata() {
         let node = KgNode::new(
             "urn:atomic:memory:01J8ZC4R8T",
-            "memory",
+            atomic_core::kg::ontology::Class::Memory,
             "architecture",
             "vault",
         )
@@ -1087,28 +1097,14 @@ mod tests {
 
     #[test]
     fn test_memory_path_to_node_id() {
+        let project = ProjectId::generate();
         assert_eq!(
-            memory_path_to_node_id("memory/architecture.md"),
-            Some("memory:architecture".to_string())
+            memory_path_to_node_id(&project, "memory/architecture.md"),
+            Some(iri::mint_memory(&project, "architecture"))
         );
-        assert_eq!(memory_path_to_node_id("intents/x/intent.md"), None);
-    }
-
-    #[test]
-    fn test_intent_path_to_node_id_flat() {
         assert_eq!(
-            intent_path_to_node_id("intents/pimo-1/intent.md"),
-            "intent:PIMO-1"
-        );
-    }
-
-    #[test]
-    fn test_intent_path_to_node_id_nested() {
-        // Hook-created intents nest view/session/turn segments; the KG
-        // indexer keeps them (uppercased) in the node id.
-        assert_eq!(
-            intent_path_to_node_id("intents/tight-storm/019e/1/intent.md"),
-            "intent:TIGHT-STORM/019E/1"
+            memory_path_to_node_id(&project, "intents/x/intent.md"),
+            None
         );
     }
 
@@ -1623,7 +1619,10 @@ mod tests {
         let items = resolve_and_rank(&repo, candidates, 5, true).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].memory_id, "urn:atomic:memory:auth-decision");
-        assert_eq!(items[0].kg_node_id, "memory:auth-decision");
+        assert_eq!(
+            items[0].kg_node_id,
+            iri::mint_memory(&repo.project_id().unwrap(), "auth-decision")
+        );
         assert!(items[0].body.contains("RS256"));
     }
 
@@ -1663,9 +1662,8 @@ mod tests {
         };
         let candidates = request.gather_candidates(&repo, 5).unwrap();
         let items = resolve_and_rank(&repo, candidates, 5, true).unwrap();
-        assert!(items
-            .iter()
-            .any(|item| item.kg_node_id == "memory:auth-decision"));
+        assert!(items.iter().any(|item| item.kg_node_id
+            == iri::mint_memory(&repo.project_id().unwrap(), "auth-decision")));
     }
 
     #[test]
@@ -1695,7 +1693,8 @@ mod tests {
         let items = resolve_and_rank(&repo, candidates, 5, true).unwrap();
         assert!(items
             .iter()
-            .any(|item| item.kg_node_id == "memory:auth-file"));
+            .any(|item| item.kg_node_id
+                == iri::mint_memory(&repo.project_id().unwrap(), "auth-file")));
     }
 
     #[test]

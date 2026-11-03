@@ -131,4 +131,17 @@ service SandboxService {
     option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
     option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
   }
+  // A session-end attestation, riding to the owner with the session state
+  // file it verifies under (CB-12B): the owner's publication gate fails
+  // closed without both. Session ownership is enforced — a sandbox submits
+  // attestations for its own sessions only — and the session id is
+  // sanitized before it names a file under the owner's `.atomic/sessions`.
+  rpc SubmitAttestation(SubmitAttestationRequest) returns (SubmitAttestationResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
+    option (atomic.required_capability) = "attestation.write";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.allowed_caller) = CALLER_CLASS_REMOTE_IDENTITY;
+    option (atomic.allowed_caller) = CALLER_CLASS_SANDBOX;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_WRITE;
+  }
 }

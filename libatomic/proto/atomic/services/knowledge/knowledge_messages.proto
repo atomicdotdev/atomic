@@ -1,13 +1,15 @@
 // atomic-protocol — KnowledgeService: knowledge-graph queries and
 // maintenance.
 //
-// DRAFT — add-only. The CLI's eleven `query` verbs collapse into TWO RPCs
-// (the headline combine of this draft):
+// DRAFT — add-only. Interactive graph queries and maintenance use:
 //  * QueryGraph — every read: content/code search, kg search, entity,
 //    neighbors, callers, graph slice, plan execution, RAG ask;
 //  * MaintainKnowledgeGraph — embed/enrich/reindex (the write/rebuild side).
+// GetProjectIdentity and GetWorkflowSnapshot provide read-only, repository-wide
+// workflow inspection for `repo identity show` and client-side SHACL validation.
 // Local file-index construction (`query index`) remains client-side. QueryGraph
-// reads a view-scoped indexed snapshot; it must never build/refresh an index.
+// reads are read-only; the view-scoped search/callers/content paths project
+// recorded graph bytes and must never build/refresh a persistent index.
 
 syntax = "proto3";
 
@@ -15,13 +17,36 @@ package atomic;
 
 import "atomic/common/common.proto";
 
+message GetProjectIdentityRequest {
+  RepositoryRef repository = 1;
+}
+message GetProjectIdentityResponse {
+  string project = 1;
+  string urn = 2;
+  string created = 3;
+  string minted = 4;
+  optional string signed_by = 5;
+  string hash = 6;
+}
+message GetWorkflowSnapshotRequest {
+  RepositoryRef repository = 1;
+}
+// One consistent, repository-wide asserted snapshot. SHACL runs client-side.
+message GetWorkflowSnapshotResponse {
+  uint32 api_version = 1;
+  uint32 generation = 2;
+  string ontology_version = 3;
+  string identity = 4;
+  repeated KGNode nodes = 5;
+  repeated KGEdge edges = 6;
+}
 
 
 message QueryGraphRequest {
   RepositoryRef repository = 1;
-  uint32 limit = 2;             // default 10-20 per kind today
+  uint32 limit = 2;             // kg_search: 0 uses 10; other kinds use their defaults
   oneof query {
-    ContentSearchQuery content_search = 3;   // `query code` (syntext index)
+    ContentSearchQuery content_search = 3;   // `query code` (recorded view bytes)
     KgSearchQuery kg_search = 4;             // `query search`
     EntityQuery entity = 5;                  // `query entities`
     NeighborsQuery neighbors = 6;            // `query neighbors`
@@ -30,24 +55,40 @@ message QueryGraphRequest {
     PlanExecutionQuery plan = 9;            // `query plan` (JSON plan steps)
     RagAskQuery rag_ask = 10;               // `query ask` (KG + LLM answer)
   }
-  ViewRef view = 11; // required; sandbox must match grant
-  // All nodes, edges, snippets, opaque payloads and every plan step are filtered
-  // BEFORE evaluation/provider calls by this effective perspective. Plans are
-  // read-only; no embed/enrich/reindex or arbitrary filesystem/provider action.
+  // For kg_search, callers, and content_search: use this view's full ancestor
+  // and dependency closure. Local callers may omit it to use WORKING_COPIES'
+  // authoritative desired view, never the current_view compatibility file.
+  // An explicit name/id mismatch or unknown view is an error, not a fallback.
+  // VCS candidates are filtered BEFORE ranking/limits. Vault-only KG records
+  // remain repository-wide. These reads never refresh indexes or materialize.
+  // Other query kinds retain their existing scope semantics.
+  ViewRef view = 11;
 }
 
 message ContentSearchQuery {
   string query = 1;
+  // Optional union of repository-relative paths or directory prefixes.
   repeated string paths = 2;
-  // SHAPE-CONFIRM: filters from query/mod.rs content search.
+  optional string path_filter = 3; // same glob semantics as `query code -g`
+  optional string file_type = 4;
+  optional string exclude_type = 5;
+  bool case_insensitive = 6;
+  // Omitted: use QueryGraphRequest.limit (or 30 when it is zero).
+  // Explicit zero: no displayed matches; totals/facets are still returned.
+  optional uint32 max_results = 7;
 }
 message KgSearchQuery {
   string query = 1;
-  // `query search --kind` (add-only): keep only nodes of this kind
-  // (case-insensitive), applied over the candidate pool before the limit.
+  // `query search --kind` (add-only): keep only nodes asserting this absolute
+  // class IRI. Exact, case-sensitive membership in any asserted type is applied
+  // AFTER view projection and BEFORE pool truncation or the result limit.
+  // Absent/empty means no filter; an unknown class matches nothing.
   optional string kind = 2;
-  // The candidate pool size (add-only): how many candidates to score
-  // before selecting the top results (the CLI's --pool, default 5000).
+  // Candidate retention budget (the CLI's --pool, default 5000), normalized
+  // to at least the effective result limit. All eligible candidates are scored.
+  // Without kind, a larger pool supports cross-type diversity. With kind,
+  // return the highest-ranked matching nodes without cross-type diversity;
+  // a small pool (including zero) cannot starve matching results.
   optional uint32 pool = 3;
 }
 message EntityQuery {
@@ -60,7 +101,15 @@ message NeighborsQuery {
   optional uint32 depth = 3;
 }
 message CallersQuery {
+  // `<path>#<symbol>` or a bare symbol, resolved from the selected view's
+  // recorded source. Working-copy edits and sibling views are excluded.
   string node_id = 1;
+}
+message CodeCaller {
+  string path = 1;
+  string name = 2;
+  uint32 line = 3;
+  optional string summary = 4;
 }
 message GraphSliceQuery {
   repeated string node_ids = 1;
@@ -99,18 +148,43 @@ message QueryGraphResponse {
   // The pre-cap node count (add-only): the `query graph` cap note's "N
   // nodes collected" figure.
   optional uint32 graph_collected = 7;
-  // Whether the neighbors subgraph holds ANY calls edge (add-only): the
-  // `query callers` hint's entry-point distinction.
+  // Whether the target has any incoming or outgoing call in the selected
+  // view. Retained for compatibility; no enrichment is required by callers.
   bool calls_present = 8;
   // The full agentic ask result (add-only; schema "atomic.query.ask.v1" =
   // the domain AgentResult JSON) plus its elapsed time.
   optional VersionedBytes ask_result = 9;
   optional uint64 ask_elapsed_ms = 10;
+  uint32 api_version = 11; // canonical workflow KG API version 1
+  repeated CodeCaller callers = 12;
+  // Complete typed `query code` result, including scoped totals, facets and
+  // offsets. `hits` also carries the displayed lines for generic clients.
+  ContentSearchResult content_result = 13;
+}
+
+message ContentSearchResult {
+  repeated ContentMatch matches = 1;
+  uint64 total_matches = 2;
+  repeated ContentDirectoryFacet dir_facets = 3;
+}
+
+message ContentMatch {
+  string path = 1;
+  uint32 line_number = 2;
+  string line_content = 3;
+  uint64 byte_offset = 4;
+  uint64 submatch_start = 5;
+  uint64 submatch_end = 6;
+}
+
+message ContentDirectoryFacet {
+  string path = 1;
+  uint64 count = 2;
 }
 
 message KGNode {
   string id = 1;
-  string node_type = 2;
+  repeated string types = 2; // asserted absolute class IRIs; breaking KG cutover
   optional string name = 3;
   optional bytes data = 4;          // node payload (SHAPE-CONFIRM)
   optional double score = 5;        // search ranking when applicable
@@ -123,7 +197,7 @@ message KGNode {
 message KGEdge {
   string source = 1;
   string target = 2;
-  string relation = 3;
+  string relation = 3; // absolute canonical predicate IRI
   // Full KG-edge field (add-only): the domain edge's metadata (JSON).
   optional bytes metadata = 4;
 }
@@ -146,6 +220,11 @@ message MaintainKnowledgeGraphRequest {
   KnowledgeMaintainAction action = 3;
   optional string scope = 4;      // e.g. entity-type filter
   repeated Hash changes = 5;     // ENRICH: limit to these changes' nodes
+  // Client-resolved credentials for optional signer discovery on reindex.
+  // The handler verifies that the configured remote still matches this URL
+  // before using these headers. No client-side repository open is required.
+  map<string, string> signer_auth_headers = 6;
+  optional string signer_remote_url = 7;
 }
 message MaintainKnowledgeGraphResponse {
   uint64 processed = 1;

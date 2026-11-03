@@ -162,7 +162,7 @@ pub fn create(binary: &Path, root: &Path, config: &Path) -> Result<Fixture> {
         let mut txn = repo.pristine().write_txn()?;
         txn.upsert_kg_node(&atomic_core::pristine::vault::KgNode::new(
             "fixture:authored-only",
-            "intent",
+            atomic_core::kg::ontology::Class::WorkIntent,
             "Authored DB-only relationship source",
             "authored",
         ))?;

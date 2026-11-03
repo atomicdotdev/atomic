@@ -1,0 +1,25 @@
+[package]
+name = "atomic-shacl"
+description = "CLI-only RDF snapshot adaptation and PurRDF SHACL validation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.98"
+
+[dependencies]
+atomic-core.workspace = true
+purrdf-shapes = "=3.0.1"
+oxrdf = "=0.2.4"
+oxttl = "=0.1.8"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+atomic-repository.workspace = true
+atomic-identity.workspace = true
+atomic-canonical.workspace = true
+redb.workspace = true

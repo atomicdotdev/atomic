@@ -133,7 +133,8 @@ impl ProvenanceBuilder {
         self
     }
 
-    /// Set timestamp (Unix epoch seconds).
+    /// Set timestamp (Unix epoch milliseconds). Legacy second values are
+    /// preserved verbatim when importing historical provenance.
     pub fn timestamp(mut self, ts: i64) -> Self {
         self.timestamp = Some(ts);
         self

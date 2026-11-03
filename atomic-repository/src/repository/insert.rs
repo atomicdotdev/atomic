@@ -1758,6 +1758,7 @@ impl Repository {
         hash: &Hash,
         options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
         let t0 = std::time::Instant::now();
 
@@ -1788,7 +1789,13 @@ impl Repository {
                 let closure =
                     super::provenance_gate::reachable_closure(self, std::slice::from_ref(hash))?;
                 let provider = super::provenance_gate::local_session_mac_key_provider(self);
-                self.enforce_publication_gate("shared-view insertion", &closure, Some(&provider))?;
+                let did_provider = super::provenance_gate::local_did_key_provider(self);
+                self.enforce_publication_gate(
+                    "shared-view insertion",
+                    &closure,
+                    Some(&provider),
+                    Some(&did_provider),
+                )?;
             }
         }
 
@@ -2065,6 +2072,9 @@ impl Repository {
 
         // Commit the transaction
         log::debug!("insert_change: committing transaction...");
+        if txn.kg_writes_enabled()? {
+            self.project_view_kg(&mut txn)?;
+        }
         let commit_start = std::time::Instant::now();
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -2165,40 +2175,41 @@ impl Repository {
                 name: view_name.to_string(),
             })?;
 
-        // Collect all needed changes (including the target)
+        // Collect every missing change (the target included) in dependency
+        // order: a depth-first post-order over the dependency graph lists
+        // each change after all of its dependencies. The previous
+        // breadth-first list reversed was not topological (a dependency
+        // listed after a sibling that needs it came out after that sibling),
+        // so a closure referenced into a new view could apply a change
+        // before the change its edges anchor to; the misanchored lines then
+        // rendered twice (a branch seeded after merges rendered a merged
+        // line both at the top and at the end of the file).
         let mut to_insert = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(*hash);
-
-        while let Some(current_hash) = queue.pop_front() {
-            if visited.contains(&current_hash) {
+        let mut stack: Vec<(Hash, bool)> = vec![(*hash, false)];
+        while let Some((current_hash, expanded)) = stack.pop() {
+            if expanded {
+                to_insert.push(current_hash);
                 continue;
             }
-            visited.insert(current_hash);
-
-            // Check if already inserted
+            if !visited.insert(current_hash) {
+                continue;
+            }
+            // Already inserted: its own dependencies are present by invariant.
             if let Ok(Some(id)) = read_txn.get_internal(&current_hash) {
                 if read_txn.get_change_seq(&view, id).ok().flatten().is_some() {
-                    continue; // Already inserted
+                    continue;
                 }
             }
-
-            // Load and queue dependencies
             let dep_change = self.load_change(&current_hash)?;
+            stack.push((current_hash, true));
             for dep in dep_change.dependencies() {
                 if !visited.contains(dep) {
-                    queue.push_back(*dep);
+                    stack.push((*dep, false));
                 }
             }
-
-            to_insert.push(current_hash);
         }
-
         drop(read_txn);
-
-        // Reverse to get topological order (dependencies first)
-        to_insert.reverse();
 
         // CB-12B: gate the complete reachable closure ONCE before any
         // mutation when the target is Shared. The per-change gate inside
@@ -2210,7 +2221,13 @@ impl Repository {
             if shared_target {
                 let closure = super::provenance_gate::reachable_closure(self, &to_insert)?;
                 let provider = super::provenance_gate::local_session_mac_key_provider(self);
-                self.enforce_publication_gate("shared-view insertion", &closure, Some(&provider))?;
+                let did_provider = super::provenance_gate::local_did_key_provider(self);
+                self.enforce_publication_gate(
+                    "shared-view insertion",
+                    &closure,
+                    Some(&provider),
+                    Some(&did_provider),
+                )?;
                 options.skip_publication_gate = true;
             }
         }
@@ -2393,7 +2410,14 @@ impl Repository {
                 })?;
             txn.update_view(&removal_view)
                 .map_err(|error| RepositoryError::Database(error.to_string()))?;
-            self.realign_tree_projection_in_txn(&mut txn, removal_view_name)?;
+            // A private snapshot's membership changed, not the selected
+            // working-copy closure. Projecting its namespace here would hide
+            // pending deletions (or rename paths) from the next durable
+            // record. Preserve the same selected-view boundary as the write
+            // above, including separately staged working-copy paths.
+            if removal_view_name == self.current_view {
+                self.realign_tree_projection_in_txn(&mut txn, removal_view_name)?;
+            }
             if removal_view_name == view_name {
                 let final_view = txn
                     .get_view(view_name)
@@ -2754,7 +2778,13 @@ impl Repository {
         if target_is_shared {
             let closure = super::provenance_gate::reachable_closure(self, &source_changes)?;
             let provider = super::provenance_gate::local_session_mac_key_provider(self);
-            self.enforce_publication_gate("triage promotion", &closure, Some(&provider))?;
+            let did_provider = super::provenance_gate::local_did_key_provider(self);
+            self.enforce_publication_gate(
+                "triage promotion",
+                &closure,
+                Some(&provider),
+                Some(&did_provider),
+            )?;
         }
 
         // When the source view is Draft, its changes were recorded against

@@ -216,7 +216,9 @@ pub(crate) fn load_graphs(
     }
     // Most-recent first (a change explained by >1 graph shows all; the newest
     // leads). Both loaders sort/return unspecified order, so sort here.
-    graphs.sort_by_key(|(_, g)| std::cmp::Reverse(g.timestamp));
+    graphs.sort_by_key(|(_, g)| {
+        std::cmp::Reverse(atomic_core::types::timestamp::epoch_millis(g.timestamp))
+    });
     Ok(graphs)
 }
 
