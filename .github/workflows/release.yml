@@ -146,7 +146,8 @@ jobs:
         run: node --test libatomic/scripts/package-runtime.test.mjs
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98
+        # Match rust-toolchain.toml so cross-target std is installed for the compiler Cargo uses.
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: ${{ matrix.target }}
 
