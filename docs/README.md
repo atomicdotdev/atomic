@@ -12,6 +12,7 @@ Welcome to the Atomic VCS documentation. This directory contains comprehensive d
 | [Shim Operating Guide](./shim-operating-guide.md) | Git shim enable/disable, vault projection policy, trust, recovery, privacy, and observability (CB-13C; exercised against the shipping CLI) | Users, Agents |
 | [Stack Walkthrough](./walkthrough-stacks.md) | Hands-on tutorial for stacks, apply, and stash | Users, Contributors |
 | [Attestation Design](./attestation-design.md) | Graph-level audit nodes for AI cost, tokens, and compliance | Developers, Contributors |
+| [Software Supply Chain Checks](./software-supply-chain.md) | The standards behind canonical bytes, proofs and signatures, and the CI jobs that hold them | Developers, Contributors |
 | [Intent Identity](./intent-identity.md) | ULID + `PROJECT::author::seq` intent identity and reference resolution | Users, Contributors |
 | [Intent Knowledge Graph](./intent-graph.md) | How intents become a queryable graph and the `atomic vault query` commands | Users, Contributors |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | System architecture, data model, and design decisions | Developers, Contributors |
