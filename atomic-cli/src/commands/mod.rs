@@ -417,13 +417,19 @@ pub(crate) fn open_readonly_repository(
     Repository::open_readonly_wait(path, std::time::Duration::from_secs(10))
 }
 
-/// Open the repository at `root` with a vault guaranteed to exist.
+/// Open the repository at `root` for a command that writes to the vault,
+/// creating the vault when it does not exist yet.
 ///
-/// Vault-facing commands — the `vault`, `intent`, and `memory` families —
-/// open through this helper so a repository created without a vault
+/// Vault *writes* — `goal start/stop/resume`, `materialize`, `sync`,
+/// `intent new/update/delete/link/attest`, `memory new/write/attest` — open
+/// through this helper so a repository created without a vault
 /// (`atomic init --no-vault`, or one that never ran `atomic vault init`)
-/// serves them on first use instead of failing with
-/// "Vault not initialized".
+/// works on first use instead of failing with "Vault not initialized".
+///
+/// Read-only commands deliberately do NOT use this helper: they open with
+/// [`open_readonly_repository`], so a read never mutates a checkout — an
+/// uninitialized vault reads as empty/not-found, and the first write
+/// initializes it.
 ///
 /// The initialization is [`Repository::ensure_vault`], the same idempotent
 /// path `atomic vault init` uses. It runs at most once: an existing vault is
@@ -432,20 +438,6 @@ pub fn open_repository_with_vault(root: &Path) -> CliResult<Repository> {
     let repo = Repository::open(root).map_err(CliError::from)?;
     ensure_vault_exists(&repo)?;
     Ok(repo)
-}
-
-/// Read-only variant of [`open_repository_with_vault`].
-///
-/// An already-initialized repository keeps the migration-free read-only
-/// handle. Only the absent-vault case pays the writable open needed to create
-/// and record the vault tables.
-pub(crate) fn open_readonly_repository_with_vault(root: &Path) -> CliResult<Repository> {
-    let repo = open_readonly_repository(root).map_err(CliError::from)?;
-    if repo.has_vault().map_err(CliError::from)? {
-        return Ok(repo);
-    }
-    drop(repo);
-    open_repository_with_vault(root)
 }
 
 /// One-time implicit vault initialization, announced on stderr so `--json`

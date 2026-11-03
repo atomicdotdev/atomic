@@ -48,6 +48,15 @@ fn vaultless_repo() -> (TempDir, TempDir) {
     (repo, home)
 }
 
+/// Permit reads, deny database writes — the read-only checkout state a
+/// CI mount or a `chmod`ed tree presents.
+fn make_database_read_only(repo: &Path) {
+    let db = repo.join(".atomic/atomic.redb");
+    let mut permissions = std::fs::metadata(&db).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&db, permissions).unwrap();
+}
+
 fn intents_written(repo: &Path) -> bool {
     std::fs::read_dir(repo.join(".vault/intents"))
         .map(|mut entries| {
@@ -99,6 +108,39 @@ fn vault_goal_and_materialize_initialize_before_running() {
     assert!(materialized.contains("Materialized"), "{materialized}");
 
     assert!(repo.path().join(".vault/goals").exists());
+}
+
+#[test]
+fn reads_do_not_initialize_the_vault() {
+    let (repo, home) = vaultless_repo();
+
+    let listed = success(atomic(repo.path(), home.path(), &["vault", "list"]));
+    assert!(listed.contains("No vault entries found"), "{listed}");
+    let intents = success(atomic(repo.path(), home.path(), &["intent", "list"]));
+    assert!(intents.contains("No intents found"), "{intents}");
+    let memories = success(atomic(repo.path(), home.path(), &["memory", "list"]));
+    assert!(memories.contains("No memories found"), "{memories}");
+
+    assert!(
+        !repo.path().join(".vault").exists(),
+        "a read must never create the vault"
+    );
+}
+
+#[test]
+fn read_only_checkout_serves_vault_reads() {
+    let (repo, home) = vaultless_repo();
+    make_database_read_only(repo.path());
+
+    let listed = success(atomic(repo.path(), home.path(), &["vault", "list"]));
+    assert!(listed.contains("No vault entries found"), "{listed}");
+    assert!(!repo.path().join(".vault").exists());
+
+    let mut permissions = std::fs::metadata(repo.path().join(".atomic/atomic.redb"))
+        .unwrap()
+        .permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(repo.path().join(".atomic/atomic.redb"), permissions).unwrap();
 }
 
 #[test]

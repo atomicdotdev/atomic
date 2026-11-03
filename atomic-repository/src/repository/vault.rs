@@ -27,10 +27,11 @@ impl Repository {
 
     /// Ensure the vault exists, initializing it on first use.
     ///
-    /// Vault-facing entry points call this so a repository created without a
-    /// vault (`atomic init --no-vault`) still serves `atomic vault`,
-    /// `atomic intent`, and `atomic memory` without a manual
-    /// `atomic vault init`.
+    /// Vault *write* paths call this so a repository created without a vault
+    /// (`atomic init --no-vault`) still supports vault and intent/memory
+    /// writes without a manual `atomic vault init`. Read paths never call it:
+    /// reads must not mutate a checkout, so an uninitialized vault reads as
+    /// empty/not-found.
     ///
     /// Initialization is the same idempotent path as
     /// [`init_vault`](Self::init_vault): an existing `.vault/` working copy is

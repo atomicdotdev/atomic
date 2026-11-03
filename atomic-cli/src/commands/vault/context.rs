@@ -196,7 +196,8 @@ impl Command for Context {
         }
 
         let root = find_repository_root()?;
-        let repo = crate::commands::open_readonly_repository_with_vault(&root)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         let limit = self.limit;
         let candidates = self.gather_candidates(&repo, limit)?;

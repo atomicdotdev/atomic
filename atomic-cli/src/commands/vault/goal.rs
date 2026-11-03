@@ -387,7 +387,8 @@ impl Command for GoalList {
         }
 
         let root = find_repository_root()?;
-        let repo = crate::commands::open_repository_with_vault(&root)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         let filter = if self.status == "all" {
             Some("all")
@@ -434,7 +435,8 @@ impl Command for GoalShow {
             return Ok(());
         }
         let root = find_repository_root()?;
-        let repo = crate::commands::open_repository_with_vault(&root)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         let entry = repo
             .vault_goal_show(&self.goal)

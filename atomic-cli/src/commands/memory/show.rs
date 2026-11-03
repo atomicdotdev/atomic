@@ -85,7 +85,8 @@ impl Command for MemoryShow {
         }
 
         let root = find_repository_root()?;
-        let repo = crate::commands::open_repository_with_vault(&root)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         let inputs = bridge::read_memory(&repo, &self.id)?;
         let attestation = bridge::load_attestation(&repo, &self.id, &inputs)?;

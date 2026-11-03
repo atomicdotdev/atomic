@@ -56,7 +56,8 @@ impl Command for Show {
         }
 
         let root = find_repository_root()?;
-        let repo = crate::commands::open_readonly_repository_with_vault(&root)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         let entry = repo
             .vault_retrieve(&self.path)

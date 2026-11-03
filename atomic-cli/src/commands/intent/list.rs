@@ -488,7 +488,8 @@ impl Command for IntentList {
         }
 
         let root = find_repository_root()?;
-        let repo = crate::commands::open_readonly_repository_with_vault(&root)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         // Resolve the verifying identity ONCE (soft-fail to "no identity").
         let verifier = resolve_verifier(&self.identity)?;
