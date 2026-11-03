@@ -636,7 +636,11 @@ impl Repository {
                     }
                 }
             }
-            for ops in change.file_ops() {
+            let file_ops = match atomic_core::change::span_patch::localize_file_ops(&txn, &change) {
+                Ok(ops) => ops,
+                Err(error) => return Ok(Err(SubmitRejection::Malformed(error.to_string()))),
+            };
+            for ops in &file_ops {
                 if let Some(id) = ops
                     .referenced_node_ids()
                     .into_iter()

@@ -455,6 +455,11 @@ pub(super) fn render_name_conflict_side<C: atomic_core::change::ChangeStore>(
     inode: Inode,
     position: Position<NodeId>,
 ) -> Result<Vec<u8>, String> {
+    if let Some(bytes) = super::content::retrieve_span_if_present(txn, store, inode, visibility)
+        .map_err(|error| format!("{path}: span: {error}"))?
+    {
+        return Ok(bytes);
+    }
     use atomic_core::output::repo::{
         output_graph_content_resolved, resolve_conflicts_semantically,
     };
@@ -1411,6 +1416,8 @@ impl Repository {
         self.validate_working_copy(working_copy)?;
         use atomic_core::output::repo::OutputItem;
         use atomic_core::output::RetrieveOptions;
+        use atomic_core::pristine::span_patch_storage::{SpanPatchReadTxn, SpanRenderContext};
+        use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
         use rayon::prelude::*;
 
         let txn = self
@@ -1440,6 +1447,74 @@ impl Repository {
                         .is_none_or(|paths| paths.contains(&item.path))
             })
             .collect();
+
+        // Name-conflict rendering still uses graph vertices; never render an
+        // indexed span claimant as an empty graph side.
+        for (path, conflict) in &name_conflicts {
+            if only_paths
+                .as_ref()
+                .is_some_and(|paths| !paths.contains(path))
+            {
+                continue;
+            }
+            for side in conflict.sides_at_path(path) {
+                if txn
+                    .span_root(side.inode)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+                    .is_some()
+                {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "cannot materialize span-backed name conflict at '{path}'"
+                        ),
+                    });
+                }
+            }
+        }
+        let mut has_visible_spans = false;
+        for item in &file_items {
+            match txn
+                .span_root(item.inode)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+            {
+                Some(root) if visibility.contains(NodeId::new(root[0])) => {
+                    if !matches!(
+                        txn.required_capability_version(SPAN_RANGE_CAPABILITY.id())
+                            .map_err(|error| RepositoryError::Database(error.to_string()))?,
+                        Some(2) | Some(3)
+                    ) {
+                        return Err(RepositoryError::Database(
+                            "span index has no matching repository capability".into(),
+                        ));
+                    }
+                    has_visible_spans = true;
+                }
+                Some(_) => {
+                    return Err(RepositoryError::Database(format!(
+                        "span root for '{}' is outside the requested view",
+                        item.path
+                    )))
+                }
+                None => {
+                    // Distinguish legacy graph files from a missing span index
+                    // before any materialization operation is prepared.
+                    super::content::retrieve_span_if_present(
+                        &txn,
+                        &self.change_store,
+                        item.inode,
+                        &visibility,
+                    )?;
+                }
+            }
+        }
+        let span_context = if has_visible_spans {
+            Some(
+                SpanRenderContext::new(&txn, &self.change_store, &visibility)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?,
+            )
+        } else {
+            None
+        };
 
         let mut inode_materialization = std::collections::HashMap::new();
         for item in &file_items {
@@ -1619,85 +1694,122 @@ impl Repository {
             .map(|item| {
                 let file_start = std::time::Instant::now();
 
-                // Cloning validated visibility is O(1).
-                let retrieve_opts =
-                    RetrieveOptions::default().with_graph_visibility(visibility.clone());
-
-                // Inline the output pipeline so we can trace each phase.
-                use atomic_core::output::repo::{
-                    output_graph_content_resolved, resolve_conflicts_semantically,
+                let span_content = match &span_context {
+                    Some(context) => context
+                        .render_if_visible(item.inode)
+                        .map_err(|error| format!("{}: span: {}", item.path, error))?,
+                    None => None,
                 };
-                use atomic_core::output::{compute_order, retrieve_graph, Writer};
-                use atomic_core::pristine::InodePreloadTxn;
 
-                // Pre-load ALL edges for this file's inode from INODE_GRAPH
-                // in a single range scan, then run retrieve_graph over the
-                // in-memory HashMap. O(M) scan + O(1) lookups vs O(V×log N)
-                // individual B-tree probes.
-                let preloaded = InodePreloadTxn::from_table(&txn, item.inode, &inode_graph_table)
-                    .map_err(|e| format!("{}: preload: {:?}", item.path, e))?;
-
-                let t_retrieve = std::time::Instant::now();
-                let retrieve_result = retrieve_graph(&preloaded, item.position, retrieve_opts)
-                    .map_err(|e| format!("{}: retrieve: {:?}", item.path, e))?;
-
-                let vertices = retrieve_result.graph.len_vertices();
-                let edges = retrieve_result.edges_traversed;
-                let retrieve_ms = t_retrieve.elapsed();
-                let mut graph = retrieve_result.graph;
-
-                let (repository_content, order_ms, content_ms, rendered_conflicts) = if graph
-                    .is_empty()
-                {
+                let (
+                    repository_content,
+                    vertices,
+                    edges,
+                    retrieve_ms,
+                    order_ms,
+                    content_ms,
+                    rendered_conflicts,
+                ) = if let Some(content) = span_content {
                     (
-                        Vec::new(),
+                        content,
+                        0,
+                        0,
+                        std::time::Duration::ZERO,
                         std::time::Duration::ZERO,
                         std::time::Duration::ZERO,
                         false,
                     )
                 } else {
-                    let t_order = std::time::Instant::now();
-                    let order = compute_order(&mut graph);
-                    let order_ms = t_order.elapsed();
+                    // Cloning validated visibility is O(1).
+                    let retrieve_opts =
+                        RetrieveOptions::default().with_graph_visibility(visibility.clone());
 
-                    let t_content = std::time::Instant::now();
-                    let resolved = resolve_conflicts_semantically(
-                        &preloaded, store, &graph, &order,
-                    )
-                    .map_err(|error| format!("{}: semantic resolution: {}", item.path, error))?;
-                    let buffer = Vec::with_capacity(graph.total_bytes());
-                    let mut writer = Writer::new(buffer);
-                    let hash_fn = |node_id: NodeId| -> Result<
-                        Option<Hash>,
-                        atomic_core::pristine::PristineError,
-                    > {
-                        if node_id.is_root() {
-                            return Ok(None);
-                        }
-                        external_hashes.get(&node_id).copied().map(Some).ok_or(
-                            atomic_core::pristine::PristineError::ChangeNotFound {
-                                id: node_id.get(),
-                            },
-                        )
+                    // Inline the output pipeline so we can trace each phase.
+                    use atomic_core::output::repo::{
+                        output_graph_content_resolved, resolve_conflicts_semantically,
                     };
-                    output_graph_content_resolved(
-                        store,
-                        hash_fn,
-                        &graph,
-                        &order,
-                        &mut writer,
-                        &resolved,
-                    )
-                    .map_err(|e| format!("{}: content: {:?}", item.path, e))?;
-                    // Whether the renderer itself emitted a conflict region.
-                    // A file whose *source* merely contains marker-shaped
-                    // lines (documentation examples, test fixtures) writes
-                    // them through `output_line` and stays marker-free here.
-                    let rendered_conflicts = writer.has_conflict_markers();
+                    use atomic_core::output::{compute_order, retrieve_graph, Writer};
+                    use atomic_core::pristine::InodePreloadTxn;
+
+                    // Pre-load ALL edges for this file's inode from INODE_GRAPH
+                    // in a single range scan, then run retrieve_graph over the
+                    // in-memory HashMap. O(M) scan + O(1) lookups vs O(V×log N)
+                    // individual B-tree probes.
+                    let preloaded =
+                        InodePreloadTxn::from_table(&txn, item.inode, &inode_graph_table)
+                            .map_err(|e| format!("{}: preload: {:?}", item.path, e))?;
+
+                    let t_retrieve = std::time::Instant::now();
+                    let retrieve_result = retrieve_graph(&preloaded, item.position, retrieve_opts)
+                        .map_err(|e| format!("{}: retrieve: {:?}", item.path, e))?;
+
+                    let vertices = retrieve_result.graph.len_vertices();
+                    let edges = retrieve_result.edges_traversed;
+                    let retrieve_ms = t_retrieve.elapsed();
+                    let mut graph = retrieve_result.graph;
+
+                    let (repository_content, order_ms, content_ms, rendered_conflicts) =
+                        if graph.is_empty() {
+                            (
+                                Vec::new(),
+                                std::time::Duration::ZERO,
+                                std::time::Duration::ZERO,
+                                false,
+                            )
+                        } else {
+                            let t_order = std::time::Instant::now();
+                            let order = compute_order(&mut graph);
+                            let order_ms = t_order.elapsed();
+
+                            let t_content = std::time::Instant::now();
+                            let resolved =
+                                resolve_conflicts_semantically(&preloaded, store, &graph, &order)
+                                    .map_err(|error| {
+                                    format!("{}: semantic resolution: {}", item.path, error)
+                                })?;
+                            let buffer = Vec::with_capacity(graph.total_bytes());
+                            let mut writer = Writer::new(buffer);
+                            let hash_fn = |node_id: NodeId| -> Result<
+                                Option<Hash>,
+                                atomic_core::pristine::PristineError,
+                            > {
+                                if node_id.is_root() {
+                                    return Ok(None);
+                                }
+                                external_hashes.get(&node_id).copied().map(Some).ok_or(
+                                    atomic_core::pristine::PristineError::ChangeNotFound {
+                                        id: node_id.get(),
+                                    },
+                                )
+                            };
+                            output_graph_content_resolved(
+                                store,
+                                hash_fn,
+                                &graph,
+                                &order,
+                                &mut writer,
+                                &resolved,
+                            )
+                            .map_err(|e| format!("{}: content: {:?}", item.path, e))?;
+                            // Whether the renderer itself emitted a conflict region.
+                            // A file whose *source* merely contains marker-shaped
+                            // lines (documentation examples, test fixtures) writes
+                            // them through `output_line` and stays marker-free here.
+                            let rendered_conflicts = writer.has_conflict_markers();
+                            (
+                                writer.into_inner(),
+                                order_ms,
+                                t_content.elapsed(),
+                                rendered_conflicts,
+                            )
+                        };
                     (
-                        writer.into_inner(),
+                        repository_content,
+                        vertices,
+                        edges,
+                        retrieve_ms,
                         order_ms,
-                        t_content.elapsed(),
+                        content_ms,
                         rendered_conflicts,
                     )
                 };

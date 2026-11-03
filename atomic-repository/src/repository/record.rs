@@ -15,6 +15,486 @@ type ExistingSemanticState = (
     Vec<atomic_core::crdt::BranchId>,
 );
 
+fn span_namespace_dependencies<T: GraphTxnT>(
+    txn: &T,
+    visibility: &GraphVisibilityClosure,
+    present: &std::collections::HashMap<String, super::name_resolution::ProjectedPathClaim>,
+    path: &str,
+    inode: Inode,
+) -> Result<Vec<Hash>, RecordError> {
+    let mut dependencies = Vec::new();
+    let mut component = Some(Path::new(path));
+    while let Some(current) = component.filter(|current| !current.as_os_str().is_empty()) {
+        let current_path = current
+            .to_str()
+            .ok_or_else(|| RecordError::Database(format!("invalid span path '{path}'")))?;
+        let claim = present.get(current_path).ok_or_else(|| {
+            RecordError::Database(format!("missing visible path claim for '{current_path}'"))
+        })?;
+        if current_path == path && claim.inode != inode {
+            return Err(RecordError::Database(format!(
+                "span path '{path}' changed identity"
+            )));
+        }
+        let ids = claim
+            .event_changes
+            .iter()
+            .copied()
+            .chain(claim.claims.iter().flat_map(|claim| {
+                [
+                    claim.introduced_by,
+                    claim.claimant.change,
+                    claim.parent.change,
+                    claim.name.change,
+                ]
+            }));
+        for id in ids.filter(|id| !id.is_root()) {
+            if !visibility.contains(id) {
+                return Err(RecordError::Database(format!(
+                    "path claim for '{current_path}' is outside the view"
+                )));
+            }
+            dependencies.push(
+                txn.get_external(id)
+                    .map_err(|error| RecordError::Database(error.to_string()))?
+                    .ok_or_else(|| {
+                        RecordError::Database(format!("path claim change {} has no hash", id.get()))
+                    })?,
+            );
+        }
+        component = current.parent();
+    }
+    dependencies.sort();
+    dependencies.dedup();
+    Ok(dependencies)
+}
+
+/// Replace the linewise content hunks of newly added files with immutable
+/// span roots. Namespace hunks and semantic operations are retained.
+fn lower_new_files_to_spans(change: &mut Change) -> Result<(), RecordError> {
+    use atomic_core::change::span_patch::{SpanOp, SpanPatch};
+    use atomic_core::change::Atom;
+
+    let mut roots = Vec::<(String, u64, u64, u64)>::new();
+    for hunk in change.hunks() {
+        if let GraphOp::FileAdd {
+            path,
+            add_inode,
+            contents,
+            ..
+        } = hunk
+        {
+            let (start, end) = contents
+                .as_ref()
+                .map(|content| (content.start.get(), content.end.get()))
+                .unwrap_or((add_inode.start.get(), add_inode.start.get()));
+            if roots.iter().any(|(existing, ..)| existing == path) {
+                return Err(RecordError::Database(format!(
+                    "duplicate added file '{path}'"
+                )));
+            }
+            roots.push((path.clone(), add_inode.start.get(), start, end));
+        }
+    }
+    if roots.is_empty() {
+        return Ok(());
+    }
+    for hunk in change.hunks() {
+        match hunk {
+            GraphOp::Edit {
+                change: Atom::Insertion(insert),
+                local,
+                ..
+            } if roots.iter().any(|(path, ..)| path == &local.path) => {
+                let (_, inode, _, end) = roots
+                    .iter_mut()
+                    .find(|(path, ..)| path == &local.path)
+                    .unwrap();
+                if insert.inode.change.is_some()
+                    || insert.inode.pos.get() != *inode
+                    || insert.start.get() != *end
+                    || !insert.successors.is_empty()
+                    || insert.predecessors.len() != 1
+                    || insert.predecessors[0].change.is_some()
+                    || insert.predecessors[0].pos.get() != *end
+                {
+                    return Err(RecordError::Database(format!(
+                        "cannot lower added file '{}' to a contiguous span",
+                        local.path
+                    )));
+                }
+                *end = insert.end.get();
+            }
+            GraphOp::Edit { local, .. } | GraphOp::Replacement { local, .. }
+                if roots.iter().any(|(path, ..)| path == &local.path) =>
+            {
+                return Err(RecordError::Database(format!(
+                    "cannot lower added file '{}' to a contiguous span",
+                    local.path
+                )));
+            }
+            _ => {}
+        }
+    }
+    let ops = roots
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (path, _, start, end))| {
+            let ordinal = u32::try_from(ordinal)
+                .map_err(|_| RecordError::Database("too many span roots".into()))?;
+            Ok(SpanOp::Root {
+                path: path.clone(),
+                ordinal,
+                start: *start,
+                end: *end,
+            })
+        })
+        .collect::<Result<Vec<_>, RecordError>>()?;
+    for hunk in &mut change.hashed.hunks {
+        if let GraphOp::FileAdd { contents, .. } = hunk {
+            *contents = None;
+        }
+    }
+    change
+        .hashed
+        .hunks
+        .retain(|hunk| !matches!(hunk, GraphOp::Edit { local, .. } if roots.iter().any(|(path, ..)| path == &local.path)));
+    match &mut change.hashed.span {
+        Some(patch) => patch.ops.extend(ops),
+        None => change.hashed.span = Some(SpanPatch::new(Vec::new(), ops)),
+    }
+    Ok(())
+}
+
+fn record_span_edit(
+    detected: &atomic_core::record::workflow::DetectedFile,
+    state: &atomic_core::pristine::span_patch_storage::SpanRecordState,
+    namespace_dependencies: Vec<Hash>,
+    new: &[u8],
+    trunk: atomic_core::crdt::TrunkId,
+    branches: &[atomic_core::crdt::BranchId],
+    algorithm: atomic_core::diff::Algorithm,
+) -> Result<atomic_core::record::workflow::RecordedFile, String> {
+    use atomic_core::change::span_patch::SpanOp;
+    use atomic_core::crdt::BranchOp;
+    use atomic_core::diff::{diff_raw, DiffOp, Line};
+    use atomic_core::record::workflow::recipes::{Recipe, RecipeContext};
+    use atomic_core::record::workflow::{DetectionKind, RecordedFile};
+    use atomic_core::types::ChangePosition;
+    let path = detected.path.as_str();
+    let inode = detected
+        .inode
+        .ok_or_else(|| "span edit has no inode".to_string())?;
+    let position = detected
+        .position
+        .ok_or_else(|| "span edit has no position".to_string())?;
+    let old = state.content.as_slice();
+    if atomic_core::record::workflow::compare::detect_encoding(old)
+        == atomic_core::change::Encoding::Binary
+        || atomic_core::record::workflow::compare::detect_encoding(new)
+            == atomic_core::change::Encoding::Binary
+    {
+        return Err("span recording cannot yet change between text and binary".into());
+    }
+    let old_lines = Line::from_bytes(old);
+    let new_lines = Line::from_bytes(new);
+    if old_lines.len() != branches.len() {
+        return Err("semantic lines do not match the span baseline".into());
+    }
+    let mut old_offsets = vec![0usize];
+    for line in &old_lines {
+        old_offsets.push(old_offsets.last().copied().unwrap() + line.len());
+    }
+    let mut blocks = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    let (mut old_cursor, mut new_cursor) = (0usize, 0usize);
+    let diff = diff_raw(&old_lines, &new_lines, algorithm);
+    for op in diff.ops() {
+        let (old_pos, new_pos, old_len, new_len, equal) = match *op {
+            DiffOp::Equal {
+                old_pos,
+                new_pos,
+                len,
+            } => (old_pos, new_pos, len, len, true),
+            DiffOp::Insert {
+                old_pos,
+                new_pos,
+                len,
+            } => (old_pos, new_pos, 0, len, false),
+            DiffOp::Delete {
+                old_pos,
+                new_pos,
+                len,
+            } => (old_pos, new_pos, len, 0, false),
+            DiffOp::Replace {
+                old_pos,
+                old_len,
+                new_pos,
+                new_len,
+            } => (old_pos, new_pos, old_len, new_len, false),
+        };
+        if old_pos != old_cursor || new_pos != new_cursor {
+            return Err("invalid line diff ordering".into());
+        }
+        if equal {
+            if let Some((old_start, new_start)) = open.take() {
+                blocks.push((old_start, old_cursor, new_start, new_cursor));
+            }
+            if old_lines.get(old_cursor..old_cursor + old_len)
+                != new_lines.get(new_cursor..new_cursor + new_len)
+            {
+                return Err("line diff does not preserve equal bytes".into());
+            }
+        } else if open.is_none() {
+            open = Some((old_cursor, new_cursor));
+        }
+        old_cursor += old_len;
+        new_cursor += new_len;
+    }
+    if let Some((old_start, new_start)) = open {
+        blocks.push((old_start, old_cursor, new_start, new_cursor));
+    }
+    if old_cursor != old_lines.len() || new_cursor != new_lines.len() || blocks.is_empty() {
+        return Err("line diff does not cover the file".into());
+    }
+
+    let mut content = Vec::new();
+    let mut span_ops = Vec::new();
+    let mut line_ranges = std::collections::BTreeMap::new();
+    for (old_start, old_end, new_start, new_end) in blocks {
+        let insert_start = content.len() as u64;
+        for (index, line) in new_lines[new_start..new_end].iter().enumerate() {
+            let start = content.len() as u64;
+            content.extend_from_slice(line.content());
+            line_ranges.insert(new_start + index + 1, (start, content.len() as u64));
+        }
+        let insert_end = content.len() as u64;
+        let start = old_offsets[old_start];
+        let end = old_offsets[old_end];
+        if start == end {
+            let segment = state
+                .spans
+                .iter()
+                .find(|span| span.output.start < start && start <= span.output.end)
+                .or_else(|| state.spans.iter().find(|span| span.output.start == start));
+            let (target, offset) = match segment {
+                Some(segment) => (
+                    segment.target.clone(),
+                    segment.target_start + (start - segment.output.start) as u64,
+                ),
+                None if old.is_empty() && start == 0 => (state.root.clone(), 0),
+                None => return Err("no authored span anchors the insertion".into()),
+            };
+            span_ops.push(SpanOp::Edit {
+                file: state.file.clone(),
+                target,
+                start: offset,
+                end: offset,
+                insert_start,
+                insert_end,
+            });
+        } else {
+            let mut cursor = start;
+            let mut first = true;
+            for segment in &state.spans {
+                let lo = start.max(segment.output.start);
+                let hi = end.min(segment.output.end);
+                if lo >= hi {
+                    continue;
+                }
+                if lo != cursor {
+                    return Err("span baseline does not cover the edit".into());
+                }
+                let target_start = segment.target_start + (lo - segment.output.start) as u64;
+                span_ops.push(SpanOp::Edit {
+                    file: state.file.clone(),
+                    target: segment.target.clone(),
+                    start: target_start,
+                    end: target_start + (hi - lo) as u64,
+                    insert_start: if first { insert_start } else { insert_end },
+                    insert_end,
+                });
+                cursor = hi;
+                first = false;
+            }
+            if cursor != end {
+                return Err("span baseline does not cover the edit".into());
+            }
+        }
+    }
+    let encoding = atomic_core::record::workflow::compare::detect_encoding(new);
+    let context = RecipeContext {
+        path,
+        old_content: old,
+        new_content: new,
+        existing_branches: Some(branches),
+        existing_trunk_id: Some(trunk),
+        encoding,
+        algorithm,
+    };
+    let (mut ops, stats) = Recipe::InPlaceEdit.build_ops(&context);
+    let mut mapped = std::collections::BTreeSet::new();
+    for line in ops.line_ops_mut() {
+        if let Some(number) = line.new_line_num() {
+            if let Some(&(start, end)) = line_ranges.get(&number) {
+                if matches!(
+                    line.operation(),
+                    BranchOp::Insert { .. } | BranchOp::Modify { .. }
+                ) {
+                    if !mapped.insert(number) {
+                        return Err("duplicate semantic line mapping".into());
+                    }
+                    line.set_content_range(ChangePosition::new(start), ChangePosition::new(end));
+                }
+            }
+        }
+    }
+    if mapped.len() != line_ranges.len() {
+        return Err("semantic edits do not cover the changed lines".into());
+    }
+    let mut recorded = RecordedFile::new(path);
+    recorded.set_kind(DetectionKind::Modified);
+    recorded.set_inode(inode);
+    recorded.set_position(position);
+    recorded.set_encoding(encoding);
+    recorded.set_old_line_count(old_lines.len());
+    recorded.set_content(content);
+    recorded.set_pre_globalized(Vec::new());
+    recorded.set_span_ops(span_ops);
+    let mut dependencies = state.dependencies.clone();
+    dependencies.extend(namespace_dependencies);
+    dependencies.sort();
+    dependencies.dedup();
+    recorded.set_span_dependencies(dependencies);
+    recorded.set_crdt_ops(ops);
+    recorded.set_crdt_stats(stats);
+    Ok(recorded)
+}
+
+fn record_binary_span_edit(
+    detected: &atomic_core::record::workflow::DetectedFile,
+    state: &atomic_core::pristine::span_patch_storage::SpanRecordState,
+    namespace_dependencies: Vec<Hash>,
+    new: &[u8],
+    trunk: atomic_core::crdt::TrunkId,
+    branches: &[atomic_core::crdt::BranchId],
+    algorithm: atomic_core::diff::Algorithm,
+) -> Result<atomic_core::record::workflow::RecordedFile, String> {
+    use atomic_core::change::span_patch::SpanOp;
+    use atomic_core::change::{Encoding, FileOps, LineOps};
+    use atomic_core::crdt::BranchOp;
+    use atomic_core::diff::Line;
+    use atomic_core::record::workflow::recipes::{Recipe, RecipeContext};
+    use atomic_core::record::workflow::{DetectionKind, RecordedFile};
+    use atomic_core::types::ChangePosition;
+    let inode = detected
+        .inode
+        .ok_or_else(|| "span edit has no inode".to_string())?;
+    let position = detected
+        .position
+        .ok_or_else(|| "span edit has no position".to_string())?;
+    let mut edits = Vec::new();
+    let mut cursor = 0usize;
+    for segment in &state.spans {
+        if segment.output.start != cursor {
+            return Err("binary span baseline is incomplete".into());
+        }
+        let length = segment.output.end - segment.output.start;
+        edits.push(SpanOp::Edit {
+            file: state.file.clone(),
+            target: segment.target.clone(),
+            start: segment.target_start,
+            end: segment.target_start + length as u64,
+            insert_start: if cursor == 0 { 0 } else { new.len() as u64 },
+            insert_end: new.len() as u64,
+        });
+        cursor = segment.output.end;
+    }
+    if cursor != state.content.len() {
+        return Err("binary span baseline is incomplete".into());
+    }
+    if edits.is_empty() {
+        edits.push(SpanOp::Edit {
+            file: state.file.clone(),
+            target: state.root.clone(),
+            start: 0,
+            end: 0,
+            insert_start: 0,
+            insert_end: new.len() as u64,
+        });
+    }
+    let mut recorded = RecordedFile::new(detected.path.as_str());
+    recorded.set_kind(DetectionKind::Modified);
+    recorded.set_inode(inode);
+    recorded.set_position(position);
+    let encoding = atomic_core::record::workflow::compare::detect_encoding(new);
+    recorded.set_encoding(encoding);
+    recorded.set_content(new.to_vec());
+    recorded.set_pre_globalized(Vec::new());
+    recorded.set_span_ops(edits);
+    let mut dependencies = state.dependencies.clone();
+    dependencies.extend(namespace_dependencies);
+    dependencies.sort();
+    dependencies.dedup();
+    recorded.set_span_dependencies(dependencies);
+    let mut ops = if encoding == Encoding::Binary {
+        let mut ops = FileOps::edit(trunk, detected.path.clone());
+        for branch in branches {
+            ops.add_line_op(LineOps::delete_empty(*branch));
+        }
+        ops
+    } else {
+        let context = RecipeContext {
+            path: &detected.path,
+            old_content: b"",
+            new_content: new,
+            existing_branches: None,
+            existing_trunk_id: Some(trunk),
+            encoding,
+            algorithm,
+        };
+        let (ops, stats) = Recipe::InPlaceEdit.build_ops(&context);
+        recorded.set_crdt_stats(stats);
+        ops
+    };
+    if encoding != Encoding::Binary {
+        if !branches.is_empty() {
+            ops.line_ops_mut()
+                .splice(0..0, branches.iter().copied().map(LineOps::delete_empty));
+        }
+        let lines = Line::from_bytes(new);
+        let mut offsets = Vec::with_capacity(lines.len());
+        let mut pos = 0u64;
+        for line in &lines {
+            let start = pos;
+            pos += line.len() as u64;
+            offsets.push((start, pos));
+        }
+        let mut mapped = std::collections::BTreeSet::new();
+        for line in ops.line_ops_mut() {
+            if let Some(index) = line.new_line_num().and_then(|number| number.checked_sub(1)) {
+                if matches!(
+                    line.operation(),
+                    BranchOp::Insert { .. } | BranchOp::Modify { .. }
+                ) {
+                    let &(start, end) = offsets
+                        .get(index)
+                        .ok_or_else(|| "semantic line outside binary transition".to_string())?;
+                    if !mapped.insert(index) {
+                        return Err("duplicate semantic line mapping".into());
+                    }
+                    line.set_content_range(ChangePosition::new(start), ChangePosition::new(end));
+                }
+            }
+        }
+        if mapped.len() != lines.len() {
+            return Err("semantic lines do not cover binary transition".into());
+        }
+    }
+    recorded.set_crdt_ops(ops);
+    Ok(recorded)
+}
+
 /// Walk the line order recorded by one effective closure. Ambient AFTER
 /// rows may have been reparented by a different view and are not a baseline.
 pub(super) fn semantic_branch_order(
@@ -375,7 +855,9 @@ impl Repository {
                 }
             }
             dependencies.insert(id, parents);
-            for ops in change.file_ops() {
+            let file_ops = atomic_core::change::span_patch::localize_file_ops(&txn, &change)
+                .map_err(|error| error.to_string())?;
+            for ops in &file_ops {
                 let raw = ops.trunk_id();
                 let trunk = if raw.change_id().is_root() {
                     TrunkId::new(id, raw.file_idx())
@@ -1155,7 +1637,12 @@ impl Repository {
                 .get_external(change_id)
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("closure change {change_id} has no hash"))?;
-            let change = self.load_change(&hash).map_err(|e| e.to_string())?;
+            let mut change = self.load_change(&hash).map_err(|e| e.to_string())?;
+            if change.hashed.span.is_some() {
+                change.hashed.file_ops =
+                    atomic_core::change::span_patch::localize_file_ops(txn, &change)
+                        .map_err(|e| e.to_string())?;
+            }
             memo.fold(change_id, &change);
         }
         Ok(memo.trunk(&trunk))
@@ -1221,6 +1708,34 @@ impl Repository {
     ) -> Result<RecordOutcome, RecordError> {
         self.validate_working_copy(working_copy)
             .map_err(RecordError::Repository)?;
+        // Keep the selected view and the span baseline stable from status
+        // through assembly and journaled publication. Nested record operations
+        // on this thread reuse the workspace lock.
+        let _span_lock = {
+            use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
+            let txn = self
+                .pristine
+                .read_txn()
+                .map_err(|error| RecordError::Database(error.to_string()))?;
+            let capability = txn
+                .required_capability_version(SPAN_RANGE_CAPABILITY.id())
+                .map_err(|error| RecordError::Database(error.to_string()))?;
+            if capability == Some(2) {
+                return Err(RecordError::Database(
+                    "span capability version 2 requires migration before recording".into(),
+                ));
+            }
+            let enabled = capability.is_some();
+            drop(txn);
+            if enabled {
+                Some(
+                    self.try_lock_workspace_operation(working_copy)
+                        .map_err(RecordError::Repository)?,
+                )
+            } else {
+                None
+            }
+        };
         let desired_view = self
             .desired_view_name(working_copy)
             .map_err(RecordError::Repository)?;
@@ -1385,6 +1900,11 @@ impl Repository {
             .map_err(|e| RecordError::Database(e.to_string()))?;
         let shared_graph_visibility =
             graph_visibility_closure(&shared_txn, &view).map_err(RecordError::Repository)?;
+        use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
+        let span_recording = shared_txn
+            .required_capability_version(SPAN_RANGE_CAPABILITY.id())
+            .map_err(|error| RecordError::Database(error.to_string()))?
+            == Some(SPAN_RANGE_CAPABILITY.minimum_version());
         let tree_projection = self
             .project_tree_for_visibility(&shared_txn, &shared_graph_visibility)
             .map_err(RecordError::Repository)?;
@@ -1423,6 +1943,18 @@ impl Repository {
 
         let shared_cached_txn =
             CachedGraphTxn::new(&shared_txn).map_err(|e| RecordError::Database(e.to_string()))?;
+        let span_context = if span_recording {
+            Some(
+                atomic_core::pristine::span_patch_storage::SpanRenderContext::new(
+                    &shared_cached_txn,
+                    &self.change_store,
+                    &shared_graph_visibility,
+                )
+                .map_err(|error| RecordError::Database(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         let move_planning = plan_file_moves(
             working_copy,
             &shared_txn,
@@ -1790,6 +2322,28 @@ impl Repository {
                 (!branches.is_empty()).then_some(branches.as_slice()),
             )
             .map_err(RecordError::Database)?;
+            if let Some(context) = &span_context {
+                if let Some(state) = context
+                    .record_state(planned.inode)
+                    .map_err(|error| RecordError::Database(error.to_string()))?
+                {
+                    if state.content != filtered.bytes {
+                        return Err(RecordError::Database(format!(
+                            "cannot yet record a span-backed move with content changes: '{}'",
+                            planned.new_path
+                        )));
+                    }
+                    let mut dependencies = state.dependencies;
+                    dependencies.extend(span_namespace_dependencies(
+                        &shared_txn,
+                        &shared_graph_visibility,
+                        &projected_present,
+                        &planned.old_path,
+                        planned.inode,
+                    )?);
+                    recorded.set_span_dependencies(dependencies);
+                }
+            }
             if opaque {
                 recorded.set_opaque_generated(true);
                 log::warn!(
@@ -2246,6 +2800,35 @@ impl Repository {
                     // Record deletion (no content needed)
                     match record_deleted_file(&detected, &core_options) {
                         Ok(mut recorded) => {
+                            let mut span_backed = false;
+                            if let Some(context) = &span_context {
+                                match context.record_state(file_inode) {
+                                    Ok(Some(state)) => {
+                                        span_backed = true;
+                                        let mut dependencies = state.dependencies;
+                                        dependencies.extend(span_namespace_dependencies(
+                                            &shared_txn,
+                                            &shared_graph_visibility,
+                                            &projected_present,
+                                            &path,
+                                            file_inode,
+                                        )?);
+                                        recorded.set_span_dependencies(dependencies);
+                                    }
+                                    Ok(None) => {
+                                        super::content::retrieve_span_if_present(
+                                            &shared_cached_txn,
+                                            &self.change_store,
+                                            file_inode,
+                                            &shared_graph_visibility,
+                                        )
+                                        .map_err(RecordError::Repository)?;
+                                    }
+                                    Err(error) => {
+                                        return Err(RecordError::Database(error.to_string()))
+                                    }
+                                }
+                            }
                             let (trunk, _) = existing_crdt_identity(
                                 self,
                                 &shared_txn,
@@ -2253,8 +2836,12 @@ impl Repository {
                                 &effective_view,
                                 &shared_graph_visibility,
                             )?;
-                            if trunk.is_none() {
-                                recorded.clear_crdt_ops();
+                            match trunk {
+                                Some(trunk) if span_backed => recorded.set_crdt_ops(
+                                    atomic_core::change::FileOps::delete(trunk, path.clone()),
+                                ),
+                                None => recorded.clear_crdt_ops(),
+                                Some(_) => {}
                             }
                             stats.files_recorded += 1;
                             stats.hunks_created += recorded.hunk_count();
@@ -2380,7 +2967,23 @@ impl Repository {
                 // state, so a positional diff against it can corrupt the file.
                 // We propagate the flag to `record_modified_file` via
                 // `force_whole_file_replace` below instead of diffing against it.
-                let (old_content, had_fork_structure) = {
+                let span_state = match &span_context {
+                    Some(context) => match context.record_state(file_inode) {
+                        Ok(content) => content,
+                        Err(error) => return ModifiedResult::Fatal(RecordError::Database(error.to_string())),
+                    },
+                    None => None,
+                };
+                if span_recording && span_state.is_none() {
+                    match super::content::retrieve_span_if_present(&shared_cached_txn, &self.change_store, file_inode, &shared_graph_visibility) {
+                        Ok(None) => {}
+                        Ok(Some(_)) => return ModifiedResult::Fatal(RecordError::Database(format!("span baseline changed while recording '{path}'"))),
+                        Err(error) => return ModifiedResult::Fatal(RecordError::Database(error.to_string())),
+                    }
+                }
+                let (old_content, had_fork_structure) = if let Some(state) = &span_state {
+                    (state.content.clone(), false)
+                } else {
                     use atomic_core::output::alive::RetrieveOptions;
                     let opts = RetrieveOptions::new()
                         .with_graph_visibility(shared_graph_visibility.clone());
@@ -2435,7 +3038,7 @@ impl Repository {
                 // branch belongs to a change visible on this view. That keeps
                 // single-view linear histories on the CRDT cleanup path without
                 // leaking sibling-view branches into cross-view recording.
-                let can_use_crdt_old_content = !existing_branches.is_empty()
+                let can_use_crdt_old_content = span_state.is_none() && !existing_branches.is_empty()
                     && existing_branches
                         .iter()
                         .all(|branch| shared_graph_visibility.contains(branch.change_id()));
@@ -2452,6 +3055,39 @@ impl Repository {
                 } else {
                     Some(existing_branches.as_slice())
                 };
+
+                if let Some(state) = &span_state {
+                    if state.content == repository_bytes && resolution.is_none() {
+                        return ModifiedResult::Skipped(path.clone(), None);
+                    }
+                    if resolution.is_some() {
+                        return ModifiedResult::Fatal(RecordError::Database(format!("span recording does not yet support this edit to '{path}'")));
+                    }
+                    let Some(trunk) = existing_trunk_id else {
+                        return ModifiedResult::Fatal(RecordError::Database(format!("span recording requires semantic state for '{path}'")));
+                    };
+                    let namespace_dependencies = match span_namespace_dependencies(&shared_txn, &shared_graph_visibility, &projected_present, path, file_inode) {
+                        Ok(dependencies) => dependencies,
+                        Err(error) => return ModifiedResult::Fatal(error),
+                    };
+                    let mut detected = atomic_core::record::workflow::DetectedFile::modified(path.as_str());
+                    detected.inode = Some(file_inode);
+                    detected.position = Some(file_position);
+                    let binary = atomic_core::record::workflow::compare::detect_encoding(&old_content) == atomic_core::change::Encoding::Binary
+                        || atomic_core::record::workflow::compare::detect_encoding(&repository_bytes) == atomic_core::change::Encoding::Binary;
+                    if opaque && !binary {
+                        return ModifiedResult::Fatal(RecordError::Database(format!("span recording does not yet support this edit to '{path}'")));
+                    }
+                    let result = if binary {
+                        record_binary_span_edit(&detected, state, namespace_dependencies, &repository_bytes, trunk, &existing_branches, core_options.get_algorithm())
+                    } else {
+                        record_span_edit(&detected, state, namespace_dependencies, &repository_bytes, trunk, &existing_branches, core_options.get_algorithm())
+                    };
+                    return match result {
+                        Ok(recorded) => ModifiedResult::Recorded(path.clone(), Box::new(recorded), None),
+                        Err(error) => ModifiedResult::Fatal(RecordError::Database(format!("{path}: {error}"))),
+                    };
+                }
 
                 // Build line-level hunks + CRDT ops via the globalize-compatible
                 // path. `record_modified_file` reads the new content from disk,
@@ -2637,6 +3273,34 @@ impl Repository {
                             BuiltHunkKind::Delete => stats.edges_modified += 1,
                         }
                         stats.content_bytes += hunk.content_len();
+                    }
+                    if !recorded.span_ops().is_empty() {
+                        stats.content_bytes += recorded.content_len() as u64;
+                        for op in recorded.span_ops() {
+                            if let atomic_core::change::span_patch::SpanOp::Edit {
+                                start,
+                                end,
+                                insert_start,
+                                insert_end,
+                                ..
+                            } = op
+                            {
+                                if insert_start < insert_end {
+                                    stats.vertices_added += 1;
+                                }
+                                if start < end {
+                                    stats.edges_modified += 1;
+                                }
+                            }
+                        }
+                        if let Some(crdt) = recorded.crdt_stats() {
+                            stats.lines_added += crdt.lines_added;
+                            stats.lines_deleted += crdt.lines_deleted;
+                            stats.lines_modified += crdt.lines_modified;
+                            stats.tokens_added += crdt.tokens_added;
+                            stats.tokens_deleted += crdt.tokens_deleted;
+                            stats.tokens_replaced += crdt.tokens_replaced;
+                        }
                     }
                     recorded_paths.push(path);
                     recorded_files.push(*recorded);
@@ -2843,6 +3507,43 @@ impl Repository {
         let application_metadata = options.get_metadata_bytes();
         if !application_metadata.is_empty() {
             change.hashed.metadata = application_metadata.to_vec();
+        }
+        if span_recording {
+            lower_new_files_to_spans(&mut change)?;
+            // Semantic IDs are repository-local. Carry their content-addressed
+            // owners in the hashed span section so another repository can
+            // translate every reference without guessing local allocations.
+            let ids: std::collections::BTreeSet<_> = change
+                .file_ops()
+                .iter()
+                .flat_map(|ops| ops.referenced_node_ids())
+                .collect();
+            let mut owners = Vec::with_capacity(ids.len());
+            for id in ids {
+                let owner = shared_txn
+                    .get_external(id)
+                    .map_err(|error| RecordError::Database(error.to_string()))?
+                    .ok_or_else(|| {
+                        RecordError::Database(format!("semantic change {} has no hash", id.get()))
+                    })?;
+                if !shared_graph_visibility.contains(id) {
+                    return Err(RecordError::Database(format!(
+                        "semantic change {} is outside the recording view",
+                        id.get()
+                    )));
+                }
+                owners.push(atomic_core::change::span_patch::SemanticOwner {
+                    authored_id: id.get(),
+                    owner,
+                });
+                change.hashed.dependencies.push(owner);
+            }
+            change.hashed.dependencies.sort();
+            change.hashed.dependencies.dedup();
+            let patch = change.hashed.span.get_or_insert_with(|| {
+                atomic_core::change::span_patch::SpanPatch::new(Vec::new(), Vec::new())
+            });
+            patch.semantic_owners = owners;
         }
         lifecycle.verify_promotion_content(&change, self)?;
         change = lifecycle.classify(change)?;
@@ -3647,6 +4348,12 @@ fn plan_file_moves(
 
     let load_old_content =
         |inode: Inode, position: Position<NodeId>| -> Result<Vec<u8>, RecordError> {
+            if let Some(bytes) =
+                super::content::retrieve_span_if_present(cached, store, inode, visibility)
+                    .map_err(RecordError::Repository)?
+            {
+                return Ok(bytes);
+            }
             super::content::retrieve_content_with_filter_fast_with_fork_info(
                 cached,
                 store,

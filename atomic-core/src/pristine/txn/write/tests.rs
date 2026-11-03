@@ -46,6 +46,40 @@ mod tests {
     }
 
     #[test]
+    fn abort_only_preview_does_not_consume_ids_or_commit() {
+        let dir = tempdir().unwrap();
+        let pristine = Pristine::open(dir.path().join("pristine")).unwrap();
+        let hash = Hash::of(b"preview");
+        let (node, inode, view) = {
+            let mut txn = pristine.write_txn().unwrap();
+            txn.enable_abort_only_allocations().unwrap();
+            let node = txn.register_change(&hash).unwrap();
+            let inode = txn.alloc_inode().unwrap();
+            let view = txn.open_or_create_view("preview").unwrap().id;
+            txn.abort().unwrap();
+            (node, inode, view)
+        };
+        {
+            let mut txn = pristine.write_txn().unwrap();
+            assert_eq!(txn.register_change(&hash).unwrap(), node);
+            assert_eq!(txn.alloc_inode().unwrap(), inode);
+            assert_eq!(txn.open_or_create_view("preview").unwrap().id, view);
+            txn.abort().unwrap();
+        }
+        {
+            let mut txn = pristine.write_txn().unwrap();
+            txn.enable_abort_only_allocations().unwrap();
+            txn.register_change(&Hash::of(b"must not commit")).unwrap();
+            assert!(txn.commit().is_err());
+        }
+        let txn = pristine.read_txn().unwrap();
+        assert_eq!(
+            txn.get_internal(&Hash::of(b"must not commit")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn test_view_operations() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("pristine");

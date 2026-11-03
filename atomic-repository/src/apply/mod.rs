@@ -236,6 +236,56 @@ pub fn write_change_to_graph(
     options: &InsertOptions,
     already_in_graph: bool,
 ) -> InsertResult<InsertOutcome> {
+    reject_unsupported_span_change(change)?;
+    write_change_to_graph_inner(
+        txn,
+        view_name,
+        change_id,
+        change_hash,
+        change,
+        options,
+        already_in_graph,
+    )
+}
+
+// The caller must either index the span operations in this transaction or
+// have proved the existing ambient index before a reference-only insertion.
+// The ordinary public writer must never discard span operations.
+pub(crate) fn write_span_hunks_with_index(
+    txn: &mut WriteTxn<'_>,
+    view_name: &str,
+    change_id: NodeId,
+    change_hash: &Hash,
+    change: &Change,
+    options: &InsertOptions,
+    already_in_graph: bool,
+) -> InsertResult<InsertOutcome> {
+    if change.hashed.span.is_none() {
+        return Err(InsertError::InvalidChange {
+            message: "span change required".into(),
+        });
+    }
+    write_change_to_graph_inner(
+        txn,
+        view_name,
+        change_id,
+        change_hash,
+        change,
+        options,
+        already_in_graph,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_change_to_graph_inner(
+    txn: &mut WriteTxn<'_>,
+    view_name: &str,
+    change_id: NodeId,
+    change_hash: &Hash,
+    change: &Change,
+    options: &InsertOptions,
+    already_in_graph: bool,
+) -> InsertResult<InsertOutcome> {
     let mut workspace = Workspace::new();
     let mut conflict_tracker = ConflictTracker::new();
     let mut stats = InsertStats::new();
@@ -334,6 +384,7 @@ pub fn apply_change_hunks_without_membership(
     verified_frontier: &atomic_core::change::VerifiedCausalFrontier,
     options: &InsertOptions,
 ) -> InsertResult<InsertStats> {
+    reject_unsupported_span_change(change)?;
     let mut workspace = Workspace::new();
     let mut conflict_tracker = ConflictTracker::new();
     let mut stats = InsertStats::new();
@@ -349,6 +400,17 @@ pub fn apply_change_hunks_without_membership(
     )?;
     stats.changes_applied = 1;
     Ok(stats)
+}
+
+// Until the span index writer is integrated, publishing only the ordinary
+// graph hunks would silently discard the span operations.
+pub(crate) fn reject_unsupported_span_change(change: &Change) -> InsertResult<()> {
+    if change.hashed.span.is_some() {
+        return Err(InsertError::InvalidChange {
+            message: "span changes require a span-aware repository writer".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// The shared hunk/FileOps mutation stage of [`write_change_to_graph`] and
@@ -418,7 +480,17 @@ fn apply_change_hunks_locked(
     // Apply FileOps to CRDT tables (semantic layer)
     // This enables human-readable diffs and token-level blame
     if change.has_file_ops() {
-        let file_ops = change.file_ops();
+        let mut localized = None;
+        if change.hashed.span.is_some() {
+            localized = Some(
+                atomic_core::change::span_patch::localize_file_ops(txn, change).map_err(
+                    |error| InsertError::InvalidChange {
+                        message: error.to_string(),
+                    },
+                )?,
+            );
+        }
+        let file_ops = localized.as_deref().unwrap_or_else(|| change.file_ops());
         let file_ops_count = file_ops.len();
         log::debug!(
             "write_change_to_graph: applying {} FileOps to CRDT tables",

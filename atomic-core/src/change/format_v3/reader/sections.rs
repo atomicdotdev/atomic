@@ -393,10 +393,20 @@ impl<'r, R: Read> ChangeReader<'r, R> {
     ///
     /// Skipped sections are still fed through the hasher for verification.
     fn sections_of_type(&mut self, target: SectionType) -> FormatResult<Vec<ReadSection>> {
+        if self.file_header.version == super::super::error::SPAN_FORMAT_VERSION {
+            return Err(FormatError::InvalidChangeMetadata {
+                reason: "selective section reads cannot interpret span changes".into(),
+            });
+        }
         let mut result = Vec::new();
 
         loop {
             match self.peek_section_type()? {
+                Some(SectionType::Span) => {
+                    return Err(FormatError::InvalidChangeMetadata {
+                        reason: "SPAN section requires schema 3 and a span-aware reader".into(),
+                    });
+                }
                 Some(st) if st == target => {
                     if let Some(section) = self.next_section()? {
                         result.push(section);

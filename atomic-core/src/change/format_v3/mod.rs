@@ -200,7 +200,8 @@ pub mod writer;
 
 // Error types
 pub use error::{
-    FormatError, FormatResult, FORMAT_VERSION, LEGACY_FORMAT_VERSION, MAGIC, MAX_HASH_TABLE_ENTRIES,
+    FormatError, FormatResult, FORMAT_VERSION, LEGACY_FORMAT_VERSION, MAGIC,
+    MAX_HASH_TABLE_ENTRIES, SPAN_FORMAT_VERSION,
 };
 
 // Core types

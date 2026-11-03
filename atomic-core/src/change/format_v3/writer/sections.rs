@@ -45,6 +45,27 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
         Ok(())
     }
 
+    /// Write the single hashed span payload required by schema 3.
+    pub fn write_span_section(&mut self, payload: &[u8]) -> FormatResult<()> {
+        use super::super::error::SPAN_FORMAT_VERSION;
+        self.ensure_metadata_complete()?;
+        if self.schema_version != SPAN_FORMAT_VERSION || self.wrote_span_section {
+            return Err(FormatError::InvalidHeader {
+                reason: "SPAN requires schema 3 and may appear only once".into(),
+            });
+        }
+        self.transition_to_at_least(WriterState::WritingGraph)?;
+        if self.state != WriterState::WritingGraph {
+            return Err(FormatError::UnexpectedSection {
+                got: "SPAN".into(),
+                expected: "after GRAPH and before SEMANTIC or CONTENT".into(),
+            });
+        }
+        self.write_raw_section(SectionType::Span, payload)?;
+        self.wrote_span_section = true;
+        Ok(())
+    }
+
     // ── Step 5: Per-File Semantic Sections ─────────────────────────
 
     /// Write a SEMANTIC section for a single file.

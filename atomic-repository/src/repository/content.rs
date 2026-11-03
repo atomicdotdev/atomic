@@ -335,14 +335,19 @@ impl Repository {
         if item.is_directory {
             return Ok(MaterializedEntry::absent(normalized, Some(item.inode)));
         }
-        let bytes = retrieve_content_with_filter_fast(
-            &txn,
-            &self.change_store,
-            item.inode,
-            item.position,
-            atomic_core::output::alive::RetrieveOptions::new().with_graph_visibility(visibility),
-        )
-        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        let bytes =
+            match retrieve_span_if_present(&txn, &self.change_store, item.inode, &visibility)? {
+                Some(bytes) => bytes,
+                None => retrieve_content_with_filter_fast(
+                    &txn,
+                    &self.change_store,
+                    item.inode,
+                    item.position,
+                    atomic_core::output::alive::RetrieveOptions::new()
+                        .with_graph_visibility(visibility),
+                )
+                .map_err(|error| RepositoryError::Database(error.to_string()))?,
+            };
         Ok(MaterializedEntry::present(normalized, item.inode, bytes))
     }
 
@@ -386,14 +391,19 @@ impl Repository {
         if item.is_directory {
             return Ok(None);
         }
-        let bytes = retrieve_content_with_filter_fast(
-            &txn,
-            &self.change_store,
-            item.inode,
-            item.position,
-            atomic_core::output::alive::RetrieveOptions::new().with_graph_visibility(visibility),
-        )
-        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        let bytes =
+            match retrieve_span_if_present(&txn, &self.change_store, item.inode, &visibility)? {
+                Some(bytes) => bytes,
+                None => retrieve_content_with_filter_fast(
+                    &txn,
+                    &self.change_store,
+                    item.inode,
+                    item.position,
+                    atomic_core::output::alive::RetrieveOptions::new()
+                        .with_graph_visibility(visibility),
+                )
+                .map_err(|error| RepositoryError::Database(error.to_string()))?,
+            };
         Ok(Some(bytes))
     }
 
@@ -804,6 +814,8 @@ impl Repository {
     where
         T: atomic_core::pristine::GraphTxnT
             + atomic_core::pristine::TreeTxnT
+            + atomic_core::pristine::CapabilityTxnT
+            + atomic_core::pristine::span_patch_storage::SpanPatchReadTxn
             + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
     {
         use atomic_core::output::alive::RetrieveOptions;
@@ -835,15 +847,23 @@ impl Repository {
             return Ok(MaterializedEntry::absent(normalized_path, Some(item.inode)));
         }
 
-        let options = RetrieveOptions::new().with_graph_visibility(visibility);
-        let bytes = retrieve_content_with_filter_fast(
-            txn,
-            &self.change_store,
-            item.inode,
-            item.position,
-            options,
-        )
-        .map_err(|e: atomic_core::record::RecordError| RepositoryError::Database(e.to_string()))?;
+        let bytes = if let Some(bytes) =
+            retrieve_span_if_present(txn, &self.change_store, item.inode, &visibility)?
+        {
+            bytes
+        } else {
+            let options = RetrieveOptions::new().with_graph_visibility(visibility);
+            retrieve_content_with_filter_fast(
+                txn,
+                &self.change_store,
+                item.inode,
+                item.position,
+                options,
+            )
+            .map_err(|e: atomic_core::record::RecordError| {
+                RepositoryError::Database(e.to_string())
+            })?
+        };
 
         Ok(MaterializedEntry::present(
             normalized_path,
@@ -885,6 +905,66 @@ impl Repository {
         // Archive with the tag's state
         self.archive(working_copy, destination, options)
     }
+}
+
+pub(super) fn retrieve_span_if_present<T, C>(
+    txn: &T,
+    store: &C,
+    inode: Inode,
+    visibility: &GraphVisibilityClosure,
+) -> Result<Option<Vec<u8>>, RepositoryError>
+where
+    T: atomic_core::pristine::span_patch_storage::SpanPatchReadTxn
+        + atomic_core::pristine::TreeTxnT
+        + atomic_core::pristine::CapabilityTxnT,
+    C: atomic_core::change::ChangeStore,
+{
+    use atomic_core::pristine::SPAN_RANGE_CAPABILITY;
+    let capability = txn
+        .required_capability_version(SPAN_RANGE_CAPABILITY.id())
+        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+    let Some(root) = txn
+        .span_root(inode)
+        .map_err(|error| RepositoryError::Database(error.to_string()))?
+    else {
+        if capability.is_some() {
+            let position = txn
+                .inode_position(inode)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            if let Some(position) = position.filter(|position| !position.change.is_root()) {
+                let hash = txn
+                    .get_external(position.change)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+                    .ok_or_else(|| {
+                        RepositoryError::Database("file origin hash is missing".into())
+                    })?;
+                let origin = store
+                    .get_change(&hash)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?;
+                if origin.hashed.span.is_some() {
+                    return Err(RepositoryError::Database(format!(
+                        "span root missing for inode {}",
+                        inode.get()
+                    )));
+                }
+            }
+        }
+        return Ok(None);
+    };
+    if !matches!(capability, Some(2) | Some(3)) {
+        return Err(RepositoryError::Database(
+            "span index has no matching repository capability".into(),
+        ));
+    }
+    if !visibility.contains(NodeId::new(root[0])) {
+        return Err(RepositoryError::Database(
+            "span root is outside the requested view".into(),
+        ));
+    }
+    atomic_core::pristine::span_patch_storage::SpanRenderContext::new(txn, store, visibility)
+        .and_then(|context| context.render(inode))
+        .map(Some)
+        .map_err(|error| RepositoryError::Database(error.to_string()))
 }
 
 pub(crate) fn retrieve_content_with_filter_fast<T, C>(

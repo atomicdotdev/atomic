@@ -305,6 +305,104 @@ impl FileOps {
         ids
     }
 
+    /// Translate existing semantic identities while preserving ROOT placeholders.
+    pub fn remap_referenced_node_ids<E>(
+        &mut self,
+        mut remap: impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
+    ) -> Result<(), E> {
+        fn trunk<E>(
+            id: &mut TrunkId,
+            f: &mut impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
+        ) -> Result<(), E> {
+            if !id.change_id().is_root() {
+                *id = TrunkId::new(f(id.change_id())?, id.file_idx());
+            }
+            Ok(())
+        }
+        fn branch<E>(
+            id: &mut BranchId,
+            f: &mut impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
+        ) -> Result<(), E> {
+            if !id.change_id().is_root() {
+                *id = BranchId::new(f(id.change_id())?, id.branch_idx());
+            }
+            Ok(())
+        }
+        fn leaf<E>(
+            id: &mut LeafId,
+            f: &mut impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
+        ) -> Result<(), E> {
+            if !id.change_id().is_root() {
+                *id = LeafId::new(f(id.change_id())?, id.leaf_idx());
+            }
+            Ok(())
+        }
+        fn leaves<E>(
+            ops: &mut [LeafOp],
+            f: &mut impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
+        ) -> Result<(), E> {
+            for op in ops {
+                match op {
+                    LeafOp::Insert {
+                        after: Some(id), ..
+                    } => leaf(id, f)?,
+                    LeafOp::Delete { leaf: id }
+                    | LeafOp::Replace { leaf: id, .. }
+                    | LeafOp::Restore { leaf: id } => leaf(id, f)?,
+                    LeafOp::Insert { after: None, .. } => {}
+                }
+            }
+            Ok(())
+        }
+        trunk(&mut self.trunk_id, &mut remap)?;
+        match &mut self.trunk_op {
+            Some(TrunkOp::Delete { trunk: id })
+            | Some(TrunkOp::Move { trunk: id, .. })
+            | Some(TrunkOp::Undelete { trunk: id })
+            | Some(TrunkOp::SetMode { trunk: id, .. })
+            | Some(TrunkOp::SetKind { trunk: id, .. }) => trunk(id, &mut remap)?,
+            Some(TrunkOp::Create { .. }) | None => {}
+        }
+        for line in &mut self.line_ops {
+            branch(&mut line.branch_id, &mut remap)?;
+            match &mut line.operation {
+                BranchOp::Insert { after, content } => {
+                    if let Some(id) = after {
+                        branch(id, &mut remap)?;
+                    }
+                    leaves(content, &mut remap)?;
+                }
+                BranchOp::Delete {
+                    branch: id,
+                    content,
+                } => {
+                    branch(id, &mut remap)?;
+                    leaves(content, &mut remap)?;
+                }
+                BranchOp::Modify {
+                    branch: id,
+                    old_content,
+                    new_content,
+                } => {
+                    branch(id, &mut remap)?;
+                    leaves(old_content, &mut remap)?;
+                    leaves(new_content, &mut remap)?;
+                }
+                BranchOp::Restore { branch: id } => branch(id, &mut remap)?,
+                BranchOp::Reparent {
+                    branch: id,
+                    new_after,
+                } => {
+                    branch(id, &mut remap)?;
+                    if let Some(id) = new_after {
+                        branch(id, &mut remap)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Adds a line operation.
     pub fn add_line_op(&mut self, op: LineOps) {
         self.line_ops.push(op);

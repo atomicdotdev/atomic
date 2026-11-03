@@ -1902,7 +1902,7 @@ impl crate::pristine::traits::CrdtTxnT for ReadTxn {
 /// reuses the handle for all subsequent operations, eliminating the
 /// per-call overhead entirely.
 pub struct CachedGraphTxn<'txn> {
-    txn: &'txn ReadTxn,
+    pub(crate) txn: &'txn ReadTxn,
     graph_table: redb::ReadOnlyMultimapTable<&'static [u8; 24], &'static [u8; 24]>,
     inode_graph_table: redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
     /// Lazily-loaded per-change span index, so `find_block` / `find_block_end`

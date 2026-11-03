@@ -5,7 +5,8 @@
 //! [`FileHeaderBuilder`] provides a fluent API for constructing headers.
 
 use super::super::error::{
-    FormatError, FormatResult, FORMAT_VERSION, LEGACY_FORMAT_VERSION, MAGIC, MAX_HASH_TABLE_ENTRIES,
+    FormatError, FormatResult, FORMAT_VERSION, LEGACY_FORMAT_VERSION, MAGIC,
+    MAX_HASH_TABLE_ENTRIES, SPAN_FORMAT_VERSION,
 };
 use super::builder::FileHeaderBuilder;
 use std::fmt;
@@ -291,7 +292,10 @@ impl FileHeader {
         }
 
         let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if version != LEGACY_FORMAT_VERSION && version != FORMAT_VERSION {
+        if version != LEGACY_FORMAT_VERSION
+            && version != FORMAT_VERSION
+            && version != SPAN_FORMAT_VERSION
+        {
             return Err(FormatError::UnsupportedVersion {
                 expected: FORMAT_VERSION,
                 got: version,
@@ -371,6 +375,9 @@ impl FileHeader {
             count += 1;
         }
         count += self.graph_section_count;
+        if self.version == SPAN_FORMAT_VERSION {
+            count += 1;
+        }
         count += self.semantic_section_count;
         count += self.contents_chunks;
         if self.flags.has(FileHeaderFlags::HAS_UNHASHED) {

@@ -4,6 +4,7 @@ const ATOM_CHANGE_MAGIC: &[u8; 4] = b"ATOM";
 const ATOM_CHANGE_FILE_HEADER_LEN: usize = 64;
 const ATOM_CHANGE_FILE_VERSION_V1: u32 = 1;
 const ATOM_CHANGE_FILE_VERSION_V2: u32 = 2;
+const ATOM_CHANGE_FILE_VERSION_SPAN: u32 = atomic_core::change::format_v3::SPAN_FORMAT_VERSION;
 
 fn atom_change_file_version(bytes: &[u8]) -> Result<u32, RepositoryError> {
     if bytes.len() < ATOM_CHANGE_FILE_HEADER_LEN {
@@ -21,6 +22,18 @@ fn atom_change_file_version(bytes: &[u8]) -> Result<u32, RepositoryError> {
 }
 
 impl Repository {
+    fn require_span_storage_capability(&self) -> Result<(), RepositoryError> {
+        use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
+        let txn = self.pristine.read_txn()?;
+        if txn.required_capability_version(SPAN_RANGE_CAPABILITY.id())?
+            != Some(SPAN_RANGE_CAPABILITY.minimum_version())
+        {
+            return Err(RepositoryError::InvalidOperation {
+                message: "storing span changes requires the span repository capability".into(),
+            });
+        }
+        Ok(())
+    }
     // Change Storage Methods
 
     /// Get a reference to the change store.
@@ -117,6 +130,9 @@ impl Repository {
     /// println!("Saved change: {}", hash.to_base32());
     /// ```
     pub fn save_change(&self, change: &Change) -> Result<Hash, RepositoryError> {
+        if change.hashed.span.is_some() {
+            self.require_span_storage_capability()?;
+        }
         self.pristine
             .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
             .map_err(RepositoryError::from)?;
@@ -139,6 +155,19 @@ impl Repository {
                 hash.to_base32(),
                 computed.to_base32()
             )));
+        }
+        if change.hashed.span.is_some() {
+            use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
+            let txn = self.pristine.read_txn()?;
+            let required = txn.required_capability_version(SPAN_RANGE_CAPABILITY.id())?;
+            drop(txn);
+            match required {
+                None => self.pristine.require_repository_capability(SPAN_RANGE_CAPABILITY)?,
+                Some(version) if version == SPAN_RANGE_CAPABILITY.minimum_version() => {}
+                Some(_) => return Err(RepositoryError::InvalidOperation {
+                    message: "existing span capability requires migration before importing new span changes".into(),
+                }),
+            }
         }
         let stored = self.save_change_bytes(hash, bytes, &change)?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
@@ -176,7 +205,22 @@ impl Repository {
         change_bytes: &[u8],
         change: &Change,
     ) -> Result<Hash, RepositoryError> {
-        if atom_change_file_version(change_bytes)? == ATOM_CHANGE_FILE_VERSION_V2 {
+        let version = atom_change_file_version(change_bytes)?;
+        if version == ATOM_CHANGE_FILE_VERSION_SPAN {
+            let (decoded, actual_hash) =
+                Change::deserialize(&mut std::io::Cursor::new(change_bytes))
+                    .map_err(|error| RepositoryError::Serialization(error.to_string()))?;
+            if actual_hash != *hash
+                || decoded.hashed != change.hashed
+                || decoded.contents != change.contents
+            {
+                return Err(RepositoryError::Serialization(
+                    "span change bytes do not match the supplied change identity".into(),
+                ));
+            }
+            self.require_span_storage_capability()?;
+        }
+        if version == ATOM_CHANGE_FILE_VERSION_V2 || version == ATOM_CHANGE_FILE_VERSION_SPAN {
             self.pristine
                 .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
                 .map_err(RepositoryError::from)?;
@@ -193,10 +237,10 @@ impl Repository {
         _change: &Change,
     ) -> Result<Hash, RepositoryError> {
         match atom_change_file_version(change_bytes)? {
-            ATOM_CHANGE_FILE_VERSION_V1 | ATOM_CHANGE_FILE_VERSION_V2 => {}
+            ATOM_CHANGE_FILE_VERSION_V1 | ATOM_CHANGE_FILE_VERSION_V2 | ATOM_CHANGE_FILE_VERSION_SPAN => {}
             version => {
                 return Err(RepositoryError::Serialization(format!(
-                    "unsupported ATOM change file-header version {version}; supported versions are 1 and 2"
+                    "unsupported ATOM change file-header version {version}; supported versions are 1, 2 and 3"
                 )))
             }
         }

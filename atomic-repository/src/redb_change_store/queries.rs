@@ -91,8 +91,11 @@ impl RedbChangeStore {
     ///
     /// A vector of decompressed graph section payloads, ordered by file index.
     pub fn load_graph_sections(&self, hash: &[u8; 32]) -> RedbStoreResult<Vec<StoredSection>> {
-        let meta = self.load_meta(hash)?;
         let txn = self.db().begin_read()?;
+        let (meta, _, span) = self.load_meta_with_header_in_txn(&txn, hash)?;
+        if span.is_some() {
+            return Err(RedbStoreError::UnsupportedSpanSelectiveRead);
+        }
         let table = txn.open_table(tables::CHANGE_GRAPH)?;
 
         let mut sections = Vec::with_capacity(meta.graph_section_count as usize);
@@ -133,8 +136,11 @@ impl RedbChangeStore {
     ///
     /// A vector of decompressed semantic section payloads, ordered by file index.
     pub fn load_semantic_sections(&self, hash: &[u8; 32]) -> RedbStoreResult<Vec<StoredSection>> {
-        let meta = self.load_meta(hash)?;
         let txn = self.db().begin_read()?;
+        let (meta, _, span) = self.load_meta_with_header_in_txn(&txn, hash)?;
+        if span.is_some() {
+            return Err(RedbStoreError::UnsupportedSpanSelectiveRead);
+        }
         let table = txn.open_table(tables::CHANGE_SEMANTIC)?;
 
         let mut sections = Vec::with_capacity(meta.semantic_section_count as usize);
@@ -171,8 +177,11 @@ impl RedbChangeStore {
     ///
     /// A vector of decompressed content chunks, ordered by chunk index.
     pub fn load_content_chunks(&self, hash: &[u8; 32]) -> RedbStoreResult<Vec<StoredContentChunk>> {
-        let meta = self.load_meta(hash)?;
         let txn = self.db().begin_read()?;
+        let (meta, _, span) = self.load_meta_with_header_in_txn(&txn, hash)?;
+        if span.is_some() {
+            return Err(RedbStoreError::UnsupportedSpanSelectiveRead);
+        }
         let manifest_table = txn.open_table(tables::CHANGE_CHUNKS)?;
         let content_table = txn.open_table(tables::CONTENT_CHUNKS)?;
 
@@ -394,7 +403,8 @@ impl RedbChangeStore {
         txn: &redb::ReadTransaction,
         hash: &[u8; 32],
     ) -> RedbStoreResult<Vec<u8>> {
-        let (meta, header_v2) = self.load_meta_with_header_in_txn(txn, hash)?;
+        let (meta, header_v2, span) = self.load_meta_with_header_in_txn(txn, hash)?;
+        let span_format = span.is_some();
 
         // Reconstruct the hash dedup table
         let hash_table = if meta.hash_table.is_empty() {
@@ -422,7 +432,10 @@ impl RedbChangeStore {
             file_header_builder = file_header_builder.with_signature();
         }
 
-        let file_header = file_header_builder.build();
+        let mut file_header = file_header_builder.build();
+        if span.is_some() {
+            file_header.version = atomic_core::change::format_v3::SPAN_FORMAT_VERSION;
+        }
 
         // Write V3 format
         let mut output = Vec::new();
@@ -481,6 +494,10 @@ impl RedbChangeStore {
             }
         }
 
+        if let Some(span) = span {
+            writer.write_span_section(&span)?;
+        }
+
         // Write SEMANTIC sections
         {
             let semantic_table = txn.open_table(tables::CHANGE_SEMANTIC)?;
@@ -536,7 +553,12 @@ impl RedbChangeStore {
             }
         }
 
-        writer.finalize()?;
+        let outcome = writer.finalize()?;
+        if span_format && &outcome.content_hash != hash {
+            return Err(RedbStoreError::Corrupt(
+                "reconstructed span change hash does not match requested identity".into(),
+            ));
+        }
 
         Ok(output)
     }

@@ -114,6 +114,10 @@ pub enum SectionType {
     ///
     /// Payload: `zstd(json(Value))`
     Unhashed = 0xF0,
+
+    /// Immutable range operations, stored as one hashed schema-3 section.
+    /// Kept last so existing postcard enum ordinals remain unchanged.
+    Span = 0x11,
 }
 
 impl SectionType {
@@ -142,6 +146,7 @@ impl SectionType {
             0x03 => Ok(SectionType::Provenance),
             0x04 => Ok(SectionType::Signature),
             0x10 => Ok(SectionType::Graph),
+            0x11 => Ok(SectionType::Span),
             0x20 => Ok(SectionType::Content),
             0x30 => Ok(SectionType::Semantic),
             0xF0 => Ok(SectionType::Unhashed),
@@ -232,6 +237,7 @@ impl SectionType {
             SectionType::Provenance => "PROVENANCE",
             SectionType::Signature => "SIGNATURE",
             SectionType::Graph => "GRAPH",
+            SectionType::Span => "SPAN",
             SectionType::Content => "CONTENT",
             SectionType::Semantic => "SEMANTIC",
             SectionType::Unhashed => "UNHASHED",
@@ -252,9 +258,10 @@ impl SectionType {
             SectionType::Provenance => 2,
             SectionType::Signature => 3,
             SectionType::Graph => 4,
-            SectionType::Semantic => 5,
-            SectionType::Content => 6,
-            SectionType::Unhashed => 7,
+            SectionType::Span => 5,
+            SectionType::Semantic => 6,
+            SectionType::Content => 7,
+            SectionType::Unhashed => 8,
         }
     }
 }

@@ -163,6 +163,7 @@ pub mod schema;
 mod set_id_index;
 pub mod slice;
 pub(crate) mod span_index;
+pub mod span_patch_storage;
 pub mod tables;
 mod traits;
 mod txn;
@@ -178,7 +179,7 @@ pub use bindings::{BindingMutTxnT, BindingStoreOutcome, BindingTxnT};
 pub use capability::{
     RepositoryCapability, RequiredRepositoryCapability, UnsupportedRepositoryCapability,
     CHANGE_FORMAT_VNEXT_CAPABILITY, REQUIRED_CAPABILITY_PREFIX, SHIM_CUTOVER_CAPABILITY,
-    SUPPORTED_REPOSITORY_CAPABILITIES,
+    SPAN_RANGE_CAPABILITY, SUPPORTED_REPOSITORY_CAPABILITIES,
 };
 pub use error::{PristineError, PristineResult};
 mod file_index_v2;
