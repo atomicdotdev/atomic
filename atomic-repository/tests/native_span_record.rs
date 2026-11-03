@@ -5,6 +5,92 @@ use atomic_core::pristine::{CapabilityMutTxnT, MutTxnT, SPAN_RANGE_CAPABILITY};
 use atomic_repository::{RecordOptions, Repository, StatusOptions};
 
 #[test]
+fn span_unrecorded_file_stays_untracked_when_switching_views() {
+    use atomic_core::operation::{EffectTarget, OperationKind, OperationScope};
+    use atomic_core::pristine::OperationTxnT;
+    use atomic_repository::OperationVerificationState;
+    use atomic_repository::{FileStatus, UnrecordOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let mut repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    {
+        let mut txn = repo.pristine().write_txn().unwrap();
+        txn.put_required_capability(SPAN_RANGE_CAPABILITY).unwrap();
+        txn.commit().unwrap();
+    }
+    std::fs::write(dir.path().join("base.txt"), b"base").unwrap();
+    repo.add(wc, "base.txt", Default::default()).unwrap();
+    let options = || {
+        RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true)
+    };
+    repo.record(wc, ChangeHeader::new("base"), options())
+        .unwrap();
+    repo.create_draft_view("feature", "dev").unwrap();
+    repo.switch_view(wc, "feature").unwrap();
+    let path = dir.path().join("temp_feature.txt");
+    std::fs::write(&path, b"unrecorded user bytes").unwrap();
+    repo.add(wc, "temp_feature.txt", Default::default())
+        .unwrap();
+    let recorded = repo
+        .record(wc, ChangeHeader::new("feature"), options())
+        .unwrap();
+    repo.unrecord(recorded.hash(), UnrecordOptions::default())
+        .unwrap();
+    std::fs::write(&path, b"edited after unrecord").unwrap();
+    let is_untracked = |repo: &Repository| {
+        repo.status(wc, StatusOptions::default())
+            .unwrap()
+            .entries()
+            .iter()
+            .any(|entry| {
+                entry.path() == std::path::Path::new("temp_feature.txt")
+                    && entry.status() == FileStatus::Untracked
+            })
+    };
+    assert!(is_untracked(&repo));
+    repo.switch_view(wc, "dev")
+        .expect("switch preserves unrecorded file");
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited after unrecord");
+    assert!(is_untracked(&repo));
+    let operation_id = {
+        let txn = repo.pristine().read_txn().unwrap();
+        let heads = txn
+            .get_operation_heads(OperationScope::WorkingCopy(wc))
+            .unwrap();
+        assert_eq!(heads.as_slice().len(), 1);
+        heads.as_slice()[0]
+    };
+    let operation = repo.operation_details(operation_id).unwrap();
+    assert_eq!(
+        operation.operation.payload().kind,
+        OperationKind::SwitchView
+    );
+    assert_eq!(operation.verification, OperationVerificationState::Verified);
+    assert!(!operation
+        .operation
+        .payload()
+        .delta
+        .effects
+        .iter()
+        .any(|effect| matches!(
+            &effect.target, EffectTarget::FilesystemPath { path } if path == "temp_feature.txt"
+        )));
+    repo.switch_view(wc, "feature")
+        .expect("switch back with untracked file");
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited after unrecord");
+    assert!(is_untracked(&repo));
+    repo.switch_view(wc, "dev")
+        .expect("switch again with untracked file");
+    drop(repo);
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited after unrecord");
+    assert!(is_untracked(&repo));
+}
+
+#[test]
 fn cross_view_span_insert_includes_dependencies_and_composes_independent_edits() {
     use atomic_repository::apply::CrossViewInsertOptions;
     let dir = tempfile::tempdir().unwrap();

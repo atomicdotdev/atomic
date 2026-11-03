@@ -133,7 +133,11 @@ for suite in "${SELECTED_SUITES[@]}"; do
 
     # Run the suite.  Capture exit code but don't abort run_all.
     set +e
-    bash "$suite"
+    if grep -qE '^[[:space:]]*print_summary([[:space:]]|$)' "$suite"; then
+        HARNESS_EXPECT_SUMMARY=1 bash "$suite"
+    else
+        HARNESS_EXPECT_SUMMARY=0 bash "$suite"
+    fi
     suite_exit=$?
     set -e
 

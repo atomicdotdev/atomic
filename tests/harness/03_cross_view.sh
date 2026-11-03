@@ -37,15 +37,15 @@ assert_file_exists "untracked.txt exists on dev" "untracked.txt"
 assert_status_flag "untracked.txt is ? on dev" "?" "untracked.txt"
 
 # Create and switch to feature
-new_view "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "switch to feature" switch_view "feature"
 
 assert_current_view "now on feature" "feature"
 assert_file_exists "untracked.txt persists on feature" "untracked.txt"
 assert_status_flag "untracked.txt is ? on feature" "?" "untracked.txt"
 
 # Switch back to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 
 assert_current_view "back on dev" "dev"
 assert_file_exists "untracked.txt persists after round-trip" "untracked.txt"
@@ -71,33 +71,23 @@ create_file "feature_only.txt" "feature content"
 assert_file_exists "feature_only.txt created on dev" "feature_only.txt"
 
 # Step 2: create and switch to feature
-new_view "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "switch to feature" switch_view "feature"
 assert_current_view "on feature" "feature"
 
 # Untracked file should still be here
 assert_file_exists "feature_only.txt exists on feature (untracked)" "feature_only.txt"
 
 # Step 3: add + record on feature
-assert_success "add feature_only.txt on feature" atomic add feature_only.txt
+require_success "add feature_only.txt on feature" atomic add feature_only.txt
 
-rec_out="$(record_change "Add feature_only.txt" 2>&1)" || true
-if echo "$rec_out" | grep -qiE "hash|recorded|created|change"; then
-    _pass "record on feature succeeds"
-else
-    _pass "record on feature completes"
-fi
+require_success "record on feature succeeds" record_change "Add feature_only.txt"
 
 # Verify it's clean on feature
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*feature_only\.txt"; then
-    _fail "feature_only.txt is clean on feature" "still dirty: $out"
-else
-    _pass "feature_only.txt is clean on feature after record"
-fi
+assert_status_no_entry "feature_only.txt is clean on feature after record" "feature_only.txt"
 
 # Step 4: switch back to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_current_view "back on dev" "dev"
 
 # Step 5: file should NOT exist on disk
@@ -111,7 +101,7 @@ assert_status_no_entry \
     "feature_only.txt"
 
 # Step 7: switch back to feature — file should reappear
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 assert_file_exists "feature_only.txt reappears on feature" "feature_only.txt"
 assert_file_content "feature_only.txt has correct content" "feature_only.txt" "feature content"
 
@@ -128,16 +118,10 @@ begin_section "Cross-View: Insert from feature to dev"
 assert_current_view "still on feature" "feature"
 
 # Insert from feature → dev
-apply_out="$(insert_from_view "feature" "dev" 2>&1)" || true
-if echo "$apply_out" | grep -qiE "inserted|success|change"; then
-    _pass "insert from feature to dev succeeds"
-else
-    # The command might have a different output format
-    _pass "insert from feature to dev completes"
-fi
+require_success "insert from feature to dev succeeds" insert_from_view "feature" "dev"
 
 # Switch to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev after insert" switch_view "dev"
 assert_current_view "on dev after insert" "dev"
 
 # Now the file SHOULD exist on dev
@@ -151,12 +135,7 @@ assert_file_content \
     "feature content"
 
 # Status should show it as clean (recorded on dev via insert)
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*feature_only\.txt"; then
-    _fail "feature_only.txt is clean on dev after insert" "still dirty: $out"
-else
-    _pass "feature_only.txt is clean on dev after insert"
-fi
+assert_status_no_entry "feature_only.txt is clean on dev after insert" "feature_only.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Cross-View: Multiple files, partial overlap"
@@ -174,21 +153,13 @@ init_repo
 
 # Record shared.txt on dev
 create_file "shared.txt" "shared content"
-assert_success "add shared.txt on dev" atomic add shared.txt
-record_change "Add shared.txt on dev" >/dev/null 2>&1 || true
+require_success "add shared.txt on dev" atomic add shared.txt
+require_success "record shared.txt on dev" record_change "Add shared.txt on dev"
 
 # Create feature from dev (inherits shared.txt)
-out="$(atomic view create feature --from dev 2>&1)" || true
-if echo "$out" | grep -qiE "created|view"; then
-    _pass "create feature view from dev"
-else
-    # Try without --from (create empty, then insert)
-    new_view "feature" >/dev/null 2>&1 || true
-    insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-    _pass "create feature view (fallback method)"
-fi
+require_success "create feature view from dev" atomic view create feature --from dev
 
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch to feature" switch_view "feature"
 assert_current_view "on feature" "feature"
 
 # shared.txt should exist on feature (inherited from dev)
@@ -196,15 +167,15 @@ assert_file_exists "shared.txt exists on feature" "shared.txt"
 
 # Create and record a feature-only file
 create_file "feature_file.txt" "feature only"
-assert_success "add feature_file.txt" atomic add feature_file.txt
-record_change "Add feature_file.txt" >/dev/null 2>&1 || true
+require_success "add feature_file.txt" atomic add feature_file.txt
+require_success "record feature_file.txt" record_change "Add feature_file.txt"
 
 # Both files should exist on feature
 assert_file_exists "shared.txt on feature" "shared.txt"
 assert_file_exists "feature_file.txt on feature" "feature_file.txt"
 
 # Switch to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_current_view "on dev" "dev"
 
 # shared.txt should exist (it's on dev)
@@ -216,7 +187,7 @@ assert_file_not_exists \
     "feature_file.txt"
 
 # Switch back to feature — both should be there
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 assert_file_exists "shared.txt on feature (round 2)" "shared.txt"
 assert_file_exists "feature_file.txt on feature (round 2)" "feature_file.txt"
 
@@ -233,11 +204,11 @@ make_temp_repo "cross-pending-add"
 init_repo
 
 create_file "pending.txt" "pending content"
-assert_success "add pending.txt on dev" atomic add pending.txt
+require_success "add pending.txt on dev" atomic add pending.txt
 assert_status_flag "pending.txt is A on dev" "A" "pending.txt"
 
 # Attempt switch — should be blocked
-new_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
 if atomic view switch feature >/dev/null 2>&1; then
     _fail "switch blocked with pending add on dev" "switch succeeded (rc=0)"
 else
@@ -247,8 +218,8 @@ assert_current_view "still on dev" "dev"
 assert_file_exists "pending.txt still on dev" "pending.txt"
 
 # Record it, then switch should work
-record_change "Record pending.txt on dev" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "record pending.txt on dev" record_change "Record pending.txt on dev"
+require_success "switch to feature after recording" switch_view "feature"
 assert_current_view "on feature after recording" "feature"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -263,19 +234,15 @@ assert_current_view "on feature" "feature"
 
 # pending.txt should exist on feature (visible from dev via parent chain
 # OR via inherited changes)
-if [[ -f "pending.txt" ]]; then
-    _pass "pending.txt visible on feature (inherited)"
-else
-    _pass "pending.txt not on feature (not yet inserted) — acceptable"
-fi
+assert_file_exists "pending.txt visible on feature (inherited)" "pending.txt"
 
 # Record a feature-only file
 create_file "feature_only.txt" "feature only"
-assert_success "add feature_only.txt" atomic add feature_only.txt
-record_change "Record feature_only.txt" >/dev/null 2>&1 || true
+require_success "add feature_only.txt" atomic add feature_only.txt
+require_success "record feature_only.txt" record_change "Record feature_only.txt"
 
 # Switch back to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_file_not_exists "feature_only.txt NOT on dev" "feature_only.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -288,17 +255,17 @@ begin_section "Cross-View: Nested directories removed on switch"
 make_temp_repo "cross-nested-cleanup"
 init_repo
 
-new_view "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "switch to feature" switch_view "feature"
 
 create_file "src/pkg/deep/module.rs" "fn deep() {}"
-assert_success "add nested file" atomic add "src/pkg/deep/module.rs"
-record_change "Add deep nested file" >/dev/null 2>&1 || true
+require_success "add nested file" atomic add "src/pkg/deep/module.rs"
+require_success "record nested file" record_change "Add deep nested file"
 
 assert_dir_exists "src/pkg/deep exists on feature" "src/pkg/deep"
 
 # Switch to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
 assert_file_not_exists \
     "src/pkg/deep/module.rs NOT on dev" \
@@ -310,7 +277,7 @@ assert_dir_not_exists \
     "src/pkg/deep"
 
 # Switch back — everything reappears
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 assert_file_exists "src/pkg/deep/module.rs on feature" "src/pkg/deep/module.rs"
 assert_dir_exists "src/pkg/deep on feature" "src/pkg/deep"
 
@@ -329,28 +296,28 @@ init_repo
 
 # Record base.txt on dev
 create_file "base.txt" "base content"
-assert_success "add base.txt" atomic add base.txt
-record_change "Add base.txt on dev" >/dev/null 2>&1 || true
+require_success "add base.txt" atomic add base.txt
+require_success "record base.txt on dev" record_change "Add base.txt on dev"
 
 # Create staging from dev
-new_view "staging" >/dev/null 2>&1 || true
+require_success "create staging view" new_view "staging"
 # Insert dev.s changes to staging so it inherits base.txt
-insert_from_view "dev" "staging" >/dev/null 2>&1 || true
-switch_view "staging" >/dev/null 2>&1 || true
+require_success "insert dev into staging" insert_from_view "dev" "staging"
+require_success "switch to staging" switch_view "staging"
 
 create_file "staging.txt" "staging content"
-assert_success "add staging.txt" atomic add staging.txt
-record_change "Add staging.txt" >/dev/null 2>&1 || true
+require_success "add staging.txt" atomic add staging.txt
+require_success "record staging.txt" record_change "Add staging.txt"
 
 # Create feature from dev
-switch_view "dev" >/dev/null 2>&1 || true
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 create_file "feature.txt" "feature content"
-assert_success "add feature.txt" atomic add feature.txt
-record_change "Add feature.txt" >/dev/null 2>&1 || true
+require_success "add feature.txt" atomic add feature.txt
+require_success "record feature.txt" record_change "Add feature.txt"
 
 # ── Verify on feature ──
 assert_file_exists "base.txt on feature" "base.txt"
@@ -358,19 +325,19 @@ assert_file_exists "feature.txt on feature" "feature.txt"
 assert_file_not_exists "staging.txt NOT on feature" "staging.txt"
 
 # ── Switch to staging ──
-switch_view "staging" >/dev/null 2>&1 || true
+require_success "switch to staging" switch_view "staging"
 assert_file_exists "base.txt on staging" "base.txt"
 assert_file_exists "staging.txt on staging" "staging.txt"
 assert_file_not_exists "feature.txt NOT on staging" "feature.txt"
 
 # ── Switch to dev ──
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_file_exists "base.txt on dev" "base.txt"
 assert_file_not_exists "staging.txt NOT on dev" "staging.txt"
 assert_file_not_exists "feature.txt NOT on dev" "feature.txt"
 
 # ── Round-trip back to feature ──
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 assert_file_exists "base.txt on feature (round 2)" "base.txt"
 assert_file_exists "feature.txt on feature (round 2)" "feature.txt"
 assert_file_not_exists "staging.txt NOT on feature (round 2)" "staging.txt"
@@ -381,14 +348,9 @@ begin_section "Cross-View: Insert between non-dev views"
 #
 # Insert feature.txt from feature to staging
 
-apply_out="$(insert_from_view "feature" "staging" 2>&1)" || true
-if echo "$apply_out" | grep -qiE "inserted|success|change"; then
-    _pass "insert from feature to staging succeeds"
-else
-    _pass "insert from feature to staging completes"
-fi
+require_success "insert from feature to staging succeeds" insert_from_view "feature" "staging"
 
-switch_view "staging" >/dev/null 2>&1 || true
+require_success "switch to staging" switch_view "staging"
 
 # staging should now have all three files
 assert_file_exists "base.txt on staging" "base.txt"
@@ -402,53 +364,41 @@ begin_section "Cross-View: Unrecord on feature, then switch"
 # Workflow:
 #   1. Switch to feature
 #   2. Unrecord the feature.txt change
-#   3. feature.txt should still be on disk (reverts to added/modified)
+#   3. feature.txt should still be on disk and become untracked
 #   4. Switch to dev
-#   5. feature.txt should NOT be on dev (it's not recorded anywhere reachable from dev)
+#   5. untracked feature.txt persists without becoming tracked on dev
 
 make_temp_repo "cross-unrecord-switch"
 init_repo
 
 # Record base on dev
 create_file "base.txt" "base"
-assert_success "add base.txt" atomic add base.txt
-record_change "Add base.txt" >/dev/null 2>&1 || true
+require_success "add base.txt" atomic add base.txt
+require_success "record base.txt" record_change "Add base.txt"
 
 # Create feature, insert dev, add feature file
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert base history into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 create_file "temp_feature.txt" "temporary"
-assert_success "add temp_feature.txt" atomic add temp_feature.txt
-record_change "Add temp_feature.txt" >/dev/null 2>&1 || true
+require_success "add temp_feature.txt" atomic add temp_feature.txt
+require_success "record temp_feature.txt" record_change "Add temp_feature.txt"
 
 # Unrecord on feature
-unrec_out="$(unrecord_last)"
-if echo "$unrec_out" | grep -qiE "unrecord|removed|hash"; then
-    _pass "unrecord on feature succeeds"
-else
-    _pass "unrecord on feature completes"
-fi
+require_success "unrecord on feature succeeds" unrecord_last
 
 # File should still be on disk
 assert_file_exists "temp_feature.txt still on disk after unrecord" "temp_feature.txt"
+assert_status_flag "temp_feature.txt is untracked after unrecord" "?" "temp_feature.txt"
 
-# Switch to dev — the file should NOT be on dev
-switch_view "dev" >/dev/null 2>&1 || true
+# Switch to dev without removing the newly untracked working-copy file.
+require_success "switch to dev after unrecord" switch_view "dev"
+assert_current_view "on dev after unrecord" "dev"
 
-# Since it was unrecorded from feature and never on dev, and it's a pending
-# add (no INODES position after unrecord), it will persist as untracked on disk.
-# This is acceptable behavior — the file is just an untracked working copy artifact.
 assert_file_exists "base.txt on dev" "base.txt"
-# The temp_feature.txt might or might not be on disk depending on whether
-# unrecord removes the INODES position (making it a pending add that persists).
-# Either behavior is acceptable.
-if [[ -f "temp_feature.txt" ]]; then
-    _pass "temp_feature.txt persists as untracked after unrecord+switch"
-else
-    _pass "temp_feature.txt cleaned up after unrecord+switch"
-fi
+assert_file_content "unrecorded file survives switch byte-for-byte" "temp_feature.txt" "temporary"
+assert_status_flag "temp_feature.txt stays untracked on dev" "?" "temp_feature.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Cross-View: Untracked files with same name on different views"
@@ -463,13 +413,13 @@ init_repo
 
 # Record hello.txt on dev
 create_file "hello.txt" "dev version"
-assert_success "add hello.txt on dev" atomic add hello.txt
-record_change "Add hello.txt on dev" >/dev/null 2>&1 || true
+require_success "add hello.txt on dev" atomic add hello.txt
+require_success "record hello.txt on dev" record_change "Add hello.txt on dev"
 
 # Create feature
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 # hello.txt should exist (inherited from dev)
 assert_file_exists "hello.txt on feature (inherited)" "hello.txt"
@@ -477,15 +427,15 @@ assert_file_content "hello.txt has dev content on feature" "hello.txt" "dev vers
 
 # Modify hello.txt on feature and record
 overwrite_file "hello.txt" "feature version"
-record_change "Modify hello.txt on feature" >/dev/null 2>&1 || true
+require_success "record feature modification" record_change "Modify hello.txt on feature"
 
 # Switch to dev — hello.txt should have dev version
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_file_exists "hello.txt on dev" "hello.txt"
 assert_file_content "hello.txt has dev content on dev" "hello.txt" "dev version"
 
 # Switch to feature — hello.txt should have feature version
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 assert_file_exists "hello.txt on feature" "hello.txt"
 assert_file_content "hello.txt has feature content" "hello.txt" "feature version"
 
@@ -499,22 +449,22 @@ make_temp_repo "cross-deletion"
 init_repo
 
 create_file "victim.txt" "will be deleted on feature"
-assert_success "add victim.txt" atomic add victim.txt
-record_change "Add victim.txt on dev" >/dev/null 2>&1 || true
+require_success "add victim.txt" atomic add victim.txt
+require_success "record victim.txt on dev" record_change "Add victim.txt on dev"
 
 # Create feature from dev
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 # Delete on feature
 rm -f victim.txt
-record_change "Delete victim.txt on feature" >/dev/null 2>&1 || true
+require_success "record victim.txt deletion" record_change "Delete victim.txt on feature"
 
 assert_file_not_exists "victim.txt deleted on feature" "victim.txt"
 
 # Switch to dev — victim.txt should still be there
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_file_exists "victim.txt still on dev" "victim.txt"
 assert_file_content "victim.txt has original content" "victim.txt" "will be deleted on feature"
 
@@ -528,21 +478,21 @@ begin_section "Cross-View: Multiple files recorded in separate changes"
 make_temp_repo "cross-multi-changes"
 init_repo
 
-new_view "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "switch to feature" switch_view "feature"
 
 # Record three separate changes
 create_file "change1.txt" "change one"
-assert_success "add change1.txt" atomic add change1.txt
-record_change "Feature change 1" >/dev/null 2>&1 || true
+require_success "add change1.txt" atomic add change1.txt
+require_success "record feature change 1" record_change "Feature change 1"
 
 create_file "change2.txt" "change two"
-assert_success "add change2.txt" atomic add change2.txt
-record_change "Feature change 2" >/dev/null 2>&1 || true
+require_success "add change2.txt" atomic add change2.txt
+require_success "record feature change 2" record_change "Feature change 2"
 
 create_file "change3.txt" "change three"
-assert_success "add change3.txt" atomic add change3.txt
-record_change "Feature change 3" >/dev/null 2>&1 || true
+require_success "add change3.txt" atomic add change3.txt
+require_success "record feature change 3" record_change "Feature change 3"
 
 # All three should exist on feature
 assert_file_exists "change1.txt on feature" "change1.txt"
@@ -550,13 +500,13 @@ assert_file_exists "change2.txt on feature" "change2.txt"
 assert_file_exists "change3.txt on feature" "change3.txt"
 
 # Switch to dev — none should exist
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_file_not_exists "change1.txt NOT on dev" "change1.txt"
 assert_file_not_exists "change2.txt NOT on dev" "change2.txt"
 assert_file_not_exists "change3.txt NOT on dev" "change3.txt"
 
 # Insert all from feature to dev
-insert_from_view "feature" "dev" >/dev/null 2>&1 || true
+require_success "insert feature changes into dev" insert_from_view "feature" "dev"
 
 # Now all three should exist on dev
 assert_file_exists "change1.txt on dev after insert" "change1.txt"
@@ -574,29 +524,27 @@ init_repo
 
 # Setup: dev has dev.txt, feature has feature.txt
 create_file "dev.txt" "dev"
-assert_success "add dev.txt" atomic add dev.txt
-record_change "Add dev.txt" >/dev/null 2>&1 || true
+require_success "add dev.txt" atomic add dev.txt
+require_success "record dev.txt" record_change "Add dev.txt"
 
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 create_file "feature.txt" "feature"
-assert_success "add feature.txt" atomic add feature.txt
-record_change "Add feature.txt" >/dev/null 2>&1 || true
+require_success "add feature.txt" atomic add feature.txt
+require_success "record feature.txt" record_change "Add feature.txt"
 
 # Rapid switch 5 times
 for i in $(seq 1 5); do
-    switch_view "dev" >/dev/null 2>&1 || true
+    require_success "switch to dev (iteration $i)" switch_view "dev"
     assert_file_exists "dev.txt on dev (iteration $i)" "dev.txt"
     assert_file_not_exists "feature.txt NOT on dev (iteration $i)" "feature.txt"
 
-    switch_view "feature" >/dev/null 2>&1 || true
+    require_success "switch to feature (iteration $i)" switch_view "feature"
     assert_file_exists "dev.txt on feature (iteration $i)" "dev.txt"
     assert_file_exists "feature.txt on feature (iteration $i)" "feature.txt"
 done
-
-_pass "rapid switching stress test: 5 round-trips completed"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Cross-View: Untracked + tracked coexistence"
@@ -610,16 +558,16 @@ init_repo
 
 # Create and record tracked.txt on dev
 create_file "tracked.txt" "tracked on dev"
-assert_success "add tracked.txt" atomic add tracked.txt
-record_change "Add tracked.txt on dev" >/dev/null 2>&1 || true
+require_success "add tracked.txt" atomic add tracked.txt
+require_success "record tracked.txt on dev" record_change "Add tracked.txt on dev"
 
 # Create an untracked file
 create_file "notes.txt" "my personal notes"
 
 # Create feature
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 # Both should exist
 assert_file_exists "tracked.txt on feature" "tracked.txt"
@@ -627,11 +575,11 @@ assert_file_exists "notes.txt on feature (untracked persists)" "notes.txt"
 
 # Record a different file on feature
 create_file "feature_code.txt" "feature code"
-assert_success "add feature_code.txt" atomic add feature_code.txt
-record_change "Add feature_code.txt" >/dev/null 2>&1 || true
+require_success "add feature_code.txt" atomic add feature_code.txt
+require_success "record feature_code.txt" record_change "Add feature_code.txt"
 
 # Switch to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 
 # tracked.txt should exist (on dev), feature_code.txt should NOT,
 # notes.txt should persist (untracked)
@@ -649,30 +597,30 @@ begin_section "Cross-View: Insert then unrecord on target"
 make_temp_repo "cross-insert-unrecord"
 init_repo
 
-new_view "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "switch to feature" switch_view "feature"
 
 create_file "applied.txt" "applied content"
-assert_success "add applied.txt" atomic add applied.txt
-record_change "Add applied.txt on feature" >/dev/null 2>&1 || true
+require_success "add applied.txt" atomic add applied.txt
+require_success "record applied.txt on feature" record_change "Add applied.txt on feature"
 
 # Insert to dev
-insert_from_view "feature" "dev" >/dev/null 2>&1 || true
+require_success "insert feature into dev" insert_from_view "feature" "dev"
 
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_file_exists "applied.txt on dev after insert" "applied.txt"
 
 # Unrecord on dev
-unrecord_last >/dev/null 2>&1 || true
+require_success "unrecord applied change on dev" unrecord_last
 
 # After unrecording the insert, the file's change is no longer on dev
 # The file might persist on disk as an untracked artifact (since unrecord
 # doesn't delete files from disk), but it should not be tracked on dev.
 # When we switch away and back, it would be cleaned up properly.
-_pass "unrecord applied change on dev completes"
+assert_status_flag "unrecorded applied.txt is untracked on dev" "?" "applied.txt"
 
 # Verify feature still has it
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch to feature after unrecord" switch_view "feature"
 assert_file_exists "applied.txt still on feature" "applied.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -684,14 +632,14 @@ init_repo
 
 # Record a file on dev
 create_file "dev_file.txt" "dev only"
-assert_success "add dev_file.txt" atomic add dev_file.txt
-record_change "Add dev_file.txt" >/dev/null 2>&1 || true
+require_success "add dev_file.txt" atomic add dev_file.txt
+require_success "record dev_file.txt" record_change "Add dev_file.txt"
 
 # Create a child view (parented on dev)
 # In the ambient graph model, child views see parent's files through
 # the filter chain — there are no truly "empty" views when parented.
-new_view "child" >/dev/null 2>&1 || true
-switch_view "child" >/dev/null 2>&1 || true
+require_success "create child view" new_view "child"
+require_success "switch to child" switch_view "child"
 
 # dev_file.txt SHOULD exist on the child view — it inherits dev's
 # changes through the parent filter chain (ambient graph model).
@@ -700,7 +648,7 @@ assert_file_exists \
     "dev_file.txt"
 
 # Switch back to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_file_exists "dev_file.txt back on dev" "dev_file.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -714,42 +662,28 @@ init_repo
 
 # Setup: dev has dev.txt (clean), feature has feature.txt (clean)
 create_file "dev.txt" "dev"
-assert_success "add dev.txt" atomic add dev.txt
-record_change "Add dev.txt" >/dev/null 2>&1 || true
+require_success "add dev.txt" atomic add dev.txt
+require_success "record dev.txt" record_change "Add dev.txt"
 
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 create_file "feature.txt" "feature"
-assert_success "add feature.txt" atomic add feature.txt
-record_change "Add feature.txt" >/dev/null 2>&1 || true
+require_success "add feature.txt" atomic add feature.txt
+require_success "record feature.txt" record_change "Add feature.txt"
 
 # On feature: both should be clean, status should not mention feature.txt or
 # dev.txt as dirty
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*dev\.txt"; then
-    _fail "dev.txt clean on feature status" "shown as dirty"
-else
-    _pass "dev.txt clean on feature status"
-fi
-if echo "$out" | grep -qE "^[MADU?].*feature\.txt"; then
-    _fail "feature.txt clean on feature status" "shown as dirty"
-else
-    _pass "feature.txt clean on feature status"
-fi
+assert_status_no_entry "dev.txt clean on feature status" "dev.txt"
+assert_status_no_entry "feature.txt clean on feature status" "feature.txt"
 
 # Switch to dev: feature.txt should not appear AT ALL in status
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
 assert_status_no_entry "feature.txt not in dev status" "feature.txt"
 
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*dev\.txt"; then
-    _fail "dev.txt clean on dev status" "shown as dirty"
-else
-    _pass "dev.txt clean on dev status"
-fi
+assert_status_no_entry "dev.txt clean on dev status" "dev.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Cross-View: File modified on both views independently"
@@ -763,31 +697,31 @@ init_repo
 
 # Record shared.txt on dev
 create_file "shared.txt" "original"
-assert_success "add shared.txt" atomic add shared.txt
-record_change "Add shared.txt" >/dev/null 2>&1 || true
+require_success "add shared.txt" atomic add shared.txt
+require_success "record shared.txt" record_change "Add shared.txt"
 
 # Create feature from dev
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
 
 # Modify on dev
 overwrite_file "shared.txt" "dev modification"
-record_change "Modify shared.txt on dev" >/dev/null 2>&1 || true
+require_success "record dev modification" record_change "Modify shared.txt on dev"
 
 # Modify on feature
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch to feature" switch_view "feature"
 overwrite_file "shared.txt" "feature modification"
-record_change "Modify shared.txt on feature" >/dev/null 2>&1 || true
+require_success "record feature modification" record_change "Modify shared.txt on feature"
 
 # Check feature version
 assert_file_content "shared.txt has feature content" "shared.txt" "feature modification"
 
 # Switch to dev — should have dev version
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_file_content "shared.txt has dev content" "shared.txt" "dev modification"
 
 # Switch back to feature
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 assert_file_content "shared.txt has feature content (round 2)" "shared.txt" "feature modification"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -880,12 +814,7 @@ assert_file_exists "beta.txt exists on shared-main" "beta.txt"
 assert_file_exists "gamma.txt exists on shared-main" "gamma.txt"
 
 # Fork a deletable draft from the shared view and record one local edit.
-draft_out="$(atomic view create local-edit --draft --from shared-main --switch 2>&1)" || true
-if echo "$draft_out" | grep -qiE "created|view|switched"; then
-    _pass "create draft local-edit from shared-main"
-else
-    _pass "create draft local-edit from shared-main completes"
-fi
+require_success "create draft local-edit from shared-main" atomic view create local-edit --draft --from shared-main --switch
 
 assert_current_view "on local-edit draft" "local-edit"
 assert_file_exists "alpha.txt exists on local-edit" "alpha.txt"
@@ -1000,20 +929,10 @@ assert_file_exists "journey.txt on feature before add" "journey.txt"
 assert_success "add journey.txt on feature" atomic add journey.txt
 assert_status_flag "journey.txt is A on feature" "A" "journey.txt"
 
-rec_out="$(record_change "Record journey.txt on feature")"
-if echo "$rec_out" | grep -qiE "hash|recorded|created|change"; then
-    _pass "record journey.txt on feature succeeds"
-else
-    _pass "record journey.txt on feature completes"
-fi
+require_success "record journey.txt on feature succeeds" record_change "Record journey.txt on feature"
 
 # Verify clean on feature after record
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU].*journey\.txt"; then
-    _fail "journey.txt clean on feature after record" "still dirty: $out"
-else
-    _pass "journey.txt clean on feature after record"
-fi
+assert_status_no_entry "journey.txt clean on feature after record" "journey.txt"
 
 # ── Step 6: Switch to dev — file is GONE ────────────────────────────────
 
@@ -1057,12 +976,7 @@ assert_file_content "journey.txt has correct content on feature" "journey.txt" "
 
 # ── Step 9: Insert from feature to dev ───────────────────────────────────
 
-apply_out="$(insert_from_view "feature" "dev")"
-if echo "$apply_out" | grep -qiE "inserted|success|change"; then
-    _pass "insert journey.txt from feature to dev"
-else
-    _pass "insert from feature to dev completes"
-fi
+require_success "insert journey.txt from feature to dev" insert_from_view "feature" "dev"
 
 # ── Step 10: Switch to dev — file exists ────────────────────────────────
 
@@ -1089,12 +1003,7 @@ assert_file_exists "base.txt still on staging" "base.txt"
 
 # ── Step 12: Insert from dev to staging ──────────────────────────────────
 
-apply_out2="$(insert_from_view "dev" "staging")"
-if echo "$apply_out2" | grep -qiE "inserted|success|change"; then
-    _pass "insert journey.txt from dev to staging"
-else
-    _pass "insert from dev to staging completes"
-fi
+require_success "insert journey.txt from dev to staging" insert_from_view "dev" "staging"
 
 # ── Step 13: Switch to staging — file exists ────────────────────────────
 
@@ -1392,12 +1301,7 @@ assert_file_content "draft_a.txt intact after blocked switch" "draft_a.txt" "Dra
 assert_file_content "draft_b.txt intact after blocked switch" "draft_b.txt" "Draft file beta content"
 
 # Step 3: --force should override the block
-switch_out="$(atomic view switch dev --force 2>&1)"
-if echo "$switch_out" | grep -qi "switched\|materiali"; then
-    _pass "switch --force overrides the block"
-else
-    _pass "switch --force completes"
-fi
+require_success "switch --force overrides the block" atomic view switch dev --force
 assert_current_view "on dev after forced switch" "dev"
 
 # Step 4: Switch back (clean working copy, should work)
@@ -1476,29 +1380,27 @@ begin_section "Cross-View: Multiple round-trips with pending files"
 make_temp_repo "cross-roundtrip-stress"
 init_repo
 
-new_view "wip" >/dev/null 2>&1 || true
-switch_view "wip" >/dev/null 2>&1 || true
+require_success "create wip view" new_view "wip"
+require_success "switch to wip" switch_view "wip"
 
 create_file "fragile.txt" "This content must not change"
-assert_success "add fragile.txt" atomic add fragile.txt
-record_change "Record fragile.txt on wip" >/dev/null 2>&1 || true
+require_success "add fragile.txt" atomic add fragile.txt
+require_success "record fragile.txt on wip" record_change "Record fragile.txt on wip"
 
 # Round-trip 3 times, recording on dev each time
 for i in 1 2 3; do
-    switch_view "dev" >/dev/null 2>&1 || true
+    require_success "switch to dev (iteration $i)" switch_view "dev"
     create_file "dev_iter_${i}.txt" "dev iteration ${i}"
-    assert_success "add dev_iter_${i}.txt" atomic add "dev_iter_${i}.txt"
-    record_change "Dev iteration ${i}" >/dev/null 2>&1 || true
+    require_success "add dev_iter_${i}.txt" atomic add "dev_iter_${i}.txt"
+    require_success "record dev iteration $i" record_change "Dev iteration ${i}"
 
-    switch_view "wip" >/dev/null 2>&1 || true
+    require_success "switch to wip (iteration $i)" switch_view "wip"
     assert_file_exists "fragile.txt exists (iteration $i)" "fragile.txt"
     assert_file_content \
         "fragile.txt content intact (iteration $i)" \
         "fragile.txt" \
         "This content must not change"
 done
-
-_pass "3 round-trips with recorded files: content preserved"
 
 # ═════════════════════════════════════════════════════════════════════
 begin_section "Cross-View: --stash auto-saves changes before switch"
@@ -1516,12 +1418,12 @@ init_repo
 
 # Record a base file on dev
 create_file "work.txt" "original content"
-assert_success "add work.txt" atomic add work.txt
-record_change "Add work.txt" >/dev/null 2>&1 || true
+require_success "add work.txt" atomic add work.txt
+require_success "record work.txt" record_change "Add work.txt"
 
 # Create feature view
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
 
 # Modify the file (dirty working copy)
 overwrite_file "work.txt" "modified content"
@@ -1534,11 +1436,7 @@ else
 fi
 
 # Switch with --stash
-if atomic view switch feature --stash >/dev/null 2>&1; then
-    _pass "switch --stash succeeds"
-else
-    _fail "switch --stash succeeds" "stash+switch failed"
-fi
+require_success "switch --stash succeeds" atomic view switch feature --stash
 assert_current_view "on feature after stash+switch" "feature"
 
 # Verify stash was created
@@ -1553,19 +1451,14 @@ fi
 assert_file_content "work.txt has original content on feature" "work.txt" "original content"
 
 # Switch back to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_current_view "back on dev" "dev"
 
 # work.txt should have original content (clean state after stash)
 assert_file_content "work.txt is clean on dev (stashed)" "work.txt" "original content"
 
 # Pop the stash — modifications restored
-pop_out="$(atomic stash pop 2>&1)"
-if echo "$pop_out" | grep -qi "applied\|stash@"; then
-    _pass "stash pop succeeds"
-else
-    _pass "stash pop completes"
-fi
+require_success "stash pop succeeds" atomic stash pop
 
 # CRITICAL: the stashed modifications are back
 assert_file_content "work.txt has modified content after pop" "work.txt" "modified content"
@@ -1582,35 +1475,27 @@ make_temp_repo "cross-stash-added"
 init_repo
 
 # Create feature view
-new_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
 
 # Add new files on dev without recording
 create_file "new_a.txt" "new file alpha"
 create_file "new_b.txt" "new file beta"
-assert_success "add new_a.txt" atomic add new_a.txt
-assert_success "add new_b.txt" atomic add new_b.txt
+require_success "add new_a.txt" atomic add new_a.txt
+require_success "add new_b.txt" atomic add new_b.txt
 assert_status_flag "new_a.txt is Added" "A" "new_a.txt"
 
 # Switch with --stash
-if atomic view switch feature --stash >/dev/null 2>&1; then
-    _pass "switch --stash with added files succeeds"
-else
-    _fail "switch --stash with added files succeeds" "stash+switch failed"
-fi
+require_success "switch --stash with added files succeeds" atomic view switch feature --stash
 assert_current_view "on feature" "feature"
 
 # Files may still be on disk (added-but-unrecorded files aren't tracked
 # in the graph, so materialize doesn't remove them). The stash saved
 # their content — what matters is that pop restores them correctly.
-if [[ -f "new_a.txt" ]]; then
-    _pass "new_a.txt persists on feature (unrecorded, expected)"
-else
-    _pass "new_a.txt cleaned up on feature"
-fi
+# The file's presence here is not an assertion; restoration is checked below.
 
 # Switch back and pop
-switch_view "dev" >/dev/null 2>&1 || true
-atomic stash pop >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
+require_success "restore stashed added files" atomic stash pop
 
 # Files should be back with original content
 assert_file_exists "new_a.txt restored after pop" "new_a.txt"
@@ -1630,29 +1515,29 @@ init_repo
 
 # Base state on dev
 create_file "base.txt" "base"
-assert_success "add base.txt" atomic add base.txt
-record_change "Add base" >/dev/null 2>&1 || true
+require_success "add base.txt" atomic add base.txt
+require_success "record base" record_change "Add base"
 
 # Create feature from dev
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
 
 # Dirty up dev: modify existing + add new
 overwrite_file "base.txt" "modified base"
 create_file "wip.txt" "work in progress"
-assert_success "add wip.txt" atomic add wip.txt
+require_success "add wip.txt" atomic add wip.txt
 
 # Stash and switch
-atomic view switch feature --stash >/dev/null 2>&1
+require_success "stash and switch to feature" atomic view switch feature --stash
 assert_current_view "on feature" "feature"
 
 # Do work on feature
 create_file "feature_work.txt" "feature work"
-assert_success "add feature_work.txt" atomic add feature_work.txt
-record_change "Feature work" >/dev/null 2>&1 || true
+require_success "add feature_work.txt" atomic add feature_work.txt
+require_success "record feature work" record_change "Feature work"
 
 # Switch back to dev (clean, no block)
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_current_view "back on dev" "dev"
 
 # base.txt should be clean (original), wip.txt should not exist
@@ -1660,14 +1545,12 @@ assert_file_content "base.txt is clean before pop" "base.txt" "base"
 assert_file_not_exists "wip.txt not on disk before pop" "wip.txt"
 
 # Pop stash
-atomic stash pop >/dev/null 2>&1 || true
+require_success "restore stashed work" atomic stash pop
 
 # CRITICAL: everything restored
 assert_file_content "base.txt has stashed modification" "base.txt" "modified base"
 assert_file_exists "wip.txt restored after pop" "wip.txt"
 assert_file_content "wip.txt has stashed content" "wip.txt" "work in progress"
-
-_pass "full stash round-trip: all changes preserved"
 
 # ═════════════════════════════════════════════════════════════════════
 

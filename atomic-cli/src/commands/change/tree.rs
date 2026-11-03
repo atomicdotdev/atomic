@@ -195,6 +195,22 @@ pub(super) fn render(
         "Graph: +{vertices} vertices, ~{edges} edges, {} bytes",
         change.contents.len()
     ));
+    if let Some(patch) = &change.hashed.span {
+        use atomic_core::change::span_patch::SpanOp;
+        let roots = patch
+            .ops
+            .iter()
+            .filter(|op| matches!(op, SpanOp::Root { .. }))
+            .count();
+        let edits = patch
+            .ops
+            .iter()
+            .filter(|op| matches!(op, SpanOp::Edit { .. }))
+            .count();
+        if roots != 0 || edits != 0 {
+            root.push(format!("Spans: {roots} roots, {edits} edits"));
+        }
+    }
     root.section(files(change, cmd.show_hunks));
     // Keep every recorded provenance entry, not just the first provider/model.
     for prov in &change.hashed.provenance {
@@ -225,8 +241,36 @@ fn files(change: &Change, show_hunks: bool) -> Tree {
             _ => None,
         })
         .collect();
+    let mut summaries = hunk_display_summaries(&change.hashed.hunks);
+    let mut known: BTreeSet<String> = summaries
+        .iter()
+        .map(|summary| summary.path.clone())
+        .collect();
+    let mut span_only = 0;
+    if change.hashed.span.as_ref().is_some_and(|patch| {
+        patch
+            .ops
+            .iter()
+            .any(|op| matches!(op, atomic_core::change::span_patch::SpanOp::Edit { .. }))
+    }) {
+        // A span edit carries its portable file identity rather than a graph
+        // hunk path. Its hashed semantic operation retains the recorded path.
+        for ops in change.file_ops() {
+            if ops.trunk_op().is_none()
+                && !ops.path().is_empty()
+                && known.insert(ops.path().to_owned())
+            {
+                summaries.push(HunkDisplaySummary {
+                    symbol: "~",
+                    path: ops.path().to_owned(),
+                    info: "(span edits)".into(),
+                });
+                span_only += 1;
+            }
+        }
+    }
     let mut paths = PathTree::default();
-    for summary in hunk_display_summaries(&change.hashed.hunks) {
+    for summary in summaries {
         let mut node = &mut paths;
         // Atomic paths use '/', including when the CLI runs on Windows. Do not
         // interpret platform-specific separators or consult the working copy.
@@ -238,7 +282,7 @@ fn files(change: &Change, show_hunks: bool) -> Tree {
     }
     let mut section = Tree::new(format!(
         "Files changed: {}",
-        count_unique_paths(&change.hashed.hunks)
+        count_unique_paths(&change.hashed.hunks) + span_only
     ));
     section.children = path_nodes(paths, show_hunks);
     section
@@ -449,6 +493,53 @@ mod tests {
             dep_messages: Default::default(),
             ledger_graphs: vec![],
         }
+    }
+
+    #[test]
+    fn span_only_edit_displays_semantic_path() {
+        use atomic_core::change::span_patch::{ExternalFile, ExternalSpan, SpanOp, SpanPatch};
+        use atomic_core::change::FileOps;
+        use atomic_core::crdt::TrunkId;
+        use atomic_core::types::NodeId;
+        let owner = Hash::of(b"prior change");
+        let mut change = Change::with_file_ops(
+            ChangeHeader::new("span edit"),
+            Vec::new(),
+            vec![FileOps::edit(
+                TrunkId::new(NodeId::new(1), 0),
+                "src/lines.txt".into(),
+            )],
+            b"replacement".to_vec(),
+            vec![owner],
+        );
+        change.hashed.span = Some(SpanPatch::new(
+            Vec::new(),
+            vec![SpanOp::Edit {
+                file: ExternalFile { owner, ordinal: 0 },
+                target: ExternalSpan {
+                    owner,
+                    start: 0,
+                    end: 5,
+                },
+                start: 0,
+                end: 5,
+                insert_start: 0,
+                insert_end: 11,
+            }],
+        ));
+        assert_eq!(
+            files(&change, false).render(),
+            "Files changed: 1\n└── src/\n    └── lines.txt [modified]\n"
+        );
+        assert!(files(&change, true).render().contains("span edits"));
+        let output = render(
+            &ChangeCmd::new(),
+            &change,
+            &Hash::of(b"change"),
+            None,
+            &data(),
+        );
+        assert!(output.contains("Spans: 0 roots, 1 edits"));
     }
 
     #[test]

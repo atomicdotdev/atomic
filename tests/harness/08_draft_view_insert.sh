@@ -1,21 +1,16 @@
 #!/usr/bin/env bash
 # 08_draft_view_insert.sh — Draft view insert correctness at scale.
 #
-# Tests the exact code path that the API server push handler follows:
-# changes are recorded on a client repo's draft (agent) view, copied
-# to a server repo, and inserted into the same draft view on the server.
+# Simulates object transfer without exercising network push or the API server:
+# changes are recorded on a client draft view, copied to a server repository,
+# and inserted into the same draft view on the server.
 #
 # The critical invariant: after inserting N sequential changes that modify
 # the same file, the server's working copy must contain ONLY the final
 # state — not a concatenation of all intermediate states.
 #
-# This is the spec for the duplication bug:
-#   When two or more changes are inserted into the same draft view via
-#   `atomic insert <hash> --view <draft>`, the second change's EdgeUpdate
-#   (which replaces old content with new content) must properly delete
-#   the old BLOCK edge in STACK_GRAPH before adding the new one.
-#   Without this, the graph traversal sees BOTH the old and new content
-#   vertices as alive, producing duplicated file output.
+# Each incoming native span edit must replace the intended prior content
+# rather than accumulating intermediate versions.
 #
 # Invariants tested at every step:
 #
@@ -34,6 +29,8 @@
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
+SNAPSHOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/atomic-test-insert-snapshots-XXXXXX")"
+_HARNESS_TMPDIRS+=("$SNAPSHOT_DIR")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Helper: copy a single change file from client to server
@@ -49,51 +46,32 @@ copy_change_to_server() {
 
     mkdir -p "$dst_dir"
 
-    local src_file
-    src_file="$(find "$src_dir" -name "${hash}*" -type f 2>/dev/null | head -1)"
-
-    if [[ -z "$src_file" ]]; then
-        src_file="$(find "$client_changes" -name "${hash}*" -type f 2>/dev/null | head -1)"
+    local src_file="$src_dir/${hash}.change"
+    if [[ -f "$src_file" ]]; then
+        cp "$src_file" "$dst_dir/" && cmp -s "$src_file" "$dst_dir/${hash}.change"
+    else
+        echo "missing client change object: $src_file" >&2
+        return 1
     fi
-
-    if [[ -n "$src_file" && -f "$src_file" ]]; then
-        cp "$src_file" "$dst_dir/"
-        return 0
-    fi
-    return 1
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Helper: get the full hash of the most recently recorded change
 # ═══════════════════════════════════════════════════════════════════════════
 
-# We track known hashes and find the newest one that isn't already known.
-# CRITICAL: changes must be discovered in the order they were recorded,
-# not alphabetically by hash. We use modification time (newest first)
-# so the most recently written .change file is found.
-KNOWN_HASHES=""
+capture_change_hashes() {
+    find "$CLIENT_DIR/.atomic/changes" -name '*.change' -type f \
+        | xargs -I{} basename {} .change | sort
+}
 
-get_newest_change_hash() {
-    local changes_dir="$1"
-    local newest=""
-
-    # Sort by modification time (newest last) so the last unknown file
-    # is the most recently recorded change.
-    while IFS= read -r f; do
-        local h
-        h="$(basename "$f" .change)"
-        if echo "$KNOWN_HASHES" | grep -qF "$h"; then
-            continue
-        fi
-        newest="$h"
-    done < <(find "$changes_dir" -name "*.change" -type f -print0 2>/dev/null \
-        | xargs -0 ls -tr 2>/dev/null)
-
-    if [[ -n "$newest" ]]; then
-        KNOWN_HASHES="${KNOWN_HASHES}${newest}
-"
-        echo "$newest"
+find_new_change_hash() {
+    local changes
+    changes="$(comm -13 "$1" "$2")"
+    if [[ -z "$changes" || "$changes" == *$'\n'* ]]; then
+        echo "expected exactly one new change object, got: $changes" >&2
+        return 1
     fi
+    printf '%s\n' "$changes"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -106,8 +84,8 @@ init_repo
 
 AGENT_VIEW="agent-ses_scale-test"
 
-new_view "$AGENT_VIEW" >/dev/null 2>&1 || true
-switch_view "$AGENT_VIEW" >/dev/null 2>&1 || true
+require_success "create client agent view" new_view "$AGENT_VIEW"
+require_success "switch to client agent view" switch_view "$AGENT_VIEW"
 assert_current_view "Client on agent view" "$AGENT_VIEW"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -148,9 +126,7 @@ NUM_CHANGES=10
 #   Change 9:  DELETE metrics, MODIFY main back to simple, ADD footer comment
 #   Change 10: MODIFY everything — final clean version
 #
-# At EVERY step, some lines are added, some are modified (replaced), and
-# some are deleted. This ensures the EdgeUpdate (del old BLOCK + add new
-# DELETED|BLOCK) path is exercised thoroughly.
+# The revisions exercise successive additions, replacements, and deletions.
 
 generate_version() {
     local v="$1"
@@ -392,15 +368,19 @@ for i in $(seq 1 $NUM_CHANGES); do
 
     # Save snapshot
     SNAPSHOTS[$i]="$(cat src/app.ts)"
+    cp src/app.ts "$SNAPSHOT_DIR/v$i"
     EXPECTED_LINE_COUNTS[$i]="$(wc -l < src/app.ts | tr -d ' ')"
 
     if [[ "$i" -eq 1 ]]; then
-        add_files src/app.ts
+        require_success "add client app.ts" atomic add src/app.ts
     fi
 
-    REC_OUT="$(record_change "Version ${i}" 2>&1)"
-
-    HASH="$(get_newest_change_hash "$CLIENT_DIR/.atomic/changes")"
+    capture_change_hashes > "$SNAPSHOT_DIR/before"
+    require_capture "record version $i" record_change "Version ${i}"
+    REC_OUT="$COMMAND_OUTPUT"
+    capture_change_hashes > "$SNAPSHOT_DIR/after"
+    require_capture "identify version $i object" find_new_change_hash "$SNAPSHOT_DIR/before" "$SNAPSHOT_DIR/after"
+    HASH="$COMMAND_OUTPUT"
 
     if [[ -n "$HASH" ]]; then
         CHANGE_HASHES[$i]="$HASH"
@@ -415,7 +395,7 @@ done
 # Final client state
 CLIENT_FINAL="$(cat src/app.ts)"
 CLIENT_FINAL_LINES="$(wc -l < src/app.ts | tr -d ' ')"
-_pass "Client final: $CLIENT_FINAL_LINES lines"
+assert_success "client final snapshot matches bytes" cmp -s "$SNAPSHOT_DIR/v$NUM_CHANGES" src/app.ts
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Setup: Server repo"
@@ -431,18 +411,11 @@ SERVER_CHANGES="$SERVER_DIR/.atomic/changes"
 # Copy ALL change files to server
 for i in $(seq 1 $NUM_CHANGES); do
     HASH="${CHANGE_HASHES[$i]}"
-    if copy_change_to_server "$HASH" "$CLIENT_CHANGES" "$SERVER_CHANGES"; then
-        : # silent success
-    else
-        _fail "Copy change $i to server" "Hash: $HASH"
-        print_summary
-        exit 1
-    fi
+    require_success "copy change $i to server byte-for-byte" copy_change_to_server "$HASH" "$CLIENT_CHANGES" "$SERVER_CHANGES"
 done
-_pass "Copied all $NUM_CHANGES change files to server"
 
 # Create the same agent view on the server
-new_view "$AGENT_VIEW" >/dev/null 2>&1 || true
+require_success "create server agent view" new_view "$AGENT_VIEW"
 assert_view_exists "Server has agent view" "$AGENT_VIEW"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -462,10 +435,10 @@ for i in $(seq 1 $NUM_CHANGES); do
     EXPECTED_LINES="${EXPECTED_LINE_COUNTS[$i]}"
 
     # Insert
-    APPLY_OUT="$(atomic insert "$HASH" --view "$AGENT_VIEW" 2>&1)" || true
+    require_success "insert version $i into agent view" atomic insert "$HASH" --view "$AGENT_VIEW"
 
     # Switch to draft view to trigger output_working_copy
-    switch_view "$AGENT_VIEW" >/dev/null 2>&1 || true
+    require_success "switch to agent view for version $i" switch_view "$AGENT_VIEW"
 
     # Read the file
     CONTENT="$(cat src/app.ts 2>/dev/null || echo "")"
@@ -594,9 +567,10 @@ for i in $(seq 1 $NUM_CHANGES); do
         _fail "v${i}: content mismatch" \
             "Server content differs from client at version $i"
     fi
+    assert_success "v${i}: content matches client byte-for-byte" cmp -s "$SNAPSHOT_DIR/v$i" src/app.ts
 
     # Switch back to dev between inserts (simulates server staying on dev)
-    switch_view "dev" >/dev/null 2>&1 || true
+    require_success "switch to dev after version $i" switch_view "dev"
 done
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -606,7 +580,7 @@ begin_section "Final verification: dev isolation"
 # After all 10 changes (with adds, modifies, AND deletes) on the draft
 # view, dev should still be empty — the app.ts file should NOT exist on dev.
 
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "select dev for isolation check" switch_view "dev"
 assert_current_view "On dev for isolation check" "dev"
 
 if [[ ! -f "src/app.ts" ]]; then
@@ -622,7 +596,8 @@ fi
 begin_section "Final verification: draft view round-trip"
 # ═══════════════════════════════════════════════════════════════════════════
 
-switch_view "$AGENT_VIEW" >/dev/null 2>&1 || true
+require_success "switch to agent for final verification" switch_view "$AGENT_VIEW"
+assert_current_view "on agent for final verification" "$AGENT_VIEW"
 
 FINAL_CONTENT="$(cat src/app.ts 2>/dev/null || echo "")"
 FINAL_LINES="$(echo "$FINAL_CONTENT" | wc -l | tr -d ' ')"
@@ -655,9 +630,10 @@ for gone_term in "formatName" "try {" "callCount" "emoji"; do
     if echo "$FINAL_CONTENT" | grep -qF "$gone_term"; then
         _fail "Final: stale content '$gone_term'" \
             "Term '$gone_term' was deleted in an earlier version but still present"
+    else
+        _pass "Final: no stale content '$gone_term'"
     fi
 done
-_pass "Final: no stale content from deleted versions"
 
 if [[ "$FINAL_CONTENT" == "$CLIENT_FINAL" ]]; then
     _pass "Final: server content matches client exactly"
@@ -665,6 +641,7 @@ else
     _fail "Final: content mismatch" \
         "Server content differs from client's final state"
 fi
+assert_success "final content matches client byte-for-byte" cmp -s "$SNAPSHOT_DIR/v$NUM_CHANGES" src/app.ts
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Scale check: file size growth is linear, not quadratic"

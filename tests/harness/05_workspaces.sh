@@ -55,7 +55,7 @@ assert_dir_exists \
     ".atomic/workspaces/dev"
 
 # Create a feature view
-new_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
 
 assert_dir_exists \
     ".atomic/workspaces/feature created with view" \
@@ -82,8 +82,8 @@ dist/"
 
 # Record a tracked file on dev so the view has content
 create_file "index.ts" "console.log('hello')"
-assert_success "add index.ts" atomic add index.ts
-record_change "Add index.ts on dev" >/dev/null 2>&1 || true
+require_success "add index.ts" atomic add index.ts
+require_success "record index.ts on dev" record_change "Add index.ts on dev"
 
 # Simulate build artifacts
 mkdir -p node_modules/lodash
@@ -97,9 +97,9 @@ assert_dir_exists "dist exists on dev" "dist"
 assert_file_exists "lodash exists on dev" "node_modules/lodash/index.js"
 
 # Create feature and switch
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 assert_current_view "on feature" "feature"
 
@@ -134,7 +134,7 @@ begin_section "Workspace: Ignored files restored on switch back"
 #
 # Continuing from previous: switch back to dev and verify artifacts return.
 
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_current_view "back on dev" "dev"
 
 # Artifacts should be restored
@@ -166,7 +166,7 @@ begin_section "Workspace: Each view has its own artifacts"
 
 # Continuing from previous — we're on dev with lodash@4.17.21
 
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch to feature" switch_view "feature"
 assert_current_view "on feature" "feature"
 
 # Feature has no node_modules yet
@@ -183,7 +183,7 @@ assert_file_content \
     '{"name":"lodash","version":"3.10.0"}'
 
 # Switch to dev — should see 4.17.21
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
 assert_file_content \
     "dev has lodash 4.17.21" \
@@ -191,7 +191,7 @@ assert_file_content \
     '{"name":"lodash","version":"4.17.21"}'
 
 # Switch to feature — should see 3.10.0
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 
 assert_file_content \
     "feature still has lodash 3.10.0" \
@@ -214,8 +214,8 @@ dist/"
 
 # Create a tracked file on dev
 create_file "app.ts" "const app = 1"
-assert_success "add app.ts" atomic add app.ts
-record_change "Add app.ts" >/dev/null 2>&1 || true
+require_success "add app.ts" atomic add app.ts
+require_success "record app.ts" record_change "Add app.ts"
 
 # Create an untracked, NON-ignored file (not in .atomicignore)
 create_file "notes.txt" "my personal notes"
@@ -225,9 +225,9 @@ mkdir -p node_modules
 create_file "node_modules/thing.js" "module.exports = 1"
 
 # Switch to feature
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 # notes.txt should persist (untracked, not ignored)
 assert_file_exists "notes.txt persists on feature" "notes.txt"
@@ -237,7 +237,7 @@ assert_file_content "notes.txt content intact" "notes.txt" "my personal notes"
 assert_dir_not_exists "node_modules shelved away" "node_modules"
 
 # Switch back — both should be there
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_file_exists "notes.txt persists on dev" "notes.txt"
 assert_dir_exists "node_modules restored on dev" "node_modules"
 
@@ -255,25 +255,25 @@ create_file ".atomicignore" "build/"
 
 # Record different files on dev and feature
 create_file "shared.ts" "shared code"
-assert_success "add shared.ts" atomic add shared.ts
-record_change "Add shared.ts on dev" >/dev/null 2>&1 || true
+require_success "add shared.ts" atomic add shared.ts
+require_success "record shared.ts on dev" record_change "Add shared.ts on dev"
 
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 create_file "feature.ts" "feature code"
-assert_success "add feature.ts" atomic add feature.ts
-record_change "Add feature.ts on feature" >/dev/null 2>&1 || true
+require_success "add feature.ts" atomic add feature.ts
+require_success "record feature.ts" record_change "Add feature.ts on feature"
 
 # Switch to dev — feature.ts should not exist (graph isolation)
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
 assert_file_exists "shared.ts on dev" "shared.ts"
 assert_file_not_exists "feature.ts NOT on dev (graph isolation)" "feature.ts"
 
 # Switch to feature — both should exist
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 
 assert_file_exists "shared.ts on feature" "shared.ts"
 assert_file_exists "feature.ts on feature" "feature.ts"
@@ -294,8 +294,8 @@ dist/
 
 # ── dev: record source, create build artifacts ──
 create_file "src/main.ts" "console.log('dev')"
-assert_success "add src/main.ts" atomic add src/main.ts
-record_change "Add main.ts on dev" >/dev/null 2>&1 || true
+require_success "add src/main.ts" atomic add src/main.ts
+require_success "record main.ts on dev" record_change "Add main.ts on dev"
 
 mkdir -p node_modules/express
 create_file "node_modules/express/index.js" "module.exports = express"
@@ -305,13 +305,13 @@ mkdir -p .cache
 create_file ".cache/tsbuildinfo" "{}"
 
 # ── feature: different source + different artifacts ──
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 # Tracked: modify source on feature
 overwrite_file "src/main.ts" "console.log('feature')"
-record_change "Modify main.ts on feature" >/dev/null 2>&1 || true
+require_success "record feature modification" record_change "Modify main.ts on feature"
 
 # Artifacts: different deps on feature
 mkdir -p node_modules/fastify
@@ -326,7 +326,7 @@ assert_file_not_exists "express NOT on feature" "node_modules/express/index.js"
 assert_file_content "dist is feature build" "dist/main.js" "console.log('feature compiled')"
 
 # ── Switch to dev: full state restored ──
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
 assert_file_content "source is dev version" "src/main.ts" "console.log('dev')"
 assert_file_exists "express on dev" "node_modules/express/index.js"
@@ -335,7 +335,7 @@ assert_file_content "dist is dev build" "dist/main.js" "console.log('dev compile
 assert_file_exists ".cache on dev" ".cache/tsbuildinfo"
 
 # ── Switch to feature: full state restored ──
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 
 assert_file_content "source is feature version (round 2)" "src/main.ts" "console.log('feature')"
 assert_file_exists "fastify on feature (round 2)" "node_modules/fastify/index.js"
@@ -359,31 +359,31 @@ dist/"
 
 # ── dev: base project with express@4 ──
 create_file "package.json" '{"dependencies":{"express":"4.18.0"}}'
-assert_success "add package.json" atomic add package.json
-record_change "Add package.json on dev" >/dev/null 2>&1 || true
+require_success "add package.json" atomic add package.json
+require_success "record package.json" record_change "Add package.json on dev"
 
 mkdir -p node_modules/express
 create_file "node_modules/express/package.json" '{"version":"4.18.0"}'
 
 # ── agent-a: testing express@5 ──
-new_view "agent-a" >/dev/null 2>&1 || true
-insert_from_view "dev" "agent-a" >/dev/null 2>&1 || true
-switch_view "agent-a" >/dev/null 2>&1 || true
+require_success "create agent-a view" new_view "agent-a"
+require_success "insert dev into agent-a" insert_from_view "dev" "agent-a"
+require_success "switch to agent-a" switch_view "agent-a"
 
 overwrite_file "package.json" '{"dependencies":{"express":"5.0.0"}}'
-record_change "Upgrade to express@5" >/dev/null 2>&1 || true
+require_success "record express upgrade" record_change "Upgrade to express@5"
 
 mkdir -p node_modules/express
 create_file "node_modules/express/package.json" '{"version":"5.0.0"}'
 
 # ── agent-b: testing fastify migration ──
-switch_view "dev" >/dev/null 2>&1 || true
-new_view "agent-b" >/dev/null 2>&1 || true
-insert_from_view "dev" "agent-b" >/dev/null 2>&1 || true
-switch_view "agent-b" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
+require_success "create agent-b view" new_view "agent-b"
+require_success "insert dev into agent-b" insert_from_view "dev" "agent-b"
+require_success "switch to agent-b" switch_view "agent-b"
 
 overwrite_file "package.json" '{"dependencies":{"fastify":"4.0.0"}}'
-record_change "Migrate to fastify" >/dev/null 2>&1 || true
+require_success "record fastify migration" record_change "Migrate to fastify"
 
 mkdir -p node_modules/fastify
 create_file "node_modules/fastify/package.json" '{"version":"4.0.0"}'
@@ -398,7 +398,7 @@ assert_file_content \
 assert_file_not_exists "agent-b has no express" "node_modules/express/package.json"
 
 # Switch to agent-a
-switch_view "agent-a" >/dev/null 2>&1 || true
+require_success "switch to agent-a" switch_view "agent-a"
 assert_file_content \
     "agent-a has express@5" \
     "node_modules/express/package.json" \
@@ -410,7 +410,7 @@ assert_file_content \
     '{"dependencies":{"express":"5.0.0"}}'
 
 # Switch to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_file_content \
     "dev has express@4" \
     "node_modules/express/package.json" \
@@ -422,7 +422,7 @@ assert_file_content \
     '{"dependencies":{"express":"4.18.0"}}'
 
 # Full round-trip back to agent-b
-switch_view "agent-b" >/dev/null 2>&1 || true
+require_success "switch back to agent-b" switch_view "agent-b"
 assert_file_content \
     "agent-b still has fastify (round 2)" \
     "node_modules/fastify/package.json" \
@@ -441,28 +441,26 @@ begin_section "Workspace: Rapid switching preserves artifacts"
 # Continuing from previous (dev, agent-a, agent-b all set up)
 
 for i in $(seq 1 5); do
-    switch_view "dev" >/dev/null 2>&1 || true
+    require_success "switch to dev (iteration $i)" switch_view "dev"
     assert_file_content \
         "dev express@4 (iteration $i)" \
         "node_modules/express/package.json" \
         '{"version":"4.18.0"}'
     assert_file_not_exists "dev no fastify (iteration $i)" "node_modules/fastify/package.json"
 
-    switch_view "agent-a" >/dev/null 2>&1 || true
+    require_success "switch to agent-a (iteration $i)" switch_view "agent-a"
     assert_file_content \
         "agent-a express@5 (iteration $i)" \
         "node_modules/express/package.json" \
         '{"version":"5.0.0"}'
 
-    switch_view "agent-b" >/dev/null 2>&1 || true
+    require_success "switch to agent-b (iteration $i)" switch_view "agent-b"
     assert_file_content \
         "agent-b fastify (iteration $i)" \
         "node_modules/fastify/package.json" \
         '{"version":"4.0.0"}'
     assert_file_not_exists "agent-b no express (iteration $i)" "node_modules/express/package.json"
 done
-
-_pass "rapid switching: 5 round-trips across 3 views completed"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Workspace: Empty view has no artifacts"
@@ -477,16 +475,16 @@ init_repo
 create_file ".atomicignore" "node_modules/"
 
 create_file "main.ts" "code"
-assert_success "add main.ts" atomic add main.ts
-record_change "Add main.ts" >/dev/null 2>&1 || true
+require_success "add main.ts" atomic add main.ts
+require_success "record main.ts" record_change "Add main.ts"
 
 # Create artifacts on dev
 mkdir -p node_modules
 create_file "node_modules/dep.js" "dep"
 
 # Create empty view and switch
-new_view "empty" >/dev/null 2>&1 || true
-switch_view "empty" >/dev/null 2>&1 || true
+require_success "create empty view" new_view "empty"
+require_success "switch to empty view" switch_view "empty"
 
 # In the ambient graph model, child views see parent's files through
 # the filter chain — the view is parented on dev so main.ts is visible.
@@ -496,7 +494,7 @@ assert_file_exists "main.ts visible on child view (inherited from dev)" "main.ts
 assert_dir_not_exists "no node_modules on empty view" "node_modules"
 
 # Switch back — everything returns
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_file_exists "main.ts back on dev" "main.ts"
 assert_dir_exists "node_modules back on dev" "node_modules"
 assert_file_content "dep.js intact" "node_modules/dep.js" "dep"
@@ -516,8 +514,8 @@ dist/
 .next/"
 
 create_file "page.tsx" "<div>hello</div>"
-assert_success "add page.tsx" atomic add page.tsx
-record_change "Add page.tsx" >/dev/null 2>&1 || true
+require_success "add page.tsx" atomic add page.tsx
+require_success "record page.tsx" record_change "Add page.tsx"
 
 # Create deeply nested build output
 mkdir -p node_modules/.cache/babel/sub
@@ -528,9 +526,9 @@ mkdir -p .next/static/chunks
 create_file ".next/static/chunks/main.js" "nextjs_chunk"
 create_file ".next/BUILD_ID" "abc123"
 
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 # All nested ignored content should be gone
 assert_dir_not_exists "node_modules gone" "node_modules"
@@ -538,7 +536,7 @@ assert_dir_not_exists "dist gone" "dist"
 assert_dir_not_exists ".next gone" ".next"
 
 # Switch back — deeply nested content restored
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 
 assert_file_content \
     "nested babel cache restored" \
@@ -576,8 +574,8 @@ dist/"
 
 # Human's dev state
 create_file "src/app.ts" "// dev version"
-assert_success "add src/app.ts" atomic add src/app.ts
-record_change "Add app.ts on dev" >/dev/null 2>&1 || true
+require_success "add src/app.ts" atomic add src/app.ts
+require_success "record app.ts on dev" record_change "Add app.ts on dev"
 
 mkdir -p node_modules/humanlib
 create_file "node_modules/humanlib/index.js" "human_dep"
@@ -585,13 +583,13 @@ mkdir -p dist
 create_file "dist/app.js" "compiled_dev"
 
 # Agent works on feature
-new_view "agent-review-test" >/dev/null 2>&1 || true
-insert_from_view "dev" "agent-review-test" >/dev/null 2>&1 || true
-switch_view "agent-review-test" >/dev/null 2>&1 || true
+require_success "create review view" new_view "agent-review-test"
+require_success "insert dev into review view" insert_from_view "dev" "agent-review-test"
+require_success "switch to review view" switch_view "agent-review-test"
 
 # Agent modifies source and builds
 overwrite_file "src/app.ts" "// agent version with fix"
-record_change "Agent fix" >/dev/null 2>&1 || true
+require_success "record agent fix" record_change "Agent fix"
 
 mkdir -p node_modules/agentlib
 create_file "node_modules/agentlib/index.js" "agent_dep"
@@ -599,7 +597,7 @@ mkdir -p dist
 create_file "dist/app.js" "compiled_agent"
 
 # Switch back to dev (simulates agent session ending)
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
 # Human's state is fully restored
 assert_file_content "human source" "src/app.ts" "// dev version"
@@ -608,7 +606,7 @@ assert_file_content "human build" "dist/app.js" "compiled_dev"
 assert_file_not_exists "no agent deps on dev" "node_modules/agentlib/index.js"
 
 # Human switches to agent's view to review
-switch_view "agent-review-test" >/dev/null 2>&1 || true
+require_success "switch to review view" switch_view "agent-review-test"
 
 # Human sees agent's FULL state
 assert_file_content \
@@ -626,7 +624,7 @@ assert_file_content \
 assert_file_not_exists "no human deps on agent view" "node_modules/humanlib/index.js"
 
 # Human goes back — their world is intact
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 
 assert_file_content "human source restored" "src/app.ts" "// dev version"
 assert_file_content "human deps restored" "node_modules/humanlib/index.js" "human_dep"
@@ -645,10 +643,10 @@ init_repo
 
 # dev ignores node_modules only
 create_file ".atomicignore" "node_modules/"
-assert_success "add .atomicignore" atomic add .atomicignore
+require_success "add .atomicignore" atomic add .atomicignore
 create_file "src/index.ts" "main"
-assert_success "add src/index.ts" atomic add src/index.ts
-record_change "Initial dev" >/dev/null 2>&1 || true
+require_success "add src/index.ts" atomic add src/index.ts
+require_success "record initial dev" record_change "Initial dev"
 
 mkdir -p node_modules
 create_file "node_modules/pkg.js" "pkg"
@@ -656,14 +654,14 @@ mkdir -p build
 create_file "build/output.js" "build_output"
 
 # Create feature that ALSO ignores build/
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 # Update .atomicignore on feature to also ignore build/
 overwrite_file ".atomicignore" "node_modules/
 build/"
-record_change "Ignore build/ on feature" >/dev/null 2>&1 || true
+require_success "record feature ignore rules" record_change "Ignore build/ on feature"
 
 # On dev, build/ was NOT ignored, so it should have persisted as untracked
 # On feature, build/ IS ignored — so when we switch AWAY from feature,
@@ -674,7 +672,7 @@ mkdir -p build
 create_file "build/output.js" "feature_build"
 
 # Switch to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
 # dev's .atomicignore only has node_modules/, so build/ is untracked-not-ignored.
 # dev should see its own node_modules restored and build/ from the persistent
@@ -692,7 +690,7 @@ if [[ -f "build/output.js" ]]; then
         "build/output.js" \
         "build_output"
 else
-    _pass "build/ not present on dev (was shelved with feature)"
+    assert_file_not_exists "feature build does not leak to dev" "build/output.js"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -708,15 +706,15 @@ init_repo
 create_file ".atomicignore" "node_modules/"
 
 create_file "code.ts" "code"
-assert_success "add code.ts" atomic add code.ts
-record_change "Add code.ts" >/dev/null 2>&1 || true
+require_success "add code.ts" atomic add code.ts
+require_success "record code.ts" record_change "Add code.ts"
 
 mkdir -p node_modules
 create_file "node_modules/dep.js" "dep_content"
 
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 # Verify workspace is inside .atomic/ (durable path)
 assert_dir_exists \
@@ -727,13 +725,14 @@ assert_dir_exists \
     "dev workspace is working-copy scoped" \
     "$(working_copy_workspace_path dev)"
 
-# Verify it's the actual content (not a symlink to /tmp)
+# The repository itself may be in a temporary directory; the workspace must
+# resolve beneath that repository, not to a separate external location.
 actual_path="$(cd "$(working_copy_workspace_path dev)" 2>/dev/null && pwd -P)"
-if echo "$actual_path" | grep -q "/tmp"; then
-    _fail "workspace is NOT in /tmp" "path resolved to $actual_path"
-else
-    _pass "workspace is NOT in /tmp"
-fi
+repo_path="$(pwd -P)"
+case "$actual_path" in
+    "$repo_path"/.atomic/working-copies/*) _pass "workspace resolves inside the repository" ;;
+    *) _fail "workspace resolves inside the repository" "path resolved to $actual_path" ;;
+esac
 
 # Verify the shelved content is really there
 assert_file_exists \
@@ -756,31 +755,26 @@ init_repo
 create_file ".atomicignore" "node_modules/"
 
 create_file "base.ts" "base"
-assert_success "add base.ts" atomic add base.ts
-record_change "Add base.ts" >/dev/null 2>&1 || true
+require_success "add base.ts" atomic add base.ts
+require_success "record base.ts" record_change "Add base.ts"
 
-new_view "ephemeral" >/dev/null 2>&1 || true
-insert_from_view "dev" "ephemeral" >/dev/null 2>&1 || true
-switch_view "ephemeral" >/dev/null 2>&1 || true
+require_success "create ephemeral view" new_view "ephemeral"
+require_success "insert dev into ephemeral" insert_from_view "dev" "ephemeral"
+require_success "switch to ephemeral" switch_view "ephemeral"
 
 # Create artifacts on ephemeral view
 mkdir -p node_modules
 create_file "node_modules/temp.js" "temp"
 
 # Switch back to dev (shelves ephemeral's artifacts)
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
 assert_dir_exists \
     "ephemeral workspace exists before delete" \
     ".atomic/workspaces/ephemeral"
 
 # Delete the ephemeral view
-del_out="$(atomic view delete ephemeral 2>&1)" || true
-if echo "$del_out" | grep -qiE "deleted|removed|success"; then
-    _pass "delete ephemeral view"
-else
-    _pass "delete ephemeral view completes"
-fi
+require_success "delete ephemeral view" atomic view delete ephemeral
 
 # Workspace storage should be cleaned up
 assert_dir_not_exists \
@@ -800,14 +794,14 @@ init_repo
 create_file ".atomicignore" "node_modules/"
 
 create_file "app.ts" "shared"
-assert_success "add app.ts" atomic add app.ts
-record_change "Add app.ts" >/dev/null 2>&1 || true
+require_success "add app.ts" atomic add app.ts
+require_success "record app.ts" record_change "Add app.ts"
 
 # Create 5 views with unique node_modules
 for i in $(seq 1 5); do
-    new_view "agent-${i}" >/dev/null 2>&1 || true
-    insert_from_view "dev" "agent-${i}" >/dev/null 2>&1 || true
-    switch_view "agent-${i}" >/dev/null 2>&1 || true
+    require_success "create agent-${i} view" new_view "agent-${i}"
+    require_success "insert dev into agent-${i}" insert_from_view "dev" "agent-${i}"
+    require_success "switch to agent-${i}" switch_view "agent-${i}"
 
     mkdir -p node_modules
     create_file "node_modules/marker.txt" "agent-${i}-deps"
@@ -815,7 +809,7 @@ done
 
 # Now cycle through all views and verify each has its own marker
 for i in $(seq 1 5); do
-    switch_view "agent-${i}" >/dev/null 2>&1 || true
+    require_success "switch to agent-${i}" switch_view "agent-${i}"
     assert_file_content \
         "agent-${i} has its own deps" \
         "node_modules/marker.txt" \
@@ -823,17 +817,15 @@ for i in $(seq 1 5); do
 done
 
 # Switch to dev — should have no node_modules (dev never created any)
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_dir_not_exists "dev has no node_modules" "node_modules"
 
 # One more round trip
-switch_view "agent-3" >/dev/null 2>&1 || true
+require_success "switch to agent-3" switch_view "agent-3"
 assert_file_content \
     "agent-3 still has its deps after full cycle" \
     "node_modules/marker.txt" \
     "agent-3-deps"
-
-_pass "5-view stress test completed"
 
 # ═══════════════════════════════════════════════════════════════════════════
 

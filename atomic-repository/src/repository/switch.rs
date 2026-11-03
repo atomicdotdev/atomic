@@ -112,6 +112,9 @@ pub(super) struct SwitchMaterializationExecutor<'a> {
     repository: &'a Repository,
     operation_lock: &'a super::locks::WorkingCopyOperationLockGuard,
     operation: Operation,
+    /// Paths the source and target projections classified as removable.
+    /// Other FILE_INDEX-only paths can be unrecorded user files.
+    switch_removal_scope: Option<HashSet<String>>,
 }
 
 impl<'a> SwitchMaterializationExecutor<'a> {
@@ -124,7 +127,13 @@ impl<'a> SwitchMaterializationExecutor<'a> {
             repository,
             operation_lock,
             operation,
+            switch_removal_scope: None,
         }
+    }
+
+    fn with_switch_removal_scope(mut self, paths: HashSet<String>) -> Self {
+        self.switch_removal_scope = Some(paths);
+        self
     }
 
     fn effect_for_expected_new(
@@ -400,6 +409,18 @@ impl super::materialize::MaterializationEffectExecutor for SwitchMaterialization
     }
 
     fn remove_path(&mut self, path: &str) -> Result<bool, RepositoryError> {
+        // The materializer also discovers historical FILE_INDEX rows. A path
+        // absent from both the source's live projection and the target's
+        // explicit deletions is now untracked, not a switch removal. Leave its
+        // bytes alone; the caller may retire the stale index row. For paths in
+        // the planned scope the normal lease checks below remain mandatory.
+        if self
+            .switch_removal_scope
+            .as_ref()
+            .is_some_and(|paths| !paths.contains(path))
+        {
+            return Ok(false);
+        }
         if self
             .effect_for_expected_new(path, |value| *value == EffectValue::Absent)
             .is_none()
@@ -754,6 +775,7 @@ impl Repository {
             .collect();
         removal_paths.extend(old_files.intersection(&new_directories).cloned());
         removal_paths.extend(old_directories.intersection(&new_files).cloned());
+        let switch_removal_scope = removal_paths.clone();
         let mut removal_paths: Vec<String> = removal_paths.into_iter().collect();
         removal_paths.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
         for path in removal_paths {
@@ -943,7 +965,8 @@ impl Repository {
         }
 
         let mut filesystem_executor =
-            SwitchMaterializationExecutor::new(self, operation_lock, prepared.operation().clone());
+            SwitchMaterializationExecutor::new(self, operation_lock, prepared.operation().clone())
+                .with_switch_removal_scope(switch_removal_scope);
 
         // ── Phase 1: Shelve ignored files into the OLD view's workspace ──
         //

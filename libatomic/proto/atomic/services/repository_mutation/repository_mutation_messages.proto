@@ -141,7 +141,25 @@ message RecordResponse {
   optional Hash view_merkle = 2;      // post-record state for the next
                                       // expected-state precondition
   optional string view = 3;           // view the change landed on (add-only)
+  optional RecordStatistics statistics = 4; // actual recorder statistics
+  repeated string recorded_paths = 5;
   ResponseMeta meta = 100;
+}
+
+// Recorded graph and semantic counts. Older services may omit this message.
+message RecordStatistics {
+  uint64 files_recorded = 1;
+  uint64 directories_recorded = 2;
+  uint64 hunks_created = 3;
+  uint64 vertices_added = 4;
+  uint64 edges_modified = 5;
+  uint64 content_bytes = 6;
+  uint64 lines_added = 7;
+  uint64 lines_deleted = 8;
+  uint64 lines_modified = 9;
+  uint64 tokens_added = 10;
+  uint64 tokens_deleted = 11;
+  uint64 tokens_replaced = 12;
 }
 
 message ReviseRequest {

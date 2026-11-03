@@ -638,12 +638,80 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
         short_hash(&change.hash),
         change.message.clone().unwrap_or_default()
     );
-    if !args.files.is_empty() {
+    if let Some(statistics) = &response.statistics {
+        if let Some(stats) = record_statistics_from_proto(statistics) {
+            print!("{}", crate::commands::record::format_record_stats(&stats));
+        } else {
+            // The record already succeeded. Invalid presentation metadata
+            // must not turn that durable success into a reported failure.
+            crate::output::print_warning(
+                "Record succeeded, but the service returned invalid statistics.",
+            );
+        }
+        for file in &response.recorded_paths {
+            println!(" {file}");
+        }
+    } else if !args.files.is_empty() {
+        // Older services did not return statistics or recorded paths.
         for file in &args.files {
             println!(" {file}");
         }
     }
     Ok(true)
+}
+
+fn record_statistics_from_proto(
+    statistics: &pb::RecordStatistics,
+) -> Option<atomic_repository::record::RecordStats> {
+    let count = |value| usize::try_from(value).ok();
+    let stats = atomic_repository::record::RecordStats {
+        files_recorded: count(statistics.files_recorded)?,
+        directories_recorded: count(statistics.directories_recorded)?,
+        hunks_created: count(statistics.hunks_created)?,
+        vertices_added: count(statistics.vertices_added)?,
+        edges_modified: count(statistics.edges_modified)?,
+        content_bytes: statistics.content_bytes,
+        lines_added: count(statistics.lines_added)?,
+        lines_deleted: count(statistics.lines_deleted)?,
+        lines_modified: count(statistics.lines_modified)?,
+        tokens_added: count(statistics.tokens_added)?,
+        tokens_deleted: count(statistics.tokens_deleted)?,
+        tokens_replaced: count(statistics.tokens_replaced)?,
+        ..Default::default()
+    };
+    stats
+        .lines_added
+        .checked_add(stats.lines_deleted)?
+        .checked_add(stats.lines_modified)?;
+    stats
+        .tokens_added
+        .checked_add(stats.tokens_deleted)?
+        .checked_add(stats.tokens_replaced)?;
+    Some(stats)
+}
+
+#[cfg(test)]
+mod record_output_tests {
+    use super::*;
+
+    #[test]
+    fn record_statistics_keep_semantic_counts_and_reject_overflow() {
+        let stats = pb::RecordStatistics {
+            files_recorded: 1,
+            lines_added: 3,
+            tokens_added: 4,
+            ..Default::default()
+        };
+        let decoded = record_statistics_from_proto(&stats).unwrap();
+        assert_eq!(decoded.lines_added, 3);
+        assert_eq!(decoded.tokens_added, 4);
+        let invalid = pb::RecordStatistics {
+            lines_added: u64::MAX,
+            lines_deleted: 1,
+            ..Default::default()
+        };
+        assert!(record_statistics_from_proto(&invalid).is_none());
+    }
 }
 
 // ---------------------------------------------------------------------------
