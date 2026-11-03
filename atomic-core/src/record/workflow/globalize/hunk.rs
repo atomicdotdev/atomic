@@ -180,13 +180,29 @@ where
                     // Middle insert into a single-vertex file — fall back to
                     // a whole-file Replace using the full file content (not
                     // just the inserted slice).
-                    globalize_replace(ctx, built, inode, inode_pos, full_content, local, encoding)
+                    globalize_replace(
+                        ctx,
+                        built,
+                        inode,
+                        inode_pos,
+                        full_content,
+                        full_content,
+                        local,
+                        encoding,
+                    )
                 }
             }
         }
-        BuiltHunkKind::Replace => {
-            globalize_replace(ctx, built, inode, inode_pos, content, local, encoding)
-        }
+        BuiltHunkKind::Replace => globalize_replace(
+            ctx,
+            built,
+            inode,
+            inode_pos,
+            content,
+            full_content,
+            local,
+            encoding,
+        ),
         BuiltHunkKind::Delete => globalize_delete(ctx, built, inode, inode_pos, local, encoding),
     }
 }
@@ -300,6 +316,7 @@ fn globalize_replace<T>(
     inode: Inode,
     inode_pos: Position<NodeId>,
     content: &[u8],
+    full_content: &[u8],
     local: Local,
     encoding: Option<Encoding>,
 ) -> GlobalizeResult<Vec<GraphOp<Option<Hash>>>>
@@ -321,6 +338,11 @@ where
     // sorted.is_empty()), and whole-file lifecycle paths (add/delete/
     // globalize_replace_whole_file) keep their opaque insert shape.
 
+    // Every whole-file fallback below rewrites the file from the FULL new
+    // content: the hunk slice holds only the replaced lines, and a replace
+    // built from it deleted every vertex and kept just those lines (a
+    // one-line tox.ini edit on a file whose vertices no longer matched its
+    // lines rendered 63 of 855 bytes and the import refused).
     let sorted = collect_sorted_content_vertices_cached(ctx, inode, inode_pos)?;
 
     // Legacy: file has no visible content vertices in this view.  Fall
@@ -336,7 +358,7 @@ where
     // dependencies — producing a phantom supersession relationship
     // between the just-recorded change and the other view's edits.
     if sorted.is_empty() {
-        return globalize_replace_whole_file(ctx, inode, inode_pos, content, local, encoding);
+        return globalize_replace_whole_file(ctx, inode, inode_pos, full_content, local, encoding);
     }
 
     // Pure insertion (no lines deleted) — treat as a middle/append insert.
@@ -348,7 +370,12 @@ where
                 Ok(p) => p,
                 Err(_) => {
                     return globalize_replace_whole_file(
-                        ctx, inode, inode_pos, content, local, encoding,
+                        ctx,
+                        inode,
+                        inode_pos,
+                        full_content,
+                        local,
+                        encoding,
                     );
                 }
             };
@@ -398,7 +425,7 @@ where
                 sorted.len()
             );
         }
-        return globalize_replace_whole_file(ctx, inode, inode_pos, content, local, encoding);
+        return globalize_replace_whole_file(ctx, inode, inode_pos, full_content, local, encoding);
     }
 
     // Resolve predecessor (end of vertex before the first deleted line).
@@ -482,7 +509,22 @@ where
     // delete it" — see its docs for why this always uses the thorough
     // SCC-aware traversal rather than a linear walk (a linear walk would
     // miss one branch of a genuine fork and leave stale content alive).
-    let deletion = delete_all_content(ctx, inode_pos)?;
+    let deletion = delete_all_content(ctx, inode, inode_pos)?;
+
+    // A rewrite to zero bytes deletes the content and inserts nothing: a
+    // zero-length content vertex would sit at the change's next content
+    // offset, exactly where whatever the change serializes next begins, and
+    // every position-only lookup (projection, content retrieval, the global
+    // vertex walk) would read the neighbour's first line as this file's
+    // content. The inode marker alone represents the empty file; a later
+    // refill inserts after it.
+    if content.is_empty() {
+        return Ok(vec![GraphOp::Edit {
+            change: Atom::EdgeUpdate(deletion),
+            local,
+            encoding,
+        }]);
+    }
 
     let insertions = if should_use_opaque_generated_vertices(&local.path) {
         vec![create_content_vertex(
@@ -604,7 +646,7 @@ where
     // application is unchanged: FileDel yields the same single EdgeUpdate
     // atom. A truncate-to-empty keeps the Edit representation, so the two
     // remain distinguishable.
-    let deletion = delete_all_content(ctx, inode_pos)?;
+    let deletion = delete_all_content(ctx, inode, inode_pos)?;
 
     Ok(vec![GraphOp::FileDel {
         del: deletion,
@@ -625,29 +667,32 @@ where
 /// deletion edges" happens. Both [`globalize_replace_whole_file`] and
 /// [`globalize_delete`] delegate here.
 ///
-/// Uses [`find_content_vertices_global`] — the full SCC-aware traversal via
-/// `retrieve_graph`, the same one used for display/diffing — rather than a
-/// linear walk (`collect_sorted_content_vertices`, used elsewhere for
-/// targeted range lookups). A linear walk only follows one BLOCK-edge
-/// successor chain from the inode, so a genuine fork (two chains both
-/// anchored on the inode — exactly what the orphan-view duplication bug
-/// produces) leaves one branch unvisited. It doesn't error on that
-/// incomplete result, so callers that only fall back to the global search on
-/// an `Err` never actually reach it: `build_deletion_edges` happily succeeds
-/// on whatever partial list it's given, deleting only that branch and
-/// leaving the other alive. This function's whole purpose is
-/// deleting *every* content vertex, so it always pays for the thorough
-/// traversal — it's a rare, non-hot-path fallback (opaque/legacy files,
-/// whole-file replace, or a full-file delete), so the extra cost is an
-/// acceptable trade for actually being complete.
+/// Uses [`find_content_vertices`]: the INODE_GRAPH walk of this file's own
+/// edges, with the global SCC-aware `retrieve_graph` traversal as the
+/// fallback when the index is not populated. Both are complete over a
+/// genuine fork (two chains anchored on the inode — exactly what the
+/// orphan-view duplication bug produces), unlike the linear walk
+/// (`collect_sorted_content_vertices`, used elsewhere for targeted range
+/// lookups), which follows one successor chain and silently leaves the
+/// other branch alive.
+///
+/// The global traversal is only a fallback because it resolves edge
+/// destinations by position alone: a zero-length vertex (a file truncated
+/// to nothing) shares its position with the start of whatever the same
+/// change serialized next, so the global walk from a truncated `go.sum`
+/// returned its neighbour's first line as `go.sum` content and the
+/// deletion edges targeted the wrong file (stretchr/objx: the import then
+/// refused the commit deleting `go.sum`). The inode-scoped walk resolves
+/// every destination within this file's own vertex index.
 fn delete_all_content<T>(
     ctx: &mut GlobalizeContext<'_, T>,
+    inode: Inode,
     inode_pos: Position<NodeId>,
 ) -> GlobalizeResult<EdgeUpdate<Option<Hash>>>
 where
     T: GraphTxnT + TreeTxnT + InodeGraphOps,
 {
-    let content_vertices = find_content_vertices_global(ctx.txn(), inode_pos)?;
+    let content_vertices = find_content_vertices(ctx.txn(), inode, inode_pos)?;
     let deletion_edges = build_deletion_edges(ctx, &content_vertices)?;
 
     Ok(EdgeUpdate {
@@ -803,6 +848,19 @@ where
 /// with live content hanging off any of them.  A single-successor walk
 /// picks one chain and silently drops the others, and an index mapping
 /// that is off by even one line deletes the wrong vertices.
+/// The number of alive content vertices the (view-filtered) graph holds for
+/// `inode`. A positional hunk indexes lines by vertex, so a caller that finds
+/// this count differing from the file's line count must rewrite the file
+/// wholesale instead of recording a per-line edit.
+pub fn alive_content_vertex_count<T>(txn: &T, inode: Inode, inode_pos: Position<NodeId>) -> usize
+where
+    T: GraphTxnT + InodeGraphOps,
+{
+    collect_sorted_content_vertices(txn, inode, inode_pos)
+        .map(|vertices| vertices.len())
+        .unwrap_or(0)
+}
+
 fn collect_sorted_content_vertices<T>(
     txn: &T,
     inode: Inode,
@@ -882,7 +940,7 @@ where
 /// a bare `ReadTxn` (no view filter).
 ///
 /// If the INODE_GRAPH path succeeds but a downstream consumer (e.g.
-/// `build_deletion_edges` → `find_predecessor_end`) fails because the
+/// `build_deletion_edges` → `find_predecessor_edge`) fails because the
 /// returned vertices lack PARENT edges in the global GRAPH, the caller
 /// will see a `GlobalizeError`.  To handle this transparently we expose
 /// a `_with_fallback` wrapper that retries via the global DFS.
@@ -1078,25 +1136,34 @@ where
     for &v in vertices {
         ctx.add_dependency_by_id(v.change)?;
 
-        let from_pos = find_predecessor_end(ctx.txn(), v)?;
+        let (from_pos, introduced_by) = find_predecessor_edge(ctx.txn(), v)?;
 
         edges.push(NewEdge {
             previous: EdgeFlags::BLOCK,
             flag: EdgeFlags::BLOCK | EdgeFlags::DELETED,
             from: position_to_option_hash_resolved(ctx.txn(), from_pos, None),
             to: vertex_to_option_hash_resolved(ctx.txn(), v, None),
-            introduced_by: find_edge_introduced_by(ctx.txn(), from_pos, v),
+            introduced_by: ctx.txn().get_external(introduced_by).ok().flatten(),
         });
     }
 
     Ok(edges)
 }
 
-/// Walk PARENT edges of `node` to find the end position of its predecessor.
-fn find_predecessor_end<T: GraphTxnT + InodeGraphOps>(
+/// Walk PARENT edges of `node` to find the end position of its predecessor
+/// and the change that introduced the edge from there into `node`.
+///
+/// The reverse row carries the same `introduced_by` as the forward edge, so
+/// the edge is read off the vertex itself. Resolving the predecessor's
+/// position back to a vertex would be ambiguous: a zero-length vertex of a
+/// neighbouring file (an empty file, or one truncated to nothing) can sit
+/// at exactly that position, and the position-only lookup used to pick it,
+/// find no edge into `node`, and leave the deletion without an introducer
+/// (which the apply then rejected: "no source ... has prior BLOCK edge").
+fn find_predecessor_edge<T: GraphTxnT + InodeGraphOps>(
     txn: &T,
     node: GraphNode<NodeId>,
-) -> GlobalizeResult<Position<NodeId>> {
+) -> GlobalizeResult<(Position<NodeId>, NodeId)> {
     let min_flag = EdgeFlags::BLOCK | EdgeFlags::PARENT;
     let max_flag = EdgeFlags::BLOCK | EdgeFlags::PARENT | EdgeFlags::FOLDER;
 
@@ -1106,45 +1173,12 @@ fn find_predecessor_end<T: GraphTxnT + InodeGraphOps>(
 
     if let Some(edge) = adj.next() {
         let edge = edge.map_err(|e| GlobalizeError::Pristine(Box::new(e)))?;
-        return Ok(edge.dest());
+        return Ok((edge.dest(), edge.introduced_by()));
     }
 
     Err(GlobalizeError::NodeNotFound {
         position: node.start_pos(),
     })
-}
-
-/// Discover which change introduced the forward edge from `from_pos` to
-/// `to_vertex`.
-fn find_edge_introduced_by<T: GraphTxnT + InodeGraphOps>(
-    txn: &T,
-    from_pos: Position<NodeId>,
-    to_vertex: GraphNode<NodeId>,
-) -> Option<Hash> {
-    let from_vertex = match txn.find_block_end(from_pos) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-
-    let min_flag = EdgeFlags::BLOCK;
-    let max_flag = EdgeFlags::BLOCK | EdgeFlags::FOLDER;
-
-    let adj = match txn.iter_adjacent(from_vertex, min_flag, max_flag) {
-        Ok(a) => a,
-        Err(_) => return None,
-    };
-
-    for edge_result in adj {
-        let edge = match edge_result {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if edge.dest() == to_vertex.start_pos() {
-            return txn.get_external(edge.introduced_by()).ok().flatten();
-        }
-    }
-
-    None
 }
 
 /// Convert a [`GraphNode<NodeId>`] to [`GraphNode<Option<Hash>>`], resolving

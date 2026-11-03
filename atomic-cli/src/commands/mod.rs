@@ -75,6 +75,7 @@ pub mod compact;
 pub mod complete;
 pub mod completions;
 pub mod conflicts;
+pub mod diagnostics;
 pub mod diff;
 pub mod doctor;
 pub mod init;
@@ -87,6 +88,7 @@ pub mod op;
 pub mod provenance;
 pub mod record;
 pub mod remove;
+pub mod repo;
 pub mod restore;
 pub mod revise;
 pub(crate) mod rpc;
@@ -149,6 +151,7 @@ pub use clone::Clone;
 pub use compact::Compact;
 pub use completions::Completions;
 pub use conflicts::Conflicts;
+pub use diagnostics::Diagnostics;
 pub use diff::Diff;
 pub use doctor::Doctor;
 pub use git::Git;
@@ -168,6 +171,7 @@ pub use query::Query;
 pub use record::Record;
 pub use remote::Remote;
 pub use remove::Remove;
+pub use repo::Repo;
 pub use restore::Restore;
 pub use revise::Revise;
 pub use sandbox::Sandbox;
@@ -411,6 +415,38 @@ pub(crate) fn open_readonly_repository(
     path: impl AsRef<Path>,
 ) -> Result<Repository, atomic_repository::RepositoryError> {
     Repository::open_readonly_wait(path, std::time::Duration::from_secs(10))
+}
+
+/// Open the repository at `root` for a command that writes to the vault,
+/// creating the vault when it does not exist yet.
+///
+/// Vault *writes* — `goal start/stop/resume`, `materialize`, `sync`,
+/// `intent new/update/delete/link/attest`, `memory new/write/attest` — open
+/// through this helper so a repository created without a vault
+/// (`atomic init --no-vault`, or one that never ran `atomic vault init`)
+/// works on first use instead of failing with "Vault not initialized".
+///
+/// Read-only commands deliberately do NOT use this helper: they open with
+/// [`open_readonly_repository`], so a read never mutates a checkout — an
+/// uninitialized vault reads as empty/not-found, and the first write
+/// initializes it.
+///
+/// The initialization is [`Repository::ensure_vault`], the same idempotent
+/// path `atomic vault init` uses. It runs at most once: an existing vault is
+/// never re-initialized.
+pub fn open_repository_with_vault(root: &Path) -> CliResult<Repository> {
+    let repo = Repository::open(root).map_err(CliError::from)?;
+    ensure_vault_exists(&repo)?;
+    Ok(repo)
+}
+
+/// One-time implicit vault initialization, announced on stderr so `--json`
+/// output stays parseable.
+fn ensure_vault_exists(repo: &Repository) -> CliResult<()> {
+    if repo.ensure_vault().map_err(CliError::from)? {
+        eprintln!("Initialized vault at {}", repo.vault_dir().display());
+    }
+    Ok(())
 }
 
 /// Open a repository or return a user-friendly error.

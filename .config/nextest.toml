@@ -1,0 +1,12 @@
+# cargo-nextest configuration. CI runs `cargo nextest run --profile ci`.
+#
+# nextest runs every test in its own process, so tests in different binaries
+# run concurrently. Tests that must not overlap use `#[file_serial]`, whose
+# lock is a file shared by every process, not the in-process `#[serial]`.
+
+[profile.ci]
+# Report every failing test instead of stopping at the first.
+fail-fast = false
+# Name long-running tests in the log so they can be tracked down.
+slow-timeout = { period = "60s" }
+failure-output = "immediate-final"

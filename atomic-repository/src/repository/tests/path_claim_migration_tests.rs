@@ -90,6 +90,17 @@ fn writable_open_atomically_backfills_claims_and_removes_reverse_only_rows() {
     drop(repo);
 
     Repository::open_readonly(temp.path()).unwrap();
+    let db = redb::ReadOnlyDatabase::open(&database_path).unwrap();
+    let read = redb::ReadableDatabase::begin_read(&db).unwrap();
+    assert_eq!(
+        atomic_core::pristine::build_metadata::read_version(
+            &read,
+            atomic_core::pristine::build_metadata::MIGRATED_WITH_KEY
+        )
+        .unwrap()
+        .as_deref(),
+        Some(atomic_core::pristine::build_metadata::BUILD_VERSION),
+    );
 }
 
 #[test]

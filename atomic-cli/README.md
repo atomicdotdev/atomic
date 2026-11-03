@@ -155,18 +155,48 @@ atomic add .
 
 #### `atomic remove <PATHS>`
 
-Remove files from tracking.
+Stop tracking files, mirroring `git rm`. What happens depends on whether the
+path's content has been recorded:
+
+- **Added but never recorded** — untracked outright; the file stays on disk.
+- **Already recorded** — removed from the working copy, and the deletion must be
+  recorded to complete the untrack. A recorded path's name is owned by the change
+  that recorded it, so it cannot be untracked by editing tracking state alone.
+  With `--keep` the untrack is instead staged as pending intent: the bytes are
+  never touched, the next `atomic record` lands the deletion, and the file then
+  reads as untracked — still on disk, yours to keep, ignore, or re-`add`.
 
 ```bash
-# Remove and delete from disk
-atomic remove old_file.txt
+# Untrack a file that was added but never recorded (the file stays on disk)
+atomic remove draft_notes.txt
 
-# Stop tracking but keep file on disk
-atomic remove --keep secrets.txt
+# Stop tracking a recorded file: this deletes it, then record the deletion
+atomic remove Cargo.lock
+atomic record -m "Stop tracking Cargo.lock"
 
-# Remove a directory
+# Also delete never-recorded files from disk
+atomic remove --delete secrets.txt
+
+# Never delete anything from disk (git rm --cached): stages the untrack, and
+# the next record completes it with the bytes kept
+atomic remove --keep .env
+
+# Discard uncommitted edits the way `git rm -f` does
+atomic remove --force Cargo.lock
+
+# Remove a directory (recursively)
 atomic remove old_code/
+
+# Preview without touching anything
+atomic remove --dry-run Cargo.lock
 ```
+
+`remove` refuses to delete a recorded path that has uncommitted edits unless
+`--force` is given, so a mistake never destroys work (`--keep` never touches
+the bytes, so it accepts edited paths). To undo a removal before you record it,
+run `atomic restore <path>` — the content is still in the graph, and the path is
+still tracked. To cancel a staged `--keep` untrack before recording it, run
+`atomic add <path>`.
 
 **Alias:** `atomic rm`
 
@@ -910,7 +940,7 @@ Global identity configuration is stored in `~/.config/atomic/` (or platform equi
 cargo test -p atomic-cli
 
 # Validate that every public command path renders help
-cargo test -p atomic-cli --test cli_surface_integration_test
+cargo test -p atomic-cli --test it -- cli_surface_integration_test::
 
 # Run the black-box CLI harness against a freshly built binary
 cargo build -p atomic-cli

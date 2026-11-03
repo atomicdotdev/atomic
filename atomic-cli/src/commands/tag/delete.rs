@@ -110,7 +110,7 @@ impl Command for Delete {
 mod tests {
     use super::*;
     use atomic_repository::TagKind;
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     // -------------------------------------------------------------------------
     // Command Builder Tests
@@ -172,7 +172,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_delete_existing_tag() {
         use tempfile::tempdir;
 
@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_delete_nonexistent_tag() {
         use tempfile::tempdir;
 
@@ -224,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_delete_preserves_other_tags() {
         use tempfile::tempdir;
 

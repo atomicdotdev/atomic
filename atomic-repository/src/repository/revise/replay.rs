@@ -178,6 +178,7 @@ fn isolated(
             pristine,
             change_store,
             is_sandbox: false,
+            semantic_closure_memo: Default::default(),
         },
         directory,
     ))

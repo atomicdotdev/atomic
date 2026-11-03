@@ -116,117 +116,16 @@ impl InodeGraphOps for ReadTxn {
         pos: Position<NodeId>,
     ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
         let table = self.txn.open_multimap_table(INODE_GRAPH)?;
-
-        let inode_id = inode.get();
-        let change_id = pos.change.get();
-        let target_pos = pos.pos.get();
-
-        // Fast path: most inode-local edge destinations point at the exact
-        // start of the next span. Probe that narrow key range first so large
-        // single-change files do not rescan the whole inode slice per hop.
-        let exact_start_key = encode_inode_vertex(inode_id, change_id, target_pos, 0);
-        let exact_end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
-        let mut empty_match = None;
-
-        for result in table.range::<&[u8; 32]>(&exact_start_key..=&exact_end_key)? {
-            let (key, _values) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-
-            if v_change != change_id || v_start != target_pos {
-                continue;
-            }
-
-            if v_start != v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-
-            if empty_match.is_none() {
-                empty_match = Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
-        }
-
-        if empty_match.is_some() {
-            return Ok(empty_match);
-        }
-
-        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
-        let end_key = encode_inode_vertex(inode_id, change_id, u64::MAX, u64::MAX);
-
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            let (key, _values) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-
-            if v_change == change_id && v_start <= target_pos && target_pos < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-        }
-
-        Ok(None)
+        super::probe::find_block_in_inode(&table, inode, pos)
     }
-
     fn find_block_end_in_inode(
         &self,
         inode: Inode,
         pos: Position<NodeId>,
     ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
         let table = self.txn.open_multimap_table(INODE_GRAPH)?;
-
-        let inode_id = inode.get();
-        let change_id = pos.change.get();
-        let target_pos = pos.pos.get();
-
-        let empty_key = encode_inode_vertex(inode_id, change_id, target_pos, target_pos);
-        if table.get(&empty_key)?.next().transpose()?.is_some() {
-            return Ok(Some(GraphNode {
-                change: NodeId::new(change_id),
-                start: ChangePosition::new(target_pos),
-                end: ChangePosition::new(target_pos),
-            }));
-        }
-
-        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
-        let end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
-
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            let (key, _values) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-
-            if v_change != change_id {
-                continue;
-            }
-
-            if v_end == target_pos && v_start < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-
-            if v_start <= target_pos && target_pos < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-        }
-
-        Ok(None)
+        super::probe::find_block_end_in_inode(&table, inode, pos)
     }
-
     fn count_inode_vertices(&self, inode: Inode) -> Result<usize, Self::InodeError> {
         let table = self.txn.open_multimap_table(INODE_GRAPH)?;
 
@@ -337,117 +236,16 @@ impl<'a> InodeGraphOps for WriteTxn<'a> {
         pos: Position<NodeId>,
     ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
         let table = self.txn.open_multimap_table(INODE_GRAPH)?;
-
-        let inode_id = inode.get();
-        let change_id = pos.change.get();
-        let target_pos = pos.pos.get();
-
-        // Fast path: most inode-local edge destinations point at the exact
-        // start of the next span. Probe that narrow key range first so large
-        // single-change files do not rescan the whole inode slice per hop.
-        let exact_start_key = encode_inode_vertex(inode_id, change_id, target_pos, 0);
-        let exact_end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
-        let mut empty_match = None;
-
-        for result in table.range::<&[u8; 32]>(&exact_start_key..=&exact_end_key)? {
-            let (key, _values) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-
-            if v_change != change_id || v_start != target_pos {
-                continue;
-            }
-
-            if v_start != v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-
-            if empty_match.is_none() {
-                empty_match = Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                });
-            }
-        }
-
-        if empty_match.is_some() {
-            return Ok(empty_match);
-        }
-
-        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
-        let end_key = encode_inode_vertex(inode_id, change_id, u64::MAX, u64::MAX);
-
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            let (key, _values) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-
-            if v_change == change_id && v_start <= target_pos && target_pos < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-        }
-
-        Ok(None)
+        super::probe::find_block_in_inode(&table, inode, pos)
     }
-
     fn find_block_end_in_inode(
         &self,
         inode: Inode,
         pos: Position<NodeId>,
     ) -> Result<Option<GraphNode<NodeId>>, Self::InodeError> {
         let table = self.txn.open_multimap_table(INODE_GRAPH)?;
-
-        let inode_id = inode.get();
-        let change_id = pos.change.get();
-        let target_pos = pos.pos.get();
-
-        let empty_key = encode_inode_vertex(inode_id, change_id, target_pos, target_pos);
-        if table.get(&empty_key)?.next().transpose()?.is_some() {
-            return Ok(Some(GraphNode {
-                change: NodeId::new(change_id),
-                start: ChangePosition::new(target_pos),
-                end: ChangePosition::new(target_pos),
-            }));
-        }
-
-        let start_key = encode_inode_vertex(inode_id, change_id, 0, 0);
-        let end_key = encode_inode_vertex(inode_id, change_id, target_pos, u64::MAX);
-
-        for result in table.range::<&[u8; 32]>(&start_key..=&end_key)? {
-            let (key, _values) = result?;
-            let (_, v_change, v_start, v_end) = decode_inode_vertex(key.value());
-
-            if v_change != change_id {
-                continue;
-            }
-
-            if v_end == target_pos && v_start < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-
-            if v_start <= target_pos && target_pos < v_end {
-                return Ok(Some(GraphNode {
-                    change: NodeId::new(v_change),
-                    start: ChangePosition::new(v_start),
-                    end: ChangePosition::new(v_end),
-                }));
-            }
-        }
-
-        Ok(None)
+        super::probe::find_block_end_in_inode(&table, inode, pos)
     }
-
     fn count_inode_vertices(&self, inode: Inode) -> Result<usize, Self::InodeError> {
         let table = self.txn.open_multimap_table(INODE_GRAPH)?;
 

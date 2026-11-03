@@ -484,7 +484,7 @@ impl TurnOrchestrator {
             None => return,
         };
 
-        let timestamp = event.timestamp.timestamp();
+        let timestamp = event.timestamp.timestamp_millis();
 
         self.with_accumulator(session_id, |acc| {
             let mut block_count = 0;
@@ -584,7 +584,7 @@ impl TurnOrchestrator {
             return;
         };
 
-        let timestamp = event.timestamp.timestamp();
+        let timestamp = event.timestamp.timestamp_millis();
         self.with_accumulator(session_id, |acc| {
             acc.append_llm_response(&response, timestamp);
             true
@@ -911,7 +911,7 @@ impl TurnOrchestrator {
                 }
             })?
         };
-        let (previous_provenance, ledger_turn_number) = ledger
+        let (mut previous_provenance, ledger_turn_number) = ledger
             .map(|(_, turns)| {
                 (
                     turns.last().map(|turn| turn.provenance_hash),
@@ -919,16 +919,54 @@ impl TurnOrchestrator {
                 )
             })
             .unwrap_or((None, 0));
+        // CB-12B: a resumed round runs in a NEW sandbox whose cache holds
+        // no session turns, so the ledger read above yields no chain link
+        // — and the owner would refuse the checkpoint's append as
+        // non-contiguous ("turn N is not an append"). The durable journal
+        // (reachable through the sink's provenance RPCs, which a sandbox's
+        // cache does not shadow) knows the session's previous turn and its
+        // published graph hash: derive the link from there. A genuinely
+        // fresh session has no previous turn anywhere and stays unchained.
+        if previous_provenance.is_none() {
+            if let Some(sink) = &self.journal_sink {
+                let mut probe = session.turn_count.max(1);
+                while previous_provenance.is_none() && probe > 0 {
+                    match sink.turn_status(session_id, probe) {
+                        Ok(Some(status)) => {
+                            previous_provenance = status.final_provenance_hash;
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            log::debug!(
+                                "Could not probe the durable journal for session {} turn \
+                                 {} while chaining the checkpoint: {} (non-fatal)",
+                                session_id,
+                                probe,
+                                error
+                            );
+                            break;
+                        }
+                    }
+                    probe -= 1;
+                }
+            }
+        }
         let source = super::JournalCheckpointSource {
             agent_name: session.agent_name.clone(),
             agent_display_name: session.agent_display_name.clone(),
             agent_vendor: session.agent_vendor.clone(),
             change_hashes: change_hashes.to_vec(),
             previous_provenance,
-            plan_id: session
-                .managed_run
-                .as_ref()
-                .and_then(|run| run.work_item_id.clone()),
+            plan_id: self
+                .session_store
+                .turn_intent_binding(session_id, session.turn_count.max(1))?
+                .map(|binding| binding.intent_uid)
+                .or_else(|| {
+                    session
+                        .managed_run
+                        .as_ref()
+                        .and_then(|run| run.work_item_id.clone())
+                }),
             ledger_turn_number,
         };
         let reservation = sink

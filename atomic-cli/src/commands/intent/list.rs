@@ -29,7 +29,7 @@
 //! `attestations/…` and are never in `manifest.intents`, so they can never
 //! surface as a row.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use atomic_canonical::did::did_for_public_key;
 use atomic_identity::keypair::PublicKey;
@@ -54,8 +54,8 @@ pub struct IntentList {
     pub identity: Option<String>,
 
     /// Only list intents of this classification (one of feature, review, bug,
-    /// chore, remediation). Read from the manifest `IntentSummary.kind` — no
-    /// lift. Mutually exclusive with `--review`.
+    /// chore, remediation). Read from intent frontmatter or the legacy manifest
+    /// fallback. Mutually exclusive with `--review`.
     #[arg(long, value_name = "KIND", conflicts_with = "review")]
     pub kind: Option<String>,
 
@@ -63,9 +63,102 @@ pub struct IntentList {
     #[arg(long)]
     pub review: bool,
 
+    /// Column to order the listing by. Every key sorts ascending; ties keep
+    /// id order.
+    #[arg(long, value_enum, default_value_t = IntentSort::Id)]
+    pub sort: IntentSort,
+
+    /// Reverse the `--sort` order (ties still keep id order).
+    #[arg(short = 'r', long)]
+    pub reverse: bool,
+
     /// Output as JSON (an array of {id,status,kind,attested,verifies}).
     #[arg(long)]
     pub json: bool,
+}
+
+/// `atomic intent list --sort` keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum IntentSort {
+    /// Sort by the human key (the existing default).
+    Id,
+    /// Sort human keys by prefix and numeric sequence (2 before 10).
+    #[value(alias = "humanKey")]
+    HumanKey,
+    Title,
+    Status,
+    Kind,
+    /// fresh, then stale, then unattested.
+    Attested,
+    /// ✓, then ✗, then –.
+    Verifies,
+}
+
+impl IntentSort {
+    pub(crate) fn wire(self) -> atomic_client::proto::VaultListSort {
+        use atomic_client::proto::VaultListSort as W;
+        match self {
+            IntentSort::Id | IntentSort::HumanKey => W::Id,
+            IntentSort::Title => W::Title,
+            IntentSort::Status => W::Status,
+            IntentSort::Kind => W::Kind,
+            IntentSort::Attested => W::Attested,
+            IntentSort::Verifies => W::Verifies,
+        }
+    }
+}
+
+/// Order `rows` by `key` (the local body's twin of the service's listing
+/// sort), with id as the tiebreak. `reverse` flips the key,
+/// not the tiebreak.
+pub(crate) fn sort_rows(rows: &mut [Row], key: IntentSort, reverse: bool) {
+    rows.sort_by(|a, b| {
+        let ord = match key {
+            IntentSort::Id => a.human_key.cmp(&b.human_key),
+            IntentSort::HumanKey => compare_human_keys(&a.human_key, &b.human_key),
+            IntentSort::Title => a.title.cmp(&b.title),
+            IntentSort::Status => a.status.cmp(&b.status),
+            IntentSort::Kind => a.kind.cmp(&b.kind),
+            IntentSort::Attested => a.attested.cmp(&b.attested),
+            IntentSort::Verifies => a.verifies.cmp(&b.verifies),
+        };
+        if reverse { ord.reverse() } else { ord }.then_with(|| a.human_key.cmp(&b.human_key))
+    });
+}
+
+/// Compare the last key component numerically without imposing an integer limit.
+/// Invalid suffixes remain deterministic and group with their own prefix.
+fn compare_human_keys(a: &str, b: &str) -> std::cmp::Ordering {
+    fn parts(key: &str) -> (&str, Option<&str>) {
+        let split = key
+            .rfind("::")
+            .map(|i| i + 2)
+            .or_else(|| key.rfind('-').map(|i| i + 1));
+        match split {
+            Some(i) => (&key[..i], Some(&key[i..])),
+            None => (key, None),
+        }
+    }
+    fn numeric(s: &str) -> Option<&str> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(s.trim_start_matches('0'))
+    }
+
+    let (a_prefix, a_suffix) = parts(a);
+    let (b_prefix, b_suffix) = parts(b);
+    a_prefix
+        .cmp(b_prefix)
+        .then_with(
+            || match (a_suffix.and_then(numeric), b_suffix.and_then(numeric)) {
+                (Some(a), Some(b)) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a_suffix.cmp(&b_suffix),
+            },
+        )
+        .then_with(|| a.cmp(b))
 }
 
 impl IntentList {
@@ -80,7 +173,7 @@ impl IntentList {
 }
 
 /// The classification of one intent's attestation, for a table/JSON row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Attested {
     Fresh,
     Stale,
@@ -108,7 +201,7 @@ impl Attested {
 }
 
 /// The result of the DID-match-then-verify rule for one row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Verifies {
     /// Same-signer, fresh attestation that cryptographically verified.
     Yes,
@@ -145,7 +238,7 @@ pub(crate) struct Row {
     /// name an intent without a second lookup. The table stays id-only.
     pub(crate) title: String,
     pub(crate) status: String,
-    /// Classification tag, read from the manifest `IntentSummary.kind` (no lift).
+    /// Classification from the stored frontmatter, falling back to the manifest.
     pub(crate) kind: String,
     pub(crate) attested: Attested,
     pub(crate) verifies: Verifies,
@@ -258,9 +351,9 @@ fn compute_row(
 
 /// Build the (optionally kind-filtered) rows for the listing.
 ///
-/// Enumeration reuses [`Repository::vault_intent_list`]; the `kind` tag is read
-/// straight from the manifest `IntentSummary.kind` (a manifest read, never a
-/// lift). Factored out of [`Command::run`] so the kind tag + filter are
+/// Enumeration reuses [`Repository::vault_intent_list`]; the `kind` tag prefers
+/// stored frontmatter over the manifest fallback. Factored out of [`Command::run`]
+/// so the kind tag + filter are
 /// unit-testable without a global identity store. A row whose id is missing from
 /// the manifest (should not happen — the same manifest backs both) degrades to
 /// the default `feature`.
@@ -276,7 +369,7 @@ fn build_rows(
         let kind = manifest
             .intents
             .get(&info.id)
-            .map(|s| s.kind.clone())
+            .map(|s| repo.vault_intent_effective_kind(&s.vault_path, &s.kind))
             .unwrap_or_else(|| "feature".to_string());
         if let Some(f) = filter {
             if kind != f {
@@ -356,7 +449,7 @@ impl IntentList {
 }
 
 /// One row reconstructed from the wire's per-entry classification — the
-/// routed twin of [`compute_row`]: the handler computed the manifest kind
+/// routed twin of [`compute_row`]: the handler computed the effective kind
 /// and the attestation/verifies state with the same domain logic, so the
 /// row maps straight off the wire columns.
 pub(crate) fn wire_row(entry: &atomic_client::proto::VaultEntry) -> Row {
@@ -418,8 +511,9 @@ impl Command for IntentList {
 
         // Enumerate via the SAME source `atomic vault intent list` uses; already
         // sorted by id. Attestation entries are never in `manifest.intents`. The
-        // kind tag is read from the manifest summary (no lift).
-        let rows = build_rows(&repo, verifier.as_ref(), filter.as_deref())?;
+        // kind tag uses stored frontmatter with a manifest fallback.
+        let mut rows = build_rows(&repo, verifier.as_ref(), filter.as_deref())?;
+        sort_rows(&mut rows, self.sort, self.reverse);
 
         if self.json {
             let json: Vec<serde_json::Value> = rows
@@ -742,6 +836,82 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    fn sort_row(id: &str, title: &str, kind: &str, attested: Attested) -> Row {
+        Row {
+            human_key: id.to_string(),
+            title: title.to_string(),
+            status: "todo".to_string(),
+            kind: kind.to_string(),
+            attested,
+            verifies: Verifies::Na,
+        }
+    }
+
+    fn keys(rows: &[Row]) -> Vec<&str> {
+        rows.iter().map(|r| r.human_key.as_str()).collect()
+    }
+
+    #[test]
+    fn sort_orders_by_key_with_id_tiebreak() {
+        let mut rows = vec![
+            sort_row("A-3", "beta", "bug", Attested::None),
+            sort_row("A-1", "gamma", "feature", Attested::Fresh),
+            sort_row("A-2", "alpha", "bug", Attested::Stale),
+        ];
+        sort_rows(&mut rows, IntentSort::Title, false);
+        assert_eq!(keys(&rows), ["A-2", "A-3", "A-1"]);
+        sort_rows(&mut rows, IntentSort::Attested, false);
+        assert_eq!(keys(&rows), ["A-1", "A-2", "A-3"]);
+        sort_rows(&mut rows, IntentSort::Kind, false);
+        assert_eq!(keys(&rows), ["A-2", "A-3", "A-1"]);
+        // Reverse flips the key; equal kinds still list in id order.
+        sort_rows(&mut rows, IntentSort::Kind, true);
+        assert_eq!(keys(&rows), ["A-1", "A-2", "A-3"]);
+        sort_rows(&mut rows, IntentSort::Id, true);
+        assert_eq!(keys(&rows), ["A-3", "A-2", "A-1"]);
+    }
+
+    #[test]
+    fn human_key_sort_is_natural_and_deterministic() {
+        for spelling in ["human-key", "humanKey"] {
+            let key = IntentSort::from_str(spelling, false).expect("human key sort spelling");
+            assert_eq!(key.wire(), atomic_client::proto::VaultListSort::Id);
+            let expected = [
+                "A-1",
+                "A-2",
+                "A-10",
+                "A::alice::001",
+                "A::alice::1",
+                "A::alice::2",
+                "A::alice::10",
+                "A::alice::999999999999999999999999999999",
+                "A::alice::1000000000000000000000000000000",
+                "A::alice::oops",
+                "A::bob::1",
+                "B-1",
+            ];
+            for reverse in [false, true] {
+                let mut actual: Vec<_> = expected
+                    .iter()
+                    .rev()
+                    .map(|id| sort_row(id, "title", "bug", Attested::None))
+                    .collect();
+                sort_rows(&mut actual, key, reverse);
+                let mut wanted = expected.to_vec();
+                if reverse {
+                    wanted.reverse();
+                }
+                assert_eq!(keys(&actual), wanted, "{spelling}, reverse={reverse}");
+            }
+        }
+        let mut lexical = vec![
+            sort_row("A-2", "", "", Attested::None),
+            sort_row("A-10", "", "", Attested::None),
+        ];
+        sort_rows(&mut lexical, IntentSort::Id, false);
+        assert_eq!(keys(&lexical), ["A-10", "A-2"]);
+    }
+
     #[test]
     fn review_flag_is_kind_review_shortcut() {
         // `--review` and `--kind review` resolve to the same filter.
@@ -749,12 +919,16 @@ mod tests {
             identity: None,
             kind: None,
             review: true,
+            sort: IntentSort::Id,
+            reverse: false,
             json: false,
         };
         let via_kind = IntentList {
             identity: None,
             kind: Some("review".to_string()),
             review: false,
+            sort: IntentSort::Id,
+            reverse: false,
             json: false,
         };
         assert_eq!(via_review.kind_filter(), Some("review".to_string()));

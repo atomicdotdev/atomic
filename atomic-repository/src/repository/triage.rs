@@ -21,7 +21,7 @@
 
 use super::*;
 
-use atomic_core::pristine::ontology::edge_kind;
+use atomic_core::kg::{iri, ontology::Class, ontology::Predicate as P};
 use serde::{Deserialize, Serialize};
 
 /// Whether a closure addition is covered by an intent in the knowledge graph.
@@ -212,7 +212,7 @@ impl Repository {
         let modifies: Vec<String> = self
             .change_modified_paths(hash)?
             .into_iter()
-            .map(|p| format!("file:{p}"))
+            .map(|p| iri::mint_file(&self.project_id().expect("project identity"), &p))
             .collect();
 
         if modifies.is_empty() {
@@ -228,9 +228,12 @@ impl Repository {
         for file_id in &modifies {
             let neighborhood = self.vault_kg_neighbors(file_id, 1)?;
             if neighborhood.edges.iter().any(|e| {
-                e.kind == edge_kind::TOUCHES
+                e.kind == P::Touches
                     && e.to_id == *file_id
-                    && e.from_id.starts_with("task:")
+                    && neighborhood
+                        .nodes
+                        .iter()
+                        .any(|node| node.id == e.from_id && node.has_type(Class::Task))
             }) {
                 covered = true;
                 break;
@@ -253,10 +256,9 @@ mod tests {
     use crate::tracking::TrackingOptions;
     use crate::Repository;
     use atomic_core::change::ChangeHeader;
-    use atomic_core::pristine::ontology::edge_kind;
+    use atomic_core::kg::{iri, ontology::Predicate as P};
     use atomic_core::pristine::VaultEntryType;
     use atomic_core::types::Hash;
-    use atomic_core::Base32;
     use tempfile::TempDir;
 
     fn record_all(repo: &Repository, message: &str) -> Hash {
@@ -299,10 +301,10 @@ mod tests {
         let hash = record_all(&repo, "add foo");
 
         // Precondition: the KG has NO MODIFIES edge for this change (unenriched).
-        let node_id = format!("change:{}", &hash.to_base32()[..12]);
+        let node_id = iri::mint_change(&hash);
         let sub = repo.vault_kg_neighbors(&node_id, 2).unwrap();
         assert!(
-            !sub.edges.iter().any(|e| e.kind == edge_kind::MODIFIES),
+            !sub.edges.iter().any(|e| e.kind == P::ModifiesFile),
             "precondition: no MODIFIES edge should exist without enrichment"
         );
 
@@ -314,7 +316,7 @@ mod tests {
 
         // An intent whose task touches src/foo.rs projects a TOUCHES edge on
         // store (via project_intent_semantics) — the only KG-side dependency.
-        let fm = r#"{"id":"COV-1","title":"Cover foo","status":"in-progress"}"#;
+        let fm = r#"{"id":"COV-1","uid":"01ARZ3NDEKTSV4RRFFQ69G5FAV","title":"Cover foo","status":"in_progress"}"#;
         let body = "\
 :::task{#cov-1-1 status=open}\nWork on foo.\n::file-ref{path=src/foo.rs}\n:::";
         repo.vault_store(
@@ -327,7 +329,10 @@ mod tests {
 
         // Covered — resolved from file_ops + the task's TOUCHES, no MODIFIES.
         let (modifies, coverage) = repo.change_coverage(&hash).unwrap();
-        assert_eq!(modifies, vec!["file:src/foo.rs".to_string()]);
+        assert_eq!(
+            modifies,
+            vec![iri::mint_file(&repo.project_id().unwrap(), "src/foo.rs")]
+        );
         assert_eq!(coverage, Coverage::Covered);
     }
 
@@ -352,7 +357,7 @@ mod tests {
         let hash = record_all(&repo, "add bar");
 
         // An intent whose task touches a DIFFERENT file.
-        let fm = r#"{"id":"COV-2","title":"Cover foo","status":"in-progress"}"#;
+        let fm = r#"{"id":"COV-2","uid":"01ARZ3NDEKTSV4RRFFQ69G5FAW","title":"Cover foo","status":"in_progress"}"#;
         let body = "\
 :::task{#cov-2-1 status=open}\nWork on foo.\n::file-ref{path=src/foo.rs}\n:::";
         repo.vault_store(
@@ -364,7 +369,10 @@ mod tests {
         .unwrap();
 
         let (modifies, coverage) = repo.change_coverage(&hash).unwrap();
-        assert_eq!(modifies, vec!["file:src/bar.rs".to_string()]);
+        assert_eq!(
+            modifies,
+            vec![iri::mint_file(&repo.project_id().unwrap(), "src/bar.rs")]
+        );
         assert_eq!(coverage, Coverage::Uncovered);
     }
 

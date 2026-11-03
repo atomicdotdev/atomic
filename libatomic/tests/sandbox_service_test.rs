@@ -40,6 +40,7 @@ const ALL: &[&str] = &[
     "provenance.read",
     "provenance.write",
     "agent.checkpoint",
+    "attestation.write",
     "vault.read",
     "vault.write",
 ];
@@ -393,6 +394,42 @@ impl RemoteSandboxLink for TestLink {
                 Ok(Ok(wire::publication_from(&published)?))
             }
             publish_provenance_response::Outcome::Refused(info) => Ok(Err(
+                wire::rejection_from_error_info(&info).ok_or_else(|| info.message.clone())?,
+            )),
+        }
+    }
+
+    fn submit_attestation(
+        &self,
+        root: &Path,
+        session_id: &str,
+        attestation: Vec<u8>,
+        session_json: String,
+    ) -> Result<Result<Hash, SubmitRejection>, String> {
+        let route = Self::route(root)?;
+        let service = SandboxImpl {
+            state: Arc::clone(&route.state),
+        };
+        let response = route
+            .rt
+            .block_on(service.submit_attestation(with_token(
+                SubmitAttestationRequest {
+                    repository: Some(route.repository.clone()),
+                    meta: None,
+                    session_id: session_id.to_string(),
+                    attestation: Some(wire::attestation_bytes(attestation)),
+                    session_json,
+                    target: None,
+                },
+                &route.token,
+            )))
+            .map_err(status_text)?
+            .into_inner();
+        match response.outcome.ok_or("no outcome")? {
+            submit_attestation_response::Outcome::Submitted(submitted) => Ok(Ok(
+                wire::hash_from_proto(submitted.attestation_hash.as_ref())?,
+            )),
+            submit_attestation_response::Outcome::Refused(info) => Ok(Err(
                 wire::rejection_from_error_info(&info).ok_or_else(|| info.message.clone())?,
             )),
         }
@@ -1338,4 +1375,105 @@ fn a_sandbox_publishes_provenance_for_its_own_work() {
         refused.to_string().contains("not on this view"),
         "{refused}"
     );
+}
+
+/// A session attestation rides to the owner with the session state file it
+/// verifies under (CB-12B): after a sandbox submits one, the owner's
+/// repository carries the attestation covering the sandbox's change, the
+/// owner's `.atomic/sessions/<id>.json` holds the MAC key, and the gate's
+/// own key provider reads it — what the sandbox saves is exactly what the
+/// owner loads.
+#[test]
+fn a_sandboxs_session_attestation_reaches_its_owner() {
+    let host = host();
+    host.draft("exp-1");
+    let opened = host.open("exp-1", ALL);
+    let vm = materialize(&host, &opened);
+    write(&vm.root, "README.md", "hello\nreader\n");
+    let change = record(&vm.cache, "greet the reader").unwrap();
+    // The sandbox's session, claimed the way a sandbox's agent hooks claim
+    // one: a provenance turn reserved through its token.
+    reserve(&host, Some(&opened.token), "agent-session", 1).unwrap();
+
+    // The session state file, as the sandbox's agent store writes it — with
+    // the MAC key its attestation verifies under.
+    let mac_key = "ab".repeat(32);
+    let session_json = serde_json::json!({
+        "session_id": "agent-session",
+        "mac_key": mac_key,
+    })
+    .to_string();
+    let mut attestation = atomic_core::change::attestation::Attestation::builder(
+        "agent-session",
+        atomic_core::change::attestation::AttestAgent::new(
+            "claude-code",
+            "Claude Code",
+            "anthropic",
+        ),
+    )
+    .changes_covered(vec![change])
+    .build();
+    attestation.sign_with_mac(&mac_key);
+    assert!(attestation.verify_mac(&mac_key));
+    let bytes = attestation.serialize().unwrap();
+
+    let submitted = vm
+        .cache
+        .submit_remote_sandbox_attestation("agent-session", &bytes, &session_json)
+        .unwrap();
+    let (_, local) = atomic_core::change::attestation::Attestation::deserialize(&bytes).unwrap();
+    assert_eq!(submitted, local, "the owner saved what the sandbox signed");
+
+    // The owner finds the attestation for the change...
+    let found = host.with_repo(|repo| repo.find_attestations_for_change(&change).unwrap());
+    let (_, theirs) = found
+        .iter()
+        .find(|(hash, attest)| *hash == submitted && attest.session_id == "agent-session")
+        .unwrap_or_else(|| panic!("no attestation for the sandbox's change: {found:?}"));
+
+    // ...its gate reads the session's MAC key from the owner's own session
+    // state file, and the attestation verifies under it.
+    let key = host.with_repo(|repo| {
+        let provider =
+            atomic_repository::repository::provenance_gate::local_session_mac_key_provider(repo);
+        provider("agent-session")
+    });
+    assert_eq!(key.as_deref(), Some(mac_key.as_str()));
+    assert!(theirs.verify_mac(&mac_key));
+    assert!(
+        host.root
+            .join(".atomic")
+            .join("sessions")
+            .join("agent-session.json")
+            .is_file(),
+        "the owner filed the session state"
+    );
+
+    // A session the sandbox does not own is refused, and nothing is written.
+    let mut foreign_attest = atomic_core::change::attestation::Attestation::builder(
+        "another-session",
+        atomic_core::change::attestation::AttestAgent::new(
+            "claude-code",
+            "Claude Code",
+            "anthropic",
+        ),
+    )
+    .changes_covered(vec![change])
+    .build();
+    foreign_attest.sign_with_mac(&mac_key);
+    let refused = vm
+        .cache
+        .submit_remote_sandbox_attestation(
+            "another-session",
+            &foreign_attest.serialize().unwrap(),
+            &session_json,
+        )
+        .unwrap_err();
+    assert!(refused.to_string().contains("FORBIDDEN"), "{refused}");
+    assert!(!host
+        .root
+        .join(".atomic")
+        .join("sessions")
+        .join("another-session.json")
+        .is_file());
 }

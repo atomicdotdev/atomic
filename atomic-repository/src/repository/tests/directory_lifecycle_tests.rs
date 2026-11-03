@@ -71,7 +71,25 @@ fn directory_delete_and_undelete_preserve_exact_claims_and_inode() {
         "name -> inode deletion must not become an inode self-loop"
     );
 
+    // A recorded deletion is final state: a directory that reappears on disk
+    // is untracked content, so a sweep has nothing to record for it.
     std::fs::create_dir(&directory).unwrap();
+    let sweep = repo.record(
+        ChangeHeader::new("sweep must not capture the recreated directory"),
+        RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true),
+    );
+    assert!(
+        sweep.is_err(),
+        "a recreated recorded-deleted directory must not be swept into a change"
+    );
+
+    // Re-tracking is deliberate: staging the directory lets record undelete
+    // it with its original claims and inode.
+    repo.add_directory(path, TrackingOptions::default())
+        .unwrap();
     let restored = record_all(&repo, "restore explicit directory");
     let undel = restored
         .change()
@@ -112,14 +130,21 @@ fn file_undelete_preserves_inode_crdt_identity_and_changed_content() {
     std::fs::write(&file, b"after\n").unwrap();
 
     let status = repo.status(StatusOptions::default()).unwrap();
-    let entry = status
+    let recreated = status
         .entries()
         .iter()
         .find(|entry| entry.path() == std::path::Path::new(path))
-        .expect("reappearing deleted file must be recordable");
-    assert_eq!(entry.status(), FileStatus::Added);
-    assert_eq!(entry.inode(), Some(original_inode));
+        .expect("a recreated deleted path must surface in status");
+    assert_eq!(
+        recreated.status(),
+        FileStatus::Untracked,
+        "a recorded deletion is final state: bytes that reappear at the path are \
+         untracked, never a change candidate"
+    );
 
+    // Re-tracking is deliberate: `add` stages the path, and record undeletes
+    // it with the original inode and CRDT identity.
+    repo.add(path, TrackingOptions::default()).unwrap();
     let restored = record_all(&repo, "undelete and edit file");
     assert!(restored.change().hunks().iter().any(
         |op| matches!(op, GraphOp::FileUndel { path: restored_path, .. } if restored_path == path)

@@ -345,6 +345,18 @@ pub trait RemoteSandboxLink: Send + Sync {
         Result<atomic_core::change::session::SessionCheckpointPublication, SubmitRejection>,
         String,
     >;
+    /// `SubmitAttestation`: a session-end attestation (`Attestation::
+    /// serialize` bytes) plus the session state file it verifies under,
+    /// saved in the repository. Without this, a remote sandbox's agent
+    /// attestations die with the sandbox and every managed change it
+    /// recorded fails the owner's publication gate (CB-12B).
+    fn submit_attestation(
+        &self,
+        root: &Path,
+        session_id: &str,
+        attestation: Vec<u8>,
+        session_json: String,
+    ) -> Result<Result<Hash, SubmitRejection>, String>;
 }
 
 static LINK: std::sync::OnceLock<Box<dyn RemoteSandboxLink>> = std::sync::OnceLock::new();
@@ -879,6 +891,44 @@ impl Repository {
             })
     }
 
+    /// In a remote sandbox, a session attestation also rides to the owner:
+    /// the signed bytes the sandbox saved, plus the session state file that
+    /// carries its MAC key. The owner files both — without them its
+    /// publication gate fails every managed change this session recorded
+    /// (CB-12B). Returns the attestation's hash on the owner.
+    pub fn submit_remote_sandbox_attestation(
+        &self,
+        session_id: &str,
+        attestation: &[u8],
+        session_json: &str,
+    ) -> Result<Hash, RepositoryError> {
+        if !self.is_remote_sandbox() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "only a remote sandbox submits attestations to an owner".to_string(),
+            });
+        }
+        // The same sanitizer the owner files the session state under; a
+        // session id that cannot name a file here cannot name one there.
+        if super::provenance_gate::safe_session_id(session_id).is_none() {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("refusing session id {session_id:?} as a file name"),
+            });
+        }
+        link()?
+            .submit_attestation(
+                &self.root,
+                session_id,
+                attestation.to_vec(),
+                session_json.to_string(),
+            )
+            .map_err(|message| RepositoryError::InvalidOperation { message })?
+            .map_err(|rejection| {
+                RepositoryError::Apply(format!(
+                    "the repository refused the attestation: {rejection}"
+                ))
+            })
+    }
+
     /// In a remote sandbox, what applying a recorded change means: hand it
     /// to the owner, and take the view as it is once it lands.
     ///
@@ -1015,6 +1065,47 @@ impl Repository {
             }
         }
         Ok(Ok(self.publish_local_provenance_checkpoint(&graph, turn)?))
+    }
+
+    /// Serve side: file a remote sandbox's session state under
+    /// `.atomic/sessions/<session_id>.json` — the path the publication gate's
+    /// [`super::provenance_gate::local_session_mac_key_provider`] reads the
+    /// session MAC key from, so the owner can verify the session's
+    /// MAC-signed attestations.
+    ///
+    /// The session id is sanitized with the gate's own
+    /// [`super::provenance_gate::safe_session_id`] before it names a file.
+    /// The state is only adopted when it carries a non-empty `mac_key`: a
+    /// session state file without one verifies nothing at the gate, so the
+    /// owner never takes it. Returns whether the file was written.
+    pub fn save_sandbox_session_state(
+        &self,
+        session_id: &str,
+        session_json: &str,
+    ) -> Result<bool, RepositoryError> {
+        let Some(safe) = super::provenance_gate::safe_session_id(session_id) else {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("refusing session id {session_id:?} as a file name"),
+            });
+        };
+        if session_json.is_empty() {
+            return Ok(false);
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(session_json).map_err(|e| RepositoryError::InvalidOperation {
+                message: format!("not a session state file: {e}"),
+            })?;
+        let carries_key = value
+            .get("mac_key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| !key.is_empty());
+        if !carries_key {
+            return Ok(false);
+        }
+        let sessions = self.dot_dir().join("sessions");
+        std::fs::create_dir_all(&sessions)?;
+        std::fs::write(sessions.join(format!("{safe}.json")), session_json)?;
+        Ok(true)
     }
 
     /// Cache side: the view's state as the cache has it (base32) — what a

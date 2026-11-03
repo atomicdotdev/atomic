@@ -30,15 +30,19 @@
 //!
 //! # What is explicitly NOT claimed
 //!
-//! The verdict carries a limitation register. As of CB-12A review 8 the
-//! attestation signature is a session-scoped keyed-Blake3 MAC, **not** the
-//! RFC-required agent-DID signature, and it omits boundary/outcome/binding/
-//! provenance roots (F3); fabricated capture evidence is not detectable here
-//! (F2); full boundary/manifest/ref/operation ancestry and leases are absent
-//! (F4/F5). A passing gate therefore proves *configured-policy enforcement
-//! over the available evidence*, nothing stronger. RFC §19 Q4 (open-source
-//! trust default) is UNRESOLVED: no default trust is granted or invented
-//! here; only explicitly configured signers ever satisfy the trust check.
+//! The verdict carries a limitation register. As of CB-12A review 8 the gate
+//! verifies both signature classes it can encounter: session-scoped
+//! keyed-Blake3 MACs and Ed25519 agent-DID signatures (V4), each through an
+//! injected key provider. Verification is still provider-dependent — without
+//! the session MAC key or a DID resolver in context, attestations are
+//! *unverifiable* and fail closed — and attestations still omit
+//! boundary/outcome/binding/provenance roots (F3); fabricated capture
+//! evidence is not detectable here (F2); full boundary/manifest/ref/
+//! operation ancestry and leases are absent (F4/F5). A passing gate
+//! therefore proves *configured-policy enforcement over the available
+//! evidence*, nothing stronger. RFC §19 Q4 (open-source trust default) is
+//! UNRESOLVED: no default trust is granted or invented here; only
+//! explicitly configured signers ever satisfy the trust check.
 //!
 //! # Content vs provenance separation (RFC §5.2/§12.8)
 //!
@@ -66,6 +70,20 @@ use crate::Repository;
 /// remotes, servers, CI) pass `None` — attestations then verify as
 /// *unverifiable* and the gate fails closed.
 pub type MacKeyProvider<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// Optional callback supplying an attestation signer DID's Ed25519 public
+/// key (32 bytes).
+///
+/// Agent VMs sign attestations with DID signatures
+/// (`Attestation::sign_with_did`) because `ATOMIC_AGENT_IDENTITY` is set;
+/// unlike the session MAC key the DID public key is not a secret, but it is
+/// also not carried in the attestation bytes (`did:atomic` is a blake3
+/// fingerprint of the key, not the key itself), so a host that wants to
+/// verify DID-signed evidence must resolve the signer through its identity
+/// store. Callers without a resolver pass `None` — DID-signed attestations
+/// then verify as *unverifiable* and the gate fails closed, exactly like
+/// MAC-signed evidence without the MAC key.
+pub type DidKeyProvider<'a> = &'a dyn Fn(&str) -> Option<[u8; 32]>;
 
 /// Configuration for one gate evaluation.
 #[derive(Debug, Clone)]
@@ -293,8 +311,10 @@ impl GateVerdict {
 
 fn default_limitations() -> Vec<String> {
     vec![
-        "attestations are session-MAC authenticated, not agent-DID signed; boundary, outcome, \
-         binding and provenance roots are not yet covered by the signature (CB-12A review F3)"
+        "attestation verification is key-provider-dependent (session MAC key or DID signer \
+         resolver); without the key in context the evidence is unverifiable and fails closed, \
+         and boundary, outcome, binding and provenance roots are not yet covered by the \
+         signature (CB-12A review F3)"
             .to_string(),
         "fabricated commit-time capture evidence is not detectable at this gate (CB-12A review F2)"
             .to_string(),
@@ -355,7 +375,11 @@ fn kind_rank(blocker: &GateBlocker) -> u8 {
 
 /// Validate a session id for local file lookup (mirrors the agent session
 /// store's traversal rules). Returns `None` for ids that cannot name a file.
-fn safe_session_id(session: &str) -> Option<&str> {
+///
+/// Public: the serve side of the sandbox attestation transport files a
+/// remote sandbox's session state under the same `<sessions>/<id>.json`
+/// path this gate later reads it from — one sanitizer, both ends.
+pub fn safe_session_id(session: &str) -> Option<&str> {
     if session.is_empty()
         || session.contains('/')
         || session.contains('\\')
@@ -387,6 +411,68 @@ pub fn local_session_mac_key_provider(repo: &Repository) -> impl Fn(&str) -> Opt
     }
 }
 
+/// A [`DidKeyProvider`] that resolves an attestation signer DID to its
+/// Ed25519 public key through the repository's own identity store first
+/// (`<repo>/.atomic/identities/`), falling back to the serving host's
+/// default store (`~/.atomic/identities/`, `ATOMIC_CONFIG_DIR`-relocatable).
+///
+/// Resolution mirrors the host's author resolution
+/// (`libatomic::daemon::services::resolve_author_for`): a signer that names
+/// a stored identity (by name) resolves to that identity's key; otherwise the
+/// store is scanned for an identity whose DID — derived from its public key
+/// (`atomic_canonical::did::did_for_public_key`, `did:atomic:<base32>`; the
+/// `did:key` rendering matches too) — equals the signer. A signer that
+/// resolves to nothing yields `None`, which makes its attestation
+/// unverifiable — fail closed.
+///
+/// The repo-local store first is what makes a hosted clone self-sufficient:
+/// an attestation's signer (a delegated agent identity) lives with the
+/// project — written into the clone by the host that opens the sandbox —
+/// not necessarily in the serving account's global store. A receiving
+/// repository without a local store simply falls back, and a clone with
+/// neither resolves nothing.
+///
+/// Read-only store access: no secret keys are loaded and the repository's
+/// write lock is never taken. The repo-local store is opened existing-only
+/// (`IdentityStore::open_existing`), so resolution never creates files.
+pub fn local_did_key_provider(repo: &Repository) -> impl Fn(&str) -> Option<[u8; 32]> {
+    let local_store = repo.dot_dir().join("identities");
+    move |signer: &str| {
+        // Repo-local first: the identities the clone carries with it.
+        if let Some(key) = atomic_identity::IdentityStore::open_existing(&local_store)
+            .ok()
+            .and_then(|store| did_key_from_store(&store, signer))
+        {
+            return Some(key);
+        }
+        // Then the serving host's global store.
+        atomic_identity::IdentityStore::open_default()
+            .ok()
+            .and_then(|store| did_key_from_store(&store, signer))
+    }
+}
+
+/// Resolve a signer DID (or identity name) to a public key through one store:
+/// a signer that names a stored identity resolves to that identity; otherwise
+/// the store is scanned for an identity whose DID matches the signer (either
+/// the `did:atomic` or the `did:key` rendering of its public key).
+fn did_key_from_store(store: &atomic_identity::IdentityStore, signer: &str) -> Option<[u8; 32]> {
+    // A signer that names a stored identity resolves to that identity.
+    if let Ok(identity) = store.load_by_name(signer) {
+        return Some(*identity.public_key.as_bytes());
+    }
+    // Otherwise scan for an identity whose DID matches the signer
+    // (either `did:atomic` or `did:key` rendering of its public key).
+    store
+        .list()
+        .ok()?
+        .iter()
+        .find(|identity| {
+            atomic_canonical::did::did_matches_public_key(signer, &identity.public_key)
+        })
+        .map(|identity| *identity.public_key.as_bytes())
+}
+
 impl Repository {
     /// Evaluate the trusted provenance gate over a change closure.
     ///
@@ -401,6 +487,7 @@ impl Repository {
         changes: &[Hash],
         config: &PublicationGateConfig,
         mac_key_provider: Option<MacKeyProvider<'_>>,
+        did_key_provider: Option<DidKeyProvider<'_>>,
     ) -> Result<GateVerdict, RepositoryError> {
         let mut verdict = GateVerdict {
             checked: changes.len(),
@@ -409,9 +496,11 @@ impl Repository {
             limitations: default_limitations(),
         };
 
-        // Per-session caches: ledger status and MAC keys are session-scoped.
+        // Per-session caches: ledger status and MAC keys are session-scoped;
+        // DID keys are signer-scoped.
         let mut ledger_cache: BTreeMap<String, LedgerStatus> = BTreeMap::new();
         let mut mac_key_cache: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut did_key_cache: BTreeMap<String, Option<[u8; 32]>> = BTreeMap::new();
 
         for hash in changes {
             let change_b32 = hash.to_base32();
@@ -591,16 +680,17 @@ impl Repository {
                 .iter()
                 .filter(|(_, attest)| attest.session_id == session)
                 .collect();
-            let key_available = mac_key_cache
-                .entry(session.clone())
-                .or_insert_with(|| mac_key_provider.and_then(|provider| provider(&session)))
-                .clone();
             let mut checks: Vec<AttestationCheck> = same_session
                 .iter()
                 .map(|(attest_hash, attest)| {
-                    let signature_available = attest.signature.is_some();
-                    match (signature_available, &key_available) {
-                        (false, _) => AttestationCheck {
+                    // Signature-class selection: a MAC-signed attestation
+                    // needs the session MAC key; a DID-signed attestation
+                    // needs the signer's Ed25519 public key. Both are
+                    // authentication material resolved through injected
+                    // providers — never trust decisions.
+                    if attest.signature.is_none() {
+                        // Unsigned historical V1/V2: unverifiable, as ever.
+                        AttestationCheck {
                             hash: attest_hash.to_base32(),
                             signer: attest.signer.clone(),
                             verified: None,
@@ -608,23 +698,55 @@ impl Repository {
                                 "attestation carries no signature (historical V1/V2 format)"
                                     .to_string(),
                             ),
-                        },
-                        (true, None) => AttestationCheck {
-                            hash: attest_hash.to_base32(),
-                            signer: attest.signer.clone(),
-                            verified: None,
-                            unverifiable_reason: Some(
-                                "session MAC key unavailable in this context".to_string(),
-                            ),
-                        },
-                        (true, Some(key)) => {
-                            let verified = attest.verify_mac(key);
-                            AttestationCheck {
+                        }
+                    } else if let Some(did) = attest.signer_did() {
+                        // V4 DID path: resolve the signer's public key
+                        // (cached per signer — one lookup per signer, not
+                        // per attestation).
+                        let key = *did_key_cache
+                            .entry(did.to_string())
+                            .or_insert_with(|| did_key_provider.and_then(|provider| provider(did)));
+                        match key {
+                            None => AttestationCheck {
                                 hash: attest_hash.to_base32(),
                                 signer: attest.signer.clone(),
-                                verified: Some(verified),
+                                verified: None,
+                                unverifiable_reason: Some(
+                                    "DID signer key unavailable in this context".to_string(),
+                                ),
+                            },
+                            Some(key) => AttestationCheck {
+                                hash: attest_hash.to_base32(),
+                                signer: attest.signer.clone(),
+                                verified: Some(attest.verify_with_did(&key)),
                                 unverifiable_reason: None,
-                            }
+                            },
+                        }
+                    } else {
+                        // MAC path (or a signer-less signature, which fails
+                        // MAC verification as tamper evidence): the session
+                        // key authenticates, cached per session as today.
+                        let key_available = mac_key_cache
+                            .entry(session.clone())
+                            .or_insert_with(|| {
+                                mac_key_provider.and_then(|provider| provider(&session))
+                            })
+                            .clone();
+                        match key_available {
+                            None => AttestationCheck {
+                                hash: attest_hash.to_base32(),
+                                signer: attest.signer.clone(),
+                                verified: None,
+                                unverifiable_reason: Some(
+                                    "session MAC key unavailable in this context".to_string(),
+                                ),
+                            },
+                            Some(key) => AttestationCheck {
+                                hash: attest_hash.to_base32(),
+                                signer: attest.signer.clone(),
+                                verified: Some(attest.verify_mac(&key)),
+                                unverifiable_reason: None,
+                            },
                         }
                     }
                 })
@@ -715,9 +837,11 @@ impl Repository {
         boundary: &str,
         changes: &[Hash],
         mac_key_provider: Option<MacKeyProvider<'_>>,
+        did_key_provider: Option<DidKeyProvider<'_>>,
     ) -> Result<GateVerdict, RepositoryError> {
         let config = PublicationGateConfig::from_repo(self)?;
-        let verdict = self.evaluate_publication_gate(changes, &config, mac_key_provider)?;
+        let verdict =
+            self.evaluate_publication_gate(changes, &config, mac_key_provider, did_key_provider)?;
         if !verdict.allowed() {
             return Err(RepositoryError::PublicationGateRefused {
                 boundary: boundary.to_string(),
@@ -837,6 +961,34 @@ mod tests {
         install_attestation_inner(repo, hash, sign).0
     }
 
+    /// A fresh Ed25519 agent keypair with its `did:atomic` DID.
+    fn agent_keypair() -> (atomic_identity::KeyPair, String) {
+        let keypair = atomic_identity::KeyPair::generate();
+        let did = atomic_canonical::did::did_for_public_key(&keypair.public);
+        (keypair, did)
+    }
+
+    /// Install a V4 DID-signed attestation covering `hash`, signed by
+    /// `keypair`'s identity (signer recorded as its `did:atomic` DID).
+    fn install_did_attestation(
+        repo: &Repository,
+        hash: &Hash,
+        keypair: &atomic_identity::KeyPair,
+    ) -> String {
+        let did = atomic_canonical::did::did_for_public_key(&keypair.public);
+        let mut attestation = Attestation::builder(
+            SESSION,
+            AttestAgent::new("test-agent", "Test Agent", "test-vendor"),
+        )
+        .changes_covered(vec![*hash])
+        .build();
+        attestation.sign_with_did(&did, keypair.secret.as_bytes());
+        let att_hash = repo
+            .save_attestation(&attestation)
+            .expect("attestation saves");
+        att_hash.to_base32()
+    }
+
     fn install_attestation_inner(
         repo: &Repository,
         hash: &Hash,
@@ -883,7 +1035,7 @@ mod tests {
         let hash = repo.save_change(&change).expect("save");
 
         let verdict = repo
-            .evaluate_publication_gate(&[hash], &config_with_signer("x"), Some(&provider))
+            .evaluate_publication_gate(&[hash], &config_with_signer("x"), Some(&provider), None)
             .expect("gate runs");
         assert!(verdict.allowed());
         assert_eq!(verdict.checked, 1);
@@ -964,6 +1116,7 @@ mod tests {
                 &[hash],
                 &config_with_signer("session-mac:sess-gate"),
                 Some(&no_provider),
+                None,
             )
             .expect("gate runs");
         assert!(
@@ -987,6 +1140,7 @@ mod tests {
                 &[hash],
                 &config_with_signer("session-mac:sess-gate"),
                 Some(&provider),
+                None,
             )
             .expect("gate runs");
         assert!(!verdict.allowed());
@@ -1021,12 +1175,155 @@ mod tests {
                 &[hash],
                 &config_with_signer("session-mac:sess-gate"),
                 Some(&provider),
+                None,
             )
             .expect("gate runs");
         assert!(
             verdict.allowed(),
             "expected complete evidence to pass: {:?}",
             verdict.refusal_report()
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // V4: DID-signed attestations (agent VMs sign with
+    // `ATOMIC_AGENT_IDENTITY`; the gate must verify them through an
+    // injected DID key provider and evaluate the DID signer against the
+    // same policy-only trust config).
+    // ---------------------------------------------------------------------
+
+    /// A DID-signed attestation whose signer's key the provider resolves
+    /// and whose DID the trust config lists passes with no attestation
+    /// blocker.
+    #[test]
+    fn did_signed_attestation_with_trusted_signer_passes() {
+        let (_dir, repo) = create_temp_repo();
+        let (keypair, did) = agent_keypair();
+        let change = managed_change("did signed trusted");
+        let hash = repo.save_change(&change).expect("save");
+        install_provenance_root_and_ledger(&repo, &hash);
+        install_did_attestation(&repo, &hash, &keypair);
+
+        let public = *keypair.public.as_bytes();
+        let did_provider = move |_signer: &str| Some(public);
+        let verdict = repo
+            .evaluate_publication_gate(
+                &[hash],
+                &config_with_signer(&did),
+                Some(&no_provider),
+                Some(&did_provider),
+            )
+            .expect("gate runs");
+        assert!(
+            verdict.allowed(),
+            "expected a verifying, DID-signed attestation from a trusted signer to pass: {}",
+            verdict.refusal_report()
+        );
+    }
+
+    /// No DID key in context (receiving remote, no resolver): the
+    /// DID-signed attestation is unverifiable and fails closed — never
+    /// silently accepted.
+    #[test]
+    fn did_signed_attestation_without_did_key_fails_closed_unverifiable() {
+        let (_dir, repo) = create_temp_repo();
+        let (keypair, _did) = agent_keypair();
+        let change = managed_change("did signed no key");
+        let hash = repo.save_change(&change).expect("save");
+        install_provenance_root_and_ledger(&repo, &hash);
+        install_did_attestation(&repo, &hash, &keypair);
+
+        // A provider that resolves nothing...
+        let verdict = repo
+            .evaluate_publication_gate(
+                &[hash],
+                &config_with_signer("did:atomic:irrelevant"),
+                Some(&no_provider),
+                Some(&|_signer: &str| None),
+            )
+            .expect("gate runs");
+        assert!(!verdict.allowed());
+        assert!(
+            blocker_kinds(&verdict).contains(&"unverifiable"),
+            "{verdict:?}"
+        );
+
+        // ...and no provider at all: the same refusal.
+        let verdict = repo
+            .evaluate_publication_gate(
+                &[hash],
+                &config_with_signer("did:atomic:irrelevant"),
+                Some(&no_provider),
+                None,
+            )
+            .expect("gate runs");
+        assert!(!verdict.allowed());
+        assert!(
+            blocker_kinds(&verdict).contains(&"unverifiable"),
+            "{verdict:?}"
+        );
+    }
+
+    /// A resolved but wrong key (signer DID does not match the signing key)
+    /// is tamper/forgery evidence: the signature does not verify.
+    #[test]
+    fn did_signed_attestation_with_wrong_key_is_refused() {
+        let (_dir, repo) = create_temp_repo();
+        let (keypair, _did) = agent_keypair();
+        let (other, _other_did) = agent_keypair();
+        let change = managed_change("did signed wrong key");
+        let hash = repo.save_change(&change).expect("save");
+        install_provenance_root_and_ledger(&repo, &hash);
+        install_did_attestation(&repo, &hash, &keypair);
+
+        let wrong = *other.public.as_bytes();
+        let did_provider = move |_signer: &str| Some(wrong);
+        let verdict = repo
+            .evaluate_publication_gate(
+                &[hash],
+                &config_with_signer("did:atomic:irrelevant"),
+                Some(&no_provider),
+                Some(&did_provider),
+            )
+            .expect("gate runs");
+        assert!(!verdict.allowed());
+        assert!(
+            blocker_kinds(&verdict).contains(&"signature"),
+            "{verdict:?}"
+        );
+    }
+
+    /// A verifying DID signature from a signer the trust policy does not
+    /// list is refused: no default trust exists for DID signers either.
+    #[test]
+    fn did_signed_attestation_with_untrusted_signer_is_refused() {
+        let (_dir, repo) = create_temp_repo();
+        let (keypair, _did) = agent_keypair();
+        let change = managed_change("did signed untrusted");
+        let hash = repo.save_change(&change).expect("save");
+        install_provenance_root_and_ledger(&repo, &hash);
+        install_did_attestation(&repo, &hash, &keypair);
+
+        let public = *keypair.public.as_bytes();
+        let did_provider = move |_signer: &str| Some(public);
+        // The key verifies, but the signer is configured nowhere (empty
+        // policy, no repository identity): policy-only trust.
+        let verdict = repo
+            .evaluate_publication_gate(
+                &[hash],
+                &PublicationGateConfig {
+                    trust: GitTrustConfig::default(),
+                    repository_identity: None,
+                },
+                Some(&no_provider),
+                Some(&did_provider),
+            )
+            .expect("gate runs");
+        assert!(!verdict.allowed());
+        let kinds = blocker_kinds(&verdict);
+        assert!(
+            kinds.contains(&"signer") && !kinds.contains(&"signature"),
+            "{verdict:?}"
         );
     }
 
@@ -1042,6 +1339,7 @@ mod tests {
                 &[hash],
                 &config_with_signer("session-mac:sess-gate"),
                 Some(&provider),
+                None,
             )
             .expect("gate runs");
         assert!(blocker_kinds(&verdict).contains(&"tampered"), "{verdict:?}");
@@ -1060,6 +1358,7 @@ mod tests {
                 &[hash],
                 &config_with_signer("session-mac:sess-gate"),
                 Some(&no_provider),
+                None,
             )
             .expect("gate runs");
         assert!(!verdict.allowed());
@@ -1082,6 +1381,7 @@ mod tests {
                 &[hash],
                 &config_with_signer("session-mac:sess-gate"),
                 Some(&provider),
+                None,
             )
             .expect("gate runs");
         assert!(!verdict.allowed());
@@ -1114,6 +1414,7 @@ mod tests {
                 &[hash],
                 &config_with_signer("session-mac:sess-gate"),
                 Some(&provider),
+                None,
             )
             .expect("gate runs");
         assert!(
@@ -1139,6 +1440,7 @@ mod tests {
                     repository_identity: None,
                 },
                 Some(&provider),
+                None,
             )
             .expect("gate runs");
         assert!(blocker_kinds(&verdict).contains(&"signer"), "{verdict:?}");
@@ -1152,7 +1454,7 @@ mod tests {
             repository_identity: None,
         };
         let verdict = repo
-            .evaluate_publication_gate(&[hash], &revoked_config, Some(&provider))
+            .evaluate_publication_gate(&[hash], &revoked_config, Some(&provider), None)
             .expect("gate runs");
         assert!(blocker_kinds(&verdict).contains(&"signer"), "{verdict:?}");
     }
@@ -1180,6 +1482,7 @@ mod tests {
                 &[hash],
                 &config_with_signer("session-mac:sess-gate"),
                 Some(&provider),
+                None,
             )
             .expect("gate runs");
         let kinds = blocker_kinds(&verdict);
@@ -1218,6 +1521,7 @@ mod tests {
                 &[hash],
                 &config_with_signer("session-mac:sess-gate"),
                 Some(&provider),
+                None,
             )
             .expect("gate runs");
         assert!(
@@ -1256,6 +1560,7 @@ mod tests {
                 &closure,
                 &config_with_signer("session-mac:sess-gate"),
                 Some(&provider),
+                None,
             )
             .expect("gate runs");
         assert!(!verdict.allowed());
@@ -1293,6 +1598,88 @@ mod tests {
         repo.create_view("gate-draft").expect("draft view");
         let outcome = repo.insert_change(&hash, crate::InsertOptions::default().view("gate-draft"));
         assert!(outcome.is_ok(), "draft insertion is not gated: {error:?}");
+    }
+
+    /// A DID signer written into the clone's repo-local identity store
+    /// (`<dot>/identities`) resolves through it: name, `did:atomic`, and
+    /// `did:key` forms all reach the identity's public key, and a signer
+    /// matching nothing resolves to nothing — fail closed.
+    #[test]
+    fn did_provider_resolves_the_clones_repo_local_identity() {
+        use atomic_canonical::did;
+        use atomic_identity::{Identity, IdentityStore, KeyPair};
+
+        let (_dir, repo) = create_temp_repo();
+        let keypair = KeyPair::generate();
+        let agent = Identity::new("aaron+rook", &keypair);
+        IdentityStore::open(&repo.dot_dir().join("identities"))
+            .expect("the clone's identity store opens")
+            .save(&agent)
+            .expect("the agent identity is saved into the clone");
+
+        let provider = super::local_did_key_provider(&repo);
+        // Both DID renderings resolve to the agent's public key.
+        assert_eq!(
+            provider(&did::did_for_public_key(&keypair.public)),
+            Some(*keypair.public.as_bytes())
+        );
+        assert_eq!(
+            provider(&did::did_key_for_public_key(&keypair.public)),
+            Some(*keypair.public.as_bytes())
+        );
+        // A signer that names the stored identity resolves too.
+        assert_eq!(provider("aaron+rook"), Some(*keypair.public.as_bytes()));
+        // A signer matching nothing resolves to nothing — unverifiable,
+        // fail closed.
+        let other = KeyPair::generate();
+        assert_eq!(provider(&did::did_for_public_key(&other.public)), None);
+    }
+
+    /// The global store is the fallback: a signer the clone does not carry
+    /// locally still resolves through the serving host's default store,
+    /// and the repo-local store wins when both could answer.
+    #[test]
+    fn did_provider_falls_back_to_the_global_store() {
+        use atomic_canonical::did;
+        use atomic_identity::{Identity, IdentityStore, KeyPair};
+
+        // Relocate the global store for the duration of the test (the same
+        // override `IdentityStore::open_default` reads), and restore it.
+        let global = tempfile::TempDir::new().unwrap();
+        let previous = std::env::var_os("ATOMIC_CONFIG_DIR");
+        std::env::set_var("ATOMIC_CONFIG_DIR", global.path());
+
+        let global_keypair = KeyPair::generate();
+        let host = Identity::new("host-account", &global_keypair);
+        IdentityStore::open_default()
+            .expect("the relocated global store opens")
+            .save(&host)
+            .expect("the host identity is saved globally");
+
+        let (_dir, repo) = create_temp_repo();
+        let local_keypair = KeyPair::generate();
+        let agent = Identity::new("aaron+rook", &local_keypair);
+        IdentityStore::open(&repo.dot_dir().join("identities"))
+            .expect("the clone's identity store opens")
+            .save(&agent)
+            .expect("the agent identity is saved into the clone");
+
+        let provider = super::local_did_key_provider(&repo);
+        // The host's signer is not in the clone: the fallback resolves it.
+        assert_eq!(
+            provider(&did::did_for_public_key(&global_keypair.public)),
+            Some(*global_keypair.public.as_bytes())
+        );
+        // The clone's own signer resolves — repo-local first.
+        assert_eq!(
+            provider(&did::did_for_public_key(&local_keypair.public)),
+            Some(*local_keypair.public.as_bytes())
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("ATOMIC_CONFIG_DIR", value),
+            None => std::env::remove_var("ATOMIC_CONFIG_DIR"),
+        }
     }
 }
 
@@ -1350,6 +1737,7 @@ mod privacy_tests {
                     repository_identity: None,
                 },
                 Some(&|_| Some("dd44dd44".to_string())),
+                None,
             )
             .expect("gate runs");
         let report = verdict.refusal_report();

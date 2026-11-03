@@ -50,7 +50,9 @@ use crate::types::{EdgeFlags, GraphNode, Hash, Inode, NodeId, Position, Serializ
 
 use super::error::LocalApplyError;
 use super::graph_batch::{add_edge_with_reverse, CachedWriteGraphTxn};
-use super::position::{resolve_context_vertex, resolve_inode, resolve_position};
+use super::position::{
+    adjust_for_mid_span, resolve_context_vertex, resolve_inode, resolve_position,
+};
 use super::workspace::Workspace;
 
 // Insertion Application
@@ -127,6 +129,10 @@ pub fn write_new_vertex_with_frontier(
     // Clear workspace context for this span
     workspace.clear_context();
 
+    // The file this span belongs to, for INODE_GRAPH indexing and for
+    // inode-scoped context resolution.
+    let resolved_inode = resolve_inode(txn, &insertion.inode, change_id)?;
+
     // Fast path for the common "append one more line from this same change"
     // pattern used by large FileAdd chains. The predecessor is a vertex we
     // already inserted in this change, there are no successors, and the new
@@ -134,7 +140,6 @@ pub fn write_new_vertex_with_frontier(
     if insertion.successors.is_empty() && insertion.predecessors.len() == 1 {
         let internal_pos = resolve_position(txn, &insertion.predecessors[0], change_id)?;
         if let Some(up_vertex) = workspace.get_current_vertex(internal_pos, true) {
-            let resolved_inode = resolve_inode(txn, &insertion.inode, change_id)?;
             let up_flag = insertion.flag | EdgeFlags::BLOCK;
             add_edge_with_reverse(txn, resolved_inode, up_flag, up_vertex, node, change_id)?;
             workspace.add_up_context(up_vertex.end_pos());
@@ -149,9 +154,7 @@ pub fn write_new_vertex_with_frontier(
     // vertices written to GRAPH earlier in the same change.
     for up_pos in &insertion.predecessors {
         let internal_pos = resolve_position(txn, up_pos, change_id)?;
-        let up_vertex = workspace
-            .get_current_vertex(internal_pos, true)
-            .unwrap_or(resolve_context_vertex(txn, internal_pos, true)?);
+        let up_vertex = context_vertex(txn, workspace, resolved_inode, internal_pos, true)?;
         // Store the end position (where new content connects)
         workspace.add_up_context(up_vertex.end_pos());
         workspace.add_up_context_vertex(up_vertex);
@@ -190,14 +193,10 @@ pub fn write_new_vertex_with_frontier(
                 {
                     inode_anchor
                 } else {
-                    workspace
-                        .get_current_vertex(internal_pos, false)
-                        .unwrap_or(resolve_context_vertex(txn, internal_pos, false)?)
+                    context_vertex(txn, workspace, resolved_inode, internal_pos, false)?
                 }
             } else {
-                workspace
-                    .get_current_vertex(internal_pos, false)
-                    .unwrap_or(resolve_context_vertex(txn, internal_pos, false)?)
+                context_vertex(txn, workspace, resolved_inode, internal_pos, false)?
             };
         // Store the start position (where new content connects)
         workspace.add_down_context(down_vertex.start_pos());
@@ -208,9 +207,6 @@ pub fn write_new_vertex_with_frontier(
             check_deleted_context(txn, workspace, change, verified_frontier, down_vertex)?;
         }
     }
-
-    // Resolve inode for inode_graph indexing
-    let resolved_inode = resolve_inode(txn, &insertion.inode, change_id)?;
 
     // Create edges from predecessors to new span
     // For predecessors, we use find_block_end because predecessors positions
@@ -309,6 +305,62 @@ fn check_deleted_context<T: GraphTxnT>(
 }
 
 // Tests
+
+/// The context vertex at `pos`: one written earlier in this change, else
+/// the inode-scoped lookup (`is_predecessor` selects the end-of-span or
+/// start-of-span reading of `pos`).
+fn context_vertex(
+    txn: &CachedWriteGraphTxn<'_, '_>,
+    workspace: &Workspace,
+    inode: Option<Inode>,
+    pos: Position<NodeId>,
+    is_predecessor: bool,
+) -> Result<GraphNode<NodeId>, LocalApplyError> {
+    match workspace.get_current_vertex(pos, is_predecessor) {
+        Some(vertex) => Ok(vertex),
+        None => resolve_context_vertex_in_inode(txn, inode, pos, is_predecessor),
+    }
+}
+
+/// Resolve a context position through the file's own vertex index first.
+///
+/// A zero-length vertex (an empty file, or a file truncated to nothing)
+/// shares its position with the end of the content serialized before it
+/// and with the start of what follows. The position-only lookups preferred
+/// that empty marker, so appending to a file whose last line was recorded
+/// in the same change as another file's truncation attached the new line
+/// to the truncated file. INODE_GRAPH attributes every vertex to its file:
+/// when it knows a vertex of `inode` at `pos`, that vertex is the context.
+/// Without an inode, or without an index row there, the global lookup
+/// still applies (the bulk insert path writes forward-only rows and adds
+/// the chain's terminal rows separately, so every applied vertex is
+/// indexed under its inode).
+fn resolve_context_vertex_in_inode(
+    txn: &CachedWriteGraphTxn<'_, '_>,
+    inode: Option<Inode>,
+    pos: Position<NodeId>,
+    is_predecessor: bool,
+) -> Result<GraphNode<NodeId>, LocalApplyError> {
+    if let Some(inode) = inode.filter(|_| !pos.change.is_root()) {
+        let found = if is_predecessor {
+            txn.find_block_end_in_inode(inode, pos)
+        } else {
+            txn.find_block_in_inode(inode, pos)
+        }
+        .map_err(|error| LocalApplyError::Internal {
+            message: format!(
+                "failed to resolve context {} in inode {}: {}",
+                pos,
+                inode.get(),
+                error
+            ),
+        })?;
+        if let Some(vertex) = found {
+            return Ok(adjust_for_mid_span(vertex, pos, is_predecessor));
+        }
+    }
+    resolve_context_vertex(txn, pos, is_predecessor)
+}
 
 #[cfg(test)]
 mod tests {

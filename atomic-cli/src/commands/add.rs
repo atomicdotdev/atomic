@@ -703,7 +703,7 @@ fn format_count(count: usize, singular: &str, plural: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+    use serial_test::file_serial;
     use std::path::{Path, PathBuf};
 
     // Add Command Construction Tests
@@ -913,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_outside_repository() {
         let _guard = DirGuard::new();
 
@@ -928,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_file_not_found() {
         let _guard = DirGuard::new();
 
@@ -950,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_single_file() {
         let _guard = DirGuard::new();
 
@@ -974,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_multiple_files() {
         let _guard = DirGuard::new();
 
@@ -999,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_directory() {
         let _guard = DirGuard::new();
 
@@ -1026,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_dry_run() {
         let _guard = DirGuard::new();
 
@@ -1056,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_already_tracked() {
         let _guard = DirGuard::new();
 
@@ -1085,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_with_force() {
         let _guard = DirGuard::new();
 
@@ -1109,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_non_recursive() {
         let _guard = DirGuard::new();
 
@@ -1139,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_all_untracked() {
         let _guard = DirGuard::new();
 
@@ -1164,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_all_no_untracked() {
         let _guard = DirGuard::new();
 
@@ -1190,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_run_nested_directory() {
         let _guard = DirGuard::new();
 
@@ -1221,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_cannot_add_atomic_dir() {
         let _guard = DirGuard::new();
 
@@ -1299,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_with_path_containing_spaces() {
         let _guard = DirGuard::new();
 
@@ -1327,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_with_unicode_filename() {
         let _guard = DirGuard::new();
 
@@ -1355,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_verify_tracking_after_add() {
         let _guard = DirGuard::new();
 
@@ -1384,7 +1384,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_add_dry_run_does_not_track() {
         let _guard = DirGuard::new();
 

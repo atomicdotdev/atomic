@@ -1822,6 +1822,14 @@ impl Repository {
         let mut affected_views = BTreeSet::new();
         for (transition, _) in pending {
             apply_metadata_value_in_write(&mut txn, &transition.target, &transition.expected_new)?;
+            if matches!(
+                transition.target,
+                MetadataTarget::View { .. } | MetadataTarget::ViewChange { .. }
+            ) && txn.kg_writes_enabled()?
+                && txn.project_identity()?.is_some()
+            {
+                self.project_view_kg(&mut txn)?;
+            }
             if let Some(view) = metadata_target_view(&transition.target) {
                 affected_views.insert(view.to_string());
             }

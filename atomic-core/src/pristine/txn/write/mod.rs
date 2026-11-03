@@ -31,8 +31,9 @@ use crate::pristine::{
 };
 
 use super::helpers::{
-    deserialize_conflicts, deserialize_edge, deserialize_view_state, serialize_conflicts,
-    serialize_edge, serialize_view_state, AdjIterator,
+    deserialize_conflicts, deserialize_edge, deserialize_pending_untracks, deserialize_view_state,
+    serialize_conflicts, serialize_edge, serialize_pending_untracks, serialize_view_state,
+    AdjIterator,
 };
 
 const SESSION_LEDGER_SCHEMA_VERSION: u32 = 1;
@@ -95,6 +96,7 @@ fn allocate_shared_inode(next_inode: &AtomicU64) -> PristineResult<Inode> {
 /// Provides read and write access to the pristine database. Only one write
 /// transaction can be active at a time.
 pub struct WriteTxn<'a> {
+    pub(crate) kg_rebuilding: bool,
     pub(crate) txn: WriteTransaction,
     pub(crate) next_node_id: &'a AtomicU64,
     pub(crate) next_view_id: &'a AtomicU64,
@@ -111,6 +113,7 @@ impl<'a> WriteTxn<'a> {
         next_inode: &'a AtomicU64,
     ) -> Self {
         Self {
+            kg_rebuilding: false,
             txn,
             next_node_id,
             next_view_id,
@@ -443,7 +446,11 @@ impl<'a> WriteTxn<'a> {
         }
         record.latest_provenance = Some(turn.provenance_hash);
         record.turn_count = turn.turn_number.saturating_add(1);
-        record.started_at = record.started_at.min(turn.timestamp);
+        if crate::types::timestamp::epoch_millis(turn.timestamp)
+            < crate::types::timestamp::epoch_millis(record.started_at)
+        {
+            record.started_at = turn.timestamp;
+        }
         {
             let mut sessions = self.txn.open_table(SESSIONS)?;
             let bytes = record.to_bytes();
@@ -551,7 +558,11 @@ impl<'a> WriteTxn<'a> {
         record.latest_provenance = turns.last().map(|turn| turn.provenance_hash);
         record.turn_count = turns.len() as u32;
         if let Some(first) = turns.first() {
-            record.started_at = record.started_at.min(first.timestamp);
+            if crate::types::timestamp::epoch_millis(first.timestamp)
+                < crate::types::timestamp::epoch_millis(record.started_at)
+            {
+                record.started_at = first.timestamp;
+            }
         }
         {
             let mut sessions = self.txn.open_table(SESSIONS)?;
@@ -831,7 +842,7 @@ impl<'a> WriteTxn<'a> {
             first_provenance: None,
             latest_provenance: None,
             turn_count: 0,
-            started_at: chrono::Utc::now().timestamp(),
+            started_at: chrono::Utc::now().timestamp_millis(),
             ended_at: None,
             status: crate::change::session::SessionStatus::Active,
         };
@@ -847,6 +858,8 @@ impl<'a> WriteTxn<'a> {
     /// session has no ledger entries yet; otherwise updates only the fields
     /// supplied, preserving ledger data (provenance links, turn count).
     /// `ended_at: None` on a re-entered (resumed) session clears a prior end.
+    /// New `ended_at` values use Unix epoch milliseconds; legacy seconds are
+    /// still accepted without changing historical records.
     pub fn upsert_session_lifecycle(
         &mut self,
         session_id: &str,
@@ -872,7 +885,7 @@ impl<'a> WriteTxn<'a> {
                 first_provenance: None,
                 latest_provenance: None,
                 turn_count: 0,
-                started_at: chrono::Utc::now().timestamp(),
+                started_at: chrono::Utc::now().timestamp_millis(),
                 ended_at: None,
                 status: crate::change::session::SessionStatus::Active,
             },
@@ -942,7 +955,7 @@ impl<'a> WriteTxn<'a> {
                 first_provenance: None,
                 latest_provenance: None,
                 turn_count: 0,
-                started_at: chrono::Utc::now().timestamp(),
+                started_at: chrono::Utc::now().timestamp_millis(),
                 ended_at: None,
                 status: SessionStatus::Active,
             },
@@ -1046,9 +1059,9 @@ impl<'a> WriteTxn<'a> {
     }
 }
 
-/// Format a Unix epoch milliseconds timestamp to RFC-3339 string.
+/// Format an event timestamp, including legacy seconds, to RFC-3339.
 fn format_timestamp_ms(epoch_ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(epoch_ms)
+    crate::types::timestamp::epoch_datetime(epoch_ms)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_else(|| format!("{}", epoch_ms))
 }
@@ -1670,6 +1683,9 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 
         // Remove all persisted conflict state for this view.
         self.del_conflicts_prefix(view.id)?;
+        // Pending untracks are per-view intent: the view is gone, so the
+        // intent to untrack on it is meaningless and must not linger.
+        self.put_pending_untracks(view.id, &[])?;
 
         Ok(())
     }
@@ -1714,6 +1730,17 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         let mut table = self.txn.open_table(CONFLICTS)?;
         for key in &keys {
             table.remove(key)?;
+        }
+        Ok(())
+    }
+
+    fn put_pending_untracks(&mut self, view_id: u64, paths: &[String]) -> PristineResult<()> {
+        let mut table = self.txn.open_table(PENDING_UNTRACKS)?;
+        if paths.is_empty() {
+            table.remove(&view_id)?;
+        } else {
+            let bytes = serialize_pending_untracks(paths)?;
+            table.insert(&view_id, bytes.as_slice())?;
         }
         Ok(())
     }

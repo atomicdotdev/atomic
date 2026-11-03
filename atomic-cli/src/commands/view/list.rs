@@ -789,7 +789,7 @@ pub(crate) fn print_local_json(views: &[JsonView], current_view: Option<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
+    use serial_test::file_serial;
 
     // -------------------------------------------------------------------------
     // Directory Guard for Safe Current Dir Changes
@@ -1098,7 +1098,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_list_default_view() {
         use tempfile::tempdir;
 
@@ -1121,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_list_multiple_views() {
         use tempfile::tempdir;
 
@@ -1147,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_list_verbose() {
         use tempfile::tempdir;
 
@@ -1171,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_list_shows_current_marker() {
         use tempfile::tempdir;
 
@@ -1197,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    #[serial]
+    #[file_serial]
     fn test_list_after_switch() {
         use tempfile::tempdir;
 

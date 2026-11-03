@@ -1,0 +1,9 @@
+{
+  "callers": {
+    "src/foundation.rs#foundation": ["src/service.rs#service"],
+    "src/service.rs#service": ["src/main.rs#main"]
+  },
+  "layers": [
+    {"title": "src", "files": ["src/foundation.rs", "src/main.rs", "src/service.rs"]}
+  ]
+}

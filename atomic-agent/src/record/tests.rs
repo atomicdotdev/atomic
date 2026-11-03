@@ -720,11 +720,12 @@ fn test_provenance_model_fallback_unknown() {
 #[test]
 fn test_provenance_has_timestamp() {
     let session = make_session();
-    let event = make_event();
+    let mut event = make_event();
+    event.timestamp = chrono::DateTime::from_timestamp_millis(1_792_920_379_589).unwrap();
     let options = make_options(&session, &event);
 
     let prov = build_turn_provenance(&options);
-    assert!(prov.timestamp.is_some());
+    assert_eq!(prov.timestamp, Some(1_792_920_379_589));
 }
 
 // build_turn_envelope tests
@@ -839,7 +840,27 @@ fn test_envelope_session_started_at() {
     let options = make_options(&session, &event);
 
     let env = build_turn_envelope(&options, &[]);
-    assert_eq!(env.session_started_at, session.started_at.timestamp());
+    assert_eq!(
+        env.session_started_at,
+        session.started_at.timestamp_millis()
+    );
+}
+
+#[test]
+fn envelope_timing_preserves_subsecond_duration() {
+    let session = make_session();
+    let mut event = make_event();
+    event.timestamp = chrono::DateTime::from_timestamp_millis(1_792_920_379_589).unwrap();
+    let mut options = make_options(&session, &event);
+    options.turn_duration_ms = 489;
+    let envelope = build_turn_envelope(&options, &[]);
+    assert_eq!(envelope.turn_ended_at, 1_792_920_379_589);
+    assert_eq!(envelope.turn_started_at, 1_792_920_379_100);
+    assert_eq!(envelope.turn_duration_ms, 489);
+    assert_eq!(
+        SessionEnvelope::decode(&envelope.encode().unwrap()).unwrap(),
+        envelope
+    );
 }
 
 #[test]

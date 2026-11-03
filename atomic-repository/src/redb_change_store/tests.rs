@@ -42,7 +42,380 @@ fn make_change_with_hunk() -> Change {
     change
 }
 
+#[test]
+fn v2_header_metadata_survives_redb_reopen_export_and_reimport() {
+    use atomic_core::change::{CausalFrontier, ChangeKind, ChangeOrigin};
+    use atomic_core::WorkingCopyId;
+
+    let (dir, store) = temp_store();
+    let mut change = make_test_change("complete header", b"body\n")
+        .with_classification(
+            ChangeKind::Snapshot {
+                working_copy: WorkingCopyId::from_bytes([5; 16]),
+            },
+            Some(Hash::from_bytes([3; 32])),
+            ChangeOrigin::Native,
+            CausalFrontier::empty(),
+        )
+        .unwrap();
+    change.hashed.extra_known = vec![Hash::from_bytes([4; 32])];
+    change.hashed.metadata = vec![0, 0xff, b'\n', b'm'];
+    let mut original = Vec::new();
+    let original_hash = change.serialize(&mut original).unwrap();
+    let hash = store.save_change(&change).unwrap();
+    assert_eq!(&hash, original_hash.as_bytes());
+    drop(store);
+
+    let store = RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+    let loaded = store.load_change(&hash).unwrap();
+    assert_eq!(loaded.hashed, change.hashed);
+    assert_eq!(loaded.contents, change.contents);
+    let exported = store.export_v3_bytes(&hash).unwrap();
+    let (decoded, exported_hash) = Change::deserialize(&mut Cursor::new(&exported)).unwrap();
+    assert_eq!(exported_hash, original_hash);
+    assert_eq!(decoded.hashed, change.hashed);
+
+    let (_receiver_dir, receiver) = temp_store();
+    assert_eq!(receiver.import_v3_bytes(&exported).unwrap(), hash);
+    assert_eq!(receiver.load_change(&hash).unwrap().hashed, change.hashed);
+}
+
+#[test]
+fn v2_git_origin_and_frontier_survive_redb_roundtrip() {
+    use atomic_core::change::{CausalFrontier, ChangeKind, ChangeOrigin, GitDerivation};
+    use atomic_core::{GitHashAlgorithm, GitObjectId};
+
+    let (_dir, store) = temp_store();
+    let oid = |byte| GitObjectId::new(GitHashAlgorithm::Sha1, vec![byte; 20]).unwrap();
+    for (origin, frontier) in [
+        (
+            ChangeOrigin::git_synthesized(oid(1), vec![oid(9), oid(2)], GitDerivation::MultiParent)
+                .unwrap(),
+            CausalFrontier::empty(),
+        ),
+        (
+            ChangeOrigin::git_resolution(oid(1), vec![oid(9), oid(2)]).unwrap(),
+            CausalFrontier::new(vec![Hash::from_bytes([8; 32])]).unwrap(),
+        ),
+    ] {
+        let change = make_change_with_hunk()
+            .with_classification(ChangeKind::Durable, None, origin, frontier)
+            .unwrap();
+        let hash = store.save_change(&change).unwrap();
+        let exported = store.export_v3_bytes(&hash).unwrap();
+        let (loaded, verified_hash) = Change::deserialize(&mut Cursor::new(exported)).unwrap();
+        assert_eq!(verified_hash.as_bytes(), &hash);
+        assert_eq!(loaded.hashed, change.hashed);
+        assert_eq!(loaded.contents, change.contents);
+    }
+}
+
+#[test]
+fn extended_meta_keeps_legacy_prefix_and_legacy_rows_readable() {
+    let (dir, store) = temp_store();
+    let change = make_test_change("legacy-compatible metadata", b"contents");
+    let hash = store.save_change(&change).unwrap();
+    let legacy_meta = {
+        let txn = store.db().begin_read().unwrap();
+        let table = txn.open_table(tables::CHANGE_META).unwrap();
+        let value = table.get(&hash).unwrap().unwrap();
+        let bytes = zstd::decode_all(value.value()).unwrap();
+        // The pre-extension decoder still reads the original prefix.
+        let legacy_meta: StoredChangeMeta = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(legacy_meta.header, change.hashed.header);
+        legacy_meta
+    };
+    // Reproduce the exact row layout written by older stores.
+    let legacy_bytes = postcard::to_allocvec(&legacy_meta).unwrap();
+    let compressed = zstd::encode_all(legacy_bytes.as_slice(), 3).unwrap();
+    let txn = store.db().begin_write().unwrap();
+    txn.open_table(tables::CHANGE_META)
+        .unwrap()
+        .insert(&hash, compressed.as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+    drop(store);
+
+    let store = RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+    assert_eq!(store.load_change(&hash).unwrap().hashed, change.hashed);
+    let exported = store.export_v3_bytes(&hash).unwrap();
+    let (_, exported_hash) = Change::deserialize(&mut Cursor::new(exported)).unwrap();
+    assert_eq!(exported_hash.as_bytes(), &hash);
+}
+
+#[test]
+fn invalid_meta_extensions_do_not_silently_drop_metadata() {
+    let (_dir, store) = temp_store();
+    let change = make_test_change("corrupt extension", b"body");
+    let hash = store.save_change(&change).unwrap();
+    let prefix = postcard::to_allocvec(&store.load_meta(&hash).unwrap()).unwrap();
+    // A truncated V1 extension and an unknown extension version must fail.
+    for suffix in [vec![0], vec![127]] {
+        let mut bytes = prefix.clone();
+        bytes.extend(suffix);
+        let compressed = zstd::encode_all(bytes.as_slice(), 3).unwrap();
+        let txn = store.db().begin_write().unwrap();
+        txn.open_table(tables::CHANGE_META)
+            .unwrap()
+            .insert(&hash, compressed.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        assert!(matches!(
+            store.export_v3_bytes(&hash),
+            Err(RedbStoreError::Corrupt(_))
+        ));
+    }
+}
+
+#[test]
+fn v2_header_survives_database_consolidation() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(crate::Repository::init(dir.path()).unwrap());
+    let dot = dir.path().join(".atomic");
+    std::fs::rename(
+        dot.join(crate::DATABASE_FILE),
+        dot.join(crate::LEGACY_PRISTINE_FILE),
+    )
+    .unwrap();
+    let store = RedbChangeStore::open(dot.join("changes.redb")).unwrap();
+    let mut change = make_test_change("migrated header", b"contents");
+    change.hashed.metadata = b"opaque metadata".to_vec();
+    change.hashed.extra_known = vec![Hash::from_bytes([6; 32])];
+    let hash = store.save_change(&change).unwrap();
+    drop(store);
+
+    let repo = crate::Repository::open(dir.path()).unwrap();
+    assert!(dot.join(crate::DATABASE_FILE).is_file());
+    assert!(!dot.join("changes.redb").exists());
+    let store = repo.redb_change_store().unwrap();
+    assert_eq!(store.load_change(&hash).unwrap().hashed, change.hashed);
+    let exported = store.export_v3_bytes(&hash).unwrap();
+    let (_, exported_hash) = Change::deserialize(&mut Cursor::new(exported)).unwrap();
+    assert_eq!(exported_hash.as_bytes(), &hash);
+}
+
 // ── Basic Operations ───────────────────────────────────────────
+
+fn attachment_change() -> Change {
+    let mut change = make_change_with_hunk();
+    change.unhashed = Some(serde_json::json!({"revision": 1, "source": "原文\r\n"}));
+    change
+        .sign_with("did:atomic:fixture", &[7; 32], 1_720_000_000)
+        .unwrap();
+    change
+}
+
+fn assert_attachment_export(store: &RedbChangeStore, hash: &[u8; 32], expected: &Change) {
+    let exported = store.export_v3_bytes(hash).unwrap();
+    let (loaded, actual_hash) = Change::deserialize(&mut Cursor::new(&exported)).unwrap();
+    assert_eq!(actual_hash.as_bytes(), hash);
+    assert_eq!(loaded.hashed, expected.hashed);
+    assert_eq!(loaded.contents, expected.contents);
+    assert_eq!(loaded.unhashed, expected.unhashed);
+    assert_eq!(loaded.signature, expected.signature);
+    assert_eq!(store.load_unhashed(hash).unwrap(), expected.unhashed);
+    if let Some(signature) = &loaded.signature {
+        let key = atomic_identity::SecretKey::from_bytes(&[7; 32]);
+        atomic_core::change::signing::verify_change_signature(
+            signature,
+            key.public_key().as_bytes(),
+            &actual_hash,
+        )
+        .unwrap();
+    }
+    let mut expected_bytes = Vec::new();
+    expected.serialize(&mut expected_bytes).unwrap();
+    assert_eq!(exported, expected_bytes);
+    let (_dir, receiver) = temp_store();
+    assert_eq!(receiver.import_v3_bytes(&exported).unwrap(), *hash);
+    assert_eq!(receiver.export_v3_bytes(hash).unwrap(), exported);
+}
+
+#[test]
+fn attachment_removal_survives_retry_reopen_and_file_reimport() {
+    for (remove_signature, remove_unhashed) in [(true, false), (false, true), (true, true)] {
+        let (dir, store) = temp_store();
+        let mut change = attachment_change();
+        let hash = store.save_change(&change).unwrap();
+        if remove_signature {
+            change.signature = None;
+        }
+        if remove_unhashed {
+            change.unhashed = None;
+        }
+        for _ in 0..2 {
+            assert_eq!(store.save_change(&change).unwrap(), hash);
+        }
+        drop(store);
+        let store =
+            RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+        assert_attachment_export(&store, &hash, &change);
+        let txn = store.db().begin_read().unwrap();
+        assert_eq!(
+            txn.open_table(tables::CHANGE_SIGNATURES)
+                .unwrap()
+                .get(&hash)
+                .unwrap()
+                .is_none(),
+            remove_signature
+        );
+        assert_eq!(
+            txn.open_table(tables::CHANGE_UNHASHED)
+                .unwrap()
+                .get(&hash)
+                .unwrap()
+                .is_none(),
+            remove_unhashed
+        );
+    }
+}
+
+#[test]
+fn attachment_replacement_keeps_logical_hash_and_exports_current_revision() {
+    let (dir, store) = temp_store();
+    let mut change = attachment_change();
+    let hash = store.save_change(&change).unwrap();
+    change.unhashed = Some(serde_json::json!({"revision": 2}));
+    change
+        .sign_with("did:atomic:fixture", &[7; 32], 1_730_000_000)
+        .unwrap();
+    assert_eq!(store.save_change(&change).unwrap(), hash);
+    assert_eq!(store.save_change(&change).unwrap(), hash);
+    drop(store);
+    let store = RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+    assert_attachment_export(&store, &hash, &change);
+}
+
+#[test]
+fn attachment_rows_are_removed_when_deleting_a_change() {
+    let (_dir, store) = temp_store();
+    let mut change = attachment_change();
+    let hash = store.save_change(&change).unwrap();
+    assert!(store.delete_change(&hash).unwrap());
+    let txn = store.db().begin_read().unwrap();
+    assert!(txn
+        .open_table(tables::CHANGE_SIGNATURES)
+        .unwrap()
+        .get(&hash)
+        .unwrap()
+        .is_none());
+    assert!(txn
+        .open_table(tables::CHANGE_UNHASHED)
+        .unwrap()
+        .get(&hash)
+        .unwrap()
+        .is_none());
+    drop(txn);
+    change.signature = None;
+    change.unhashed = None;
+    assert_eq!(store.save_change(&change).unwrap(), hash);
+    assert_attachment_export(&store, &hash, &change);
+}
+
+#[test]
+fn attachment_export_uses_one_snapshot_across_concurrent_updates() {
+    let (_dir, store) = temp_store();
+    let old = attachment_change();
+    let hash = store.save_change(&old).unwrap();
+    let old_bytes = store.export_v3_bytes(&hash).unwrap();
+    let snapshot = store.db().begin_read().unwrap();
+
+    let mut updated = old.clone();
+    updated.signature = None;
+    updated.unhashed = None;
+    assert_eq!(store.save_change(&updated).unwrap(), hash);
+    assert_eq!(
+        store.export_v3_bytes_in_txn(&snapshot, &hash).unwrap(),
+        old_bytes
+    );
+    assert_attachment_export(&store, &hash, &updated);
+
+    // The same holds in the opposite direction, when attachments are added.
+    let snapshot = store.db().begin_read().unwrap();
+    let new_bytes = store.export_v3_bytes_in_txn(&snapshot, &hash).unwrap();
+    assert_eq!(store.save_change(&old).unwrap(), hash);
+    assert_eq!(
+        store.export_v3_bytes_in_txn(&snapshot, &hash).unwrap(),
+        new_bytes
+    );
+    assert_attachment_export(&store, &hash, &old);
+}
+
+#[test]
+fn extended_header_and_attachments_export_from_the_same_snapshot() {
+    let (_dir, store) = temp_store();
+    let mut original = attachment_change();
+    original.hashed.metadata = b"opaque header metadata".to_vec();
+    original.hashed.extra_known = vec![Hash::from_bytes([6; 32])];
+    original
+        .sign_with("did:atomic:fixture", &[7; 32], 1_720_000_000)
+        .unwrap();
+    let hash = store.save_change(&original).unwrap();
+    assert_attachment_export(&store, &hash, &original);
+
+    let mut without_attachments = original.clone();
+    without_attachments.signature = None;
+    without_attachments.unhashed = None;
+    for (before, after) in [
+        (&original, &without_attachments),
+        (&without_attachments, &original),
+    ] {
+        let snapshot = store.db().begin_read().unwrap();
+        assert_eq!(store.save_change(after).unwrap(), hash);
+
+        let exported = store.export_v3_bytes_in_txn(&snapshot, &hash).unwrap();
+        let mut expected = Vec::new();
+        before.serialize(&mut expected).unwrap();
+        assert_eq!(exported, expected);
+        let (loaded, verified_hash) = Change::deserialize(&mut Cursor::new(exported)).unwrap();
+        assert_eq!(verified_hash.as_bytes(), &hash);
+        assert_eq!(loaded.hashed, before.hashed);
+        assert_eq!(loaded.unhashed, before.unhashed);
+        assert_eq!(loaded.signature, before.signature);
+        assert_attachment_export(&store, &hash, after);
+    }
+}
+
+#[test]
+fn attachment_export_ignores_legacy_rows_after_removal() {
+    let (dir, store) = temp_store();
+    let mut change = attachment_change();
+    let hash = store.save_change(&change).unwrap();
+    // Reproduce old writers: flags changed but attachment rows survived.
+    let mut meta = store.load_meta(&hash).unwrap();
+    meta.has_signature = false;
+    meta.has_unhashed = false;
+    let bytes = postcard::to_allocvec(&meta).unwrap();
+    let compressed = zstd::encode_all(bytes.as_slice(), 3).unwrap();
+    let txn = store.db().begin_write().unwrap();
+    txn.open_table(tables::CHANGE_META)
+        .unwrap()
+        .insert(&hash, compressed.as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+    drop(store);
+    let store = RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+    change.signature = None;
+    change.unhashed = None;
+    assert_attachment_export(&store, &hash, &change);
+}
+
+#[test]
+fn attachment_export_rejects_missing_required_payload_without_overwriting_file() {
+    for table in [tables::CHANGE_SIGNATURES, tables::CHANGE_UNHASHED] {
+        let (dir, store) = temp_store();
+        let hash = store.save_change(&attachment_change()).unwrap();
+        let txn = store.db().begin_write().unwrap();
+        txn.open_table(table).unwrap().remove(&hash).unwrap();
+        txn.commit().unwrap();
+        let destination = dir.path().join("existing.change");
+        std::fs::write(&destination, b"keep existing file").unwrap();
+        let error = store.export_v3_file(&hash, &destination).unwrap_err();
+        assert!(matches!(error, RedbStoreError::Corrupt(_)));
+        assert!(error.to_string().contains("payload"));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"keep existing file");
+    }
+}
 
 #[test]
 fn test_open_creates_tables() {

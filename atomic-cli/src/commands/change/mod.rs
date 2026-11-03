@@ -25,27 +25,30 @@
 //!
 //! ## Default Format
 //!
-//! The default format provides comprehensive information about the change:
+//! The default format groups change metadata and evidence in a terminal tree.
+//! Directory names end in `/`; textual badges describe recorded operations,
+//! without folder emoji or a dependence on color. `--show-hunks` expands the
+//! per-path graph summaries and `--show-deps` includes dependency messages.
 //!
 //! ```text
-//! change ABC123456789012345678901234567890123456789012345678901
-//! Author: Alice <alice@example.com>
-//! Date:   Mon Jan 15 10:30:45 2024 -0500
-//!
-//!     Add authentication module
-//!
-//!     This implements JWT-based authentication for the API.
-//!     Includes token generation and validation.
-//!
-//! Dependencies: 2
-//!   DEF98765... - Initial project setup
-//!   GHI11111... - Add user model
-//!
-//! Files changed: 3
-//!   + src/auth/mod.rs
-//!   + src/auth/jwt.rs
-//!   ~ src/lib.rs
+//! change ABC123456789
+//! ├── Metadata
+//! │   ├── Author: Alice <alice@example.com>
+//! │   └── Date: 2024-01-15 10:30:45
+//! ├── Message
+//! │   └── Add authentication module
+//! ├── Graph: +12 vertices, ~3 edges, 420 bytes
+//! └── Files changed: 3
+//!     └── src/
+//!         ├── auth/
+//!         │   ├── jwt.rs [added]
+//!         │   └── mod.rs [added]
+//!         └── lib.rs [modified]
 //! ```
+//!
+//! Other badges include `[deleted]`, `[moved]`, `[restored]`, `[attributes]`,
+//! `[resolved]` and `[conflicted]`. Unchanged parent directories are grouping
+//! nodes without a badge, not assertions that those directories were changed.
 //!
 //! ## Short Format (-f short)
 //!
@@ -84,8 +87,8 @@
 //! ```
 //!
 //! The `ledger` array carries the causal decision graph(s) explaining the
-//! change (the machine-readable form of the `=== Change Ledger ===` text
-//! section). It is omitted entirely when no provenance graph is recorded.
+//! change (the machine-readable form of the `Change Ledger` tree branch).
+//! It is omitted entirely when no provenance graph is recorded.
 //!
 //! # Change Identification
 //!
@@ -139,14 +142,13 @@ use crate::commands::{
 };
 use crate::error::{CliError, CliResult};
 use crate::output::{
-    author as style_author, emphasis, hash as style_hash, hint, info, path as style_path,
-    timestamp as style_timestamp, truncate_bytes,
+    author as style_author, hash as style_hash, hint, timestamp as style_timestamp, truncate_bytes,
 };
-use console::style;
 
 // Output Format
 
 pub(crate) mod command;
+mod tree;
 pub(crate) mod types;
 
 pub use command::*;

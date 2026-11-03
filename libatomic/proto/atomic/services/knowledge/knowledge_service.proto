@@ -10,6 +10,19 @@ import "atomic/common/options.proto";
 import "atomic/services/knowledge/knowledge_messages.proto";
 
 service KnowledgeService {
+  // Repository-wide workflow inspection; not a view-scoped sandbox query.
+  rpc GetProjectIdentity(GetProjectIdentityRequest) returns (GetProjectIdentityResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "repository.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
+  rpc GetWorkflowSnapshot(GetWorkflowSnapshotRequest) returns (GetWorkflowSnapshotResponse) {
+    option (atomic.execution_scope) = EXECUTION_SCOPE_LOCAL;
+    option (atomic.required_capability) = "knowledge.read";
+    option (atomic.allowed_caller) = CALLER_CLASS_LOCAL;
+    option (atomic.effect) = RPC_EFFECT_REPOSITORY_READ;
+  }
   rpc QueryGraph(QueryGraphRequest) returns (QueryGraphResponse) {
     option (atomic.execution_scope) = EXECUTION_SCOPE_BOTH;
     option (atomic.required_capability) = "knowledge.read";

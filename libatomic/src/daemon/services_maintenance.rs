@@ -31,11 +31,12 @@ fn repair_action(action: i32) -> Result<RepairAction, Status> {
         x if x == Action::RebuildDependencyIndex as i32 => Action::RebuildDependencyIndex,
         x if x == Action::MaterializeCrdt as i32 => Action::MaterializeCrdt,
         x if x == Action::ReindexWorkingCopy as i32 => Action::ReindexWorkingCopy,
+        x if x == Action::RebuildNativeIndexes as i32 => Action::RebuildNativeIndexes,
         _ => {
             return Err(domain_status(
                 ErrorCode::InvalidArgument,
                 "repair action is required (REBUILD_DEPENDENCY_INDEX, MATERIALIZE_CRDT, \
-                 or REINDEX_WORKING_COPY)",
+                 REINDEX_WORKING_COPY, or REBUILD_NATIVE_INDEXES)",
             ))
         }
     })
@@ -68,9 +69,46 @@ impl MaintenanceService for MaintenanceImpl {
         let action = repair_action(request.action)?;
         let force = request.force;
         let view = request.view;
-        let gate_handle = handle.clone();
-        let _gate = gate_handle.exclusive().await;
+        let gate = handle.exclusive_owned().await;
         let result = tokio::task::spawn_blocking(move || -> Result<RepairResponse, Status> {
+            let _gate = gate;
+            if action == RepairAction::RebuildNativeIndexes {
+                // Even opening a writable redb handle can truncate unused tail
+                // pages on close. Refuse missing/corrupt authority before that
+                // open, rather than treating "no committed repair" as read-only.
+                let report = handle
+                    .native_index_repository(true)?
+                    .verify_native_derived_indexes()
+                    .map_err(repository_error)?;
+                if let Some(problem) = report.problems.iter().find(|problem| {
+                    problem.kind == atomic_repository::NativeIndexProblemKind::Unrepairable
+                }) {
+                    return Err(Status::failed_precondition(format!(
+                        "Native derived indexes are unrepairable: {problem}"
+                    )));
+                }
+                if report.is_healthy() {
+                    return Ok(RepairResponse {
+                        native_already_healthy: true,
+                        native_rows_written: report.expected_rows as u64,
+                        ..Default::default()
+                    });
+                }
+                let repo = handle.native_index_repository(false)?;
+                let outcome = repo.repair_native_derived_indexes().map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "Native derived indexes are unrepairable: {error}"
+                    ))
+                })?;
+                return Ok(RepairResponse {
+                    repaired: outcome.problems_repaired as u64,
+                    native_already_healthy: outcome.already_healthy,
+                    native_rows_written: outcome.rows_written as u64,
+                    native_problems_repaired: outcome.problems_repaired as u64,
+                    native_operation: outcome.operation.map(|operation| operation.to_string()),
+                    ..Default::default()
+                });
+            }
             let mut repo = handle.repository()?;
             match action {
                 RepairAction::RebuildDependencyIndex => {
@@ -137,9 +175,12 @@ impl MaintenanceService for MaintenanceImpl {
                         }),
                         skip_samples: outcome.skip_samples.clone(),
                         meta: None,
+                        ..Default::default()
                     })
                 }
-                RepairAction::Unspecified => unreachable!("validated above"),
+                RepairAction::RebuildNativeIndexes | RepairAction::Unspecified => {
+                    unreachable!("handled or validated above")
+                }
             }
         })
         .await

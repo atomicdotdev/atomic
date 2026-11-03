@@ -79,21 +79,21 @@ run_check dependencies cargo tree --locked -p atomic-core --depth 1
 
 if [[ "$full" -eq 1 ]]; then
     run_check pristine cargo test --locked -p atomic-core --lib pristine:: -- --test-threads=4
-    run_check storage cargo test --locked -p atomic-core --test merge_test \
-        -p atomic-repository --test database_lock_exclusivity_test \
-        --test database_open_wait_test --test database_consolidation_bridge_test \
-        --test legacy_database_merge_test --test schema_guard_test \
-        --test provenance_checkpoint_test
+    run_check storage-core cargo test --locked -p atomic-core --test merge_test
+    run_check storage cargo test --locked -p atomic-repository --test it -- \
+        database_lock_exclusivity_test:: database_open_wait_test:: \
+        database_consolidation_shim_test:: legacy_database_merge_test:: \
+        schema_guard_test:: provenance_checkpoint_test::
     run_check libatomic cargo check --locked -p libatomic
 else
     run_check snapshots cargo test --locked -p atomic-core --lib \
         pristine::txn::pristine::snapshot::tests
     run_check exclusion cargo test --locked -p atomic-repository \
-        --test database_lock_exclusivity_test
+        --test it -- database_lock_exclusivity_test::
     run_check lock-waits cargo test --locked -p atomic-repository \
-        --test database_open_wait_test
+        --test it -- database_open_wait_test::
     run_check provenance cargo test --locked -p atomic-repository \
-        --test provenance_checkpoint_test
+        --test it -- provenance_checkpoint_test::
 fi
 
 printf '\nChecks: %s passed, %s failed\nSummary: %s\n' "$passed" "$failed" "$summary"

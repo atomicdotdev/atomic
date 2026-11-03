@@ -1,7 +1,7 @@
 //! View-visible namespace bindings, independent of file content aliveness.
 
 use crate::output::RetrieveOptions;
-use crate::pristine::{GraphTxnT, PristineError};
+use crate::pristine::{GraphTxnT, PathClaimId, PristineError};
 use crate::types::{ChangePosition, EdgeFlags, GraphNode, NodeId, Position};
 
 /// Find live name vertices attached to an inode under a view's change filter.
@@ -20,6 +20,22 @@ pub fn live_inode_names<T: GraphTxnT>(
     inode: Position<NodeId>,
     options: &RetrieveOptions,
 ) -> Result<Vec<GraphNode<NodeId>>, PristineError> {
+    live_inode_names_with_claims(txn, inode, options, &[])
+}
+
+/// Resolve names using exact structural spans already supplied by PATH_CLAIMS.
+///
+/// Claims must come from the current namespace projection. A unique matching
+/// span is used only when its vertex exists. Missing, empty or ambiguous spans
+/// fall back to the ordinary block lookup. All visibility and folder-edge
+/// liveness checks are identical to [`live_inode_names`]. This avoids building
+/// or scanning an entire change's vertex index just to find a known basename.
+pub fn live_inode_names_with_claims<T: GraphTxnT>(
+    txn: &T,
+    inode: Position<NodeId>,
+    options: &RetrieveOptions,
+    claims: &[PathClaimId],
+) -> Result<Vec<GraphNode<NodeId>>, PristineError> {
     let mut names = Vec::new();
     for edge in txn.get_edges(inode.inode_node())? {
         let flags = edge.flag();
@@ -35,10 +51,25 @@ pub fn live_inode_names<T: GraphTxnT>(
         }
         // The predecessor name ends at this position. find_block_end would
         // prefer the empty inode marker at the same position for a FileAdd.
-        let name = txn.find_block(Position::new(
-            end.change,
-            ChangePosition::new(end.pos.get() - 1),
-        ))?;
+        let mut candidates = claims
+            .iter()
+            .filter(|claim| {
+                claim.claimant == inode
+                    && claim.name.change == end.change
+                    && claim.name.end == end.pos
+                    && !claim.name.is_empty()
+            })
+            .map(|claim| claim.name);
+        let exact = candidates
+            .next()
+            .filter(|first| candidates.all(|other| other == *first));
+        let name = match exact {
+            Some(name) if txn.has_vertex(name)? => name,
+            _ => txn.find_block(Position::new(
+                end.change,
+                ChangePosition::new(end.pos.get() - 1),
+            ))?,
+        };
         let mut linked = false;
         let mut unlinked = false;
         // Namespace edges carry BLOCK|FOLDER together. Inspect those flags

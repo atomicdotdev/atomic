@@ -82,18 +82,22 @@ pub fn transferable_binding_refs(git: &git2::Repository) -> Result<Vec<String>, 
         .map_err(|error| format!("cannot enumerate refs: {error}"))?
     {
         let reference = reference.map_err(|error| format!("cannot read ref: {error}"))?;
-        if let Some(name) = reference.name() {
-            if is_transferable_ref(name) {
-                if names.len() >= MAX_TRANSFER_REFS {
-                    return Err(format!(
-                        "the binding ref surface exceeds the transfer bound of \
-                         {MAX_TRANSFER_REFS} refs; the enumeration is bounded and refuses \
-                         instead of feeding an unbounded queue"
-                    ));
-                }
-                names.push(name.to_string());
-            }
+        // Git permits ref names that are not valid UTF-8; such a name cannot
+        // appear in a transferable name list, so it is skipped, not fatal.
+        let Ok(name) = reference.name() else {
+            continue;
+        };
+        if !is_transferable_ref(name) {
+            continue;
         }
+        if names.len() >= MAX_TRANSFER_REFS {
+            return Err(format!(
+                "the binding ref surface exceeds the transfer bound of \
+                 {MAX_TRANSFER_REFS} refs; the enumeration is bounded and refuses \
+                 instead of feeding an unbounded queue"
+            ));
+        }
+        names.push(name.to_string());
     }
     names.sort();
     Ok(names)

@@ -84,8 +84,11 @@ impl FilesystemProvider for SyntheticFilesystem {
         _file: &ObservedFile,
         _path: &RepoPath,
         _filter: &dyn ContentFilter,
-    ) -> Result<Hash, ChangeSourceError> {
-        Ok(Hash::of(CONTENT))
+    ) -> Result<CanonicalContentId, ChangeSourceError> {
+        Ok(CanonicalContentId {
+            cleaned: Hash::of(CONTENT),
+            raw: Hash::of(CONTENT),
+        })
     }
 }
 

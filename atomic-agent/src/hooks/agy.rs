@@ -84,7 +84,7 @@ use serde_json::Value;
 
 use crate::error::{AgentError, AgentResult};
 use crate::event::{HookType, TurnEvent};
-use crate::hooks::AgentHook;
+use crate::hooks::{timestamp::TimestampFormat, AgentHook};
 
 // Constants
 
@@ -244,6 +244,8 @@ impl AgentHook for AgyHook {
                 reason: e.to_string(),
             })?;
 
+        let timestamp = TimestampFormat::Rfc3339.parse(self.name(), hook_type, &raw_json)?;
+
         match hook_type {
             HookType::TurnStart => {
                 // Antigravity: PreInvocation → TurnStart
@@ -318,6 +320,7 @@ impl AgentHook for AgyHook {
                 reason: format!("hook type {:?} is not supported by agy", hook_type),
             }),
         }
+        .map(|event| event.with_timestamp(timestamp))
     }
 
     fn install(&self, _repo_root: &Path) -> AgentResult<usize> {

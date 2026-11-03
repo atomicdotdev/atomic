@@ -107,7 +107,7 @@ inode. Removing and re-adding the file is unnecessary.
 cargo build -p atomic-cli --release
 ATOMIC_BIN="$PWD/target/release/atomic" bash tests/harness/run_all.sh 39 41
 cargo test -p atomic-core -p atomic-repository --lib
-cargo test -p atomic-repository --test causal_file_identity_test
+cargo test -p atomic-repository --test it -- causal_file_identity_test::
 ```
 
 Suite 39 is the unchanged prior view-switch regression. Suite 41 adds the

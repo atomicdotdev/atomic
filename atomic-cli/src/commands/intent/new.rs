@@ -141,10 +141,6 @@ fn create_intent(
 
 impl Command for IntentNew {
     fn run(&self) -> CliResult<()> {
-        if crate::commands::rpc::intent_new(self)? {
-            return Ok(());
-        }
-
         if self.template != "feature" {
             return Err(CliError::InvalidArgument {
                 message: format!(
@@ -154,8 +150,12 @@ impl Command for IntentNew {
             });
         }
 
+        if crate::commands::rpc::intent_new(self)? {
+            return Ok(());
+        }
+
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         let (created, kind) =
             create_intent(&repo, &self.title, &self.kind, self.review.as_deref())?;

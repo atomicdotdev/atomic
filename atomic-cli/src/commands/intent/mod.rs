@@ -11,6 +11,7 @@
 //! ```text
 //! atomic intent validate <ID|path>   Gate an intent against the canonical shapes
 //! atomic intent show <ID>            Render an intent as a read-time projection
+//! atomic intent graph <ID>           Show the intent's semantic change lineage
 //! atomic intent new <TITLE>          Scaffold a directive-based intent
 //! atomic intent attest <ID>          Sign an intent into a tracked attestation entry
 //! atomic intent verify <ID>          Verify a signed intent's attestation
@@ -40,6 +41,7 @@ pub mod bridge {
     pub use atomic_repository::intent_bridge::*;
 }
 pub mod delete;
+pub mod graph;
 pub mod key_cache;
 pub mod link;
 pub mod list;
@@ -51,6 +53,7 @@ pub mod verify;
 
 pub use attest::IntentAttest;
 pub use delete::IntentDelete;
+pub use graph::IntentGraph;
 pub use link::IntentLink;
 pub use list::IntentList;
 pub use new::IntentNew;
@@ -69,8 +72,11 @@ pub enum IntentCommands {
     /// Validate an intent against the canonical shapes (the authoring gate).
     Validate(IntentValidate),
 
-    /// Show an intent as a rendered read-time projection.
+    /// Show an intent as a complete terminal tree (--json for canonical JSON-LD).
     Show(IntentShow),
+
+    /// Show an intent tree (--details expands evidence; --html opens a browser graph).
+    Graph(IntentGraph),
 
     /// Scaffold a new directive-based intent into the vault.
     New(IntentNew),
@@ -112,6 +118,7 @@ impl Command for Intent {
         match &self.command {
             IntentCommands::Validate(cmd) => cmd.run(),
             IntentCommands::Show(cmd) => cmd.run(),
+            IntentCommands::Graph(cmd) => cmd.run(),
             IntentCommands::New(cmd) => cmd.run(),
             IntentCommands::Attest(cmd) => cmd.run(),
             IntentCommands::Verify(cmd) => cmd.run(),

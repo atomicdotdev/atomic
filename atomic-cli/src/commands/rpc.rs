@@ -22,12 +22,14 @@ use std::path::{Path, PathBuf};
 
 use atomic_client::proto as pb;
 use atomic_core::types::{Base32, Merkle};
+use atomic_repository::intent_evidence;
 use libatomic::atomic::attestation_target::Kind as TargetKind;
 use libatomic::atomic::update_vault_entity_request::Update as UpdateKind;
 use libatomic::atomic::verify_attestation_request::Target as VerifyTarget;
 use libatomic::atomic::VaultEntityKind as Kind;
 use libatomic::atomic::VaultEntityStatus as Status;
 
+use crate::commands::intent::validation_failed;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_info, print_success, print_warning};
 use crate::service::{status_message, Service};
@@ -145,7 +147,7 @@ fn memory_sources(bundle: &EntryBundle) -> crate::commands::memory::bridge::Atte
 fn kg_node_domain(node: &pb::KgNode) -> atomic_core::pristine::vault::KgNode {
     atomic_core::pristine::vault::KgNode {
         id: node.id.clone(),
-        kind: node.node_type.clone(),
+        types: node.types.clone(),
         label: node.name.clone().unwrap_or_default(),
         summary: node
             .data
@@ -160,16 +162,21 @@ fn kg_node_domain(node: &pb::KgNode) -> atomic_core::pristine::vault::KgNode {
 }
 
 /// Wire KGEdge → the domain edge.
-fn kg_edge_domain(edge: &pb::KgEdge) -> atomic_core::pristine::vault::KgEdge {
-    atomic_core::pristine::vault::KgEdge {
+fn kg_edge_domain(edge: &pb::KgEdge) -> CliResult<atomic_core::pristine::vault::KgEdge> {
+    Ok(atomic_core::pristine::vault::KgEdge {
         from_id: edge.source.clone(),
         to_id: edge.target.clone(),
-        kind: edge.relation.clone(),
+        kind: atomic_core::kg::ontology::Predicate::from_iri(&edge.relation).ok_or_else(|| {
+            CliError::Internal(anyhow::anyhow!(
+                "unknown canonical predicate from service: {}",
+                edge.relation
+            ))
+        })?,
         metadata: edge
             .metadata
             .as_ref()
             .and_then(|metadata| serde_json::from_slice(metadata).ok()),
-    }
+    })
 }
 
 pub(crate) fn request_meta() -> Option<pb::RequestMeta> {
@@ -534,6 +541,9 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
                     Ok(pb::FileStatus::Conflicted) => {
                         atomic_repository::status::FileStatus::Conflicted
                     }
+                    Ok(pb::FileStatus::PendingUntrack) => {
+                        atomic_repository::status::FileStatus::PendingUntrack
+                    }
                     _ => atomic_repository::status::FileStatus::Clean,
                 };
                 (status, file.path.clone())
@@ -658,15 +668,34 @@ pub fn intent_new(args: &super::intent::new::IntentNew) -> CliResult<bool> {
         developer: None,
         intent: None,
         model: None,
+        intent_kind: Some(args.kind.clone()),
+        review_target: args.review.clone(),
         view: None,
         expected_snapshot: None,
     };
     let response = session.create_vault_entity(request)?;
     let entry = response.entry.expect("created entry");
+    let expected_kind = if args.review.is_some() {
+        "review"
+    } else {
+        &args.kind
+    };
+    if expected_kind != "feature" && entry.manifest_kind.as_deref() != Some(expected_kind) {
+        return Err(CliError::Internal(anyhow::anyhow!(
+            "intent {} was created, but the service did not confirm kind '{}'; upgrade the service and inspect the intent",
+            entry.id, expected_kind
+        )));
+    }
     println!("Created intent: {}", entry.id);
     println!("  file: {}", entry.vault_path.clone().unwrap_or_default());
     println!("  template: {}", args.template);
-    println!("  kind: {}", args.kind);
+    println!(
+        "  kind: {}",
+        entry.manifest_kind.as_deref().unwrap_or(&args.kind)
+    );
+    if let Some(target) = &args.review {
+        println!("  reviews: {target}");
+    }
     Ok(true)
 }
 
@@ -860,6 +889,10 @@ pub fn intent_attest(args: &super::intent::attest::IntentAttest) -> CliResult<bo
     };
     let response = session.record_attestation(request)?;
     let info = response.attestation.expect("recorded attestation");
+    if args.json {
+        print_attestation_json(&session, &info)?;
+        return Ok(true);
+    }
     println!("Attested intent: {}", info.id);
     println!(
         "  vault:     {}",
@@ -874,6 +907,33 @@ pub fn intent_attest(args: &super::intent::attest::IntentAttest) -> CliResult<bo
     Ok(true)
 }
 
+fn print_attestation_json(session: &Service, info: &pb::AttestationInfo) -> CliResult<()> {
+    let path = info.vault_path.as_deref().ok_or_else(|| {
+        CliError::Internal(anyhow::anyhow!("the service returned no attestation path"))
+    })?;
+    let response = session.get_vault_entry(pb::GetVaultEntryRequest {
+        repository: Some(session.reference.clone()),
+        kind: Kind::Unspecified as i32,
+        id: String::new(),
+        path: Some(path.trim_start_matches(".vault/").to_string()),
+        include_bundle: true,
+        view: None,
+    })?;
+    let bundle = response.entry_bundle.as_ref().ok_or_else(|| {
+        CliError::Internal(anyhow::anyhow!(
+            "the service returned no attestation bundle"
+        ))
+    })?;
+    let bundle = parse_entry_bundle(bundle)?;
+    let node: serde_json::Value = serde_json::from_slice(&bundle.entry.content_bytes)
+        .map_err(|error| CliError::Internal(anyhow::anyhow!("attested node: {error}")))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&node).map_err(|error| CliError::Internal(error.into()))?
+    );
+    Ok(())
+}
+
 pub fn intent_validate(args: &super::intent::validate::IntentValidate) -> CliResult<bool> {
     // Path-arg form reads a file, no redb — stays local.
     if args.id_or_path.ends_with(".md") || args.id_or_path.contains('/') {
@@ -882,7 +942,193 @@ pub fn intent_validate(args: &super::intent::validate::IntentValidate) -> CliRes
     let Some(session) = Service::open()? else {
         return Ok(false);
     };
+    // Evidence replay needs the manifest and checker on the service host; the
+    // handler owns the pins, the ordinary gate, and the post-checker freshness
+    // read. The local body remains the fallback when no service session exists.
+    if args.evidence_context || args.replay_evidence.is_some() {
+        return replay_evidence(&session, args);
+    }
     validate_entity(&session, Kind::Intent, &args.id_or_path, args.json)
+}
+
+fn replay_evidence(
+    session: &Service,
+    args: &super::intent::validate::IntentValidate,
+) -> CliResult<bool> {
+    let (manifest, manifest_base) = match &args.replay_evidence {
+        Some(path) => {
+            let bytes = intent_evidence::read_manifest(path).map_err(evidence_cli_error)?;
+            // Relative artifact roots must resolve against the manifest's
+            // directory on the service host, not the service process's cwd.
+            let absolute = std::path::absolute(path).map_err(CliError::Io)?;
+            let base = absolute.parent().unwrap_or_else(|| Path::new("."));
+            (bytes, base.display().to_string())
+        }
+        None => (Vec::new(), String::new()),
+    };
+    let request = pb::ReplayVaultEvidenceRequest {
+        repository: Some(session.reference.clone()),
+        kind: Kind::Intent as i32,
+        id: args.id_or_path.clone(),
+        evidence_context: true,
+        manifest,
+        manifest_base,
+        checker: args
+            .evidence_checker
+            .as_ref()
+            .map(|path| {
+                std::path::absolute(path)
+                    .unwrap_or_else(|_| path.clone())
+                    .display()
+                    .to_string()
+            })
+            .unwrap_or_default(),
+        view: None,
+    };
+    let response = session
+        .replay_vault_evidence(request)
+        .map_err(validation_refusal)?;
+
+    let context = response
+        .evidence_context
+        .as_ref()
+        .map(evidence_context_json);
+    let replay = response.evidence_replay.as_ref().map(evidence_replay_json);
+    let mut results: Vec<serde_json::Value> = response
+        .issues
+        .iter()
+        .map(|message| serde_json::json!({ "message": message }))
+        .collect();
+    if let Some(report) = &response.evidence_replay {
+        for decision in &report.decisions {
+            if decision.decision != "supported" {
+                results.push(serde_json::json!({
+                    "focus_node": decision.criterion_id,
+                    "shape": "EvidenceReplay",
+                    "path": "evidence",
+                    "message": format!(
+                        "{}: {} ({})",
+                        decision.claim_type, decision.decision, decision.reason
+                    ),
+                }));
+            }
+        }
+        if report.freshness_changed {
+            let focus = response
+                .evidence_context
+                .as_ref()
+                .map(|context| context.intent_id.as_str())
+                .unwrap_or_default();
+            results.push(serde_json::json!({
+                "focus_node": focus,
+                "shape": "EvidenceReplayFreshness",
+                "path": serde_json::Value::Null,
+                "message": "intent substance or view chain changed during evidence replay",
+            }));
+        }
+    }
+    let conforms = response.valid;
+
+    if args.json {
+        let mut output = serde_json::json!({
+            "conforms": conforms,
+            "results": results,
+        });
+        if let Some(context) = context {
+            output["evidence_context"] = context;
+        }
+        if let Some(replay) = replay {
+            output["evidence_replay"] = replay;
+        }
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    } else {
+        if conforms {
+            println!("conforms: yes");
+        } else {
+            println!("conforms: no ({} violation(s))", results.len());
+            for result in &results {
+                if let Some(message) = result["message"].as_str() {
+                    println!("  ✗ {message}");
+                }
+            }
+        }
+        if let Some(report) = &response.evidence_replay {
+            for decision in &report.decisions {
+                println!(
+                    "  evidence {}: {} ({})",
+                    decision.claim_type, decision.decision, decision.reason
+                );
+            }
+            if report.freshness_changed {
+                println!("  evidence replay: intent or view chain changed during replay");
+            }
+        }
+    }
+
+    if conforms {
+        Ok(true)
+    } else {
+        Err(validation_failed(format!(
+            "intent does not conform ({} violation(s))",
+            results.len()
+        )))
+    }
+}
+
+/// Evidence refusals over the wire are user-fixable gate errors (exit 2), not
+/// generic service refusals (exit 1).
+fn validation_refusal(error: CliError) -> CliError {
+    match error {
+        CliError::ServiceRefusal { message } if message.contains("atomic:INVALID_ARGUMENT:") => {
+            validation_failed(message)
+        }
+        other => other,
+    }
+}
+
+fn evidence_cli_error(error: intent_evidence::EvidenceError) -> CliError {
+    match error {
+        intent_evidence::EvidenceError::Repository(error) => CliError::Repository(error),
+        intent_evidence::EvidenceError::Io(error) => CliError::Io(error),
+        other => validation_failed(other.to_string()),
+    }
+}
+
+fn evidence_context_json(context: &pb::EvidenceContext) -> serde_json::Value {
+    serde_json::json!({
+        "intent_id": context.intent_id,
+        "intent_substance_hash": context.intent_substance_hash,
+        "intent_source_hash": context.intent_source_hash,
+        "view_chain": context
+            .view_chain
+            .iter()
+            .map(|pin| serde_json::json!({
+                "name": pin.name,
+                "merkle": pin.merkle,
+                "scope": pin.scope,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn evidence_replay_json(replay: &pb::EvidenceReplay) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": replay.schema_version,
+        "decisions": replay
+            .decisions
+            .iter()
+            .map(|decision| serde_json::json!({
+                "schema_version": decision.schema_version,
+                "request_digest": decision.request_digest,
+                "criterion_id": decision.criterion_id,
+                "claim_type": decision.claim_type,
+                "decision": decision.decision,
+                "reason": decision.reason,
+                "details": serde_json::from_str::<serde_json::Value>(&decision.details_json)
+                    .unwrap_or(serde_json::Value::Null),
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 pub fn intent_verify(args: &super::intent::verify::IntentVerify) -> CliResult<bool> {
@@ -948,6 +1194,8 @@ pub fn intent_list(args: &super::intent::list::IntentList) -> CliResult<bool> {
         entry_type: None,
         status_filter: None,
         tool_result_previews: false,
+        sort: Some(args.sort.wire() as i32),
+        reverse: args.reverse,
     };
     let response = session.list_vault_entries(request)?;
     let mut rows = response
@@ -957,6 +1205,11 @@ pub fn intent_list(args: &super::intent::list::IntentList) -> CliResult<bool> {
         .collect::<Vec<_>>();
     if let Some(kind) = &filter {
         rows.retain(|row| &row.kind == kind);
+    }
+    // This request is unbudgeted and returns the full intent listing. Keep the
+    // existing wire ID order for older services, then apply the new CLI sort.
+    if args.sort == super::intent::list::IntentSort::HumanKey {
+        super::intent::list::sort_rows(&mut rows, args.sort, args.reverse);
     }
     super::intent::list::IntentList::render(&rows, args.json);
     Ok(true)
@@ -1058,11 +1311,24 @@ pub fn memory_new(args: &super::memory::new::MemoryNew) -> CliResult<bool> {
         developer: None,
         intent: None,
         model: None,
+        intent_kind: None,
+        review_target: None,
         view: None,
         expected_snapshot: None,
     };
     let response = session.create_vault_entity(request)?;
     let entry = response.entry.expect("created entry");
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "id": entry.id,
+                "file": entry.vault_path.unwrap_or_default(),
+                "kind": args.kind,
+            })
+        );
+        return Ok(true);
+    }
     println!("Created memory: {}", entry.id);
     println!("  file: {}", entry.vault_path.clone().unwrap_or_default());
     println!("  kind: {}", args.kind);
@@ -1087,6 +1353,10 @@ pub fn memory_attest(args: &super::memory::attest::MemoryAttest) -> CliResult<bo
     };
     let response = session.record_attestation(request)?;
     let info = response.attestation.expect("recorded attestation");
+    if args.json {
+        print_attestation_json(&session, &info)?;
+        return Ok(true);
+    }
     println!("Attested memory: {}", info.id);
     println!(
         "  vault:     {}",
@@ -1165,6 +1435,8 @@ pub fn memory_list(args: &super::memory::list::MemoryList) -> CliResult<bool> {
         entry_type: None,
         status_filter: None,
         tool_result_previews: false,
+        sort: Some(args.sort.wire() as i32),
+        reverse: args.reverse,
     };
     let response = session.list_vault_entries(request)?;
     let rows = response
@@ -1184,9 +1456,8 @@ pub fn memory_list(args: &super::memory::list::MemoryList) -> CliResult<bool> {
 /// `atomic vault query search` over QueryGraph (KgSearch) — every form:
 /// the wire's KGNode now carries the full domain fields (source,
 /// metadata), so the JSON serializes the same shape the local body
-/// emits; `--kind` rides the request (the handler filters the candidate
-/// pool server-side, taking the limit after the filter — the local
-/// post-filter order) and `--pool` names the candidate pool. The plain
+/// emits; `--kind` rides the request (the repository filters projected nodes
+/// before ranking/pool limits) and `--pool` names the retention budget. The plain
 /// render reads the same kind/id/summary columns.
 pub fn query_search(args: &super::query::QueryNodes) -> CliResult<bool> {
     let Some(session) = Service::open()? else {
@@ -1225,7 +1496,12 @@ pub fn query_search(args: &super::query::QueryNodes) -> CliResult<bool> {
         } else {
             format!("  {}", super::query::truncate_display(summary, 60))
         };
-        println!("  [{}] {}{}", node.kind, node.id, summary_display);
+        println!(
+            "  [{}] {}{}",
+            atomic_core::kg::ontology::compact(node.primary_type()),
+            node.id,
+            summary_display
+        );
     }
     println!("\n{} result(s).", nodes.len());
     Ok(true)
@@ -1309,6 +1585,7 @@ pub fn query_enrich(args: &super::query::QueryEnrich) -> CliResult<bool> {
         action: pb::KnowledgeMaintainAction::Enrich as i32,
         scope: args.rebuild.then(|| "rebuild".to_string()),
         changes,
+        ..Default::default()
     };
     let response = session.maintain_knowledge_graph(request)?;
     if !args.changes.is_empty() {
@@ -1555,6 +1832,8 @@ pub fn vault_list(args: &super::vault::list::List) -> CliResult<bool> {
         entry_type: type_filter.map(|kind| kind.to_string()),
         status_filter: None,
         tool_result_previews: false,
+        sort: None,
+        reverse: false,
     };
     let response = session.list_vault_entries(request)?;
     let rows = response
@@ -2601,6 +2880,8 @@ pub fn vault_goal_list(args: &super::vault::goal::GoalList) -> CliResult<bool> {
         entry_type: None,
         status_filter: Some(args.status.clone()),
         tool_result_previews: false,
+        sort: None,
+        reverse: false,
     };
     let response = session.list_vault_entries(request)?;
     let rows = response
@@ -2650,7 +2931,7 @@ pub fn query_neighbors(args: &super::query::QueryNeighbors) -> CliResult<bool> {
         .edges
         .iter()
         .map(kg_edge_domain)
-        .collect::<Vec<_>>();
+        .collect::<CliResult<Vec<_>>>()?;
     if args.json {
         let subgraph = atomic_core::pristine::vault::KgSubgraph { nodes, edges };
         println!("{}", serde_json::to_string_pretty(&subgraph).unwrap());
@@ -2668,7 +2949,12 @@ pub fn query_neighbors(args: &super::query::QueryNeighbors) -> CliResult<bool> {
         } else {
             format!("  {}", super::query::truncate_display(summary, 50))
         };
-        println!("  [{}] {}{}", node.kind, node.id, summary_display);
+        println!(
+            "  [{}] {}{}",
+            atomic_core::kg::ontology::compact(node.primary_type()),
+            node.id,
+            summary_display
+        );
     }
     println!("\nEdges ({}):", edges.len());
     for edge in &edges {
@@ -2683,6 +2969,39 @@ pub fn query_neighbors(args: &super::query::QueryNeighbors) -> CliResult<bool> {
 // ---------------------------------------------------------------------------
 // doctor (MaintenanceService)
 // ---------------------------------------------------------------------------
+
+/// Native repair refuses unrepairable authority in a read-only handler preflight.
+pub fn doctor_repair_native_indexes() -> CliResult<()> {
+    let root = super::find_repository_root()?;
+    let session = Service::open_root(&root)?.ok_or_else(|| CliError::InvalidArgument {
+        message: "native-index repair requires a local repository service".into(),
+    })?;
+    print_info("Rebuilding native derived indexes from graph authority...");
+    let outcome = session.repair(pb::RepairRequest {
+        repository: Some(session.reference.clone()),
+        meta: request_meta(),
+        action: pb::RepairAction::RebuildNativeIndexes as i32,
+        force: false,
+        view: String::new(),
+    })?;
+    if outcome.native_already_healthy {
+        print_success(&format!(
+            "Native derived indexes are already consistent ({} rows).",
+            outcome.native_rows_written
+        ));
+    } else {
+        print_success(&format!(
+            "Repaired {} native derived-index problem(s); wrote {} rows atomically{}.",
+            outcome.native_problems_repaired,
+            outcome.native_rows_written,
+            outcome
+                .native_operation
+                .map(|operation| format!("; journaled as operation {operation}"))
+                .unwrap_or_default()
+        ));
+    }
+    Ok(())
+}
 
 /// `atomic doctor check` over CheckRepository — the read-only consistency
 /// check. Rendered to mirror the in-process path exactly (non-zero exit
@@ -2838,13 +3157,77 @@ pub fn remove(args: &super::remove::Remove) -> CliResult<bool> {
         keep_working_copy: !args.delete || args.keep,
         dry_run: args.dry_run,
         force: args.force,
+        untrack_only: args.keep,
     };
     let response = session.remove_files(request)?;
+    let dirty = response
+        .refusals
+        .iter()
+        .filter(|refusal| refusal.reason == "uncommitted-edits")
+        .map(|refusal| refusal.path.clone())
+        .collect::<Vec<_>>();
+
     if args.dry_run {
-        println!("Would remove {} file(s) from tracking", response.removed);
+        println!(
+            "Would remove {} file(s) from tracking",
+            response.removed as usize
+                + response.pending_deletions.len()
+                + response.pending_untracks.len()
+        );
+        for pending in &response.pending_deletions {
+            println!("Would delete recorded path: {pending} (then 'atomic record' it)");
+        }
+        for pending in &response.pending_untracks {
+            println!("Would stage untrack of {pending}: bytes kept; 'atomic record' completes it");
+        }
+        for path in &dirty {
+            println!("Would refuse {path}: it has uncommitted edits (--force to discard)");
+        }
         return Ok(true);
     }
-    println!("Removed {} file(s) from tracking", response.removed);
+
+    if response.removed > 0 {
+        println!("Untracked {} file(s)", response.removed);
+    }
+    if !response.pending_deletions.is_empty() {
+        println!(
+            "Removed {} recorded file(s) from the working copy",
+            response.pending_deletions.len()
+        );
+    }
+    if !response.pending_untracks.is_empty() {
+        println!(
+            "Staged untrack of {} recorded file(s); bytes kept",
+            response.pending_untracks.len()
+        );
+    }
+    if !response.pending_deletions.is_empty() || !response.pending_untracks.is_empty() {
+        println!();
+        println!("Hint: Run 'atomic record' to record these deletions and stop tracking them");
+    }
+    if !response.failed_deletions.is_empty() {
+        super::remove::print_failed_deletions(&response.failed_deletions);
+    }
+    if response.removed == 0
+        && response.pending_deletions.is_empty()
+        && response.pending_untracks.is_empty()
+        && response.failed_deletions.is_empty()
+        && dirty.is_empty()
+    {
+        println!("Nothing to remove");
+    }
+    if !dirty.is_empty() {
+        return Err(CliError::InvalidArgument {
+            message: super::remove::refusal_message(&dirty),
+        });
+    }
+    // A path whose bytes are still on disk was not removed, so the command did
+    // not do what it reported: fail instead of counting it as a success.
+    if !response.failed_deletions.is_empty() {
+        return Err(super::remove::failed_deletions_error(
+            response.failed_deletions.len(),
+        ));
+    }
     Ok(true)
 }
 
@@ -5809,6 +6192,8 @@ pub fn vault_goal_start(args: &super::vault::goal::GoalStart) -> CliResult<bool>
         developer: args.developer.clone(),
         intent: args.intent.clone(),
         model: args.model.clone(),
+        intent_kind: None,
+        review_target: None,
         view: None,
         expected_snapshot: None,
     };
@@ -6003,6 +6388,8 @@ pub fn vault_summaries(args: &super::vault::summaries::Summaries) -> CliResult<b
         entry_type: None,
         status_filter: None,
         tool_result_previews: true,
+        sort: None,
+        reverse: false,
     };
     let response = session.list_vault_entries(request)?;
     let mut summaries = serde_json::Map::new();
@@ -6103,13 +6490,9 @@ pub fn query_graph(args: &super::query::QueryGraph) -> CliResult<bool> {
         .edges
         .iter()
         .map(kg_edge_domain)
-        .collect::<Vec<_>>();
-    if nodes.is_empty() {
-        if args.json {
-            println!("{{\"nodes\":[],\"edges\":[]}}");
-        } else {
-            eprintln!("No results for {:?} (kinds: {}).", args.query, args.kinds);
-        }
+        .collect::<CliResult<Vec<_>>>()?;
+    if nodes.is_empty() && !args.json {
+        eprintln!("No results for {:?} (kinds: {}).", args.query, args.kinds);
         return Ok(true);
     }
     // Cap note: the wire carries only the final set; the note's collected
@@ -6181,9 +6564,8 @@ pub fn query_graph(args: &super::query::QueryGraph) -> CliResult<bool> {
     Ok(true)
 }
 
-/// `atomic query callers` over QueryGraph (Callers) — the handler filters
-/// the 1-hop subgraph to CALLS edges at the entity; the CLI renders the
-/// local caller lines and hints.
+/// `atomic query callers` over QueryGraph (Callers) — the handler resolves
+/// calls from the selected view's recorded source; the CLI renders callers.
 pub fn query_callers(args: &super::query::QueryCallers) -> CliResult<bool> {
     let Some(session) = Service::open()? else {
         return Ok(false);
@@ -6197,60 +6579,69 @@ pub fn query_callers(args: &super::query::QueryCallers) -> CliResult<bool> {
         view: None,
     };
     let response = session.query_graph(request)?;
-    let caller_nodes = response
-        .nodes
-        .iter()
-        .map(kg_node_domain)
-        .collect::<Vec<_>>();
-    let caller_edges = response
-        .edges
-        .iter()
-        .map(kg_edge_domain)
-        .collect::<Vec<_>>();
+    let callers: Vec<_> = response
+        .callers
+        .into_iter()
+        .map(|caller| atomic_repository::repository::Caller {
+            path: caller.path,
+            name: caller.name,
+            line: caller.line,
+            summary: caller.summary,
+        })
+        .collect();
+    super::query::render_callers(&args.entity_id, &callers, args.json)?;
+    Ok(true)
+}
 
-    if args.json {
-        let out: Vec<serde_json::Value> = caller_edges
-            .iter()
-            .map(|edge| {
-                let node = caller_nodes.iter().find(|node| node.id == edge.from_id);
-                serde_json::json!({
-                    "caller_id": edge.from_id,
-                    "summary": node.and_then(|node| node.summary.as_deref()),
-                })
+/// `query code` uses the same graph-filtered read over both local-service and
+/// reactor transports. Preserve the complete domain JSON/human render.
+pub fn query_code(args: &super::query::QueryCode) -> CliResult<bool> {
+    let Some(session) = Service::open()? else {
+        return Ok(false);
+    };
+    let response = session.query_graph(pb::QueryGraphRequest {
+        repository: Some(session.reference.clone()),
+        query: Some(pb::query_graph_request::Query::ContentSearch(
+            pb::ContentSearchQuery {
+                query: args.pattern.clone(),
+                paths: Vec::new(),
+                path_filter: args.path_filter.clone(),
+                file_type: args.file_type.clone(),
+                exclude_type: None,
+                case_insensitive: args.case_insensitive,
+                max_results: Some(u32::try_from(args.max_results).map_err(|_| {
+                    CliError::Internal(anyhow::anyhow!("max-results exceeds the RPC limit"))
+                })?),
+            },
+        )),
+        ..Default::default()
+    })?;
+    let result = response.content_result.ok_or_else(|| {
+        CliError::Internal(anyhow::anyhow!(
+            "the service returned no content search result"
+        ))
+    })?;
+    let result = atomic_repository::ContentSearchResult {
+        matches: result
+            .matches
+            .into_iter()
+            .map(|m| atomic_repository::ContentMatch {
+                path: m.path,
+                line_number: m.line_number,
+                line_content: m.line_content,
+                byte_offset: m.byte_offset,
+                submatch_start: m.submatch_start as usize,
+                submatch_end: m.submatch_end as usize,
             })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&out).unwrap());
-        return Ok(true);
-    }
-
-    if caller_edges.is_empty() {
-        println!("No callers found for '{}'.", args.entity_id);
-        if !response.calls_present {
-            println!(
-                "Hint: run `atomic vault query enrich` to populate CALLS edges, \
-                then retry."
-            );
-        } else {
-            println!("This function is an entry point — nothing in the repo calls it.");
-        }
-    } else {
-        println!("{} caller(s) of {}:\n", caller_edges.len(), args.entity_id);
-        for edge in &caller_edges {
-            let display = if let Some(rest) = edge.from_id.strip_prefix("entity:") {
-                let last = rest.rfind(':').unwrap_or(rest.len());
-                let inner = &rest[..last];
-                let sig = caller_nodes
-                    .iter()
-                    .find(|node| node.id == edge.from_id)
-                    .and_then(|node| node.summary.as_deref())
-                    .map(|summary| format!("  [{}]", summary));
-                format!("  {}{}", inner, sig.unwrap_or_default())
-            } else {
-                format!("  {}", edge.from_id)
-            };
-            println!("{display}");
-        }
-    }
+            .collect(),
+        total_matches: result.total_matches as usize,
+        dir_facets: result
+            .dir_facets
+            .into_iter()
+            .map(|facet| (facet.path, facet.count as usize))
+            .collect(),
+    };
+    super::query::print_code_result(&result, args.json)?;
     Ok(true)
 }
 
@@ -6305,7 +6696,11 @@ pub fn query_plan(args: &super::query::PlanExec) -> CliResult<bool> {
         if !result.nodes.is_empty() {
             println!("\nNodes ({}):", result.nodes.len());
             for node in &result.nodes {
-                print!("  [{}] {}", node.kind, node.label);
+                print!(
+                    "  [{}] {}",
+                    atomic_core::kg::ontology::compact(node.primary_type()),
+                    node.label
+                );
                 if let Some(summary) = &node.summary {
                     let short: String = summary.chars().take(60).collect();
                     print!(": {}", short);
@@ -6417,6 +6812,7 @@ pub fn query_embed(args: &super::query::QueryEmbed) -> CliResult<bool> {
         action: pb::KnowledgeMaintainAction::Embed as i32,
         scope: args.path.clone(),
         changes: Vec::new(),
+        ..Default::default()
     };
     let response = session.maintain_knowledge_graph(request)?;
     println!(
@@ -6439,20 +6835,141 @@ pub fn query_embed(args: &super::query::QueryEmbed) -> CliResult<bool> {
 
 /// `atomic query reindex` over MaintainKnowledgeGraph (REINDEX) — the
 /// handler runs vault_reindex_kg; the CLI prints the local report.
-pub fn query_reindex() -> CliResult<bool> {
-    let Some(session) = Service::open()? else {
-        return Ok(false);
+pub fn query_reindex(full: bool) -> CliResult<()> {
+    let root = super::find_repository_root()?;
+    let session = Service::open_root(&root)?.ok_or_else(|| CliError::InvalidArgument {
+        message: "knowledge graph reindex requires a local repository service".into(),
+    })?;
+    let remote = match sync_resolve_remote(&session, &None) {
+        Ok((_, url)) => Some(url),
+        Err(CliError::RemoteNotFound { .. }) => None,
+        Err(error) => return Err(error),
     };
+    let signer_auth_headers = remote
+        .as_deref()
+        .map(|url| sync_auth_headers(url, None))
+        .unwrap_or_default();
     let request = pb::MaintainKnowledgeGraphRequest {
         repository: Some(session.reference.clone()),
         meta: request_meta(),
         action: pb::KnowledgeMaintainAction::Reindex as i32,
-        scope: None,
+        scope: full.then(|| "full".to_owned()),
         changes: Vec::new(),
+        signer_auth_headers,
+        signer_remote_url: remote,
     };
     let response = session.maintain_knowledge_graph(request)?;
     println!("Indexed {} nodes + edges.", response.processed);
-    Ok(true)
+    Ok(())
+}
+
+/// Fetch the asserted graph through the same service for local and reactor
+/// modes. The CLI adapts this immutable snapshot to RDF without opening redb.
+pub(crate) fn workflow_snapshot(
+    root: &Path,
+) -> CliResult<atomic_repository::repository::WorkflowSnapshot> {
+    let session = Service::open_root(root)?.ok_or_else(|| CliError::InvalidArgument {
+        message: "workflow validation requires a local repository service".into(),
+    })?;
+    let response = session.get_workflow_snapshot(pb::GetWorkflowSnapshotRequest {
+        repository: Some(session.reference.clone()),
+    })?;
+    decode_workflow_snapshot(response)
+}
+
+fn decode_workflow_snapshot(
+    response: pb::GetWorkflowSnapshotResponse,
+) -> CliResult<atomic_repository::repository::WorkflowSnapshot> {
+    if response.api_version != 1
+        || response.generation != atomic_core::kg::KG_GENERATION
+        || response.ontology_version != atomic_core::kg::ontology::VERSION_IRI
+    {
+        return Err(CliError::Internal(anyhow::anyhow!(
+            "unsupported workflow snapshot API/generation/ontology"
+        )));
+    }
+    Ok(atomic_repository::repository::WorkflowSnapshot {
+        generation: response.generation,
+        ontology_version: atomic_core::kg::ontology::VERSION_IRI,
+        identity: response.identity,
+        nodes: response.nodes.iter().map(kg_node_domain).collect(),
+        edges: response
+            .edges
+            .iter()
+            .map(kg_edge_domain)
+            .collect::<CliResult<_>>()?,
+    })
+}
+
+/// Compose existing local/reactor read endpoints without opening redb client-side.
+/// The selection itself runs purely over one consistent workflow snapshot.
+pub(crate) fn intent_graph(
+    id: &str,
+    max_nodes: usize,
+) -> CliResult<atomic_repository::intent_graph::IntentGraph> {
+    let root = super::find_repository_root()?;
+    let session = Service::open_root(&root)?.ok_or_else(|| CliError::InvalidArgument {
+        message: "intent graphs require a local repository service (local or reactor mode)".into(),
+    })?;
+    let canonical = atomic_core::kg::iri::parse_intent(id)
+        .ok()
+        .map(|_| id.to_owned());
+    let uid = if canonical.is_none() {
+        let response = session.get_vault_entry(pb::GetVaultEntryRequest {
+            repository: Some(session.reference.clone()),
+            kind: Kind::Intent as i32,
+            id: id.into(),
+            path: None,
+            include_bundle: true,
+            view: None,
+        })?;
+        let bundle = response
+            .entry_bundle
+            .as_ref()
+            .map(parse_entry_bundle)
+            .transpose()?
+            .ok_or_else(|| {
+                CliError::Internal(anyhow::anyhow!("intent service returned no entry bundle"))
+            })?;
+        let inputs = crate::commands::intent::bridge::inputs_from_entry(&bundle.entry)?;
+        Some(
+            inputs
+                .frontmatter
+                .get("uid")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| CliError::InvalidArgument {
+                    message: "intent has no canonical UID".into(),
+                })?
+                .to_uppercase(),
+        )
+    } else {
+        None
+    };
+    let snapshot = decode_workflow_snapshot(session.get_workflow_snapshot(
+        pb::GetWorkflowSnapshotRequest {
+            repository: Some(session.reference.clone()),
+        },
+    )?)?;
+    let canonical = match canonical {
+        Some(id) => id,
+        None => {
+            let candidates: Vec<_> = snapshot
+                .nodes
+                .iter()
+                .filter(|node| {
+                    atomic_core::kg::iri::parse_intent(&node.id)
+                        .ok()
+                        .is_some_and(|(_, value)| Some(&value) == uid.as_ref())
+                })
+                .collect();
+            if candidates.len() != 1 {
+                return Err(CliError::InvalidArgument { message: "intent is missing or ambiguous in the workflow snapshot; run atomic query enrich".into() });
+            }
+            candidates[0].id.clone()
+        }
+    };
+    atomic_repository::intent_graph::IntentGraph::from_snapshot(&snapshot, &canonical, max_nodes)
+        .map_err(CliError::Repository)
 }
 
 // ---------------------------------------------------------------------------

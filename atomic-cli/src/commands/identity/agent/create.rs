@@ -206,21 +206,25 @@ impl Create {
             .save_delegation(&delegation_id, &document)
             .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to store certificate: {e}")))?;
 
-        if self.json {
-            println!("{document}");
-            return Ok(());
-        }
-
         // 6. Enroll, and bind in config so hooks find the key without flags.
         let enrolled = match &server_url {
             Some(url) => self.enroll(&delegator, &agent, &certificate, url).await,
             None => Ok(false),
         };
 
-        self.report(&delegator, &agent, &terms, server_url.as_deref(), &enrolled);
+        if !self.json {
+            self.report(&delegator, &agent, &terms, server_url.as_deref(), &enrolled);
+        }
 
         if server_url.is_some() && matches!(enrolled, Ok(true)) {
             bind_agent_in_config(self.server.as_deref(), &agent.name);
+        }
+
+        if self.json {
+            if let (Some(url), Err(error)) = (server_url.as_deref(), &enrolled) {
+                print_warning(&format!("Not registered with {url}: {error}"));
+            }
+            println!("{document}");
         }
 
         Ok(())

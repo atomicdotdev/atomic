@@ -686,7 +686,7 @@ pub(super) fn plan_carried_reassembly_trees<'a>(
                         Some(_) => plan.entries.push((
                             path,
                             CarriedEntry::Write {
-                                repository_bytes: carried_e.repository_bytes.clone(),
+                                repository_bytes: carried_e.repository_bytes.to_vec(),
                                 mode: carried_e.mode,
                                 kind: carried_e.kind,
                             },
@@ -694,7 +694,7 @@ pub(super) fn plan_carried_reassembly_trees<'a>(
                         None => plan.entries.push((
                             path,
                             CarriedEntry::Write {
-                                repository_bytes: carried_e.repository_bytes.clone(),
+                                repository_bytes: carried_e.repository_bytes.to_vec(),
                                 mode: carried_e.mode,
                                 kind: carried_e.kind,
                             },
@@ -2446,7 +2446,7 @@ impl Repository {
                 })
                 .map(|candidate| &candidate.repository_bytes);
             match projected {
-                Some(projected) if projected == repository_bytes => {}
+                Some(projected) if projected[..] == repository_bytes[..] => {}
                 other => {
                     return Err(RepositoryError::InvalidOperation {
                         message: format!(

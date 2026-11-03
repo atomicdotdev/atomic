@@ -1,0 +1,692 @@
+//! Integration tests for `atomic provenance {trace,show}`, driving the real CLI
+//! binary end-to-end against a temporary repository with a real, in-process
+//! `ProvenanceGraph` saved via `atomic-repository` (NOT the forbidden
+//! `atomic-agent` capture path).
+//!
+//! These prove the PROJECTION path end-to-end:
+//!   1. a REAL `ProvenanceGraph` is persisted with `repo.save_provenance_graph`,
+//!   2. `atomic provenance show` projects it UNSIGNED on the fly (the baseline's
+//!      "signable, not signed" default),
+//!   3. `atomic provenance show --sign` emits the signable artifact, and its proof
+//!      verifies via `verify_prov` against the resolved identity's public key,
+//!   4. `atomic provenance trace` prints the human flywheel chain, and
+//!   5. compute-on-demand: no new files appear and the provenance-graph count is
+//!      unchanged after trace/show.
+//!
+//! The REV_DEPS fallback is exercised too: a graph fixture written directly to
+//! the content-addressed store without pristine registration is invisible to
+//! REV_DEPS, and the disk-scan fallback still finds it.
+//!
+//! Windows is excluded: the tests isolate the identity store by pointing `HOME`
+//! at a temp dir, but on Windows `dirs::home_dir()` resolves via the system API
+//! (FOLDERID_Profile) and ignores the env var, so the store cannot be redirected
+//! from a test. An explicit identity-store override (env/flag) would lift this.
+#![cfg(not(windows))]
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output};
+
+use atomic_canonical::did::did_for_public_key;
+use atomic_canonical::prov::verify_prov;
+use atomic_core::change::provenance_graph::{ProvenanceNode, ProvenanceNodeKind};
+use atomic_core::change::session::SessionTodo;
+use atomic_core::change::ProvenanceGraph;
+use atomic_core::types::{Base32, Hash};
+use atomic_identity::IdentityStore;
+use atomic_repository::Repository;
+use serde_json::Value;
+use tempfile::TempDir;
+
+const ATOMIC_BIN: &str = env!("CARGO_BIN_EXE_atomic");
+
+#[cfg(feature = "dsse-export")]
+#[test]
+fn dsse_export_round_trip_uses_pinned_key_and_writes_nothing() {
+    use atomic_canonical::provenance_export::verify_provenance_export;
+
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    let pubkey = create_default_identity(home_tmp.path());
+    let change_hash = repo_with_internal_change(repo_tmp.path(), home_tmp.path());
+    {
+        let repo = Repository::open(repo_tmp.path()).unwrap();
+        let graph = ProvenanceGraph::builder("session-dsse", "claude-code")
+            .agent_display_name("Claude Code")
+            .add_change_explained(change_hash)
+            .build();
+        repo.save_provenance_graph(&graph).unwrap();
+        let second = ProvenanceGraph::builder("second-session-dsse", "opencode")
+            .agent_display_name("OpenCode")
+            .add_change_explained(change_hash)
+            .build();
+        repo.save_provenance_graph(&second).unwrap();
+    }
+    let before = snapshot_files(repo_tmp.path());
+    let target = change_hash.to_base32();
+    for args in [
+        vec!["provenance", "show", &target, "--dsse"],
+        vec!["provenance", "show", &target, "--sign", "--dsse"],
+        vec!["provenance", "trace", &target, "--json", "--dsse"],
+    ] {
+        let exported = atomic(repo_tmp.path(), home_tmp.path(), &args);
+        assert!(
+            exported.status.success(),
+            "{}",
+            String::from_utf8_lossy(&exported.stderr)
+        );
+        let verified = verify_provenance_export(&exported.stdout, &pubkey).unwrap();
+        let envelope_file = home_tmp.path().join("export.dsse.json");
+        fs::write(&envelope_file, &exported.stdout).unwrap();
+        // The consumer does not need a repository or an identity store.
+        let out = atomic(
+            home_tmp.path(),
+            home_tmp.path(),
+            &[
+                "provenance",
+                "verify-dsse",
+                envelope_file.to_str().unwrap(),
+                "--public-key",
+                &pubkey.to_base32(),
+            ],
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, verified.payload);
+        let parsed: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(parsed["projections"].as_array().unwrap().len(), 2);
+        if args.contains(&"--sign") {
+            verify_prov(&parsed["projections"][0], &pubkey).unwrap();
+        } else {
+            assert!(parsed["projections"][0].get("proof").is_none());
+        }
+
+        let wrong = atomic_identity::KeyPair::generate();
+        let refused = atomic(
+            home_tmp.path(),
+            home_tmp.path(),
+            &[
+                "provenance",
+                "verify-dsse",
+                envelope_file.to_str().unwrap(),
+                "--public-key",
+                &wrong.public.to_base32(),
+            ],
+        );
+        assert!(!refused.status.success());
+        assert!(refused.stdout.is_empty());
+
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut stdin_consumer = Command::new(ATOMIC_BIN)
+            .args([
+                "provenance",
+                "verify-dsse",
+                "--public-key",
+                &pubkey.to_base32(),
+            ])
+            .current_dir(home_tmp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        stdin_consumer
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&exported.stdout)
+            .unwrap();
+        let stdin_out = stdin_consumer.wait_with_output().unwrap();
+        assert!(
+            stdin_out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stdin_out.stderr)
+        );
+        assert_eq!(stdin_out.stdout, verified.payload);
+
+        // The dedicated workflow sets this; ordinary Rust-only builds need
+        // neither Python nor cryptography. CI makes the independent check required.
+        if let Ok(python) = std::env::var("ATOMIC_DSSE_PYTHON") {
+            let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../tools/provenance-export/verify_dsse.py");
+            let run = |bytes: &[u8], key: &str| {
+                fs::write(&envelope_file, bytes).unwrap();
+                Command::new(&python)
+                    .arg(&script)
+                    .arg(&envelope_file)
+                    .args(["--public-key", key])
+                    .output()
+                    .unwrap()
+            };
+            let independent = run(&exported.stdout, &pubkey.to_base32());
+            assert!(
+                independent.status.success(),
+                "{}",
+                String::from_utf8_lossy(&independent.stderr)
+            );
+            assert_eq!(independent.stdout, verified.payload);
+            let wrong = atomic_identity::KeyPair::generate();
+            let refused = run(&exported.stdout, &wrong.public.to_base32());
+            assert!(!refused.status.success());
+            assert!(refused.stdout.is_empty());
+            let original: Value = serde_json::from_slice(&exported.stdout).unwrap();
+            for (field, bad) in [
+                ("payloadType", "application/json"),
+                ("payload", "e30="),
+                ("payload", "eB=="),
+            ] {
+                let mut changed = original.clone();
+                changed[field] = Value::String(bad.into());
+                let refused = run(&serde_json::to_vec(&changed).unwrap(), &pubkey.to_base32());
+                assert!(!refused.status.success());
+                assert!(refused.stdout.is_empty());
+            }
+        }
+    }
+    let invalid = atomic(
+        repo_tmp.path(),
+        home_tmp.path(),
+        &["provenance", "trace", &target, "--dsse"],
+    );
+    assert!(!invalid.status.success(), "trace --dsse requires --json");
+    assert_eq!(snapshot_files(repo_tmp.path()), before);
+}
+
+/// Run `atomic <args>` inside `repo_dir` with `HOME` pointed at `home_dir` so the
+/// identity store resolves to a test-owned location.
+fn atomic(repo_dir: &Path, home_dir: &Path, args: &[&str]) -> Output {
+    Command::new(ATOMIC_BIN)
+        .args(args)
+        .current_dir(repo_dir)
+        .env("HOME", home_dir)
+        .output()
+        .expect("run atomic")
+}
+
+/// A prov node so the graph is non-trivial (the projection ignores nodes, but a
+/// real graph carries them).
+fn goal_node() -> ProvenanceNode {
+    ProvenanceNode {
+        id: "s-1".into(),
+        kind: ProvenanceNodeKind::Goal,
+        timestamp: 1_735_689_600_000,
+        summary: "Fix the auth bug".into(),
+        detail: None,
+        change_hash: None,
+        tool_name: None,
+        tool_call_id: None,
+        duration_ms: None,
+        classified: false,
+        confidence: None,
+        consolidated_from: Vec::new(),
+    }
+}
+
+/// Recursively collect every file path under `root` (relative), for a
+/// before/after "nothing was written" assertion.
+fn snapshot_files(root: &Path) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    fn walk(dir: &Path, base: &Path, set: &mut BTreeSet<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, set);
+            } else if let Ok(rel) = path.strip_prefix(base) {
+                set.insert(rel.to_string_lossy().to_string());
+            }
+        }
+    }
+    walk(root, root, &mut set);
+    set
+}
+
+/// Create a default identity in a test-owned identity store rooted under
+/// `home_dir/.atomic/identities`, matching `IdentityStore::open_default()` when
+/// `HOME=home_dir`. Returns the identity's public key for verification.
+fn create_default_identity(home_dir: &Path) -> atomic_identity::keypair::PublicKey {
+    let store_root = home_dir.join(".atomic").join("identities");
+    let mut store = IdentityStore::open(&store_root).expect("open identity store");
+    let keypair = atomic_identity::keypair::KeyPair::generate();
+    let identity = atomic_identity::identity::Identity::new("tester", &keypair);
+    store
+        .save_with_keypair(&identity, &keypair, None)
+        .expect("save identity");
+    store.set_default(&identity.id).expect("set default");
+    keypair.public
+}
+
+/// Record a file into a fresh repo and return a real, internal change `Hash`.
+///
+/// `atomic init` itself records baseline changes ("Initialize repository",
+/// "Initialize vault"), so the repo has several internal changes; any one of
+/// them is a valid target for the projection (REV_DEPS works because it is
+/// internal). We take the first.
+fn repo_with_internal_change(repo_dir: &Path, home_dir: &Path) -> Hash {
+    assert!(atomic(repo_dir, home_dir, &["init"]).status.success());
+    std::fs::write(repo_dir.join("file.txt"), b"v1\n").unwrap();
+    assert!(atomic(repo_dir, home_dir, &["add", "file.txt"])
+        .status
+        .success());
+    assert!(atomic(repo_dir, home_dir, &["record", "-m", "rec"])
+        .status
+        .success());
+
+    let repo = Repository::open(repo_dir).expect("open repo");
+    let mut changes = repo.iter_changes();
+    changes
+        .next()
+        .expect("at least one recorded change")
+        .expect("iter change")
+}
+
+#[test]
+fn provenance_show_defaults_unsigned_and_sign_flag_verifies_and_writes_nothing() {
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    let repo_dir = repo_tmp.path();
+    let home_dir = home_tmp.path();
+
+    let pubkey = create_default_identity(home_dir);
+    let change_hash = repo_with_internal_change(repo_dir, home_dir);
+
+    // Save a REAL ProvenanceGraph explaining the recorded change, via the
+    // repository path (NOT the atomic-agent capture path).
+    {
+        let repo = Repository::open(repo_dir).expect("open repo");
+        let graph = ProvenanceGraph::builder("session-abc", "claude-code")
+            .agent_display_name("Claude Code")
+            .agent_vendor("anthropic")
+            .add_node(goal_node())
+            .add_change_explained(change_hash)
+            .build();
+        repo.save_provenance_graph(&graph).expect("save graph");
+    }
+
+    // Snapshot the repo tree; trace/show must not add or remove any files.
+    let before = snapshot_files(repo_dir);
+    let graphs_before = {
+        let repo = Repository::open(repo_dir).expect("open repo");
+        repo.find_provenance_for_change_scan(&change_hash)
+            .expect("scan")
+            .len()
+    };
+
+    // `show` — emits the signed PROV JSON-LD to stdout.
+    let show = atomic(
+        repo_dir,
+        home_dir,
+        &["provenance", "show", &change_hash.to_base32()],
+    );
+    assert!(
+        show.status.success(),
+        "provenance show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let stdout = String::from_utf8(show.stdout).unwrap();
+    let value: Value = serde_json::from_str(&stdout).expect("show emits valid JSON-LD");
+
+    // Shape assertions.
+    assert_eq!(
+        value.get("@id").and_then(Value::as_str),
+        Some(format!("urn:atomic:provgraph:{}", change_hash.to_base32()).as_str())
+    );
+    let graph_nodes = value.get("@graph").and_then(Value::as_array).unwrap();
+    assert_eq!(graph_nodes.len(), 3);
+    let activity = graph_nodes
+        .iter()
+        .find(|n| n.get("@type").and_then(Value::as_str) == Some("prov:Activity"))
+        .unwrap();
+    assert_eq!(
+        activity.get("generated"),
+        Some(&serde_json::json!([format!(
+            "urn:atomic:change:{}",
+            change_hash.to_base32()
+        )]))
+    );
+    // `used` is omitted when empty (unknown links omitted, never invented).
+    assert!(activity.get("used").is_none());
+    let agent = graph_nodes
+        .iter()
+        .find(|n| n.get("@type").and_then(Value::as_str) == Some("prov:SoftwareAgent"))
+        .unwrap();
+    let agent_id = agent.get("@id").and_then(Value::as_str).unwrap();
+    assert_eq!(agent_id, "urn:atomic:agent:claude");
+    assert!(!agent_id.starts_with("did:"), "agent id must NOT be a did");
+    assert_eq!(
+        agent.get("label").and_then(Value::as_str),
+        Some("Claude Code")
+    );
+
+    // Default `show` is UNSIGNED — the baseline's "signable, not signed" unit.
+    assert!(
+        value.get("proof").is_none(),
+        "default show must be unsigned"
+    );
+    assert!(value.get("attributedTo").is_none());
+    assert!(value.get("contentHash").is_none());
+
+    // `show --sign` emits the SIGNABLE artifact: it verifies against the resolved
+    // key and carries the top-level attributedTo/contentHash/proof envelope.
+    let signed_out = atomic(
+        repo_dir,
+        home_dir,
+        &["provenance", "show", "--sign", &change_hash.to_base32()],
+    );
+    assert!(
+        signed_out.status.success(),
+        "provenance show --sign failed: {}",
+        String::from_utf8_lossy(&signed_out.stderr)
+    );
+    let signed: Value = serde_json::from_str(&String::from_utf8(signed_out.stdout).unwrap())
+        .expect("show --sign emits valid JSON-LD");
+    verify_prov(&signed, &pubkey).expect("signed PROV proof must verify");
+    assert_eq!(
+        signed.get("attributedTo").and_then(Value::as_str),
+        Some(did_for_public_key(&pubkey).as_str())
+    );
+    assert!(signed.get("proof").is_some());
+    assert!(signed
+        .get("contentHash")
+        .and_then(Value::as_str)
+        .is_some_and(|h| h.starts_with("blake3:")));
+
+    // `trace` — prints the human chain (change -> activity -> generated -> ...).
+    let trace = atomic(
+        repo_dir,
+        home_dir,
+        &["provenance", "trace", &change_hash.to_base32()],
+    );
+    assert!(
+        trace.status.success(),
+        "provenance trace failed: {}",
+        String::from_utf8_lossy(&trace.stderr)
+    );
+    let trace_out = String::from_utf8(trace.stdout).unwrap();
+    assert!(trace_out.contains("activity"), "trace shows the activity");
+    assert!(
+        trace_out.contains("generated"),
+        "trace shows generated edge"
+    );
+    assert!(
+        trace_out.contains(&format!("urn:atomic:change:{}", change_hash.to_base32())),
+        "trace shows the generated change urn"
+    );
+
+    // Compute-on-demand: nothing was written.
+    let after = snapshot_files(repo_dir);
+    assert_eq!(before, after, "trace/show must not write any files");
+    let graphs_after = {
+        let repo = Repository::open(repo_dir).expect("open repo");
+        repo.find_provenance_for_change_scan(&change_hash)
+            .expect("scan")
+            .len()
+    };
+    assert_eq!(
+        graphs_before, graphs_after,
+        "provenance-graph count must be unchanged after trace/show"
+    );
+}
+
+#[test]
+fn provenance_trace_uses_scan_fallback_when_rev_deps_missing() {
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    let repo_dir = repo_tmp.path();
+    let home_dir = home_tmp.path();
+
+    create_default_identity(home_dir);
+    // Init a real repo so `provenance` finds a repository root. The graph below
+    // is written directly to the content store to model legacy/interrupted data
+    // that exists on disk without pristine registration.
+    assert!(atomic(repo_dir, home_dir, &["init"]).status.success());
+
+    // A change hash that was never recorded remains invisible to REV_DEPS.
+    let phantom_change = Hash::of(b"never-recorded-change");
+    {
+        let repo = Repository::open(repo_dir).expect("open repo");
+        let graph = ProvenanceGraph::builder("session-scan", "opencode")
+            .agent_display_name("OpenCode")
+            .add_node(goal_node())
+            .add_change_explained(phantom_change)
+            .build();
+        let bytes = graph.serialize().expect("serialize graph");
+        let graph_hash = Hash::of(&bytes);
+        let graph_path = repo.change_store().provenance_path(&graph_hash);
+        fs::create_dir_all(graph_path.parent().expect("graph parent")).expect("create graph dir");
+        fs::write(&graph_path, bytes).expect("write unregistered graph fixture");
+
+        // Confirm the premise: REV_DEPS finds nothing, the scan finds it.
+        assert!(
+            repo.find_provenance_for_change(&phantom_change)
+                .expect("rev_deps lookup")
+                .is_empty(),
+            "REV_DEPS must be empty for an unregistered graph"
+        );
+        assert_eq!(
+            repo.find_provenance_for_change_scan(&phantom_change)
+                .expect("scan")
+                .len(),
+            1,
+            "the disk scan must find the graph"
+        );
+    }
+
+    // The CLI must find it via the fallback and print the chain.
+    let trace = atomic(
+        repo_dir,
+        home_dir,
+        &["provenance", "trace", &phantom_change.to_base32()],
+    );
+    assert!(
+        trace.status.success(),
+        "provenance trace (fallback) failed: {}",
+        String::from_utf8_lossy(&trace.stderr)
+    );
+    let out = String::from_utf8(trace.stdout).unwrap();
+    assert!(
+        out.contains(&format!("urn:atomic:change:{}", phantom_change.to_base32())),
+        "fallback trace shows the generated change urn"
+    );
+}
+
+#[test]
+fn session_show_reads_ordered_atomic_ledger() {
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    let repo_dir = repo_tmp.path();
+    let home_dir = home_tmp.path();
+    let session_id = "ledger-session";
+
+    assert!(atomic(repo_dir, home_dir, &["init"]).status.success());
+    let first_change = Hash::of(b"ledger-change-0");
+    let second_change = Hash::of(b"ledger-change-1");
+    {
+        let repo = Repository::open(repo_dir).expect("open repo");
+        let first = repo
+            .save_provenance_graph(
+                &ProvenanceGraph::builder(session_id, "opencode")
+                    .plan_id("ATOM-25")
+                    .todos(vec![
+                        SessionTodo {
+                            id: "todo-1".into(),
+                            content: "Render session\noutput".into(),
+                            status: "completed".into(),
+                            priority: "high".into(),
+                        },
+                        SessionTodo {
+                            id: "todo-2".into(),
+                            content: "Keep output readable".into(),
+                            status: "in_progress".into(),
+                            priority: "medium".into(),
+                        },
+                    ])
+                    .add_node(goal_node())
+                    .add_change_explained(first_change)
+                    .build(),
+            )
+            .expect("save first graph");
+        repo.save_provenance_graph(
+            &ProvenanceGraph::builder(session_id, "opencode")
+                .previous(first)
+                .add_change_explained(second_change)
+                .build(),
+        )
+        .expect("save second graph");
+
+        let ledger = repo
+            .get_session_ledger(session_id)
+            .expect("read ledger")
+            .expect("ledger exists");
+        assert_eq!(ledger.0.session_id, session_id);
+        assert_eq!(ledger.0.turn_count, 2);
+        assert_eq!(ledger.1.len(), 2);
+        assert_eq!(ledger.1[0].turn_number, 0);
+        assert_eq!(ledger.1[1].turn_number, 1);
+        assert_eq!(ledger.1[1].previous_provenance, Some(first));
+        repo.upsert_session_lifecycle(
+            session_id,
+            Some("agent-ledger".into()),
+            Some("dev".into()),
+            None,
+        )
+        .expect("lifecycle metadata");
+    }
+
+    let show = atomic(repo_dir, home_dir, &["session", "show", session_id]);
+    assert!(
+        show.status.success(),
+        "session show failed: {}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let output = String::from_utf8(show.stdout).unwrap();
+    assert!(output.contains("Session ledger-session"));
+    assert!(output.contains("Turn 0"));
+    assert!(output.contains("Goal marker: Fix the auth bug"));
+    assert!(output.contains("Intent: ATOM-25"));
+    assert!(output.contains("Todos (2):"));
+    assert!(output.contains("[x] [high] Render session output"));
+    assert!(output.contains("[~] [medium] Keep output readable"));
+    assert!(output.contains("Turn 1"));
+
+    let recent = atomic(repo_dir, home_dir, &["session", "show", "-n", "1"]);
+    assert!(recent.status.success());
+    let recent_output = String::from_utf8(recent.stdout).unwrap();
+    assert!(recent_output.contains("Recent sessions (1):"));
+    assert!(recent_output.contains("ledger-session"));
+    assert!(recent_output.contains("agent-ledger"));
+    // The list view shows intent count; detail view shows individual IDs.
+    assert!(recent_output.contains("INTENTS"));
+
+    let recent_json = atomic(repo_dir, home_dir, &["session", "show", "--json"]);
+    assert!(recent_json.status.success());
+    let value: Value = serde_json::from_slice(&recent_json.stdout).unwrap();
+    assert_eq!(value.as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn session_show_without_id_handles_empty_repository() {
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    assert!(atomic(repo_tmp.path(), home_tmp.path(), &["init"])
+        .status
+        .success());
+
+    let show = atomic(repo_tmp.path(), home_tmp.path(), &["session", "show"]);
+    assert!(show.status.success());
+    assert_eq!(
+        String::from_utf8(show.stdout).unwrap().trim(),
+        "No sessions recorded."
+    );
+
+    let json = atomic(
+        repo_tmp.path(),
+        home_tmp.path(),
+        &["session", "show", "--json"],
+    );
+    assert!(json.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&json.stdout).unwrap(),
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn session_tables_populate_for_non_sherpa_agent() {
+    // Provenance from any agent — here a generic OpenCode graph with no
+    // `profile` and a `detail`-less Goal node exactly like the real capture
+    // path produces — must populate the session tables, not be skipped.
+    let repo_tmp = TempDir::new().unwrap();
+    let home_tmp = TempDir::new().unwrap();
+    let repo_dir = repo_tmp.path();
+    let home_dir = home_tmp.path();
+
+    assert!(atomic(repo_dir, home_dir, &["init"]).status.success());
+    let change = Hash::of(b"non-sherpa-change");
+
+    let repo = Repository::open(repo_dir).expect("open repo");
+    let todo_node = ProvenanceNode {
+        id: "t-1".into(),
+        kind: ProvenanceNodeKind::Todo,
+        timestamp: 1_735_689_600_000,
+        summary: "Wire up readline".into(),
+        detail: Some(
+            serde_json::json!({
+                "todo_id": "todo-7",
+                "content": "Wire up readline",
+                "status": "completed",
+                "priority": "medium",
+                "record_type": "todo",
+            })
+            .to_string(),
+        ),
+        change_hash: None,
+        tool_name: None,
+        tool_call_id: None,
+        duration_ms: None,
+        classified: false,
+        confidence: None,
+        consolidated_from: Vec::new(),
+    };
+    let graph = ProvenanceGraph::builder("non-sherpa-session", "opencode")
+        .agent_display_name("OpenCode")
+        .agent_vendor("moonshotai")
+        .add_node(goal_node()) // Goal has no detail, like `append_goal`
+        .add_node(todo_node)
+        .add_change_explained(change)
+        .build();
+    assert!(graph.profile.is_none(), "generic graph has no profile");
+    let prov_hash = repo.save_provenance_graph(&graph).expect("save graph");
+
+    // The fast UI gate must recognise this as having session data, even
+    // though the generic Goal node carries no intent `detail`.
+    assert!(
+        repo.has_session_data(&prov_hash),
+        "non-Sherpa provenance must report session data"
+    );
+
+    // Every node is indexed as a session event.
+    let events = repo.get_session_events(&prov_hash).expect("events");
+    assert_eq!(events.len(), 2, "one session event per provenance node");
+
+    // The Todo node populates the todos table with its generic detail.
+    let todos = repo.get_session_todos(&prov_hash).expect("todos");
+    assert_eq!(todos.len(), 1);
+    assert_eq!(todos[0].todo_id, "todo-7");
+    assert_eq!(todos[0].content, "Wire up readline");
+    assert_eq!(todos[0].final_status, "completed");
+
+    // No intent entry: the generic Goal node had no intent `detail`.
+    assert!(
+        repo.get_session_intent(&prov_hash)
+            .expect("intent")
+            .is_none(),
+        "generic Goal without detail yields no intent entry"
+    );
+}

@@ -45,7 +45,7 @@ impl Command for MemoryWrite {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         // Freeform body from stdin — no lift/gate; this is the raw path.
         use std::io::Read;

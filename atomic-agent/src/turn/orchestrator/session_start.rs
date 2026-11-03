@@ -132,6 +132,12 @@ impl TurnOrchestrator {
             }
         };
 
+        // CB-12B: a resumed dispatch creates a fresh local session state —
+        // the previous round ran in a different (since-destroyed) sandbox,
+        // so the session JSON never carried over. Adopt the durable history
+        // from the repository's session ledger before anything else runs.
+        self.hydrate_session_from_durable_ledger(&mut session)?;
+
         // Only sessions CREATED here get the run stamp — the early return
         // above keeps pre-existing sessions out of the run's attribution.
         if let Some(stamp) = self.managed_stamp() {
@@ -379,6 +385,133 @@ impl TurnOrchestrator {
         Ok(DispatchResult::new(session_id, session.phase).with_message(message))
     }
 
+    /// Hydrate a freshly created session from the durable session ledger.
+    ///
+    /// A resumed dispatch starts a fresh local session state: the previous
+    /// round ran in a different (since-destroyed) sandbox, so
+    /// `.atomic/sessions/<id>.json` — the runtime fallback — is gone, and a
+    /// session created for the same id starts at zero turns with no
+    /// recorded changes. The DURABLE evidence of the previous round
+    /// survives in the repository's session ledger (a remote sandbox's
+    /// ledger lives with its owner), so that is what a fresh session for an
+    /// existing id must adopt:
+    ///
+    /// - `turn_count` — the number of published ledger turns — so the next
+    ///   turn numbers past the durable history instead of colliding with
+    ///   the previous round's journal turn. A colliding reservation hits
+    ///   the previous checkpoint's `ProvenanceCheckpointConflict`, the
+    ///   turn-end hook fails BEFORE its session save, and the round's
+    ///   recorded change hashes — and with them its same-session
+    ///   attestation — are lost;
+    /// - `recorded_change_hashes` — each published turn's changes — so the
+    ///   session-end attestation knows what the earlier rounds of this
+    ///   same session already covered, attests only the new round's
+    ///   changes, and chains to the session's latest attestation via
+    ///   `previous_attestation`.
+    ///
+    /// A session id with no durable ledger (a genuinely fresh session) is
+    /// left untouched. Best-effort on read failures, matching
+    /// [`Self::sync_session_lifecycle`]: the JSON state remains the
+    /// runtime fallback either way.
+    pub(crate) fn hydrate_session_from_durable_ledger(
+        &self,
+        session: &mut AgentSession,
+    ) -> AgentResult<()> {
+        // The journal sink reaches the durable owner store wherever the
+        // session runs — in a remote sandbox the provenance RPCs carry it
+        // to the repository's owner (the local cache holds no journal).
+        // Probe upward from the local count while durable turns exist:
+        // each answered turn is history this same session already
+        // published, so adopt its number and its checkpoint's changes.
+        if let Some(sink) = &self.journal_sink {
+            let mut turn_number = session.turn_count.saturating_add(1);
+            loop {
+                match sink.turn_status(&session.session_id, turn_number) {
+                    Ok(Some(status)) => {
+                        log::info!(
+                            "Resumed session {}: durable journal turn {} exists ({:?}) — \
+                             adopting it into a fresh local state",
+                            session.session_id,
+                            turn_number,
+                            status.lifecycle,
+                        );
+                        session.turn_count = turn_number;
+                        for hash in status.checkpoint_change_hashes {
+                            if !session.recorded_change_hashes.contains(&hash) {
+                                session.recorded_change_hashes.push(hash);
+                            }
+                        }
+                        turn_number = turn_number.saturating_add(1);
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        log::debug!(
+                            "Could not probe the durable journal for session {} turn {}: \
+                             {} (non-fatal)",
+                            session.session_id,
+                            turn_number,
+                            error
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        // The repository's session ledger is the authoritative local
+        // record; where the journal is remote (a sandbox's cache) it holds
+        // no turns and this is a no-op, and where it is local it is the
+        // source of truth for a resumed same-machine session.
+        let repo = match atomic_repository::Repository::open_readonly_wait(
+            &self.repo_root,
+            wait_budget::database_wait(),
+        ) {
+            Ok(repo) => repo,
+            Err(error) => {
+                log::debug!(
+                    "Could not open the repository to hydrate session {} from its \
+                     durable ledger: {} (non-fatal)",
+                    session.session_id,
+                    error,
+                );
+                return Ok(());
+            }
+        };
+        let ledger = match repo.get_session_ledger(&session.session_id) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                log::warn!(
+                    "Could not read the durable session ledger for {}: {} (non-fatal)",
+                    session.session_id,
+                    error
+                );
+                return Ok(());
+            }
+        };
+        let Some((_record, turns)) = ledger else {
+            return Ok(());
+        };
+        if turns.is_empty() {
+            return Ok(());
+        }
+        let durable_turn_count = turns.len() as u32;
+        if durable_turn_count > session.turn_count {
+            log::info!(
+                "Resumed session {}: adopting {} durable ledger turn(s) into a \
+                 fresh local state",
+                session.session_id,
+                durable_turn_count,
+            );
+            session.turn_count = durable_turn_count;
+        }
+        for hash in turns.iter().flat_map(|turn| turn.change_hashes.iter()) {
+            if !session.recorded_change_hashes.contains(hash) {
+                session.recorded_change_hashes.push(*hash);
+            }
+        }
+        Ok(())
+    }
+
     /// Best-effort lifecycle reconciliation into the Atomic session ledger.
     ///
     /// `ended_at: None` marks the session active (clearing a stale end
@@ -585,6 +718,11 @@ impl TurnOrchestrator {
                         }
                     }
                 }
+
+                // CB-12B: a resumed dispatch has fresh local state — adopt
+                // the durable ledger before persisting, exactly as
+                // `handle_session_start` does.
+                self.hydrate_session_from_durable_ledger(&mut session)?;
 
                 self.coordinate_session_view(&session.view_name)?;
 

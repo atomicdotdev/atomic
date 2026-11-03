@@ -81,7 +81,7 @@ fn full_round_trip_lifts_attests_gates_verifies_renders() {
 
     // Render regenerates the status line from the spine.
     let text = render(&node, Target::Cli);
-    assert!(text.contains("Status:    todo"), "render:\n{text}");
+    assert!(text.contains("Status: todo"), "render:\n{text}");
     assert!(text.contains("[x] On first load"));
 }
 

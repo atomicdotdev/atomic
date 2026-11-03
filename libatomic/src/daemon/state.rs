@@ -209,6 +209,23 @@ impl RepoHandle {
         })
     }
 
+    /// Native-index diagnostics must tolerate incomplete derived schemas and
+    /// must not trigger automatic migration or recovery. Repair callers first
+    /// inspect authority read-only, then open writable only if it is repairable.
+    pub(super) fn native_index_repository(&self, readonly: bool) -> Result<Repository, Status> {
+        let result = if readonly {
+            Repository::open_readonly_for_native_repair(&self.root)
+        } else {
+            Repository::open_for_native_repair(&self.root)
+        };
+        result.map_err(|error| {
+            domain_status(
+                ErrorCode::Repository,
+                format!("Native derived indexes are unrepairable: {error}"),
+            )
+        })
+    }
+
     /// The redb-native change/provenance store (atomic.redb — the merged
     /// database) for this request — opened by path WITHOUT opening the
     /// repository handle. redb refuses a second concurrent handle on the

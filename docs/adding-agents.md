@@ -107,8 +107,10 @@ X"); the agent reframes it as a *problem*, gets agreement, then executes.
 
 ### 2. Code Intelligence (`code-intelligence`) — navigating the code
 
-Atomic maintains a knowledge graph and content index of the repository. This
-skill teaches the agent to use it **instead of blind `grep`/`find`**:
+Atomic maintains a knowledge graph over the repository's recorded state, and
+search reads recorded bytes through the current view — no content index,
+checkout, or materialized files required. This skill teaches the agent to use
+it **instead of blind `grep`/`find`**:
 
 ```bash
 atomic vault query code "fn parse_query" -t rs   # source content search (grep replacement)
