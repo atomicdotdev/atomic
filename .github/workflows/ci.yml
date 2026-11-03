@@ -36,14 +36,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The nextest step took 26 minutes on macOS and 22 on Windows against
-        # 10.5 on Linux, so those two set every PR's wall-clock time. Each
-        # runs in two halves; both halves of an OS share one rust-cache key
-        # and restore the same build.
+        # Windows runs in two halves: its nextest step took 22 minutes
+        # against 10.5 on Linux, and halved it is ~15. Both halves share one
+        # rust-cache key and restore the same build.
+        #
+        # macOS stays whole. GitHub runs only a few macOS jobs at once per
+        # organization, so a second macOS job queues other PRs' and dev's
+        # macOS jobs (dev waited 22 minutes behind a split run). In that
+        # run each macOS half took about as long as the whole suite, so the
+        # split gained nothing.
         include:
           - { os: ubuntu-latest, shard: 1, shards: 1 }
-          - { os: macos-latest, shard: 1, shards: 2 }
-          - { os: macos-latest, shard: 2, shards: 2 }
+          - { os: macos-latest, shard: 1, shards: 1 }
           - { os: windows-latest, shard: 1, shards: 2 }
           - { os: windows-latest, shard: 2, shards: 2 }
     env:
