@@ -1342,6 +1342,28 @@ impl vault_service_server::VaultService for VaultImpl {
                     .memory_kind
                     .clone()
                     .unwrap_or_else(|| "context".to_string());
+                if !atomic_canonical::vocab::MEMORY_KIND.contains(&memory_kind.as_str()) {
+                    return Err(domain_status(
+                        ErrorCode::InvalidArgument,
+                        format!("unknown memory kind '{memory_kind}'"),
+                    ));
+                }
+                let memory_status = request
+                    .memory_status
+                    .clone()
+                    .unwrap_or_else(|| "active".to_string());
+                if !atomic_canonical::vocab::MEMORY_STATUS.contains(&memory_status.as_str()) {
+                    return Err(domain_status(
+                        ErrorCode::InvalidArgument,
+                        format!("unknown memory status '{memory_status}'"),
+                    ));
+                }
+                let status = match memory_status.as_str() {
+                    "active" => VaultEntityStatus::Active,
+                    "superseded" => VaultEntityStatus::Superseded,
+                    "retracted" => VaultEntityStatus::Retracted,
+                    _ => unreachable!("validated memory status"),
+                };
                 let text = request.body.clone().unwrap_or_default();
                 if text.trim().is_empty() {
                     return Err(domain_status(
@@ -1351,8 +1373,24 @@ impl vault_service_server::VaultService for VaultImpl {
                 }
                 let derived_from = request.derived_from.clone();
                 let about = request.about.clone();
-                let id = ulid::Ulid::new().to_string().to_lowercase();
-                let vault_path = format!("memory/{id}.md");
+                let id = request
+                    .memory_id
+                    .clone()
+                    .unwrap_or_else(|| ulid::Ulid::new().to_string().to_lowercase());
+                let stem = id.strip_prefix("memory/").unwrap_or(&id);
+                let stem = stem.strip_suffix(".md").unwrap_or(stem);
+                if stem.trim().is_empty()
+                    || stem == "."
+                    || stem == ".."
+                    || stem.contains(['/', '\\'])
+                    || stem.chars().any(char::is_control)
+                {
+                    return Err(domain_status(
+                        ErrorCode::InvalidArgument,
+                        "memory ID must be a single non-empty filename stem",
+                    ));
+                }
+                let vault_path = format!("memory/{stem}.md");
                 let body = format!("{}\n", text.trim());
                 let body_for_store = body.clone();
                 let handle_for_task = handle.clone();
@@ -1363,10 +1401,55 @@ impl vault_service_server::VaultService for VaultImpl {
                     let body = body_for_store;
                     move || {
                         let repo = handle.repository()?;
+                        if repo
+                            .vault_retrieve(&vault_path)
+                            .map_err(repository_error)?
+                            .is_some()
+                        {
+                            return Err(Status::already_exists(format!(
+                                "memory '{id}' already exists"
+                            )));
+                        }
+                        let vault_root = repo.root().join(".vault");
+                        for directory in [&vault_root, &vault_root.join("memory")] {
+                            match std::fs::symlink_metadata(directory) {
+                                Ok(metadata)
+                                    if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                                Ok(_) => {
+                                    return Err(Status::failed_precondition(format!(
+                                        "memory directory '{}' is not a real directory",
+                                        directory.display()
+                                    )))
+                                }
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => {
+                                    return Err(Status::internal(format!(
+                                        "cannot inspect memory directory '{}': {error}",
+                                        directory.display()
+                                    )))
+                                }
+                            }
+                        }
+                        let disk_path = vault_root.join(&vault_path);
+                        match std::fs::symlink_metadata(&disk_path) {
+                            Ok(_) => {
+                                return Err(Status::already_exists(format!(
+                                    "memory file '{}' already exists",
+                                    disk_path.display()
+                                )))
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(Status::internal(format!(
+                                    "cannot inspect memory file '{}': {error}",
+                                    disk_path.display()
+                                )))
+                            }
+                        }
                         let mut frontmatter = Map::new();
                         frontmatter.insert("uid".into(), Value::String(id));
                         frontmatter.insert("memoryKind".into(), Value::String(memory_kind));
-                        frontmatter.insert("status".into(), Value::String("active".into()));
+                        frontmatter.insert("status".into(), Value::String(memory_status));
                         frontmatter.insert("createdAt".into(), Value::String(now_rfc3339()));
                         if !about.is_empty() {
                             frontmatter.insert(
@@ -1409,7 +1492,7 @@ impl vault_service_server::VaultService for VaultImpl {
                         kind: Kind::Memory as i32,
                         id: id.clone(),
                         title: id.clone(),
-                        status: Some(VaultEntityStatus::Active as i32),
+                        status: Some(status as i32),
                         body: Some(body),
                         created_at: None,
                         updated_at: None,

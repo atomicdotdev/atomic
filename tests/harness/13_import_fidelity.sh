@@ -21,7 +21,10 @@ source "$HARNESS_DIR/helpers.sh"
 assert_import_clean_with_bootstrap() {
     local desc="$1"
     local out
-    out="$(get_status_short)"
+    if ! out="$(get_status_short 2>&1)"; then
+        _fail "$desc" "status command failed: $out"
+        return
+    fi
 
     local unexpected=""
     while IFS= read -r line; do
@@ -56,16 +59,26 @@ assert_import_clean_with_bootstrap() {
 assert_no_diff_except_bootstrap() {
     local desc="$1"
     local diff_out
-    diff_out="$(atomic diff 2>/dev/null || true)"
+    if ! diff_out="$(atomic diff --no-color 2>&1)"; then
+        _fail "$desc" "diff command failed: $diff_out"
+        return
+    fi
 
     local unexpected=""
     while IFS= read -r line; do
-        if [[ "$line" =~ ^diff\ --atomic\ a/.*\ b/(.*)\ \( ]]; then
-            local path="${BASH_REMATCH[1]}"
+        if [[ "$line" =~ ^diff\ --atomic\ (a/[^[:space:]]+|/dev/null)\ (b/[^[:space:]]+|/dev/null) ]]; then
+            local old_path="${BASH_REMATCH[1]}" new_path="${BASH_REMATCH[2]}" path
+            if [[ "$new_path" == /dev/null ]]; then
+                path="${old_path#a/}"
+            else
+                path="${new_path#b/}"
+            fi
             case "$path" in
                 .atomicignore | .vault/*) continue ;;
                 *) unexpected+="${path}"$'\n' ;;
             esac
+        elif [[ "$line" == 'diff --atomic '* ]]; then
+            unexpected+="unrecognized diff header: ${line}"$'\n'
         fi
     done <<< "$diff_out"
 
@@ -106,8 +119,8 @@ git commit --quiet -m "Delete gamma"
 # beta should survive
 git_commit "Modify beta" "beta.txt" "beta v2"
 
-atomic init >/dev/null 2>&1
-assert_success "import succeeds" atomic git import
+require_success "initialize Atomic repository" atomic init
+require_success "import succeeds" atomic git import
 
 # Verify deleted files are gone from atomic
 assert_import_clean_with_bootstrap "working tree clean after import"
@@ -136,8 +149,8 @@ done
 git rm --quiet dir/file1.txt dir/file3.txt dir/file5.txt
 git commit --quiet -m "Remove odd files"
 
-atomic init >/dev/null 2>&1
-assert_success "import bulk deletion succeeds" atomic git import
+require_success "initialize Atomic repository" atomic init
+require_success "import bulk deletion succeeds" atomic git import
 assert_import_clean_with_bootstrap "clean after bulk deletion import"
 
 assert_file_not_exists "file1 deleted" "dir/file1.txt"
@@ -161,9 +174,10 @@ dd if=/dev/urandom bs=1 count=256 >> image.png 2>/dev/null
 git add image.png
 git commit --quiet -m "Add binary image"
 
-atomic init >/dev/null 2>&1
-assert_success "import with binary add succeeds" atomic git import
+require_success "initialize Atomic repository" atomic init
+require_success "import with binary add succeeds" atomic git import
 assert_import_clean_with_bootstrap "clean after binary add import"
+assert_success "binary addition matches Git HEAD" git diff --exit-code HEAD -- image.png
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -186,9 +200,10 @@ modified_size=$(wc -c < image.png | tr -d ' ')
 git add image.png
 git commit --quiet -m "Update binary image"
 
-atomic init >/dev/null 2>&1
-assert_success "import with binary modification succeeds" atomic git import
+require_success "initialize Atomic repository" atomic init
+require_success "import with binary modification succeeds" atomic git import
 assert_import_clean_with_bootstrap "clean after binary modification import"
+assert_success "modified binary matches Git HEAD" git diff --exit-code HEAD -- image.png
 
 # Also verify diff shows nothing
 assert_no_diff_except_bootstrap "no diff after binary modification import"
@@ -215,9 +230,10 @@ done
 
 final_size=$(wc -c < icon.png | tr -d ' ')
 
-atomic init >/dev/null 2>&1
-assert_success "import with multiple binary mods succeeds" atomic git import
+require_success "initialize Atomic repository" atomic init
+require_success "import with multiple binary mods succeeds" atomic git import
 assert_import_clean_with_bootstrap "clean after multiple binary modifications"
+assert_success "final binary matches Git HEAD" git diff --exit-code HEAD -- icon.png
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -234,8 +250,8 @@ git commit --quiet -m "Add logo"
 git rm --quiet logo.png
 git commit --quiet -m "Remove logo"
 
-atomic init >/dev/null 2>&1
-assert_success "import with binary deletion succeeds" atomic git import
+require_success "initialize Atomic repository" atomic init
+require_success "import with binary deletion succeeds" atomic git import
 assert_import_clean_with_bootstrap "clean after binary deletion"
 assert_file_not_exists "logo.png deleted" "logo.png"
 
@@ -313,8 +329,8 @@ git commit --quiet -m "Rewrite tests, add helpers"
 git_commit "Update helpers" "helpers.rs" "$(cat helpers.rs)
 pub fn extra() {}"
 
-atomic init >/dev/null 2>&1
-assert_success "import rewrite+add succeeds" atomic git import
+require_success "initialize Atomic repository" atomic init
+require_success "import rewrite+add succeeds" atomic git import
 assert_import_clean_with_bootstrap "clean after rewrite+add import"
 
 # Both files must be tracked
@@ -322,17 +338,8 @@ assert_file_exists "tests.rs exists" "tests.rs"
 assert_file_exists "helpers.rs exists" "helpers.rs"
 
 # Verify status doesn't show either as untracked
-status_out="$(atomic status 2>/dev/null || true)"
-if echo "$status_out" | grep -qF "tests.rs"; then
-    _fail "tests.rs not listed in status" "tests.rs appears in status output"
-else
-    _pass "tests.rs not listed in status"
-fi
-if echo "$status_out" | grep -qF "helpers.rs"; then
-    _fail "helpers.rs not listed in status" "helpers.rs appears in status output"
-else
-    _pass "helpers.rs not listed in status"
-fi
+assert_status_no_entry "tests.rs not listed in status" "tests.rs"
+assert_status_no_entry "helpers.rs not listed in status" "helpers.rs"
 
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -367,8 +374,8 @@ EOF
 git add brand_new.txt
 git commit --quiet -m "Add brand_new.txt"
 
-atomic init >/dev/null 2>&1
-assert_success "import rename-vs-rewrite succeeds" atomic git import
+require_success "initialize Atomic repository" atomic init
+require_success "import rename-vs-rewrite succeeds" atomic git import
 assert_import_clean_with_bootstrap "clean after rename-vs-rewrite import"
 
 assert_file_not_exists "original.txt removed" "original.txt"
@@ -461,8 +468,8 @@ deleted_files=(
 )
 
 # Import
-atomic init >/dev/null 2>&1
-assert_success "stress test import succeeds" atomic git import
+require_success "initialize Atomic repository" atomic init
+require_success "stress test import succeeds" atomic git import
 assert_import_clean_with_bootstrap "clean after stress test import"
 
 # Verify expected files exist

@@ -41,15 +41,15 @@ import json
 def main():
     pass
 PYEOF
-assert_success "add imports.py" atomic add imports.py
-record_change "Add imports.py on dev" >/dev/null 2>&1 || true
+require_success "add imports.py" atomic add imports.py
+require_success "record base imports" record_change "Add imports.py on dev"
 
 # Create two draft views parented on dev
-new_view "alpha" --draft --parent dev >/dev/null 2>&1 || true
-new_view "beta"  --draft --parent dev >/dev/null 2>&1 || true
+require_success "create alpha" new_view "alpha" --draft --parent dev
+require_success "create beta" new_view "beta" --draft --parent dev
 
 # On alpha: add an empty line after the imports section (after 'import json')
-switch_view "alpha" >/dev/null 2>&1 || true
+require_success "switch to alpha" switch_view "alpha"
 cat > imports.py << 'PYEOF'
 import os
 import sys
@@ -69,10 +69,10 @@ import json
 def main():
     pass
 PYEOF
-record_change "Alpha: add blank line after imports" >/dev/null 2>&1 || true
+require_success "record alpha edit" record_change "Alpha: add blank line after imports"
 
 # On beta: add the same empty line at the same position
-switch_view "beta" >/dev/null 2>&1 || true
+require_success "switch to beta" switch_view "beta"
 cat > imports.py << 'PYEOF'
 import os
 import sys
@@ -82,16 +82,36 @@ import json
 def main():
     pass
 PYEOF
-record_change "Beta: add blank line after imports" >/dev/null 2>&1 || true
+require_success "record beta edit" record_change "Beta: add blank line after imports"
 
 # Switch to dev, insert from alpha, then beta
-switch_view "dev" >/dev/null 2>&1 || true
-insert_from_view "alpha" "dev" >/dev/null 2>&1 || true
-insert_from_view "beta" "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
+require_success "insert alpha into dev" insert_from_view "alpha" "dev"
+snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-concurrent-snapshot-XXXXXX")"
+_HARNESS_TMPDIRS+=("$snapshot_dir")
+cp imports.py "$snapshot_dir/imports.py"
+require_capture "read dev history before beta insert" atomic log --format json --view dev --all
+history_before="$COMMAND_OUTPUT"
+if insert_out="$(insert_from_view "beta" "dev" 2>&1)"; then
+    _pass "insert identical beta edit into dev"
+else
+    _fail "insert identical beta edit into dev" "$insert_out"
+    assert_success "refused insert preserves file bytes" cmp -s "$snapshot_dir/imports.py" imports.py
+    assert_current_view "refused insert preserves dev view" "dev"
+    require_capture "read dev history after refusal" atomic log --format json --view dev --all
+    if [[ "$COMMAND_OUTPUT" == "$history_before" ]]; then
+        _pass "refused insert preserves dev history"
+    else
+        _fail "refused insert preserves dev history" "history changed"
+    fi
+    _skip "remaining case 1 and cases 2–4" "identical concurrent insertion refused"
+    print_summary || true
+    exit 1
+fi
 
 # Re-materialize: switch away and back
-switch_view "alpha" >/dev/null 2>&1 || true
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to alpha" switch_view "alpha"
+require_success "switch back to dev" switch_view "dev"
 
 assert_file_exists "imports.py exists on dev after inserts" "imports.py"
 assert_no_conflict_markers "no conflict markers on dev (identical edits)" "imports.py"
@@ -101,8 +121,8 @@ assert_file_contains "dev has def main" "imports.py" "def main():"
 
 # Verify content is stable across switches
 DEV_SNAPSHOT_1="$(snapshot_file "imports.py")"
-switch_view "alpha" >/dev/null 2>&1 || true
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to alpha again" switch_view "alpha"
+require_success "switch back to dev again" switch_view "dev"
 assert_file_stable "dev content stable after round-trip (case 1)" "imports.py" "$DEV_SNAPSHOT_1"
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -39,6 +39,7 @@ _HARNESS_SUMMARY_PRINTED=0
 # Exit code used when an entire suite cannot run because a prerequisite is
 # unavailable. The top-level runner recognizes 77 as SKIPPED, not PASSED.
 HARNESS_SKIP_EXIT="${HARNESS_SKIP_EXIT:-77}"
+HARNESS_PARTIAL_EXIT="${HARNESS_PARTIAL_EXIT:-78}"
 
 # ── Binary discovery ────────────────────────────────────────────────────────
 
@@ -373,30 +374,63 @@ assert_file_content() {
     fi
 }
 
-# Assert that stdout of a command contains a substring.
+# Assert that a successful command's output contains a substring.
 # Usage:  assert_output_contains "desc" "substring" command args...
 assert_output_contains() {
     local desc="$1"
     local needle="$2"
     shift 2
     local out
-    out="$("$@" 2>&1)" || true
-    if echo "$out" | grep -qF "$needle"; then
+    if ! out="$("$@" 2>&1)"; then
+        _fail "$desc" "command failed: $*${out:+
+$out}"
+        return
+    fi
+    if printf '%s\n' "$out" | grep -qF -- "$needle"; then
         _pass "$desc"
     else
         _fail "$desc" "output did not contain '$needle'. Got: $(echo "$out" | head -5)"
     fi
 }
 
-# Assert that stdout of a command does NOT contain a substring.
+# Assert that a successful command's output does NOT contain a substring.
 assert_output_not_contains() {
     local desc="$1"
     local needle="$2"
     shift 2
     local out
-    out="$("$@" 2>&1)" || true
-    if echo "$out" | grep -qF "$needle"; then
+    if ! out="$("$@" 2>&1)"; then
+        _fail "$desc" "command failed: $*${out:+
+$out}"
+        return
+    fi
+    if printf '%s\n' "$out" | grep -qF -- "$needle"; then
         _fail "$desc" "output should not contain '$needle' but does"
+    else
+        _pass "$desc"
+    fi
+}
+
+# Assertions on diagnostics from a command that must fail.
+assert_failed_output_contains() {
+    local desc="$1" needle="$2" out; shift 2
+    if out="$("$@" 2>&1)"; then
+        _fail "$desc" "expected command failure: $*${out:+
+$out}"
+    elif printf '%s\n' "$out" | grep -qF -- "$needle"; then
+        _pass "$desc"
+    else
+        _fail "$desc" "failure output did not contain '$needle': $out"
+    fi
+}
+
+assert_failed_output_not_contains() {
+    local desc="$1" needle="$2" out; shift 2
+    if out="$("$@" 2>&1)"; then
+        _fail "$desc" "expected command failure: $*${out:+
+$out}"
+    elif printf '%s\n' "$out" | grep -qF -- "$needle"; then
+        _fail "$desc" "failure output unexpectedly contained '$needle': $out"
     else
         _pass "$desc"
     fi
@@ -638,7 +672,7 @@ git_merge_branch() {
 git_add_submodule() {
     local url="$1"
     local path="$2"
-    git submodule add --quiet "$url" "$path" 2>/dev/null
+    git submodule add --quiet "$url" "$path" || return $?
     git commit --quiet -m "Add submodule $path"
 }
 
@@ -675,7 +709,10 @@ assert_change_author() {
     local ref="$2"
     local expected="$3"
     local out
-    out="$(atomic change "$ref" 2>/dev/null || true)"
+    if ! out="$(atomic change "$ref" 2>&1)"; then
+        _fail "$desc" "change command failed: $out"
+        return
+    fi
     if echo "$out" | grep -qiE "author.*$expected"; then
         _pass "$desc"
     else
@@ -690,7 +727,10 @@ assert_change_message() {
     local ref="$2"
     local expected="$3"
     local out
-    out="$(atomic change "$ref" 2>/dev/null || true)"
+    if ! out="$(atomic change "$ref" 2>&1)"; then
+        _fail "$desc" "change command failed: $out"
+        return
+    fi
     if echo "$out" | grep -qF "$expected"; then
         _pass "$desc"
     else
@@ -729,6 +769,9 @@ print_summary() {
 
     if [[ $TESTS_FAILED -gt 0 ]]; then
         return 1
+    fi
+    if [[ $TESTS_SKIPPED -gt 0 ]]; then
+        return "$HARNESS_PARTIAL_EXIT"
     fi
     return 0
 }

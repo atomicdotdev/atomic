@@ -319,7 +319,7 @@ pub fn log(args: &crate::commands::log::command::Log) -> CliResult<bool> {
     // -f json, and the styled default format (hash === markers, (tag)
     // marker, blank line between entries) otherwise.
     use crate::commands::log::types::{JsonAuthor, JsonLogEntry, LogFormat};
-    if matches!(args.format, LogFormat::Json) {
+    if matches!(args.effective_format(), LogFormat::Json) {
         let json_entries: Vec<JsonLogEntry> = entries
             .iter()
             .map(|entry| JsonLogEntry {
@@ -349,10 +349,17 @@ pub fn log(args: &crate::commands::log::command::Log) -> CliResult<bool> {
         return Ok(true);
     }
 
-    use crate::commands::{format_hash_with_length, format_timestamp, DEFAULT_HASH_LENGTH};
+    use crate::commands::{format_hash_with_length, format_timestamp};
     use crate::output::{
         author as style_author, hash as style_hash, hint, timestamp as style_timestamp,
     };
+    if matches!(
+        args.effective_format(),
+        LogFormat::Short | LogFormat::Oneline
+    ) {
+        print!("{}", format_service_compact_log(&entries, args));
+        return Ok(true);
+    }
     for (i, entry) in entries.iter().enumerate() {
         // Separator between entries (the old formatter's `i > 0` rule).
         if i > 0 {
@@ -366,7 +373,7 @@ pub fn log(args: &crate::commands::log::command::Log) -> CliResult<bool> {
                 .and_then(|h| h.value.clone().try_into().ok())
                 .unwrap_or([0u8; 32]),
         );
-        let hash_str = format_hash_with_length(&hash, DEFAULT_HASH_LENGTH);
+        let hash_str = format_hash_with_length(&hash, args.get_hash_length());
         let tagged_marker = if entry.is_tagged { " (tag)" } else { "" };
         println!(
             "{} === {} ==={}",
@@ -408,6 +415,108 @@ pub fn log(args: &crate::commands::log::command::Log) -> CliResult<bool> {
         }
     }
     Ok(true)
+}
+
+fn format_service_compact_log(
+    entries: &[pb::ChangeLogEntry],
+    args: &crate::commands::log::command::Log,
+) -> String {
+    use crate::commands::log::truncate_string;
+    use crate::commands::log::types::LogFormat;
+    use crate::output::{
+        author as style_author, hash as style_hash, hint, timestamp as style_timestamp,
+    };
+    let oneline = matches!(args.effective_format(), LogFormat::Oneline);
+    let width = entries
+        .iter()
+        .filter_map(|entry| entry.authors.first())
+        .map(|author| author.name.len())
+        .max()
+        .unwrap_or(10)
+        .min(20);
+    let mut output = String::new();
+    for entry in entries {
+        let full = wire_hash_base32(&entry.hash);
+        let hash = full
+            .get(..args.get_hash_length().min(full.len()))
+            .unwrap_or(&full);
+        let message = entry.message.as_deref().unwrap_or("(no message)");
+        let first_line = message.lines().next().unwrap_or(message);
+        if oneline {
+            let date = entry
+                .recorded_at
+                .as_ref()
+                .and_then(|ts| chrono::DateTime::from_timestamp(ts.seconds, ts.nanos.max(0) as u32))
+                .map(|date| date.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "          ".into());
+            let author = entry
+                .authors
+                .first()
+                .map(|author| truncate_string(&author.name, width))
+                .unwrap_or_else(|| "(unknown)".into());
+            let marker = if entry.is_tagged { "*" } else { " " };
+            output.push_str(&format!(
+                "{}{} {} {:width$} {}\n",
+                style_hash(hash),
+                hint(marker),
+                style_timestamp(&date),
+                style_author(&author),
+                first_line
+            ));
+        } else {
+            let marker = if entry.is_tagged { " *" } else { "" };
+            output.push_str(&format!(
+                "{}{} {}\n",
+                style_hash(hash),
+                hint(marker),
+                first_line
+            ));
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod service_log_format_tests {
+    use super::*;
+    use crate::commands::log::{Log, LogFormat};
+
+    #[test]
+    fn compact_formats_honor_full_hash_and_short_alias() {
+        let hash = Merkle::of(b"log entry");
+        let entry = pb::ChangeLogEntry {
+            hash: Some(pb::Hash {
+                value: hash.0.to_vec(),
+                algorithm: pb::HashAlgorithm::Blake3 as i32,
+            }),
+            message: Some("first line\nsecond line".into()),
+            authors: vec![pb::Author {
+                name: "Alice".into(),
+                email: None,
+            }],
+            is_tagged: true,
+            ..Default::default()
+        };
+        let full = hash.to_base32();
+        let short = Log::new()
+            .with_format(LogFormat::Short)
+            .with_full_hash(true);
+        let rendered = format_service_compact_log(std::slice::from_ref(&entry), &short);
+        assert_eq!(rendered, format!("{full} * first line\n"));
+        let mut alias = Log::new();
+        alias.short = true;
+        assert_eq!(
+            format_service_compact_log(std::slice::from_ref(&entry), &alias),
+            format!("{} * first line\n", &full[..alias.get_hash_length()])
+        );
+        let oneline = Log::new()
+            .with_format(LogFormat::Oneline)
+            .with_full_hash(true);
+        let rendered = format_service_compact_log(&[entry], &oneline);
+        assert!(rendered.starts_with(&format!("{full}* ")));
+        assert!(rendered.contains("Alice first line"));
+        assert!(!rendered.contains("second line"));
+    }
 }
 
 /// The Base32 form of a wire `Hash` (the local path's `Hash::to_base32`).
@@ -567,6 +676,9 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
         (author, None)
     };
     let root = crate::commands::find_repository_root()?;
+    if args.skip_binary || args.max_size.is_some() {
+        session.ensure_record_file_options()?;
+    }
     // `--all` stages untracked files first — the same client-side
     // composition `atomic add --all` performs (a Status read + AddFiles),
     // silently like the local body's pre-record staging.
@@ -607,6 +719,8 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
         ai_authorship: None,
         author,
         identity_name,
+        skip_binary: args.skip_binary.then_some(true),
+        max_file_size: args.max_size,
     };
     let response = session.record(request)?;
     let Some(change) = response.change else {
@@ -656,6 +770,20 @@ pub fn record(args: &super::record::Record) -> CliResult<bool> {
         for file in &args.files {
             println!(" {file}");
         }
+    }
+    if !response.file_errors.is_empty() {
+        println!();
+        print_warning("Some files had errors:");
+        for error in &response.file_errors {
+            println!("  {}: {}", error.path, error.message);
+        }
+    }
+    if !response.skipped_paths.is_empty() {
+        println!();
+        print_hint(&format!(
+            "{} skipped (unchanged, empty, binary, or too large)",
+            crate::commands::record::format_count(response.skipped_paths.len(), "file")
+        ));
     }
     Ok(true)
 }
@@ -736,6 +864,8 @@ pub fn intent_new(args: &super::intent::new::IntentNew) -> CliResult<bool> {
         model: None,
         intent_kind: Some(args.kind.clone()),
         review_target: args.review.clone(),
+        memory_id: None,
+        memory_status: None,
         view: None,
         expected_snapshot: None,
     };
@@ -1179,12 +1309,35 @@ pub fn memory_new(args: &super::memory::new::MemoryNew) -> CliResult<bool> {
     let Some(session) = Service::open()? else {
         return Ok(false);
     };
+    if !atomic_canonical::vocab::MEMORY_KIND.contains(&args.kind.as_str()) {
+        return Err(CliError::InvalidArgument {
+            message: format!("unknown memory kind '{}'", args.kind),
+        });
+    }
+    if !atomic_canonical::vocab::MEMORY_STATUS.contains(&args.status.as_str()) {
+        return Err(CliError::InvalidArgument {
+            message: format!("unknown memory status '{}'", args.status),
+        });
+    }
+    if args
+        .text
+        .as_ref()
+        .is_some_and(|text| text.trim().is_empty())
+    {
+        return Err(CliError::InvalidArgument {
+            message: "memory text cannot be empty".into(),
+        });
+    }
     let request = pb::CreateVaultEntityRequest {
         repository: Some(session.reference.clone()),
         meta: request_meta(),
         kind: Kind::Memory as i32,
         title: String::new(),
-        body: args.text.clone(),
+        body: Some(
+            args.text
+                .clone()
+                .unwrap_or_else(|| super::memory::new::MEMORY_SCAFFOLD.to_string()),
+        ),
         memory_kind: Some(args.kind.clone()),
         derived_from: args.derived_from.clone(),
         about: args.about.clone(),
@@ -1193,6 +1346,8 @@ pub fn memory_new(args: &super::memory::new::MemoryNew) -> CliResult<bool> {
         model: None,
         intent_kind: None,
         review_target: None,
+        memory_id: args.id.clone(),
+        memory_status: (args.status != "active").then_some(args.status.clone()),
         view: None,
         expected_snapshot: None,
     };
@@ -1213,6 +1368,15 @@ pub fn memory_new(args: &super::memory::new::MemoryNew) -> CliResult<bool> {
     println!("  file: {}", entry.vault_path.clone().unwrap_or_default());
     println!("  kind: {}", args.kind);
     println!("  status: {}", args.status);
+    if !args.derived_from.is_empty() {
+        println!("  derived from: {} source(s)", args.derived_from.len());
+    }
+    println!();
+    if args.text.is_none() {
+        println!("Edit the :::memory stub, then:");
+    }
+    println!("  atomic memory validate {}", entry.id);
+    println!("  atomic memory attest {}", entry.id);
     Ok(true)
 }
 
@@ -2280,9 +2444,12 @@ fn diff_change(args: &super::diff::command::Diff, change_ref: &str) -> CliResult
         // The FileOps hunks pad their context from the wire-carried
         // before-content — the same context the local path reads from
         // the graph.
-        super::diff::change_file_diffs_with(&change, &config, |path| {
-            before_content.get(path).cloned()
-        })?
+        super::diff::projected_change_file_diffs_with(
+            &change,
+            &config,
+            |path| Ok(before_content.get(path).cloned()),
+            |path| Ok(after_content.get(path).cloned()),
+        )?
     } else {
         // Legacy changes carry no file_ops: the diff computes from the
         // reconstructed before/after content — the SAME builder the
@@ -6074,6 +6241,8 @@ pub fn vault_goal_start(args: &super::vault::goal::GoalStart) -> CliResult<bool>
         model: args.model.clone(),
         intent_kind: None,
         review_target: None,
+        memory_id: None,
+        memory_status: None,
         view: None,
         expected_snapshot: None,
     };

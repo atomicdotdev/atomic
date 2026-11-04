@@ -528,12 +528,19 @@ pub struct FileDiff {
 
     /// Whether this is a binary file.
     pub is_binary: bool,
+
+    /// Git inferred this rename; the imported Atomic graph retained separate
+    /// delete/add identities rather than asserting a causal file move.
+    pub git_rename_identity_unproven: bool,
 }
 
 impl FileDiff {
     /// Check if this file diff has any changes.
     pub fn has_changes(&self) -> bool {
-        !self.hunks.is_empty()
+        matches!(
+            self.status,
+            FileChangeStatus::Renamed | FileChangeStatus::Copied
+        ) || !self.hunks.is_empty()
             || self.stats.insertions > 0
             || self.stats.deletions > 0
             || self.is_binary
@@ -554,6 +561,7 @@ impl FileDiff {
             hunks: Vec::new(),
             stats: FileDiffStats::default(),
             is_binary: false,
+            git_rename_identity_unproven: false,
         }
     }
 
@@ -571,6 +579,7 @@ impl FileDiff {
                 ..Default::default()
             },
             is_binary: false,
+            git_rename_identity_unproven: false,
         }
     }
 
@@ -588,6 +597,7 @@ impl FileDiff {
                 ..Default::default()
             },
             is_binary: false,
+            git_rename_identity_unproven: false,
         }
     }
 
@@ -605,6 +615,7 @@ impl FileDiff {
                 ..Default::default()
             },
             is_binary: false,
+            git_rename_identity_unproven: false,
         }
     }
 

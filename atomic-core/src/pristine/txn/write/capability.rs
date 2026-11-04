@@ -28,6 +28,9 @@ impl CapabilityTxnT for WriteTxn<'_> {
 
 impl CapabilityMutTxnT for WriteTxn<'_> {
     fn put_required_capability(&mut self, capability: RepositoryCapability) -> PristineResult<u32> {
+        if capability.id() == crate::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY.id() {
+            crate::pristine::schema::require_projected_semantics_schema(&self.txn)?;
+        }
         let mut table = self.txn.open_table(PRISTINE_META)?;
         let key = capability_metadata_key(capability.id());
         let existing = table.get(key.as_str())?.map(|version| version.value());
@@ -42,12 +45,38 @@ impl CapabilityMutTxnT for WriteTxn<'_> {
     }
 
     fn put_required_capability_exact(&mut self, id: &str, version: u32) -> PristineResult<u32> {
+        let projected = crate::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY;
+        if id == projected.id() {
+            if version < projected.minimum_version() {
+                return Err(crate::pristine::PristineError::Inconsistent {
+                    message: "projected span semantic capability cannot be lowered".into(),
+                });
+            }
+            let existing = {
+                let table = self.txn.open_table(PRISTINE_META)?;
+                let version = table
+                    .get(capability_metadata_key(id).as_str())?
+                    .map(|value| value.value());
+                version
+            };
+            if existing.is_some_and(|old| version < old) {
+                return Err(crate::pristine::PristineError::Inconsistent {
+                    message: "projected span semantic capability cannot be lowered".into(),
+                });
+            }
+            crate::pristine::schema::require_projected_semantics_schema(&self.txn)?;
+        }
         let mut table = self.txn.open_table(PRISTINE_META)?;
         table.insert(capability_metadata_key(id).as_str(), version)?;
         Ok(version)
     }
 
     fn del_required_capability(&mut self, id: &str) -> PristineResult<bool> {
+        if id == crate::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY.id() {
+            return Err(crate::pristine::PristineError::Inconsistent {
+                message: "projected span semantic capability cannot be removed".into(),
+            });
+        }
         let mut table = self.txn.open_table(PRISTINE_META)?;
         let key = capability_metadata_key(id);
         let removed = table.remove(key.as_str())?;

@@ -116,6 +116,45 @@ fn preinit_record(native: bool) {
 }
 
 #[test]
+fn incremental_graph_import_preserves_independent_draft_edit() {
+    let f = Fixture {
+        root: TempDir::new().unwrap(),
+        home: TempDir::new().unwrap(),
+    };
+    let initial = b"app:\n  name: TestApp\n  version: \"1.0\"\n  debug: false\n\ndatabase:\n  host: localhost\n  port: 5432\n";
+    let shared = String::from_utf8(initial.to_vec())
+        .unwrap()
+        .replace("5432", "5433");
+    let draft = String::from_utf8(initial.to_vec())
+        .unwrap()
+        .replace("debug: false", "debug: true");
+    let merged = shared.replace("debug: false", "debug: true");
+    let path = f.root.path().join("config.yml");
+    f.git(&["init", "-q", "-b", "main"]);
+    fs::write(&path, initial).unwrap();
+    f.git(&["add", "config.yml"]);
+    f.git(&["commit", "-qm", "initial"]);
+    f.atomic(&["git", "import", "--no-vault", "--branch", "main"]);
+    f.atomic(&["view", "create", "tweak", "--draft", "--parent", "main"]);
+    f.atomic(&["view", "switch", "tweak", "--force"]);
+    fs::write(&path, &draft).unwrap();
+    f.atomic(&["add", "config.yml"]);
+    f.atomic(&["record", "-m", "draft debug"]);
+    f.atomic(&["view", "switch", "main", "--force"]);
+    fs::write(&path, &shared).unwrap();
+    f.git(&["add", "config.yml"]);
+    f.git(&["commit", "-qm", "upstream port"]);
+    f.atomic(&["git", "import", "--incremental", "--branch", "main"]);
+    assert_eq!(fs::read(&path).unwrap(), shared.as_bytes());
+    f.assert_content("main", "config.yml", shared.as_bytes());
+    f.assert_content("tweak", "config.yml", merged.as_bytes());
+    f.atomic(&["view", "switch", "tweak", "--force"]);
+    assert_eq!(fs::read(&path).unwrap(), merged.as_bytes());
+    f.atomic(&["view", "switch", "main", "--force"]);
+    assert_eq!(fs::read(&path).unwrap(), shared.as_bytes());
+}
+
+#[test]
 fn preinit_record_all_through_service() {
     preinit_record(false);
 }

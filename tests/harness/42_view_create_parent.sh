@@ -23,33 +23,31 @@ make_temp_repo "view-create-parent"
 init_repo
 
 create_file "seed.txt" "seed content"
-assert_success "add seed.txt" atomic add seed.txt
-record_change "seed base" >/dev/null 2>&1 || true
+require_success "add seed.txt" atomic add seed.txt
+require_success "record seed base" record_change "seed base"
 
 # ───────────────────────────────────────────────────────────────────────────
 begin_section "Bug: --parent child is empty, switch wipes the tree"
 # ───────────────────────────────────────────────────────────────────────────
-$ATOMIC_BIN view create child --parent dev >/dev/null 2>&1 || true
+require_success "create --parent child view" atomic view create child --parent dev
+assert_view_exists "--parent child view is created" child
+require_capture "read child scope and parent" atomic view list --all --json
+assert_success "child is a draft parented on dev" python3 -c \
+    'import json,sys; rows=json.loads(sys.argv[1])["views"]; assert any(r["name"]=="child" and r["scope"]=="draft" and r["parent"]=="dev" for r in rows)' "$COMMAND_OUTPUT"
 
-if $ATOMIC_BIN view list -a 2>/dev/null | grep -q "child"; then
-    _pass "--parent child view is created"
-else
-    _fail "--parent child view is created" "view create failed"
-fi
-
-switch_view "child" >/dev/null 2>&1 || true
+require_success "switch to child" switch_view "child"
 assert_current_view "now on child" "child"
 
 # THE REGRESSION: the child inherited dev's state, so switching must keep
 # the tracked files on disk.
-assert_file_exists "seed.txt survives the switch into --parent child" "seed.txt"
+assert_file_content "seed.txt survives the switch into --parent child" "seed.txt" "seed content"
 
 # ───────────────────────────────────────────────────────────────────────────
 begin_section "Round-trip: dev still holds the file after switching back"
 # ───────────────────────────────────────────────────────────────────────────
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_current_view "back on dev" "dev"
-assert_file_exists "seed.txt is intact back on dev" "seed.txt"
+assert_file_content "seed.txt is intact back on dev" "seed.txt" "seed content"
 
 # ───────────────────────────────────────────────────────────────────────────
 print_summary

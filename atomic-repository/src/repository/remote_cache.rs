@@ -659,6 +659,26 @@ impl Repository {
             }
         }
 
+        if change.file_ops().iter().any(|ops| {
+            matches!(
+                ops.trunk_op(),
+                Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+            )
+        }) {
+            if cfg!(not(unix)) {
+                return Ok(Err(SubmitRejection::Malformed(
+                    "projected semantic submission is not supported on this platform".into(),
+                )));
+            }
+            if change.hashed.span.is_none() {
+                return Ok(Err(SubmitRejection::Malformed(
+                    "projected semantic edit requires a span change".into(),
+                )));
+            }
+            self.pristine.require_repository_capability(
+                atomic_core::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY,
+            )?;
+        }
         self.save_change_bytes(hash, bytes, &change)?;
         let outcome = match self.insert_change(hash, crate::InsertOptions::default().view(view)) {
             Ok(outcome) => outcome,

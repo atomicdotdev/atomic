@@ -13,6 +13,10 @@ use serde::Deserialize;
 struct GitMetadataDiffFile {
     path: String,
     lines: Vec<GitDiffLine>,
+    #[serde(default)]
+    old_path: Option<String>,
+    #[serde(default)]
+    operation: Option<String>,
 }
 
 /// A changed line paired with the insert/delete offset preceding it.
@@ -563,6 +567,30 @@ impl Diff {
             }
 
             if hunk_lines.is_empty() {
+                if entry.operation.as_deref() == Some("renamed") {
+                    if let Some(old_path) = &entry.old_path {
+                        let unproven = change
+                            .unhashed
+                            .as_ref()
+                            .and_then(|value| value.pointer("/git/stream/rename_identity_loss"))
+                            .and_then(|value| value.as_array())
+                            .is_some_and(|losses| {
+                                losses.iter().any(|loss| {
+                                    loss.get("from").and_then(|v| v.as_str())
+                                        == Some(old_path.as_str())
+                                        && loss.get("to").and_then(|v| v.as_str())
+                                            == Some(entry.path.as_str())
+                                })
+                            });
+                        let mut file_diff = FileDiff::new(&entry.path, FileChangeStatus::Renamed);
+                        file_diff.old_path = old_path.clone();
+                        file_diff.stats.path = entry.path.clone();
+                        file_diff.stats.status = 'R';
+                        file_diff.git_rename_identity_unproven = unproven;
+                        stats.add_file(file_diff.stats.clone());
+                        file_diffs.push(file_diff);
+                    }
+                }
                 continue;
             }
 
@@ -923,15 +951,82 @@ pub(crate) fn change_file_diffs(
     change_hash: &Hash,
     config: &DiffOutputConfig,
 ) -> CliResult<(Vec<FileDiff>, DiffStats)> {
+    projected_change_file_diffs_with(
+        change,
+        config,
+        |path| {
+            repo.get_file_content_before_change(path, change_hash)
+                .map_err(CliError::Repository)
+        },
+        |path| {
+            repo.get_file_content_after_change(path, change_hash)
+                .map_err(CliError::Repository)
+        },
+    )
+}
+
+pub(crate) fn projected_change_file_diffs_with<B, A>(
+    change: &Change,
+    config: &DiffOutputConfig,
+    before_content: B,
+    after_content: A,
+) -> CliResult<(Vec<FileDiff>, DiffStats)>
+where
+    B: Fn(&str) -> CliResult<Option<Vec<u8>>>,
+    A: Fn(&str) -> CliResult<Option<Vec<u8>>>,
+{
+    let projected: Vec<_> = change
+        .file_ops()
+        .iter()
+        .filter(|ops| matches!(ops.trunk_op(), Some(TrunkOp::ProjectedSpanEdit { .. })))
+        .collect();
+    if !projected.is_empty() {
+        let mut ordinary = change.clone();
+        ordinary
+            .hashed
+            .file_ops
+            .retain(|ops| !matches!(ops.trunk_op(), Some(TrunkOp::ProjectedSpanEdit { .. })));
+        let (mut files, mut stats) = change_file_diffs_with(&ordinary, config, |path| {
+            before_content(path).ok().flatten()
+        })?;
+        for ops in projected {
+            let path = ops.path();
+            let before = before_content(path)?.ok_or_else(|| CliError::InvalidArgument {
+                message: format!("projected span file '{path}' is absent before the change"),
+            })?;
+            let after = after_content(path)?.ok_or_else(|| CliError::InvalidArgument {
+                message: format!("projected span file '{path}' is absent after the change"),
+            })?;
+            let mut file_diff = FileDiff::modified(path);
+            let binary = before.contains(&0)
+                || after.contains(&0)
+                || std::str::from_utf8(&before).is_err()
+                || std::str::from_utf8(&after).is_err();
+            if binary {
+                file_diff.is_binary = true;
+            } else {
+                let result = diff_text(&before, &after, Algorithm::Myers);
+                if !result.is_unchanged() {
+                    let old_lines: Vec<_> = before.split(|&byte| byte == b'\n').collect();
+                    let new_lines: Vec<_> = after.split(|&byte| byte == b'\n').collect();
+                    for hunk in
+                        build_hunks_from_diff(&result, &old_lines, &new_lines, config.context_lines)
+                    {
+                        file_diff.add_hunk(hunk);
+                    }
+                }
+            }
+            file_diff.compute_stats();
+            stats.add_file(file_diff.stats.clone());
+            files.push(file_diff);
+        }
+        return Ok((files, stats));
+    }
     // The before-content fetch: the file's recorded state prior to the
     // change, read from the graph. The wire path has no such fetch — it
     // passes a `None` resolver and the hunks render zero-context, the
     // same degradation this path applies when the read fails.
-    change_file_diffs_with(change, config, |path| {
-        repo.get_file_content_before_change(path, change_hash)
-            .ok()
-            .flatten()
-    })
+    change_file_diffs_with(change, config, |path| before_content(path).ok().flatten())
 }
 
 /// Build the legacy (no-file_ops) change's file diffs from per-file
@@ -1051,6 +1146,11 @@ where
 
         let trunk_op = ops.trunk_op();
         let line_ops = ops.line_ops();
+        if matches!(trunk_op, Some(TrunkOp::ProjectedSpanEdit { .. })) {
+            return Err(CliError::InvalidArgument {
+                message: "projected span edit requires a span-aware semantic diff".into(),
+            });
+        }
 
         // Determine file change status from trunk operation
         let change_status = match trunk_op {
@@ -1059,7 +1159,8 @@ where
             Some(TrunkOp::Move { .. }) => FileChangeStatus::Renamed,
             Some(TrunkOp::Undelete { .. })
             | Some(TrunkOp::SetMode { .. })
-            | Some(TrunkOp::SetKind { .. }) => FileChangeStatus::Modified,
+            | Some(TrunkOp::SetKind { .. })
+            | Some(TrunkOp::ProjectedSpanEdit { .. }) => FileChangeStatus::Modified,
             None => FileChangeStatus::Modified,
         };
 

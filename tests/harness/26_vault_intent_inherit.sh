@@ -35,22 +35,26 @@ copy_all_changes() {
     local src_changes="$1/.atomic/changes"
     local dst_changes="$2/.atomic/changes"
 
-    find "$src_changes" -name "*.change" -type f 2>/dev/null | while read -r f; do
+    find "$src_changes" -name "*.change" -type f -print0 | while IFS= read -r -d '' f; do
         local rel="${f#$src_changes/}"
         local dst_dir="$dst_changes/$(dirname "$rel")"
-        mkdir -p "$dst_dir"
-        cp "$f" "$dst_dir/"
+        mkdir -p "$dst_dir" || exit 1
+        cp "$f" "$dst_dir/" || exit 1
+        cmp -s "$f" "$dst_dir/$(basename "$f")" || exit 1
     done
 }
 
 get_change_hashes() {
-    find "$1/.atomic/changes" -name "*.change" -type f 2>/dev/null \
-        | sort | xargs -I{} basename {} .change
-}
-
-# Extract the first PROJECT::author::seq human key from `intent list` output.
-first_human_key() {
-    atomic intent list 2>/dev/null | grep -oE '[^ ]+::[^ ]+::[0-9]+' | head -1
+    local log
+    if ! log="$(cd "$1" && atomic log --format json --reverse 2>&1)"; then
+        printf 'cannot read source history: %s\n' "$log" >&2
+        return 1
+    fi
+    printf '%s\n' "$log" | python3 -c '
+import json,sys
+entries=json.load(sys.stdin)
+assert entries and all(isinstance(e.get("hash"),str) and len(e["hash"]) == 52 for e in entries)
+print("\n".join(e["hash"] for e in entries))'
 }
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -61,23 +65,33 @@ make_temp_repo "vault-inherit-A"
 REPO_A="$REPO_DIR"
 init_repo --vault
 
-atomic intent new "Inherited from A" >/dev/null 2>&1
-A_KEY="$(first_human_key)"
+require_capture "User A: create intent" atomic intent new "Inherited from A"
+A_KEY="$(printf '%s\n' "$COMMAND_OUTPUT" | sed -n 's/.*Created intent: \([A-Za-z0-9:_-]*\).*/\1/p' | head -1)"
+A_INTENT_FILE="$(printf '%s\n' "$COMMAND_OUTPUT" | sed -n 's|.*file: \.vault/||p' | head -1)"
 if [[ -n "$A_KEY" ]]; then
     _pass "User A: intent created ($A_KEY)"
 else
     _fail "User A: intent created" "no human key in intent list"
+    print_summary || true
+    exit 1
 fi
 A_SEQ="${A_KEY##*::}"
+if [[ ! "$A_SEQ" =~ ^[0-9]+$ || ! "$A_INTENT_FILE" =~ ^intents/[0-9A-HJKMNP-TV-Z]{26}/intent\.md$ ]]; then
+    _fail "User A: intent identity and path" "key=$A_KEY file=$A_INTENT_FILE"
+    print_summary || true
+    exit 1
+fi
+assert_file_exists "User A: intent file exists" ".vault/$A_INTENT_FILE"
 
-atomic memory new --kind lesson --id inherited-note \
-    --text "Vault entries must survive inheritance." >/dev/null 2>&1
+require_success "User A: create memory" atomic memory new --kind lesson --id inherited-note \
+    --text "Vault entries must survive inheritance."
 assert_output_contains "User A: memory listed" "inherited-note" \
     atomic memory list
 
-record_change "vault: intent + memory" -a >/dev/null 2>&1 || true
+require_success "User A: record vault content" record_change "vault: intent + memory" -a
 
-A_HASHES="$(get_change_hashes "$REPO_A")"
+require_capture "User A: read ordered change hashes" get_change_hashes "$REPO_A"
+A_HASHES="$COMMAND_OUTPUT"
 if [[ -n "$A_HASHES" ]]; then
     _pass "User A: recorded vault content"
 else
@@ -92,19 +106,21 @@ make_temp_repo "vault-inherit-B"
 REPO_B="$REPO_DIR"
 init_repo --no-vault
 
-copy_all_changes "$REPO_A" "$REPO_B"
+require_success "copy changes byte-for-byte" copy_all_changes "$REPO_A" "$REPO_B"
 cd "$REPO_B"
 for hash in $A_HASHES; do
-    atomic insert "$hash" --view dev >/dev/null 2>&1 || true
+    require_success "User B: insert $hash" atomic insert "$hash" --view dev
 done
-atomic view switch dev >/dev/null 2>&1 || true
+require_success "User B: select dev" atomic view switch dev
 assert_file_exists "User B: inherited memory materialized" \
     ".vault/memory/inherited-note.md"
+assert_success "User B: memory bytes match source" cmp -s "$REPO_A/.vault/memory/inherited-note.md" "$REPO_B/.vault/memory/inherited-note.md"
+assert_success "User B: intent bytes match source" cmp -s "$REPO_A/.vault/$A_INTENT_FILE" "$REPO_B/.vault/$A_INTENT_FILE"
 
 # Bootstrap the vault tables from the materialized files (clone does this
 # automatically; we simulated the transfer with insert), then sync.
-atomic vault init >/dev/null 2>&1 || true
-atomic vault sync >/dev/null 2>&1 || true
+require_success "User B: initialize vault" atomic vault init
+require_success "User B: sync vault" atomic vault sync
 
 # ════════════════════════════════════════════════════════════════════════════
 begin_section "User B: inherited intent + memory are queryable"
@@ -126,29 +142,35 @@ assert_output_contains "User B: memory list shows inherited memory" \
 begin_section "User B: local create allocates next seq; sync is idempotent"
 # ════════════════════════════════════════════════════════════════════════════
 
-atomic intent new "Created on B" >/dev/null 2>&1
+require_capture "User B: create local intent" atomic intent new "Created on B"
+B_KEY="$(printf '%s\n' "$COMMAND_OUTPUT" | sed -n 's/.*Created intent: \([A-Za-z0-9:_-]*\).*/\1/p' | head -1)"
+if [[ -z "$B_KEY" || "$B_KEY" == "$A_KEY" || ! "${B_KEY##*::}" =~ ^[0-9]+$ ]]; then
+    _fail "User B: local intent gets a distinct numeric key" "inherited=$A_KEY created=$B_KEY"
+    print_summary || true
+    exit 1
+fi
 
-B_LIST="$(atomic intent list 2>/dev/null)"
-B_COUNT="$(echo "$B_LIST" | grep -cE '[^ ]+::[^ ]+::[0-9]+' || true)"
+require_capture "User B: list intents" atomic intent list --json
+B_LIST="$COMMAND_OUTPUT"
+B_COUNT="$(printf '%s\n' "$B_LIST" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
 if [[ "$B_COUNT" == "2" ]]; then
     _pass "User B: both intents listed after local create"
 else
     _fail "User B: both intents listed" "expected 2 keys, got $B_COUNT: $B_LIST"
 fi
 
-if [[ "$(echo "$B_LIST" | grep -oE '[^ ]+::[^ ]+::[0-9]+' | sort -u | wc -l | tr -d ' ')" == "2" ]]; then
-    _pass "User B: local intent got a fresh key (no collision with $A_KEY)"
+assert_success "User B: both unique intent keys and titles persist" python3 -c \
+    'import json,sys; rows=json.loads(sys.argv[1]); assert len(rows)==2; assert {(r["id"],r["title"]) for r in rows} == {(sys.argv[2],"Inherited from A"),(sys.argv[3],"Created on B")}' "$B_LIST" "$A_KEY" "$B_KEY"
+if [[ "${B_KEY##*::}" -eq $((10#$A_SEQ + 1)) ]]; then
+    _pass "User B: local intent gets next sequence"
 else
-    _fail "User B: allocator collision" "duplicate human keys: $B_LIST"
+    _fail "User B: local intent gets next sequence" "inherited=$A_KEY created=$B_KEY"
 fi
 
-atomic vault sync >/dev/null 2>&1 || true
-B_COUNT_AFTER="$(atomic intent list 2>/dev/null | grep -cE '[^ ]+::[^ ]+::[0-9]+' || true)"
-if [[ "$B_COUNT_AFTER" == "2" ]]; then
-    _pass "User B: second vault sync is idempotent"
-else
-    _fail "User B: second vault sync" "expected 2 keys, got $B_COUNT_AFTER"
-fi
+require_success "User B: sync vault again" atomic vault sync
+require_capture "User B: list intents after second sync" atomic intent list --json
+assert_success "User B: second vault sync is idempotent" python3 -c \
+    'import json,sys; before=json.loads(sys.argv[1]); after=json.loads(sys.argv[2]); assert sorted((r["id"],r["title"]) for r in before)==sorted((r["id"],r["title"]) for r in after)' "$B_LIST" "$COMMAND_OUTPUT"
 
 # ════════════════════════════════════════════════════════════════════════════
 

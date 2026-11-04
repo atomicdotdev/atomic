@@ -63,6 +63,75 @@ fn typed_span_survives_redb_reopen_and_export() {
 }
 
 #[test]
+fn projected_semantic_span_survives_redb_reopen_and_export() {
+    use atomic_core::change::span_patch::{
+        ExternalFile, ExternalSpan, SpanOp, SpanPatch, SpanProjectionId,
+    };
+    let owner = Hash::of(b"historical change");
+    let file = ExternalFile { owner, ordinal: 3 };
+    let baseline = SpanProjectionId(Hash::of(b"verified semantic baseline"));
+    let mut change = Change::new(
+        ChangeHeader::new("native span edit"),
+        vec![],
+        b"new".to_vec(),
+        vec![owner],
+    );
+    change.hashed.span = Some(SpanPatch::new(
+        vec![],
+        vec![SpanOp::Edit {
+            file: file.clone(),
+            target: ExternalSpan {
+                owner,
+                start: 0,
+                end: 4,
+            },
+            start: 0,
+            end: 3,
+            insert_start: 0,
+            insert_end: 3,
+        }],
+    ));
+    change
+        .hashed
+        .file_ops
+        .push(atomic_core::change::FileOps::projected_span_edit(
+            "file.txt".into(),
+            file,
+            baseline,
+        ));
+    let mut original = Vec::new();
+    let original_hash = change.serialize(&mut original).unwrap();
+    let (dir, store) = temp_store();
+    let hash = store.import_v3_bytes(&original).unwrap();
+    assert_eq!(hash, *original_hash.as_bytes());
+    drop(store);
+    let store = RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+    assert!(matches!(
+        store.load_graph_sections(&hash),
+        Err(RedbStoreError::UnsupportedSpanSelectiveRead)
+    ));
+    assert!(matches!(
+        store.load_semantic_sections(&hash),
+        Err(RedbStoreError::UnsupportedSpanSelectiveRead)
+    ));
+    assert!(matches!(
+        store.load_content_chunks(&hash),
+        Err(RedbStoreError::UnsupportedSpanSelectiveRead)
+    ));
+    let exported = store.export_v3_bytes(&hash).unwrap();
+    let (loaded, exported_hash) = Change::deserialize(&mut Cursor::new(&exported)).unwrap();
+    assert_eq!(exported_hash, original_hash);
+    assert_eq!(loaded.hashed, change.hashed);
+    assert_eq!(loaded.contents, change.contents);
+    assert!(
+        matches!(loaded.file_ops()[0].trunk_op(), Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { baseline: saved, .. }) if *saved == baseline)
+    );
+    let (_receiver_dir, receiver) = temp_store();
+    assert_eq!(receiver.import_v3_bytes(&exported).unwrap(), hash);
+    assert_eq!(receiver.load_change(&hash).unwrap().hashed, change.hashed);
+}
+
+#[test]
 fn altered_span_cannot_be_exported_under_its_original_hash() {
     use atomic_core::change::span_patch::{SpanOp, SpanPatch};
     let (dir, store) = temp_store();

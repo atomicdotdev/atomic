@@ -91,6 +91,12 @@ impl Diff {
                 println!("+++ {}", new_path);
             }
 
+            if file_diff.git_rename_identity_unproven {
+                println!(
+                    "Git-detected rename; Atomic recorded delete+add (inode identity unproven)"
+                );
+            }
+
             // Handle binary files
             if file_diff.is_binary {
                 println!("Binary files differ");

@@ -68,7 +68,97 @@ fn record_request(repository: &RepositoryRef) -> RecordRequest {
         author: None,
         identity_name: None,
         ai_authorship: None,
+        skip_binary: None,
+        max_file_size: None,
     }
+}
+
+#[tokio::test]
+async fn record_file_options_and_oversize_details_preserve_working_bytes() {
+    let (_dir, root, state, repository) = host();
+    let mutation = MutationImpl {
+        state: state.clone(),
+    };
+    let binary_path = root.join("large-é.bin");
+    std::fs::write(&binary_path, vec![0u8; 32]).unwrap();
+    {
+        let repo = Repository::open(&root).unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.add(wc, "large-é.bin", TrackingOptions::default())
+            .unwrap();
+    }
+    write(&root, "README.md", "new\n");
+    let before_state = {
+        let handle = state.register(root.clone());
+        let repo = handle.repository_readonly().unwrap();
+        repo.get_view_info("dev").unwrap().state
+    };
+    let mut request = record_request(&repository);
+    request.max_file_size = Some(8);
+    let error = mutation
+        .record(Request::new(request.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert_eq!(
+        error
+            .metadata()
+            .get("atomic-record-error")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "file-too-large"
+    );
+    assert_eq!(
+        error
+            .metadata()
+            .get_bin("atomic-file-path-bin")
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+            .as_ref(),
+        "large-é.bin".as_bytes()
+    );
+    assert_eq!(
+        error
+            .metadata()
+            .get("atomic-file-size")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "32"
+    );
+    assert_eq!(
+        error
+            .metadata()
+            .get("atomic-file-limit")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "8"
+    );
+    assert_eq!(std::fs::read(&binary_path).unwrap(), vec![0u8; 32]);
+    assert_eq!(std::fs::read(root.join("README.md")).unwrap(), b"new\n");
+    {
+        let handle = state.register(root.clone());
+        let repo = handle.repository_readonly().unwrap();
+        assert_eq!(repo.get_view_info("dev").unwrap().state, before_state);
+    }
+    request.skip_binary = Some(true);
+    let response = mutation
+        .record(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response
+        .recorded_paths
+        .iter()
+        .any(|path| path == "README.md"));
+    assert!(response
+        .skipped_paths
+        .iter()
+        .any(|path| path == "large-é.bin"));
+    assert_eq!(std::fs::read(&binary_path).unwrap(), vec![0u8; 32]);
 }
 
 #[tokio::test]

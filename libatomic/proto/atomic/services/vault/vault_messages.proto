@@ -247,6 +247,8 @@ message CreateVaultEntityRequest {
   // Intent classification and optional reviewed target (add-only).
   optional string intent_kind = 12;
   optional string review_target = 13;
+  optional string memory_id = 14;     // explicit memory filename stem
+  optional string memory_status = 15; // active|superseded|retracted
   ViewRef view = 20;
   ViewSnapshot expected_snapshot = 21;
 }

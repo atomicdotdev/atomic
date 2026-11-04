@@ -4,6 +4,334 @@ use atomic_core::change::{ChangeHeader, GraphOp};
 use atomic_core::pristine::{CapabilityMutTxnT, MutTxnT, SPAN_RANGE_CAPABILITY};
 use atomic_repository::{RecordOptions, Repository, StatusOptions};
 
+#[cfg(unix)]
+#[test]
+fn skipping_oversized_addition_preserves_other_attribute_only_changes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    {
+        let mut txn = repo.pristine().write_txn().unwrap();
+        txn.put_required_capability(SPAN_RANGE_CAPABILITY).unwrap();
+        txn.commit().unwrap();
+    }
+    let existing = dir.path().join("existing.txt");
+    std::fs::write(&existing, b"hello\n").unwrap();
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+    repo.add(wc, "existing.txt", Default::default()).unwrap();
+    let options = || {
+        RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true)
+    };
+    repo.record(wc, ChangeHeader::new("base"), options())
+        .unwrap();
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let large = dir.path().join("large.bin");
+    std::fs::write(&large, [0u8; 32]).unwrap();
+    repo.add(wc, "large.bin", Default::default()).unwrap();
+
+    let outcome = repo
+        .record(
+            wc,
+            ChangeHeader::new("mode only"),
+            options().with_max_file_size(8).with_skip_binary(true),
+        )
+        .unwrap();
+    assert!(outcome
+        .skipped_files()
+        .iter()
+        .any(|path| path == "large.bin"));
+    let change = repo.load_change(outcome.hash()).unwrap();
+    assert!(change
+        .hunks()
+        .iter()
+        .any(|op| matches!(op, GraphOp::SetAttr {
+        path, value: atomic_core::change::InodeAttr::Mode(0o755), ..
+    } if path == "existing.txt")));
+    assert!(!change
+        .hunks()
+        .iter()
+        .any(|op| matches!(op, GraphOp::SetAttr { path, .. } if path == "large.bin")));
+    assert_eq!(std::fs::read(existing).unwrap(), b"hello\n");
+    assert_eq!(std::fs::read(large).unwrap(), [0u8; 32]);
+}
+
+#[test]
+fn native_span_sandbox_images_use_recorded_view_bytes() {
+    use atomic_repository::{SealOptions, StageOptions};
+    use std::io::Read;
+
+    fn layer_file(image: &std::path::Path, digest: &str, wanted: &str) -> Vec<u8> {
+        let path = image
+            .join("blobs/sha256")
+            .join(digest.strip_prefix("sha256:").unwrap());
+        let file = std::fs::File::open(path).unwrap();
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(file));
+        for item in archive.entries().unwrap() {
+            let mut entry = item.unwrap();
+            if entry
+                .path()
+                .unwrap()
+                .to_string_lossy()
+                .trim_start_matches("./")
+                == wanted
+            {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                return bytes;
+            }
+        }
+        panic!("{wanted} missing from OCI layer {digest}");
+    }
+    fn manifest(image: &std::path::Path, digest: &str) -> serde_json::Value {
+        let path = image
+            .join("blobs/sha256")
+            .join(digest.strip_prefix("sha256:").unwrap());
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut repo = Repository::init(&root).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    {
+        let mut txn = repo.pristine().write_txn().unwrap();
+        txn.put_required_capability(SPAN_RANGE_CAPABILITY).unwrap();
+        txn.commit().unwrap();
+    }
+    let path = root.join("source.txt");
+    std::fs::write(&path, b"base\n").unwrap();
+    repo.add(wc, "source.txt", Default::default()).unwrap();
+    let options = || {
+        RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true)
+    };
+    repo.record(wc, ChangeHeader::new("base"), options())
+        .unwrap();
+    repo.create_draft_view("feature", "dev").unwrap();
+    repo.switch_view(wc, "feature").unwrap();
+    std::fs::write(&path, b"feature\n").unwrap();
+    repo.record(wc, ChangeHeader::new("feature"), options())
+        .unwrap();
+    std::fs::write(&path, b"unrecorded\n").unwrap();
+
+    let materialized = dir.path().join("materialized");
+    repo.materialize_view_to("feature", &materialized).unwrap();
+    assert_eq!(
+        std::fs::read(materialized.join("source.txt")).unwrap(),
+        b"feature\n"
+    );
+    let sealed = dir.path().join("sealed");
+    let result = repo
+        .seal(SealOptions {
+            view: "dev".into(),
+            out: sealed.clone(),
+            entrypoint: vec![],
+            env: vec![],
+        })
+        .unwrap();
+    let document = manifest(&sealed, &result.manifest_digest);
+    assert_eq!(document["layers"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        layer_file(
+            &sealed,
+            document["layers"][0]["digest"].as_str().unwrap(),
+            "source.txt"
+        ),
+        b"base\n"
+    );
+    let staged = dir.path().join("staged");
+    let result = repo
+        .stage(StageOptions {
+            view: "feature".into(),
+            base_view: "dev".into(),
+            out: staged.clone(),
+        })
+        .unwrap();
+    assert_eq!(result.delta_files, 1);
+    let document = manifest(&staged, &result.manifest_digest);
+    assert_eq!(document["layers"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        layer_file(
+            &staged,
+            document["layers"][1]["digest"].as_str().unwrap(),
+            "source.txt"
+        ),
+        b"feature\n"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"unrecorded\n");
+}
+
+#[test]
+fn native_span_project_tree_uses_exact_recorded_bytes() {
+    use atomic_core::operation::GitHashAlgorithm;
+    use atomic_repository::ConversionPolicy;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    {
+        let mut txn = repo.pristine().write_txn().unwrap();
+        txn.put_required_capability(SPAN_RANGE_CAPABILITY).unwrap();
+        txn.commit().unwrap();
+    }
+    let path = dir.path().join("source.txt");
+    std::fs::write(&path, b"first\n").unwrap();
+    std::fs::write(dir.path().join("empty.txt"), b"").unwrap();
+    std::fs::write(dir.path().join("binary.dat"), b"\x00binary\xff").unwrap();
+    repo.add(wc, "source.txt", Default::default()).unwrap();
+    repo.add(wc, "empty.txt", Default::default()).unwrap();
+    repo.add(wc, "binary.dat", Default::default()).unwrap();
+    let options = || {
+        RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true)
+    };
+    let first = repo
+        .record(wc, ChangeHeader::new("first"), options())
+        .unwrap();
+    let first_state = first.new_state().unwrap();
+    let policy = ConversionPolicy::new(GitHashAlgorithm::Sha1);
+    let bytes = |project: &atomic_repository::ProjectTree| {
+        project
+            .manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path.as_bytes() == b"source.txt")
+            .expect("source path in project")
+            .repository_bytes
+            .to_vec()
+    };
+    let initial = repo.project_tree("dev", &policy).unwrap();
+    assert_eq!(bytes(&initial), b"first\n");
+    for (name, expected) in [
+        (b"empty.txt".as_slice(), b"".as_slice()),
+        (b"binary.dat".as_slice(), b"\x00binary\xff".as_slice()),
+    ] {
+        assert_eq!(
+            initial
+                .manifest
+                .entries
+                .iter()
+                .find(|entry| entry.path.as_bytes() == name)
+                .unwrap()
+                .repository_bytes
+                .as_ref(),
+            expected
+        );
+    }
+    std::fs::write(&path, b"second\n").unwrap();
+    repo.record(wc, ChangeHeader::new("second"), options())
+        .unwrap();
+    std::fs::write(&path, b"unrecorded bytes\n").unwrap();
+    assert_eq!(
+        bytes(&repo.project_tree("dev", &policy).unwrap()),
+        b"second\n"
+    );
+    assert_eq!(
+        bytes(
+            &repo
+                .project_tree_for_change_closure("dev", &[*first.hash()], &policy)
+                .unwrap()
+        ),
+        b"first\n"
+    );
+    assert_eq!(
+        bytes(
+            &repo
+                .project_tree_at_state("dev", first_state, &policy)
+                .unwrap()
+        ),
+        b"first\n"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), b"unrecorded bytes\n");
+}
+
+#[test]
+fn native_span_queries_use_recorded_view_content() {
+    use atomic_repository::ContentSearchOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let mut repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    {
+        let mut txn = repo.pristine().write_txn().unwrap();
+        txn.put_required_capability(SPAN_RANGE_CAPABILITY).unwrap();
+        txn.commit().unwrap();
+    }
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    let source = dir.path().join("src/lib.rs");
+    std::fs::write(
+        &source,
+        "pub fn target() {}\npub fn caller() { target(); }\n",
+    )
+    .unwrap();
+    repo.add(wc, "src/lib.rs", Default::default()).unwrap();
+    let options = || {
+        RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true)
+    };
+    repo.record(wc, ChangeHeader::new("base"), options())
+        .unwrap();
+    repo.create_draft_view("feature", "dev").unwrap();
+    repo.switch_view(wc, "feature").unwrap();
+    std::fs::write(
+        &source,
+        "pub fn target(secret: SiblingSecret) {}\npub fn caller() {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/sibling.rs"),
+        "pub fn sibling_only() { target(); }\n",
+    )
+    .unwrap();
+    repo.add(wc, "src/sibling.rs", Default::default()).unwrap();
+    repo.record(wc, ChangeHeader::new("feature"), options())
+        .unwrap();
+    let search = |view: &str, pattern: &str| {
+        repo.search_content_on_view(view, pattern, ContentSearchOptions::default())
+            .unwrap()
+            .total_matches
+    };
+    let callers = |view: &str| {
+        repo.query_callers_on_view(view, "src/lib.rs#target")
+            .unwrap()
+            .into_iter()
+            .map(|caller| format!("{}#{}", caller.path, caller.name))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(search("feature", "SiblingSecret"), 1);
+    assert_eq!(search("dev", "SiblingSecret"), 0);
+    assert_eq!(search("dev", "target"), 2);
+    assert_eq!(callers("feature"), ["src/sibling.rs#sibling_only"]);
+    assert_eq!(callers("dev"), ["src/lib.rs#caller"]);
+    std::fs::write(&source, "pub fn disk_only() {}\n").unwrap();
+    assert_eq!(search("feature", "disk_only"), 0);
+    assert_eq!(callers("dev"), ["src/lib.rs#caller"]);
+    drop(repo);
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(
+        repo.search_content_on_view("feature", "SiblingSecret", ContentSearchOptions::default())
+            .unwrap()
+            .total_matches,
+        1
+    );
+    assert_eq!(
+        repo.query_callers_on_view("dev", "src/lib.rs#target")
+            .unwrap()[0]
+            .name,
+        "caller"
+    );
+}
+
 #[test]
 fn span_unrecorded_file_stays_untracked_when_switching_views() {
     use atomic_core::operation::{EffectTarget, OperationKind, OperationScope};
@@ -1515,15 +1843,17 @@ fn missing_span_root_refuses_without_overwriting_working_bytes() {
     let path = dir.path().join("file.txt");
     std::fs::write(&path, b"recorded\n").unwrap();
     repo.add(wc, "file.txt", Default::default()).unwrap();
-    repo.record(
-        wc,
-        ChangeHeader::new("root"),
-        RecordOptions::new()
-            .with_all(true)
-            .save_to_store(true)
-            .apply_after_record(true),
-    )
-    .unwrap();
+    let recorded = repo
+        .record(
+            wc,
+            ChangeHeader::new("root"),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+    let recorded_hash = *recorded.hash();
     let inode = repo
         .pristine()
         .read_txn()
@@ -1547,6 +1877,47 @@ fn missing_span_root_refuses_without_overwriting_working_bytes() {
     let repo = Repository::open(dir.path()).unwrap();
     let error = repo.get_file_content("file.txt").unwrap_err();
     assert!(error.to_string().contains("span root missing"), "{error}");
+    let error = repo
+        .search_content_on_view("dev", "recorded", Default::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("span root missing"), "{error}");
+    let error = repo.query_callers_on_view("dev", "target").unwrap_err();
+    assert!(error.to_string().contains("span root missing"), "{error}");
+    let policy =
+        atomic_repository::ConversionPolicy::new(atomic_core::operation::GitHashAlgorithm::Sha1);
+    let error = repo.project_tree("dev", &policy).unwrap_err();
+    assert!(error.to_string().contains("span root missing"), "{error}");
+    let error = repo
+        .project_tree_for_change_closure("dev", &[recorded_hash], &policy)
+        .unwrap_err();
+    assert!(error.to_string().contains("span root missing"), "{error}");
+    let output = dir.path().join("should-not-materialize");
+    let error = repo.materialize_view_to("dev", &output).unwrap_err();
+    assert!(error.to_string().contains("span root missing"), "{error}");
+    assert!(!output.exists());
+    let output = dir.path().join("should-not-stage");
+    let error = match repo.stage(atomic_repository::StageOptions {
+        view: "dev".into(),
+        base_view: "dev".into(),
+        out: output.clone(),
+    }) {
+        Ok(_) => panic!("stage accepted a missing span root"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("span root missing"), "{error}");
+    assert!(!output.exists());
+    let output = dir.path().join("should-not-seal");
+    let error = match repo.seal(atomic_repository::SealOptions {
+        view: "dev".into(),
+        out: output.clone(),
+        entrypoint: vec![],
+        env: vec![],
+    }) {
+        Ok(_) => panic!("seal accepted a missing span root"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("span root missing"), "{error}");
+    assert!(!output.exists());
     std::fs::write(&path, b"user work\n").unwrap();
     let error = repo.materialize(wc).unwrap_err();
     assert!(error.to_string().contains("span root missing"), "{error}");

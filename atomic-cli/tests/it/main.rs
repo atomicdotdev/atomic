@@ -51,6 +51,8 @@ mod git_shim_daily_workflow_regression;
 mod git_shim_logging_test;
 mod git_shim_opt_in_test;
 mod git_shim_workspace_test;
+#[cfg(all(unix, feature = "experimental-span-import"))]
+mod git_span_blame_test;
 mod git_transport_cb10b_test;
 mod git_wip_cb0b_test;
 mod graph_only_export_cb9b_test;

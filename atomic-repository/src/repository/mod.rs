@@ -181,7 +181,7 @@ pub use ignore_mirror::{
     check_ignore_policy, mirror_ignores, IgnoreMirrorError, IgnorePolicyReport,
     MANAGED_BLOCK_BEGIN, MANAGED_BLOCK_END,
 };
-pub use locks::RepositoryCommonLockGuard;
+pub use locks::{GitImportPreflightGuard, RepositoryCommonLockGuard, RepositoryMaintenanceGuard};
 pub use operation::{
     OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,
     OperationVerificationState, PreparedRemoteOperation, PreparedShimGitWrite,

@@ -949,6 +949,13 @@ pub(crate) fn reconcile_transaction_budgeted(
     budget: ReconcileEffectBudget,
     notice: Option<&WatchNoticeSink<'_>>,
 ) -> CliResult<()> {
+    // The Git-to-Atomic arm may create a detached view before invoking the
+    // importer. Until span-aware incremental synthesis exists, refuse before
+    // opening writable state or appending reconciliation effects. Keep the
+    // lock for the whole boundary so span capability cannot race this check.
+    let _span_preflight =
+        Repository::try_lock_git_import_without_span(root, budget.is_metadata_only())
+            .map_err(|error| git_error(format!("Git shim preflight refused: {error}")))?;
     let emit_notice = |kind: WatchNoticeKind, detail: &str| {
         if let Some(notice) = notice {
             notice(kind, detail);
@@ -1790,6 +1797,9 @@ fn import_git_to_atomic(root: &Path) -> CliResult<()> {
 /// defers instead of replaying.
 #[tracing::instrument(name = "import_head", skip_all, fields(budget = ?budget))]
 fn import_git_to_atomic_budgeted(root: &Path, budget: ReconcileEffectBudget) -> CliResult<()> {
+    let _span_preflight =
+        Repository::try_lock_git_import_without_span(root, budget.is_metadata_only())
+            .map_err(|error| git_error(format!("Git shim import preflight refused: {error}")))?;
     let git = open_git(root)?;
     let head = observe_head(&git).map_err(observation_error)?;
     // §7.5: a detached HEAD imports behind its commit into the workspace

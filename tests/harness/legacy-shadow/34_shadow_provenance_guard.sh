@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 34_shadow_provenance_guard.sh — Validator Rule V4 (provenance / excluded paths).
+# HISTORICAL: coverage migrated to ../40_git_shim_safety.sh.
 #
 # SPEC-single-materializer-validator.md, Phase 1 / Rule V4: a shadow commit MUST
 # never stage a git-excluded Atomic provenance path (`.atomic/`, `.vault/`,
@@ -25,11 +25,6 @@ begin_section "Prerequisites"
 require_git
 
 # Grep the committed tree for any Atomic provenance path.
-tree_has_provenance() {
-    git ls-tree -r --name-only HEAD 2>/dev/null \
-        | grep -qE '^\.atomic/|^\.vault/|^\.atomicignore$'
-}
-
 # ════════════════════════════════════════════════════════════════════════
 # A normal shadow commit never contains provenance paths
 # ════════════════════════════════════════════════════════════════════════
@@ -39,16 +34,17 @@ begin_section "Normal shadow commit excludes provenance paths"
 make_temp_repo "v4-clean"
 init_git_repo
 git_commit "Initial" "README.md" "# Project"
-assert_success "git import seeds the view" atomic git import --no-vault
+require_success "git import seeds the view" atomic git import --no-vault
 
 assert_dir_exists ".atomic exists on disk" ".atomic"
 
 create_file "src/app.ts" "const x = 1;"
-add_files "src/app.ts"
-record_change "feat: app" >/dev/null
-assert_success "clean shadow push commits" atomic git push --no-push -m "sync"
+require_success "add app.ts" atomic add "src/app.ts"
+require_success "record app.ts" record_change "feat: app"
+require_success "clean shadow push commits locally" atomic git push --no-push -m "sync"
 
-if tree_has_provenance; then
+require_capture "read committed Git tree" git ls-tree -r --name-only HEAD
+if printf '%s\n' "$COMMAND_OUTPUT" | grep -qE '^\.atomic/|^\.vault/|^\.atomicignore$'; then
     _fail "committed tree has no provenance paths" \
         "found: $(git ls-tree -r --name-only HEAD | grep -E '^\.atomic/|^\.vault/|^\.atomicignore$' | head -3)"
 else
@@ -65,29 +61,53 @@ begin_section "V4 aborts on an already-tracked provenance path"
 make_temp_repo "v4-tracked"
 init_git_repo
 git_commit "Initial" "README.md" "# Project"
-assert_success "git import" atomic git import --no-vault
+require_success "git import" atomic git import --no-vault
 
 # Simulate the dangerous pre-condition: a `.vault/` path that got committed to
 # git before excludes were in place, so it is TRACKED (exclude rules no longer
 # protect it and `git add -A`/update_all will keep staging it).
 mkdir -p .vault
 printf 'intent: precious' > .vault/note.md
-git add -f .vault/note.md
-git commit -q -m "Accidentally tracked a provenance path"
+require_success "stage fixture provenance path" git add -f .vault/note.md
+require_success "commit fixture provenance path" git commit -q -m "Accidentally tracked a provenance path"
 
-VAULT_HASH_BEFORE="$(git hash-object .vault/note.md)"
-COUNT_BEFORE="$(git_commit_count)"
+require_capture "hash fixture provenance bytes" git hash-object .vault/note.md
+VAULT_HASH_BEFORE="$COMMAND_OUTPUT"
+require_capture "read fixture Git commit count" git rev-list --count HEAD
+COUNT_BEFORE="$COMMAND_OUTPUT"
 
 # Record an ordinary change and attempt a shadow push.
 create_file "src/app.ts" "const y = 2;"
-add_files "src/app.ts"
-record_change "feat: app2" >/dev/null
+if add_out="$(atomic add "src/app.ts" 2>&1)"; then
+    _pass "add app.ts with tracked provenance fixture"
+else
+    _fail "add app.ts with tracked provenance fixture" "$add_out"
+    require_capture "hash provenance after refused add" git hash-object .vault/note.md
+    if [[ "$COMMAND_OUTPUT" == "$VAULT_HASH_BEFORE" ]]; then _pass "refused add preserves provenance bytes"; else _fail "refused add preserves provenance bytes" "bytes changed"; fi
+    assert_file_content "refused add preserves source bytes" src/app.ts "const y = 2;"
+    require_capture "read Git commit count after refused add" git rev-list --count HEAD
+    if [[ "$COMMAND_OUTPUT" == "$COUNT_BEFORE" ]]; then _pass "refused add preserves Git history"; else _fail "refused add preserves Git history" "commit count changed"; fi
+    _skip "tracked-provenance shadow push checks" "fixture add refused"
+    print_summary || true
+    exit 1
+fi
+if record_out="$(record_change "feat: app2" 2>&1)"; then
+    _pass "record app.ts with tracked provenance fixture"
+else
+    _fail "record app.ts with tracked provenance fixture" "$record_out"
+    require_capture "hash provenance after refused record" git hash-object .vault/note.md
+    if [[ "$COMMAND_OUTPUT" == "$VAULT_HASH_BEFORE" ]]; then _pass "refused record preserves provenance bytes"; else _fail "refused record preserves provenance bytes" "bytes changed"; fi
+    _skip "tracked-provenance shadow push checks" "fixture record refused"
+    print_summary || true
+    exit 1
+fi
 
 set +e
 PUSH_OUT="$(atomic git push --no-push -m "sync tracked provenance" 2>&1)"
 PUSH_RC=$?
 set -e
-COUNT_AFTER="$(git_commit_count)"
+require_capture "read Git commit count after refusal" git rev-list --count HEAD
+COUNT_AFTER="$COMMAND_OUTPUT"
 
 if [ "$PUSH_RC" -ne 0 ]; then
     _pass "shadow push aborts (V4) on a tracked provenance path"
@@ -115,7 +135,8 @@ else
 fi
 
 # Provenance byte-identical after the aborted push.
-VAULT_HASH_AFTER="$(git hash-object .vault/note.md)"
+require_capture "hash provenance after shadow push" git hash-object .vault/note.md
+VAULT_HASH_AFTER="$COMMAND_OUTPUT"
 if [ "$VAULT_HASH_AFTER" = "$VAULT_HASH_BEFORE" ]; then
     _pass "provenance file left byte-identical on abort"
 else

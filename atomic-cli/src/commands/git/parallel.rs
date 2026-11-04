@@ -723,6 +723,8 @@ pub struct ParallelImportOptions {
     /// duplicate file content are omitted, which significantly reduces change
     /// size and import time for large repositories.
     pub graph_only: bool,
+    /// Compile fresh first-parent streams as immutable spans rather than line edges.
+    pub span_stream: bool,
     /// Keep a foreign Atomic view's working copy untouched while importing.
     ///
     /// When an agent draft is current, the files on disk describe that draft,
@@ -755,6 +757,7 @@ impl Default for ParallelImportOptions {
             repo_name: "unknown".to_string(),
             mainline_only: true,
             graph_only: false,
+            span_stream: false,
             preserve_working_copy: false,
             target_view: String::new(),
             known_states: HashSet::new(),
@@ -8045,11 +8048,31 @@ impl ParallelImporter {
             "short_sha": parsed.short_sha,
         });
 
+        // A pure Git-detected rename has no patch lines, but omitting it makes
+        // the Git-origin diff fall back to the graph's deliberate delete+add
+        // representation. Record this as non-authoritative Git evidence only
+        // when every path has a usable text diff or is an exact-byte rename.
+        let complete_diff = parsed.files.iter().all(|file| {
+            file.diff_lines.is_some()
+                || (file.operation == FileOperation::Renamed
+                    && file.old_content.is_some()
+                    && file.old_content == file.new_content)
+        });
         let diff_files: Vec<serde_json::Value> = parsed
             .files
             .iter()
+            // A partial list would silently omit changed paths when the
+            // metadata-based renderer takes precedence over graph diffs.
+            .filter(|_| complete_diff)
             .filter_map(|file| {
-                file.diff_lines.as_ref().map(|lines| {
+                let exact_rename = file.operation == FileOperation::Renamed
+                    && file.old_content.is_some()
+                    && file.old_content == file.new_content;
+                let lines = file
+                    .diff_lines
+                    .as_deref()
+                    .or_else(|| (complete_diff && exact_rename).then_some(&[][..]))?;
+                Some({
                     serde_json::json!({
                         "path": file.path,
                         "old_path": file.old_path,
@@ -9755,6 +9778,50 @@ mod tests {
             parent_tree_oid: None,
             raw_object: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pure_rename_diff_evidence_requires_a_complete_git_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = GitRepository::init(dir.path()).unwrap();
+        let importer = ParallelImporter::new(&git, ParallelImportOptions::default());
+        let mut parsed = added_commit("new.txt", b"same\n");
+        parsed.files[0].operation = FileOperation::Renamed;
+        parsed.files[0].old_path = Some("old.txt".into());
+        parsed.files[0].old_content = Some(b"same\n".to_vec());
+        let metadata = importer.build_git_metadata(&parsed, false, false);
+        assert_eq!(metadata["git"]["diff_lines"][0]["old_path"], "old.txt");
+        assert_eq!(metadata["git"]["diff_lines"][0]["operation"], "renamed");
+        assert_eq!(
+            metadata["git"]["diff_lines"][0]["lines"],
+            serde_json::json!([])
+        );
+
+        // A missing diff for a different changed file must not make a
+        // rename-only metadata projection hide that file's changes.
+        parsed.files.push(ParsedFile {
+            path: "other.bin".into(),
+            operation: FileOperation::Modified,
+            old_content: Some(vec![0]),
+            new_content: Some(vec![1]),
+            diff_lines: None,
+            old_path: None,
+            new_mode: Some(0o100644),
+        });
+        let metadata = importer.build_git_metadata(&parsed, false, false);
+        assert!(metadata["git"].get("diff_lines").is_none());
+
+        parsed.files.push(ParsedFile {
+            path: "text.txt".into(),
+            operation: FileOperation::Modified,
+            old_content: Some(b"old\n".to_vec()),
+            new_content: Some(b"new\n".to_vec()),
+            diff_lines: Some(vec![]),
+            old_path: None,
+            new_mode: Some(0o100644),
+        });
+        let metadata = importer.build_git_metadata(&parsed, false, false);
+        assert!(metadata["git"].get("diff_lines").is_none());
     }
 
     #[test]

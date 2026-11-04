@@ -83,6 +83,10 @@ pub fn apply_trunk_op<T: MutCrdtTxnT>(
         // Attribute state is applied by GraphOp::SetAttr; semantic operations
         // remain in FileOps for review and replay without duplicating storage.
         TrunkOp::SetMode { .. } | TrunkOp::SetKind { .. } => Ok(()),
+        TrunkOp::ProjectedSpanEdit { .. } => Err(ApplyError::InvalidContent {
+            description: "projected span edit requires span-aware validation and application"
+                .into(),
+        }),
     }
 }
 

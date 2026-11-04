@@ -155,6 +155,7 @@ mod bindings;
 pub mod build_metadata;
 mod capability;
 mod error;
+mod git_closure;
 pub(crate) mod inode_graph;
 pub mod merge;
 mod path_claim;
@@ -178,8 +179,9 @@ pub use attribute::{
 pub use bindings::{BindingMutTxnT, BindingStoreOutcome, BindingTxnT};
 pub use capability::{
     RepositoryCapability, RequiredRepositoryCapability, UnsupportedRepositoryCapability,
-    CHANGE_FORMAT_VNEXT_CAPABILITY, REQUIRED_CAPABILITY_PREFIX, SHIM_CUTOVER_CAPABILITY,
-    SPAN_RANGE_CAPABILITY, SUPPORTED_REPOSITORY_CAPABILITIES,
+    CHANGE_FORMAT_VNEXT_CAPABILITY, GIT_CLOSURE_SHARING_CAPABILITY, REQUIRED_CAPABILITY_PREFIX,
+    SHIM_CUTOVER_CAPABILITY, SPAN_PROJECTED_SEMANTICS_CAPABILITY, SPAN_RANGE_CAPABILITY,
+    SUPPORTED_REPOSITORY_CAPABILITIES,
 };
 pub use error::{PristineError, PristineResult};
 mod file_index_v2;

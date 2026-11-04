@@ -22,6 +22,39 @@ fn atom_change_file_version(bytes: &[u8]) -> Result<u32, RepositoryError> {
 }
 
 impl Repository {
+    fn require_projected_semantic_storage_capability(
+        &self,
+        change: &Change,
+    ) -> Result<(), RepositoryError> {
+        if !change.file_ops().iter().any(|ops| {
+            matches!(
+                ops.trunk_op(),
+                Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+            )
+        }) {
+            return Ok(());
+        }
+        if change.hashed.span.is_none() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "projected semantic edit requires a span change".into(),
+            });
+        }
+        use atomic_core::pristine::{CapabilityTxnT, SPAN_PROJECTED_SEMANTICS_CAPABILITY};
+        if self
+            .pristine
+            .read_txn()?
+            .required_capability_version(SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())?
+            != Some(SPAN_PROJECTED_SEMANTICS_CAPABILITY.minimum_version())
+        {
+            return Err(RepositoryError::InvalidOperation {
+                message:
+                    "storing projected semantic edits requires the projected semantic capability"
+                        .into(),
+            });
+        }
+        Ok(())
+    }
+
     fn require_span_storage_capability(&self) -> Result<(), RepositoryError> {
         use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
         let txn = self.pristine.read_txn()?;
@@ -130,6 +163,19 @@ impl Repository {
     /// println!("Saved change: {}", hash.to_base32());
     /// ```
     pub fn save_change(&self, change: &Change) -> Result<Hash, RepositoryError> {
+        self.require_projected_semantic_storage_capability(change)?;
+        if change.file_ops().iter().any(|ops| {
+            matches!(
+                ops.trunk_op(),
+                Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+            )
+        }) {
+            let mut bytes = Vec::new();
+            let hash = change
+                .serialize(&mut bytes)
+                .map_err(|error| RepositoryError::Serialization(error.to_string()))?;
+            return self.save_change_bytes(&hash, &bytes, change);
+        }
         if change.hashed.span.is_some() {
             self.require_span_storage_capability()?;
         }
@@ -156,6 +202,23 @@ impl Repository {
                 computed.to_base32()
             )));
         }
+        let projected = change.file_ops().iter().any(|ops| {
+            matches!(
+                ops.trunk_op(),
+                Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+            )
+        });
+        if projected && cfg!(not(unix)) {
+            return Err(RepositoryError::InvalidOperation {
+                message: "projected semantic change import is not supported on this platform"
+                    .into(),
+            });
+        }
+        if projected && change.hashed.span.is_none() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "projected semantic edit requires a span change".into(),
+            });
+        }
         if change.hashed.span.is_some() {
             use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
             let txn = self.pristine.read_txn()?;
@@ -168,6 +231,11 @@ impl Repository {
                     message: "existing span capability requires migration before importing new span changes".into(),
                 }),
             }
+        }
+        if projected {
+            self.pristine.require_repository_capability(
+                atomic_core::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY,
+            )?;
         }
         let stored = self.save_change_bytes(hash, bytes, &change)?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
@@ -198,7 +266,7 @@ impl Repository {
     ///
     /// * `hash` - The content hash (from the original serialization)
     /// * `change_bytes` - The exact ATOM bytes to write to disk
-    /// * `_change` - The deserialized Change (unused, kept for API compatibility)
+    /// * `change` - The deserialized change used for capability checks
     pub(crate) fn save_change_bytes(
         &self,
         hash: &Hash,
@@ -206,6 +274,7 @@ impl Repository {
         change: &Change,
     ) -> Result<Hash, RepositoryError> {
         let version = atom_change_file_version(change_bytes)?;
+        self.require_projected_semantic_storage_capability(change)?;
         if version == ATOM_CHANGE_FILE_VERSION_SPAN {
             let (decoded, actual_hash) =
                 Change::deserialize(&mut std::io::Cursor::new(change_bytes))
@@ -234,8 +303,9 @@ impl Repository {
         &self,
         hash: &Hash,
         change_bytes: &[u8],
-        _change: &Change,
+        change: &Change,
     ) -> Result<Hash, RepositoryError> {
+        self.require_projected_semantic_storage_capability(change)?;
         match atom_change_file_version(change_bytes)? {
             ATOM_CHANGE_FILE_VERSION_V1 | ATOM_CHANGE_FILE_VERSION_V2 | ATOM_CHANGE_FILE_VERSION_SPAN => {}
             version => {
@@ -248,6 +318,15 @@ impl Repository {
         let change_path = self.change_store.change_path(hash);
         if let Some(parent) = change_path.parent() {
             std::fs::create_dir_all(parent)?;
+        }
+        if change.file_ops().iter().any(|ops| {
+            matches!(
+                ops.trunk_op(),
+                Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+            )
+        }) {
+            save_projected_change_without_overwrite(&change_path, change_bytes)?;
+            return Ok(*hash);
         }
         std::fs::write(&change_path, change_bytes)?;
         Ok(*hash)
@@ -1786,5 +1865,164 @@ impl Repository {
         txn.get_session_events(provenance_id)
             .map(|events| !events.is_empty())
             .unwrap_or(false)
+    }
+}
+
+#[cfg(unix)]
+fn save_projected_change_without_overwrite(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), RepositoryError> {
+    use std::io::Write;
+    fn verify_existing(path: &Path, expected: &[u8]) -> Result<(), RepositoryError> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() || std::fs::read(path)? != expected {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!("projected change object '{}' already exists with different bytes; refusing to overwrite it", path.display()),
+            });
+        }
+        // A prior process may have linked the complete object but died before
+        // syncing the containing directory. Finish that durability step when
+        // reusing an identical object.
+        std::fs::File::open(path)?.sync_all()?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| RepositoryError::InvalidOperation {
+                message: "projected change path has no parent".into(),
+            })?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return verify_existing(path, bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| RepositoryError::InvalidOperation {
+            message: "projected change path has no parent".into(),
+        })?;
+    if let Some(ancestor) = parent.parent() {
+        // The hash-prefix directory may have just been created. Persist its
+        // entry before publishing an object within it.
+        std::fs::File::open(ancestor)?.sync_all()?;
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    #[cfg(all(test, unix))]
+    if std::env::var_os("ATOMIC_TEST_PROJECTED_STORE_PAUSE").is_some() {
+        println!("ATOMIC_PROJECTED_STORE_STAGED");
+        std::io::stdout().flush()?;
+        loop {
+            std::thread::park();
+        }
+    }
+    match temporary.persist_noclobber(path) {
+        Ok(_) => {
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            verify_existing(path, bytes)
+        }
+        Err(error) => Err(error.error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn save_projected_change_without_overwrite(
+    _path: &Path,
+    _bytes: &[u8],
+) -> Result<(), RepositoryError> {
+    Err(RepositoryError::InvalidOperation {
+        message: "durable projected change publication is not supported on this platform".into(),
+    })
+}
+
+#[cfg(all(test, unix))]
+mod projected_store_tests {
+    use super::save_projected_change_without_overwrite;
+    use std::io::BufRead;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn staged_projected_change_survives_process_kill_without_partial_publication() {
+        const ROOT: &str = "ATOMIC_TEST_PROJECTED_STORE_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let path = std::path::PathBuf::from(root).join("object.change");
+            save_projected_change_without_overwrite(&path, b"complete change bytes").unwrap();
+            panic!("child did not pause before object publication");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object.change");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "repository::changes::projected_store_tests::staged_projected_change_survives_process_kill_without_partial_publication", "--nocapture"])
+            .env(ROOT, dir.path())
+            .env("ATOMIC_TEST_PROJECTED_STORE_PAUSE", "1")
+            .stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) if line.contains("ATOMIC_PROJECTED_STORE_STAGED") => {
+                        let _ = send.send(Ok(()));
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = send.send(Err(error.to_string()));
+                        return;
+                    }
+                }
+            }
+            let _ = send.send(Err("child exited before staging marker".to_string()));
+        });
+        let ready = receive.recv_timeout(std::time::Duration::from_secs(60));
+        let killed = child.kill();
+        let status = child.wait().unwrap();
+        if ready.is_ok() {
+            reader.join().unwrap();
+        }
+        ready
+            .expect("child timed out")
+            .expect("child did not stage object");
+        assert!(killed.is_ok() && status.signal() == Some(9));
+        assert!(!path.exists(), "partial object must not be published");
+        save_projected_change_without_overwrite(&path, b"complete change bytes").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete change bytes");
+        save_projected_change_without_overwrite(&path, b"complete change bytes").unwrap();
+        assert!(save_projected_change_without_overwrite(&path, b"different bytes").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete change bytes");
+    }
+
+    #[test]
+    fn concurrent_projected_publication_never_overwrites_the_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("object.change");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = [b"first object".as_slice(), b"second object".as_slice()]
+            .into_iter()
+            .map(|bytes| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (bytes, save_projected_change_without_overwrite(&path, bytes))
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(
+            results.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        let winner = results.iter().find(|(_, result)| result.is_ok()).unwrap().0;
+        assert_eq!(std::fs::read(path).unwrap(), winner);
     }
 }

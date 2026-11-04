@@ -325,6 +325,17 @@ pub enum TrunkOp {
 
     /// Add a causal materialized-kind value for this trunk's inode.
     SetKind { trunk: TrunkId, kind: InodeKind },
+
+    /// A semantic edit against a span-derived file, whose historical content
+    /// has no CRDT trunk. The projected baseline is a content-addressed
+    /// semantic snapshot, not a claim that this change created old tokens.
+    /// Its corresponding span edits carry the actual content transition.
+    ProjectedSpanEdit {
+        /// Portable identity of the affected file.
+        file: crate::change::span_patch::ExternalFile,
+        /// Semantic snapshot on the edit's dependency closure.
+        baseline: crate::change::span_patch::SpanProjectionId,
+    },
 }
 
 impl TrunkOp {
@@ -333,7 +344,7 @@ impl TrunkOp {
     /// Returns `None` for `Create` since the ID is assigned later.
     pub fn trunk_id(&self) -> Option<TrunkId> {
         match self {
-            TrunkOp::Create { .. } => None,
+            TrunkOp::Create { .. } | TrunkOp::ProjectedSpanEdit { .. } => None,
             TrunkOp::Delete { trunk } => Some(*trunk),
             TrunkOp::Move { trunk, .. } => Some(*trunk),
             TrunkOp::Undelete { trunk } => Some(*trunk),
@@ -374,6 +385,7 @@ impl TrunkOp {
             TrunkOp::Undelete { .. } => "undelete",
             TrunkOp::SetMode { .. } => "set-mode",
             TrunkOp::SetKind { .. } => "set-kind",
+            TrunkOp::ProjectedSpanEdit { .. } => "projected-span-edit",
         }
     }
 }
@@ -395,6 +407,9 @@ impl fmt::Display for TrunkOp {
             TrunkOp::Undelete { trunk } => write!(f, "undelete {}", trunk),
             TrunkOp::SetMode { trunk, mode } => write!(f, "set mode of {} to {mode:#o}", trunk),
             TrunkOp::SetKind { trunk, kind } => write!(f, "set kind of {} to {kind}", trunk),
+            TrunkOp::ProjectedSpanEdit { file, .. } => {
+                write!(f, "edit projected span file {:?}", file)
+            }
         }
     }
 }

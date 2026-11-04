@@ -19,33 +19,21 @@ fi
 
 mkfifo unrelated.pipe
 
-INIT_STATUS=0
-atomic init >init.out 2>&1 &
-INIT_PID=$!
-
-# Keep the harness finite if this behavior regresses. Polling avoids relying on
-# GNU `timeout`, which is not installed by default on macOS.
-for _ in {1..100}; do
-    if ! kill -0 "$INIT_PID" 2>/dev/null; then
-        break
-    fi
-    sleep 0.1
-done
-
-if kill -0 "$INIT_PID" 2>/dev/null; then
-    kill "$INIT_PID" 2>/dev/null || true
-    wait "$INIT_PID" 2>/dev/null || true
-    _fail "atomic init completes without reading the FIFO" \
-        "initialization was still running after 10 seconds"
-else
-    wait "$INIT_PID" || INIT_STATUS=$?
-    if [[ "$INIT_STATUS" -eq 0 ]]; then
-        _pass "atomic init completes without reading the FIFO"
-    else
-        _fail "atomic init completes without reading the FIFO" \
-            "atomic init exited $INIT_STATUS: $(head -5 init.out)"
-    fi
-fi
+# The timeout kills only the process group created for this fixture, including
+# the real CLI beneath any harness wrapper, so no blocked child is orphaned.
+require_capture "atomic init completes without reading the FIFO" python3 -c '
+import os,signal,subprocess,sys
+p=subprocess.Popen([sys.argv[1],"init"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,start_new_session=True)
+try:
+    out,_=p.communicate(timeout=10)
+except subprocess.TimeoutExpired:
+    os.killpg(p.pid,signal.SIGKILL)
+    out,_=p.communicate()
+    sys.stdout.buffer.write(out)
+    print("initialization was still running after 10 seconds",file=sys.stderr)
+    sys.exit(1)
+sys.stdout.buffer.write(out)
+sys.exit(p.returncode)' "$ATOMIC_BIN"
 
 assert_dir_exists "repository metadata was initialized" .atomic
 assert_dir_exists "vault was initialized" .vault

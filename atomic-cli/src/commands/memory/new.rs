@@ -27,7 +27,7 @@ use crate::error::{CliError, CliResult};
 /// counts as text, so a freshly-scaffolded memory lifts to non-empty text and
 /// its ONLY validate violations are the fillable `attributedTo` + `proof`
 /// (attest-ready), mirroring intent-new behavior.
-const MEMORY_SCAFFOLD: &str = "\
+pub(crate) const MEMORY_SCAFFOLD: &str = "\
 :::memory
 <!-- The durable fact. State the constraint / preference / lesson / context.
      Its content is never graded — but it must be present. Replace this stub. -->

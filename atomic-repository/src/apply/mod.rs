@@ -491,6 +491,31 @@ fn apply_change_hunks_locked(
             );
         }
         let file_ops = localized.as_deref().unwrap_or_else(|| change.file_ops());
+        if change.hashed.span.is_none()
+            && file_ops.iter().any(|ops| {
+                matches!(
+                    ops.trunk_op(),
+                    Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+                )
+            })
+        {
+            return Err(InsertError::InvalidChange {
+                message: "projected semantic edit requires a span change".into(),
+            });
+        }
+        // Projected span edits are validated and applied by the span index
+        // writer in this same transaction, not by the CRDT table writer.
+        let regular_ops: Vec<_> = file_ops
+            .iter()
+            .filter(|ops| {
+                !matches!(
+                    ops.trunk_op(),
+                    Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+                )
+            })
+            .cloned()
+            .collect();
+        let file_ops = regular_ops.as_slice();
         let file_ops_count = file_ops.len();
         log::debug!(
             "write_change_to_graph: applying {} FileOps to CRDT tables",

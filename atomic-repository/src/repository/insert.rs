@@ -169,6 +169,9 @@ impl Repository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             txn.put_change_deps(id, change.dependencies())
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            if applied && is_graph_only_git_span(&change) {
+                index_replayed_git_span(&mut txn, id, hash, &change, false)?;
+            }
             let view = txn
                 .get_view(view_name)
                 .map_err(|e| RepositoryError::Database(e.to_string()))?
@@ -287,10 +290,60 @@ fn write_recorded_graph_and_spans(
         return write_change_to_graph(txn, view_name, change_id, hash, change, options, false)
             .map_err(|error| RepositoryError::Apply(error.to_string()));
     };
+    if change.file_ops().iter().any(|ops| {
+        matches!(
+            ops.trunk_op(),
+            Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+        )
+    }) {
+        use atomic_core::pristine::{CapabilityMutTxnT, SPAN_PROJECTED_SEMANTICS_CAPABILITY};
+        txn.put_required_capability(SPAN_PROJECTED_SEMANTICS_CAPABILITY)?;
+    }
     use atomic_core::change::span_patch::SpanOp;
     use atomic_core::pristine::{span_patch_storage::SpanPatchReadTxn, CrdtTxnT};
     let semantic = atomic_core::change::span_patch::localize_file_ops(txn, change)
         .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+    let graph_only_git = is_graph_only_git_span(change);
+    let projected: Vec<_> = semantic
+        .iter()
+        .filter_map(|ops| match ops.trunk_op() {
+            Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { file, .. }) => Some((ops, file)),
+            _ => None,
+        })
+        .collect();
+    if !projected.is_empty() {
+        let mut ids = Vec::new();
+        for hash in change.dependencies() {
+            ids.push(txn.get_internal(hash)?.ok_or_else(|| {
+                RepositoryError::Apply("projected semantic dependency missing".into())
+            })?);
+        }
+        let membership = atomic_core::pristine::ViewMembershipSet::from_ordered(ids);
+        let visibility = super::filter::graph_visibility_from_membership(txn, &membership)?;
+        for (ops, file) in &projected {
+            let inode = txn
+                .span_file_inode(file)
+                .map_err(|error| RepositoryError::Apply(error.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Apply("projected semantic file mapping missing".into())
+                })?;
+            if txn.get_crdt_inode_trunk(inode.get())?.is_some() {
+                return Err(RepositoryError::Apply(
+                    "projected semantic edit cannot replace an existing CRDT trunk".into(),
+                ));
+            }
+            let binding = repository
+                .projected_path_binding_for_visibility(txn, &visibility, ops.path())?
+                .ok_or_else(|| {
+                    RepositoryError::Apply("projected semantic path is absent or conflicted".into())
+                })?;
+            if binding.directory || binding.inode != inode {
+                return Err(RepositoryError::Apply(
+                    "projected semantic path names a different file".into(),
+                ));
+            }
+        }
+    }
     // The portable mapping is author-supplied. A hash in the dependency
     // closure is not by itself proof that its semantic branch belongs to the
     // file named by a span edit.
@@ -302,6 +355,12 @@ fn write_recorded_graph_and_spans(
             .span_file_inode(file)
             .map_err(|e| RepositoryError::Apply(e.to_string()))?
             .ok_or_else(|| RepositoryError::Apply("span file mapping missing".into()))?;
+        if graph_only_git {
+            continue;
+        }
+        if semantic.iter().any(|ops| matches!(ops.trunk_op(), Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { file: projected, .. }) if projected == file)) {
+            continue;
+        }
         let trunk_key = txn
             .get_crdt_inode_trunk(inode.get())
             .map_err(|e| RepositoryError::Database(e.to_string()))?
@@ -428,9 +487,10 @@ fn write_recorded_graph_and_spans(
                 .iter()
                 .filter(|ops| ops.path() == path && ops.is_create())
                 .collect();
-            if creators.len() != 1
-                || !creators[0].trunk_id().change_id().is_root()
-                || !matches!(creators[0].trunk_op(), Some(atomic_core::crdt::TrunkOp::Create { path: created, .. }) if created == path)
+            if !graph_only_git
+                && (creators.len() != 1
+                    || !creators[0].trunk_id().change_id().is_root()
+                    || !matches!(creators[0].trunk_op(), Some(atomic_core::crdt::TrunkOp::Create { path: created, .. }) if created == path))
             {
                 return Err(RepositoryError::InvalidOperation {
                     message: format!("span root '{path}' has no unique semantic creation"),
@@ -469,7 +529,124 @@ fn write_recorded_graph_and_spans(
         &roots,
     )
     .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+    if graph_only_git {
+        index_replayed_git_span(txn, change_id, *hash, change, true)?;
+    }
     Ok(inserted)
+}
+
+fn is_graph_only_git_span(change: &Change) -> bool {
+    change.hashed.span.is_some()
+        && matches!(
+            change.origin(),
+            atomic_core::change::ChangeOrigin::GitSynthesized { .. }
+        )
+        && change.file_ops().is_empty()
+}
+
+fn index_replayed_git_span(
+    txn: &mut atomic_core::pristine::WriteTxn<'_>,
+    change_id: NodeId,
+    hash: Hash,
+    change: &Change,
+    allow_create: bool,
+) -> Result<(), RepositoryError> {
+    use atomic_core::pristine::{
+        EffectiveProjectionClosure, GitCommitClosureMutTxnT, GitCommitClosureTxnT,
+        GitShaIndexMutTxnT, GitShaIndexTxnT, ViewMembershipSet,
+    };
+    let atomic_core::change::ChangeOrigin::GitSynthesized {
+        commit, parents, ..
+    } = change.origin()
+    else {
+        return Err(RepositoryError::Apply(
+            "replayed Git span has no Git origin".into(),
+        ));
+    };
+    let sha = super::synthesis::git_oid_hex(commit);
+    match txn.get_by_git_sha(&sha)? {
+        Some(existing) if existing != change_id => {
+            return Err(RepositoryError::Apply(format!(
+                "Git commit {sha} already has a different repository identity"
+            )))
+        }
+        None if !allow_create => {
+            return Err(RepositoryError::Apply(format!(
+                "Git commit {sha} identity is missing"
+            )))
+        }
+        _ => {}
+    }
+    let mut closure = if let Some(parent) = parents.first() {
+        let parent_sha = super::synthesis::git_oid_hex(parent);
+        let parent_id = txn.get_by_git_sha(&parent_sha)?.ok_or_else(|| {
+            RepositoryError::Apply(format!("Git parent {parent_sha} is not indexed"))
+        })?;
+        let dependency_ids = change
+            .dependencies()
+            .iter()
+            .map(|dependency| {
+                txn.get_internal(dependency)?
+                    .ok_or_else(|| RepositoryError::Apply("Git replay dependency missing".into()))
+            })
+            .collect::<Result<Vec<_>, RepositoryError>>()?;
+        let visible = EffectiveProjectionClosure::try_from_membership(
+            txn,
+            &ViewMembershipSet::from_ordered(dependency_ids),
+        )?;
+        if !visible.contains(parent_id) {
+            return Err(RepositoryError::Apply(
+                "Git first parent is outside the change dependency closure".into(),
+            ));
+        }
+        let parent_hash = txn
+            .get_external(parent_id)?
+            .ok_or_else(|| RepositoryError::Apply("Git parent hash missing".into()))?;
+        let closure = txn.get_git_commit_closure(&parent_sha)?.ok_or_else(|| {
+            RepositoryError::Apply(format!(
+                "Git parent {parent_sha} interpretation closure is missing"
+            ))
+        })?;
+        if !closure.contains(&parent_hash) || closure.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(RepositoryError::Apply(
+                "Git parent interpretation closure is not canonical".into(),
+            ));
+        }
+        for member in &closure {
+            let id = txn.get_internal(member)?.ok_or_else(|| {
+                RepositoryError::Apply("Git interpretation closure member missing".into())
+            })?;
+            if !visible.contains(id) {
+                return Err(RepositoryError::Apply(
+                    "Git interpretation closure exceeds the change dependency closure".into(),
+                ));
+            }
+        }
+        closure
+    } else {
+        Vec::new()
+    };
+    closure.push(hash);
+    closure.sort();
+    closure.dedup();
+    match txn.get_git_commit_closure(&sha)? {
+        Some(existing) if existing != closure => {
+            return Err(RepositoryError::Apply(format!(
+                "Git commit {sha} has a different interpretation closure"
+            )))
+        }
+        None if !allow_create => {
+            return Err(RepositoryError::Apply(format!(
+                "Git commit {sha} interpretation closure is missing"
+            )))
+        }
+        _ => {}
+    }
+    if allow_create {
+        txn.put_git_sha(&sha, change_id)?;
+        txn.put_git_commit_closure(&sha, &closure)?;
+    }
+    Ok(())
 }
 
 fn write_recorded_in_txn(
@@ -501,6 +678,7 @@ fn write_recorded_in_txn(
     let inserted = write_recorded_graph_and_spans(
         repository, txn, view_name, change_id, hash, change, &options,
     )?;
+    validate_recorded_span_projection(repository, txn, view_name, *hash, change)?;
     repository.apply_tree_projection(
         txn,
         &tree_projection,
@@ -508,6 +686,50 @@ fn write_recorded_in_txn(
         preserve_existing_tree_paths,
     )?;
     Ok(inserted)
+}
+
+fn validate_recorded_span_projection(
+    repository: &Repository,
+    txn: &atomic_core::pristine::WriteTxn<'_>,
+    view_name: &str,
+    hash: Hash,
+    change: &Change,
+) -> Result<(), RepositoryError> {
+    use atomic_core::change::span_patch::{ExternalFile, SpanOp};
+    use atomic_core::pristine::span_patch_storage::{SpanPatchReadTxn, SpanRenderContext};
+    let Some(patch) = &change.hashed.span else {
+        return Ok(());
+    };
+    let view = txn
+        .get_view(view_name)?
+        .ok_or_else(|| RepositoryError::ViewNotFound {
+            name: view_name.to_string(),
+        })?;
+    let visibility = graph_visibility_closure(txn, &view)?;
+    let context = SpanRenderContext::new(txn, &repository.change_store, &visibility)
+        .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+    let mut inodes = HashSet::new();
+    for op in &patch.ops {
+        let file = match op {
+            SpanOp::Root { ordinal, .. } => ExternalFile {
+                owner: hash,
+                ordinal: *ordinal,
+            },
+            SpanOp::Edit { file, .. } => file.clone(),
+        };
+        let inode = txn
+            .span_file_inode(&file)
+            .map_err(|error| RepositoryError::Apply(error.to_string()))?
+            .ok_or_else(|| {
+                RepositoryError::Apply("span file mapping missing after record".into())
+            })?;
+        if inodes.insert(inode) {
+            context
+                .render(inode)
+                .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Timing details for the git-import fresh-write path.
@@ -2875,13 +3097,6 @@ impl Repository {
             self, &mut txn, view_name, change_id, hash, change, &options,
         )?;
 
-        self.apply_tree_projection(
-            &mut txn,
-            &tree_projection,
-            view_name,
-            preserve_existing_tree_paths,
-        )?;
-
         if let Some((removal_view_name, removed_hash)) = removal {
             let mut removal_view = txn
                 .get_view(removal_view_name)
@@ -2908,9 +3123,6 @@ impl Repository {
             // pending deletions (or rename paths) from the next durable
             // record. Preserve the same selected-view boundary as the write
             // above, including separately staged working-copy paths.
-            if removal_view_name == self.current_view {
-                self.realign_tree_projection_in_txn(&mut txn, removal_view_name)?;
-            }
             if removal_view_name == view_name {
                 let final_view = txn
                     .get_view(view_name)
@@ -2920,6 +3132,21 @@ impl Repository {
                     })?;
                 apply_outcome.new_state = final_view.state;
                 apply_outcome.sequence = final_view.change_count;
+            }
+        }
+        // Snapshot replacement deliberately has both the old and new private
+        // references in the transaction until the old one is removed. Verify
+        // the final view, not that transient overlap, before committing.
+        validate_recorded_span_projection(self, &txn, view_name, *hash, change)?;
+        self.apply_tree_projection(
+            &mut txn,
+            &tree_projection,
+            view_name,
+            preserve_existing_tree_paths,
+        )?;
+        if let Some((removal_view_name, _)) = removal {
+            if removal_view_name == self.current_view {
+                self.realign_tree_projection_in_txn(&mut txn, removal_view_name)?;
             }
         }
 

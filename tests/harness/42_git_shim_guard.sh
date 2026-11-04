@@ -50,12 +50,15 @@ start_colocated_repo() {
     create_file tracked.txt "checkpoint\n"
     git add tracked.txt
     git commit --no-gpg-sign --quiet -m "checkpoint"
-    atomic git import --no-vault >/dev/null
-    atomic git shim reconcile >/dev/null
+    require_success "$label: import Git" atomic git import --no-vault
+    require_success "$label: reconcile Git shim" atomic git shim reconcile
     if [[ -s .atomic/bridge/workspace.json ]]; then
         _pass "$label: valid shim checkpoint established"
     else
         _fail "$label: valid shim checkpoint established" ".atomic/bridge/workspace.json missing"
+        _skip "guard matrix and subsequent checks" "fixture checkpoint unavailable"
+        print_summary || true
+        exit 1
     fi
 }
 
@@ -89,15 +92,40 @@ snapshot_guard_state() {
     } > "$destination"
 }
 
+snapshot_operations() {
+    local scope="$1" destination="$2"
+    python3 -c '
+import json, subprocess, sys
+binary, scope = sys.argv[1:]
+args = [binary, "op", "log", "--json"] + (["--repository"] if scope == "repository" else [])
+log = json.loads(subprocess.check_output(args, text=True))
+details = [json.loads(subprocess.check_output([binary, "op", "show", entry["id"], "--json"], text=True)) for entry in log["entries"]]
+print(json.dumps({"log": log, "details": details}, sort_keys=True))' "$ATOMIC_BIN" "$scope" > "$destination"
+}
+
 assert_guard_refusal() {
     local label="$1"
     local operation="$2"
     shift 2
-    local before after output rc lines
+    local before baseline after before_ops after_ops before_repo_ops after_repo_ops output rc lines
     before="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-before-XXXXXX")"
+    baseline="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-baseline-XXXXXX")"
     after="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-after-XXXXXX")"
-    _HARNESS_TMPDIRS+=("$before" "$after")
+    _HARNESS_TMPDIRS+=("$before" "$baseline" "$after")
+    before_ops="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-before-ops-XXXXXX")"
+    after_ops="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-after-ops-XXXXXX")"
+    before_repo_ops="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-before-repo-ops-XXXXXX")"
+    after_repo_ops="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-after-repo-ops-XXXXXX")"
+    _HARNESS_TMPDIRS+=("$before_ops" "$after_ops" "$before_repo_ops" "$after_repo_ops")
+    require_success "$label: capture working-copy operations before command" snapshot_operations working-copy "$before_ops"
+    require_success "$label: capture repository operations before command" snapshot_operations repository "$before_repo_ops"
+    snapshot_guard_state "$baseline"
     snapshot_guard_state "$before"
+    if cmp -s "$baseline" "$before"; then
+        _pass "$label: consecutive snapshots are stable before command"
+    else
+        _fail "$label: consecutive snapshots are stable before command" "$(diff -u "$baseline" "$before" || true)"
+    fi
 
     set +e
     output="$("$@" 2>&1)"
@@ -164,19 +192,26 @@ assert_guard_refusal() {
     else
         _fail "$label: refusal is non-mutating" "$(diff -u "$before" "$after" || true)"
     fi
+    require_success "$label: capture working-copy operations after command" snapshot_operations working-copy "$after_ops"
+    require_success "$label: capture repository operations after command" snapshot_operations repository "$after_repo_ops"
+    assert_success "$label: refusal preserves working-copy operation DAG and receipts" cmp -s "$before_ops" "$after_ops"
+    assert_success "$label: refusal preserves repository operation DAG and receipts" cmp -s "$before_repo_ops" "$after_repo_ops"
 }
 
 begin_section "Every working-copy boundary shares one early refusal"
 start_colocated_repo "git-shim-guard-matrix"
-atomic view create feature --draft --parent main >/dev/null
-CHANGE="$(atomic log -f oneline --full-hash | awk 'NR == 1 { print $1 }')"
-HISTORY_BEFORE="$(atomic diff --change "$CHANGE" --name-only --no-color)"
+require_success "create feature view" atomic view create feature --draft --parent main
+require_capture "read latest change hash" atomic log -f json --count 1
+require_capture "extract latest change hash" python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); assert len(rows)==1 and len(rows[0]["hash"])==52; print(rows[0]["hash"])' "$COMMAND_OUTPUT"
+CHANGE="$COMMAND_OUTPUT"
+require_capture "read historical diff before drift" atomic diff --change "$CHANGE" --name-only --no-color
+HISTORY_BEFORE="$COMMAND_OUTPUT"
 
-atomic git shim enable >/dev/null
+require_success "enable shim" atomic git shim enable
 HOOK_PATH="$(git rev-parse --git-path hooks/post-checkout)"
 rm -f "$HOOK_PATH"
 raw_git_drift raw-drift
-if [[ ! -e .atomic/bridge/git-events.jsonl ]]; then
+if [[ ! -e .atomic/bridge/git-events.jsonl ]] || ! grep -q '"record_type":"post-checkout"' .atomic/bridge/git-events.jsonl; then
     _pass "removing the advisory hook leaves no checkout journal"
 else
     _fail "removing the advisory hook leaves no checkout journal" "$(cat .atomic/bridge/git-events.jsonl)"

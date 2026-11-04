@@ -1416,6 +1416,59 @@ pub fn change_file_diffs(
     change_hash: &Hash,
     config: &DiffOutputConfig,
 ) -> Result<(Vec<FileDiff>, DiffStats), crate::error::RepositoryError> {
+    let projected: Vec<_> = change
+        .file_ops()
+        .iter()
+        .filter(|ops| matches!(ops.trunk_op(), Some(TrunkOp::ProjectedSpanEdit { .. })))
+        .collect();
+    if !projected.is_empty() {
+        let mut ordinary = change.clone();
+        ordinary
+            .hashed
+            .file_ops
+            .retain(|ops| !matches!(ops.trunk_op(), Some(TrunkOp::ProjectedSpanEdit { .. })));
+        let (mut files, mut stats) = change_file_diffs_with(&ordinary, config, |path| {
+            repo.get_file_content_before_change(path, change_hash)
+                .ok()
+                .flatten()
+        })?;
+        for ops in projected {
+            let path = ops.path();
+            let before = repo
+                .get_file_content_before_change(path, change_hash)?
+                .ok_or_else(|| crate::error::RepositoryError::InvalidOperation {
+                    message: format!("projected span file '{path}' is absent before the change"),
+                })?;
+            let after = repo
+                .get_file_content_after_change(path, change_hash)?
+                .ok_or_else(|| crate::error::RepositoryError::InvalidOperation {
+                    message: format!("projected span file '{path}' is absent after the change"),
+                })?;
+            let mut file_diff = FileDiff::modified(path);
+            if before.contains(&0)
+                || after.contains(&0)
+                || std::str::from_utf8(&before).is_err()
+                || std::str::from_utf8(&after).is_err()
+            {
+                file_diff.is_binary = true;
+            } else {
+                let result = diff_text(&before, &after, Algorithm::Myers);
+                if !result.is_unchanged() {
+                    let old_lines: Vec<_> = before.split(|&byte| byte == b'\n').collect();
+                    let new_lines: Vec<_> = after.split(|&byte| byte == b'\n').collect();
+                    for hunk in
+                        build_hunks_from_diff(&result, &old_lines, &new_lines, config.context_lines)
+                    {
+                        file_diff.add_hunk(hunk);
+                    }
+                }
+            }
+            file_diff.compute_stats();
+            stats.add_file(file_diff.stats.clone());
+            files.push(file_diff);
+        }
+        return Ok((files, stats));
+    }
     // The before-content fetch: the file's recorded state prior to the
     // change, read from the graph. The wire path has no such fetch — it
     // passes a `None` resolver and the hunks render zero-context, the
@@ -1605,6 +1658,11 @@ where
 
         let trunk_op = ops.trunk_op();
         let line_ops = ops.line_ops();
+        if matches!(trunk_op, Some(TrunkOp::ProjectedSpanEdit { .. })) {
+            return Err(crate::error::RepositoryError::InvalidOperation {
+                message: "projected span edit requires a span-aware semantic diff".into(),
+            });
+        }
 
         // Determine file change status from trunk operation
         let change_status = match trunk_op {
@@ -1613,7 +1671,8 @@ where
             Some(TrunkOp::Move { .. }) => FileChangeStatus::Renamed,
             Some(TrunkOp::Undelete { .. })
             | Some(TrunkOp::SetMode { .. })
-            | Some(TrunkOp::SetKind { .. }) => FileChangeStatus::Modified,
+            | Some(TrunkOp::SetKind { .. })
+            | Some(TrunkOp::ProjectedSpanEdit { .. }) => FileChangeStatus::Modified,
             None => FileChangeStatus::Modified,
         };
 

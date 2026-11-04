@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 36_shadow_coherence_v2.sh — Validator Rule V2 (tree ↔ view coherence).
+# HISTORICAL: coverage migrated to ../40_git_shim_safety.sh.
 #
 # SPEC-single-materializer-validator.md §6.2 / Phase 4: the staged tree must
 # correspond to what the current view materializes. A working copy that has
@@ -29,25 +29,39 @@ begin_section "Coherent record → push commits (no false positive)"
 make_temp_repo "v2-coherence"
 init_git_repo
 git_commit "Initial" "README.md" "# Project"
-assert_success "git import" atomic git import --no-vault
+require_success "git import" atomic git import --no-vault
 
 create_file "src/a.ts" "const a = 1;"
-add_files "src/a.ts"
-record_change "feat: a" >/dev/null
-assert_success "coherent shadow push commits" atomic git push --no-push -m "baseline"
-BASE_COUNT="$(git_commit_count)"
+require_success "add src/a.ts" atomic add "src/a.ts"
+require_success "record src/a.ts" record_change "feat: a"
+require_success "coherent local shadow commit" atomic git push --no-push -m "baseline"
+require_capture "read baseline Git commit count" git rev-list --count HEAD
+BASE_COUNT="$COMMAND_OUTPUT"
+require_capture "read baseline Git HEAD" git rev-parse HEAD
+BASE_HEAD="$COMMAND_OUTPUT"
 
 begin_section "Out-of-band drift is rejected by V2"
 
 # Edit a tracked file on disk WITHOUT recording it: the working copy now
 # diverges from the view's recorded content.
 overwrite_file "src/a.ts" "const a = 999; // edited on disk, never recorded"
+snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-shadow-drift-XXXXXX")"
+_HARNESS_TMPDIRS+=("$snapshot_dir")
+cp src/a.ts "$snapshot_dir/a.ts"
+require_capture "read Atomic history before drift refusal" atomic log --format json
+history_before="$COMMAND_OUTPUT"
 
 set +e
 PUSH_OUT="$(atomic git push --no-push -m "drift" 2>&1)"
 PUSH_RC=$?
 set -e
-AFTER_COUNT="$(git_commit_count)"
+require_capture "read Git count after drift refusal" git rev-list --count HEAD
+AFTER_COUNT="$COMMAND_OUTPUT"
+assert_success "drift refusal preserves working bytes" cmp -s "$snapshot_dir/a.ts" src/a.ts
+require_capture "read Git HEAD after drift refusal" git rev-parse HEAD
+if [[ "$COMMAND_OUTPUT" == "$BASE_HEAD" ]]; then _pass "drift refusal preserves Git HEAD"; else _fail "drift refusal preserves Git HEAD" "HEAD changed"; fi
+require_capture "read Atomic history after drift refusal" atomic log --format json
+if [[ "$COMMAND_OUTPUT" == "$history_before" ]]; then _pass "drift refusal preserves Atomic history"; else _fail "drift refusal preserves Atomic history" "history changed"; fi
 
 if [ "$PUSH_RC" -ne 0 ]; then
     _pass "shadow push aborts (V2) on out-of-band drift"
@@ -76,11 +90,12 @@ fi
 
 begin_section "Recording the edit restores coherence"
 
-add_files "src/a.ts"
-record_change "feat: a (edited)" >/dev/null
-assert_success "push commits once coherent" atomic git push --no-push -m "recorded edit"
+require_success "add src/a.ts" atomic add "src/a.ts"
+require_success "record edited src/a.ts" record_change "feat: a (edited)"
+require_success "local shadow commit succeeds once coherent" atomic git push --no-push -m "recorded edit"
 
-FINAL_COUNT="$(git_commit_count)"
+require_capture "read final Git commit count" git rev-list --count HEAD
+FINAL_COUNT="$COMMAND_OUTPUT"
 if [ "$FINAL_COUNT" -eq "$((BASE_COUNT + 1))" ]; then
     _pass "exactly one commit after recording ($FINAL_COUNT)"
 else

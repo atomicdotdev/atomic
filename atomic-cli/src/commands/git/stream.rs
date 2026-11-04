@@ -9,6 +9,8 @@ use atomic_repository::{
 
 #[path = "rolling_dashboard.rs"]
 mod rolling_dashboard;
+#[path = "span_compiler.rs"]
+mod span_compiler;
 
 #[cfg(test)]
 thread_local! { static FORBID_ORDINARY_RECORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
@@ -86,6 +88,7 @@ struct Compiler {
     index: ImportLineIndex,
     attrs: HashMap<String, (u16, atomic_core::change::InodeKind, ContentHash)>,
     last_hash: Option<ContentHash>,
+    spans: Option<span_compiler::SpanCompiler>,
 }
 
 impl Compiler {
@@ -332,7 +335,18 @@ impl Compiler {
         }
         let mut deps: Vec<_> = deps.into_iter().collect();
         deps.sort();
-        let compiled = Change::new(header, hunks, change.contents, deps);
+        let span_lowering = self
+            .spans
+            .as_ref()
+            .map(|spans| spans.lower(&pending, &mut hunks))
+            .transpose()?;
+        let mut compiled = Change::new(header, hunks, change.contents, deps);
+        if let Some((ops, _)) = &span_lowering {
+            compiled.hashed.span = Some(atomic_core::change::span_patch::SpanPatch::new(
+                Vec::new(),
+                ops.clone(),
+            ));
+        }
         let algorithm = git_algorithm_for_sha(&parsed.git_sha)?;
         let parents = parsed
             .parent_oids
@@ -367,9 +381,16 @@ impl Compiler {
             record["tree_algorithm"] = record["algorithm"].clone();
             facts = serde_json::to_vec(&record).map_err(|error| git_error(error.to_string()))?;
         }
-        let prepared = PreparedGitGraphChange::new(compiled, origin, facts, unhashed)
-            .map_err(CliError::from)?;
+        let prepared = if span_lowering.is_some() {
+            PreparedGitGraphChange::new_span(compiled, origin, facts, unhashed)
+        } else {
+            PreparedGitGraphChange::new(compiled, origin, facts, unhashed)
+        }
+        .map_err(CliError::from)?;
         let hash = prepared.hash();
+        if let (Some(spans), Some((_, roots))) = (&mut self.spans, &span_lowering) {
+            spans.finish(hash, &pending, roots)?;
+        }
         self.last_hash = Some(hash);
         apply_line_index_updates(&mut self.index, hash, pending);
         for path in retired {
@@ -485,7 +506,12 @@ impl ParallelImporter {
         let started = Instant::now();
         let outcome =
             self.import_graph_stream_rolling(repo, stream.tip, limits, &stream.ordered)?;
-        print_info(&format!("Direct graph stream: {} commits in {} private batches; final tip verified (historical states not independently verified)", outcome.commits, outcome.batches));
+        let kind = if self.options.span_stream {
+            "span"
+        } else {
+            "graph"
+        };
+        print_info(&format!("Direct {kind} stream: {} commits in {} private batches; final tip verified (historical states not independently verified)", outcome.commits, outcome.batches));
         Ok(ImportStats {
             commits_found: total,
             commits_parsed: total,
@@ -497,6 +523,198 @@ impl ParallelImporter {
             ..Default::default()
         })
     }
+
+    /// Rebuild the compiler from the exact persisted prefix, then append only
+    /// the unimported suffix through the journaled private span stage.
+    /// This internal path does not inspect Git HEAD/index or the worktree; the
+    /// command boundary must hold the common lock and prove those separately.
+    pub(crate) fn import_span_incremental<F>(
+        &self,
+        repo: &mut Repository,
+        tip: Oid,
+        limits: GitStreamLimits,
+        expected_order: &[Oid],
+        mut validate_git: F,
+    ) -> CliResult<GitStreamOutcome>
+    where
+        F: FnMut() -> CliResult<()>,
+    {
+        use atomic_core::pristine::{GraphTxnT, ViewTxnT};
+
+        if !self.options.graph_only
+            || !self.options.mainline_only
+            || !self.options.span_stream
+            || !self.options.imported_shas.is_empty()
+            || self.options.target_view != repo.current_view()
+        {
+            return Err(git_error("incremental span stream requires an unfiltered first-parent replay into the current view"));
+        }
+        let (git, policy, ordered) = self.graph_stream_inputs(tip)?;
+        if ordered != expected_order {
+            return Err(git_error(
+                "pinned Git stream history changed after preflight",
+            ));
+        }
+        let (stage_hashes, target_members, target_state) = {
+            let txn = repo
+                .pristine()
+                .read_txn()
+                .map_err(|error| git_error(error.to_string()))?;
+            let target = txn
+                .get_view(repo.current_view())
+                .map_err(|error| git_error(error.to_string()))?
+                .ok_or_else(|| git_error("incremental span target view missing"))?;
+            let stage = txn
+                .get_view("git-stream-private")
+                .map_err(|error| git_error(error.to_string()))?
+                .ok_or_else(|| git_error("incremental span private stage missing"))?;
+            let hashes = |view: &atomic_core::pristine::ViewState| -> CliResult<Vec<ContentHash>> {
+                txn.iter_changes(view, 0)
+                    .map_err(|error| git_error(error.to_string()))?
+                    .map(|row| {
+                        let (_, id, _) = row.map_err(|error| git_error(error.to_string()))?;
+                        txn.get_external(id)
+                            .map_err(|error| git_error(error.to_string()))?
+                            .ok_or_else(|| git_error("stream member has no change hash"))
+                    })
+                    .collect()
+            };
+            (
+                hashes(&stage)?,
+                hashes(&target)?.into_iter().collect::<HashSet<_>>(),
+                target.state,
+            )
+        };
+        if stage_hashes.is_empty() || stage_hashes.len() > ordered.len() {
+            return Err(git_error(
+                "incremental span history is not an ancestor of the pinned Git tip",
+            ));
+        }
+        let base_len = stage_hashes
+            .iter()
+            .take_while(|hash| target_members.contains(*hash))
+            .count();
+        if base_len == 0
+            || stage_hashes[base_len..]
+                .iter()
+                .any(|hash| target_members.contains(hash))
+        {
+            return Err(git_error(
+                "incremental span stage and target do not share a contiguous prefix",
+            ));
+        }
+        let positions: HashMap<_, _> = ordered
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, oid)| (oid, index))
+            .collect();
+        let mut compiler = Compiler {
+            spans: Some(Default::default()),
+            ..Default::default()
+        };
+        let mut prefix = Vec::with_capacity(base_len);
+        let mut staged = Vec::with_capacity(stage_hashes.len() - base_len);
+        for (index, oid) in ordered.iter().copied().take(stage_hashes.len()).enumerate() {
+            let commit = git
+                .find_commit(oid)
+                .map_err(|error| git_error(error.to_string()))?;
+            input_budget(&git, &commit, limits.bytes())?;
+            let parsed = parse_commit_with_scope(&git, oid, index, &positions, false)?;
+            let metadata = self.build_git_metadata(&parsed, parsed.is_empty, parsed.is_merge);
+            let prepared = compiler.compile(&parsed, &policy, &[], metadata)?;
+            if prepared.hash() != stage_hashes[index] {
+                return Err(git_error(format!(
+                    "replayed Git commit {oid} differs from the persisted private stage"
+                )));
+            }
+            if index < base_len {
+                prefix.push((oid.to_string(), prepared.hash()));
+            } else {
+                staged.push((oid.to_string(), prepared.hash()));
+            }
+        }
+        let baseline = import_expected_tree_oid(
+            &git,
+            git.find_commit(ordered[base_len - 1])
+                .map_err(|error| git_error(error.to_string()))?
+                .tree_id(),
+            &policy,
+        )?;
+        validate_git()?;
+        let mut session = if staged.is_empty() {
+            GitGraphImportSession::begin_span_incremental(repo, limits, &prefix, &policy, &baseline)
+        } else {
+            GitGraphImportSession::resume_span_incremental(
+                repo, limits, &prefix, &staged, &policy, &baseline,
+            )
+        }
+        .map_err(CliError::from)?;
+        if stage_hashes.len() == ordered.len() && staged.is_empty() {
+            return Ok(GitStreamOutcome {
+                commits: 0,
+                batches: 0,
+                state: target_state,
+                private_publish_seconds: 0.0,
+                final_proof_promotion_seconds: 0.0,
+            });
+        }
+        let mut batch = Vec::new();
+        let mut bytes = 0usize;
+        for (index, oid) in ordered.iter().copied().enumerate().skip(stage_hashes.len()) {
+            let commit = git
+                .find_commit(oid)
+                .map_err(|error| git_error(error.to_string()))?;
+            input_budget(&git, &commit, limits.bytes())?;
+            let parsed = parse_commit_with_scope(&git, oid, index, &positions, false)?;
+            let metadata = self.build_git_metadata(&parsed, parsed.is_empty, parsed.is_merge);
+            let prepared = compiler.compile(&parsed, &policy, &[], metadata)?;
+            if prepared.payload_bytes() > limits.bytes() {
+                return Err(git_error(
+                    "single compiled span change exceeds the stream budget",
+                ));
+            }
+            if !batch.is_empty()
+                && (batch.len() == limits.commits()
+                    || prepared.payload_bytes() > limits.bytes() - bytes)
+            {
+                validate_git()?;
+                session.publish(&batch).map_err(CliError::from)?;
+                batch.clear();
+                bytes = 0;
+            }
+            bytes += prepared.payload_bytes();
+            batch.push(prepared);
+        }
+        if !batch.is_empty() {
+            validate_git()?;
+            session.publish(&batch).map_err(CliError::from)?;
+        }
+        finish_graph_stream_with_guard(session, &git, &policy, tip, || {
+            validate_git().map_err(
+                |error| atomic_repository::RepositoryError::InvalidOperation {
+                    message: format!("Git observation changed before span promotion: {error}"),
+                },
+            )
+        })
+    }
+
+    pub(crate) fn import_span_incremental_prevalidated<F>(
+        &self,
+        repo: &mut Repository,
+        plan: ProspectiveImportPlan,
+        limits: GitStreamLimits,
+        validate_git: F,
+    ) -> CliResult<GitStreamOutcome>
+    where
+        F: FnMut() -> CliResult<()>,
+    {
+        let stream = plan
+            .stream
+            .ok_or_else(|| git_error("missing incremental span preflight"))?;
+        self.import_span_incremental(repo, stream.tip, limits, &stream.ordered, validate_git)
+    }
+
     fn graph_stream_inputs(
         &self,
         tip: Oid,
@@ -565,7 +783,12 @@ impl ParallelImporter {
             .enumerate()
             .map(|(index, oid)| (oid, index))
             .collect();
-        let mut session = GitGraphImportSession::begin(repo, limits).map_err(CliError::from)?;
+        let mut session = if self.options.span_stream {
+            GitGraphImportSession::begin_span(repo, limits)
+        } else {
+            GitGraphImportSession::begin(repo, limits)
+        }
+        .map_err(CliError::from)?;
         let enabled = std::io::stderr().is_terminal()
             && std::env::var_os("TERM").is_some_and(|term| term != "dumb");
         let mut dashboard = rolling_dashboard::Dashboard::start(500, limits.bytes(), enabled);
@@ -574,6 +797,9 @@ impl ParallelImporter {
             state.checked = ordered.len();
         });
         let mut compiler = Compiler::default();
+        if self.options.span_stream {
+            compiler.spans = Some(Default::default());
+        }
         let mut pending = VecDeque::new();
         let (mut next, mut processed, mut pending_bytes) = (0usize, 0usize, 0usize);
         let started = Instant::now();
@@ -678,8 +904,16 @@ impl ParallelImporter {
             .enumerate()
             .map(|(index, oid)| (oid, index))
             .collect();
-        let mut session = GitGraphImportSession::begin(repo, limits).map_err(CliError::from)?;
+        let mut session = if self.options.span_stream {
+            GitGraphImportSession::begin_span(repo, limits)
+        } else {
+            GitGraphImportSession::begin(repo, limits)
+        }
+        .map_err(CliError::from)?;
         let mut compiler = Compiler::default();
+        if self.options.span_stream {
+            compiler.spans = Some(Default::default());
+        }
         let mut batch = Vec::new();
         let mut bytes = 0usize;
         let mut staged = 0usize;
@@ -731,6 +965,19 @@ fn finish_graph_stream(
     policy: &ConversionPolicy,
     tip: Oid,
 ) -> CliResult<GitStreamOutcome> {
+    finish_graph_stream_with_guard(session, git, policy, tip, || Ok(()))
+}
+
+fn finish_graph_stream_with_guard<F>(
+    session: GitGraphImportSession<'_>,
+    git: &GitRepository,
+    policy: &ConversionPolicy,
+    tip: Oid,
+    guard: F,
+) -> CliResult<GitStreamOutcome>
+where
+    F: FnOnce() -> Result<(), atomic_repository::RepositoryError>,
+{
     let tree = git
         .find_commit(tip)
         .and_then(|commit| commit.tree())
@@ -747,7 +994,9 @@ fn finish_graph_stream(
     let expected = import_expected_tree_oid(git, tree.id(), policy)?;
     let proof = verify_prospective_equivalence(&project, &expected)
         .map_err(|error| git_error(error.to_string()))?;
-    session.finish(&project, &proof).map_err(CliError::from)
+    session
+        .finish_with_guard(&project, &proof, guard)
+        .map_err(CliError::from)
 }
 
 #[cfg(test)]
@@ -1416,6 +1665,2516 @@ mod tests {
             );
         }
         (temp, git, previous.unwrap(), files)
+    }
+
+    fn assert_imported_authored_ranges(
+        repo: &Repository,
+        expected: &[u8],
+        minimum_owners: usize,
+    ) -> atomic_core::pristine::span_patch_storage::SpanProjectionId {
+        use atomic_core::pristine::span_patch_storage::SpanRenderContext;
+        use atomic_core::pristine::{GraphTxnT, TreeTxnT, ViewTxnT};
+        let txn = repo.pristine().read_txn().unwrap();
+        let view = txn.get_view(repo.current_view()).unwrap().unwrap();
+        let visibility = atomic_repository::graph_visibility_closure(&txn, &view).unwrap();
+        let inode = txn.get_inode("hot.txt").unwrap().unwrap();
+        let context = SpanRenderContext::new(&txn, repo.change_store(), &visibility).unwrap();
+        let state = context.record_state(inode).unwrap().unwrap();
+        assert_eq!(state.content, expected);
+        let mut reconstructed = Vec::new();
+        let mut owners = std::collections::BTreeSet::new();
+        for range in state.authored_ranges(0..state.content.len()).unwrap() {
+            let change = repo.load_change(&range.target.owner).unwrap();
+            let start = (range.target.start + range.target_start) as usize;
+            let end = start + range.output.len();
+            reconstructed.extend_from_slice(&change.contents[start..end]);
+            owners.insert(range.target.owner);
+        }
+        assert_eq!(reconstructed, state.content);
+        assert!(
+            owners.len() >= minimum_owners,
+            "fixture did not exercise the requested distinct authorship spans"
+        );
+        let mut semantic_bytes = Vec::new();
+        let snapshot = state.semantic_snapshot().unwrap();
+        let id = snapshot.id;
+        for line in snapshot.lines {
+            for token in line.tokens {
+                let mut token_bytes = Vec::new();
+                for fragment in token.authors {
+                    let change = repo.load_change(&fragment.target.owner).unwrap();
+                    let start = (fragment.target.start + fragment.target_start) as usize;
+                    let end = start + fragment.output.len();
+                    token_bytes.extend_from_slice(&change.contents[start..end]);
+                }
+                assert_eq!(token_bytes, state.content[token.output.clone()]);
+                semantic_bytes.extend_from_slice(&token_bytes);
+            }
+        }
+        assert_eq!(semantic_bytes, state.content);
+        id
+    }
+
+    #[test]
+    fn span_stream_preserves_each_git_state_and_reopens() {
+        use atomic_core::pristine::{GitShaIndexTxnT, GraphTxnT};
+
+        let (_git_dir, git, tip, files) = fixture(16);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let outcome = importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(outcome.commits, 16);
+        let mut commits = Vec::new();
+        let mut current = tip;
+        loop {
+            commits.push(current);
+            let commit = git.find_commit(current).unwrap();
+            if commit.parent_count() == 0 {
+                break;
+            }
+            current = commit.parent_id(0).unwrap();
+        }
+        commits.reverse();
+        let mut expected_closure = Vec::new();
+        let mut closures = Vec::new();
+        for oid in commits {
+            let hash = {
+                let txn = repo.pristine().read_txn().unwrap();
+                let id = txn.get_by_git_sha(&oid.to_string()).unwrap().unwrap();
+                txn.get_external(id).unwrap().unwrap()
+            };
+            expected_closure.push(hash);
+            let mut sorted_closure = expected_closure.clone();
+            sorted_closure.sort();
+            sorted_closure.dedup();
+            assert_eq!(
+                repo.git_commit_closure(&oid.to_string()).unwrap(),
+                Some(sorted_closure.clone()),
+                "closure for {oid}"
+            );
+            closures.push((oid, sorted_closure));
+            let change = repo.load_change(&hash).unwrap();
+            assert!(change.hashed.span.is_some(), "{oid} is not a span change");
+            assert!(
+                change.file_ops().is_empty(),
+                "Git stream must not synthesize native semantic identity"
+            );
+            let tree = git.find_commit(oid).unwrap().tree().unwrap();
+            for path in [
+                "hot.txt",
+                "moved.txt",
+                "stable.txt",
+                "nested/deep/empty",
+                "nested/deep/recreated",
+                "blob.bin",
+            ] {
+                let expected = tree
+                    .get_path(Path::new(path))
+                    .ok()
+                    .map(|entry| git.find_blob(entry.id()).unwrap().content().to_vec());
+                let actual = repo
+                    .get_file_content_after_change_on_view(path, &hash, repo.current_view())
+                    .unwrap();
+                assert_eq!(actual, expected, "{oid} {path}");
+            }
+        }
+        for (path, (bytes, _)) in &files {
+            assert_eq!(
+                repo.get_file_content(path).unwrap().as_deref(),
+                Some(bytes.as_slice()),
+                "{path}"
+            );
+        }
+        assert_imported_authored_ranges(&repo, b"alpha\nrestored\nlast\n", 1);
+        repo.materialize(repo.require_working_copy_id().unwrap())
+            .unwrap();
+        for (path, (bytes, _)) in &files {
+            assert_eq!(
+                std::fs::read(target.path().join(path)).unwrap(),
+                *bytes,
+                "{path}"
+            );
+        }
+        assert!(repo
+            .status(
+                repo.require_working_copy_id().unwrap(),
+                atomic_repository::StatusOptions::default()
+            )
+            .unwrap()
+            .is_clean());
+        drop(repo);
+        let reopened = Repository::open(target.path()).unwrap();
+        assert_imported_authored_ranges(&reopened, b"alpha\nrestored\nlast\n", 1);
+        for (oid, closure) in closures {
+            assert_eq!(
+                reopened.git_commit_closure(&oid.to_string()).unwrap(),
+                Some(closure)
+            );
+        }
+        for (path, (bytes, _)) in &files {
+            assert_eq!(
+                reopened.get_file_content(path).unwrap().as_deref(),
+                Some(bytes.as_slice()),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_span_authored_ranges_preserve_multiple_change_owners() {
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let snapshot = assert_imported_authored_ranges(&repo, b"alpha\nchanged\nlast\n", 2);
+        drop(repo);
+        let reopened = Repository::open(target.path()).unwrap();
+        assert_eq!(
+            assert_imported_authored_ranges(&reopened, b"alpha\nchanged\nlast\n", 2),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn span_compiler_replays_imported_prefix_and_matches_fresh_extension() {
+        use atomic_core::pristine::{GitShaIndexTxnT, GraphTxnT, MutTxnT};
+
+        let (_git_dir, git, tip, _) = fixture(5);
+        let mut prefix = tip;
+        for _ in 0..3 {
+            prefix = git.find_commit(prefix).unwrap().parent_id(0).unwrap();
+        }
+        let partial_dir = tempfile::tempdir().unwrap();
+        let mut partial = Repository::init(partial_dir.path()).unwrap();
+        let make_importer = |repo: &Repository| {
+            ParallelImporter::new(
+                &git,
+                ParallelImportOptions {
+                    graph_only: true,
+                    span_stream: true,
+                    target_view: repo.current_view().into(),
+                    ..Default::default()
+                },
+            )
+        };
+        make_importer(&partial)
+            .import_graph_stream(
+                &mut partial,
+                prefix,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        drop(partial);
+        let mut partial = Repository::open(partial_dir.path()).unwrap();
+
+        let full_dir = tempfile::tempdir().unwrap();
+        let mut full = Repository::init(full_dir.path()).unwrap();
+        let importer = make_importer(&full);
+        importer
+            .import_graph_stream(
+                &mut full,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let (git, policy, ordered) = importer.graph_stream_inputs(tip).unwrap();
+        assert_eq!(ordered.len(), 5);
+        let positions: HashMap<_, _> = ordered
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, oid)| (oid, index))
+            .collect();
+        let mut compiler = Compiler {
+            spans: Some(Default::default()),
+            ..Default::default()
+        };
+        let partial_txn = partial.pristine().read_txn().unwrap();
+        let full_txn = full.pristine().read_txn().unwrap();
+        let mut replayed_prefix = Vec::new();
+        for (index, oid) in ordered.iter().copied().enumerate() {
+            let parsed = parse_commit_with_scope(&git, oid, index, &positions, false).unwrap();
+            let metadata = importer.build_git_metadata(&parsed, parsed.is_empty, parsed.is_merge);
+            let replayed = compiler
+                .compile(&parsed, &policy, &[], metadata)
+                .unwrap()
+                .hash();
+            let full_id = full_txn.get_by_git_sha(&oid.to_string()).unwrap().unwrap();
+            assert_eq!(
+                full_txn.get_external(full_id).unwrap(),
+                Some(replayed),
+                "fresh extension at {oid}"
+            );
+            let existing = partial_txn.get_by_git_sha(&oid.to_string()).unwrap();
+            if index < 2 {
+                assert_eq!(
+                    partial_txn.get_external(existing.unwrap()).unwrap(),
+                    Some(replayed),
+                    "existing prefix at {oid}"
+                );
+                replayed_prefix.push((oid.to_string(), replayed));
+            } else {
+                assert!(existing.is_none(), "replay must not publish {oid}");
+            }
+        }
+        drop(partial_txn);
+        drop(full_txn);
+        partial.create_shared_view("unrelated").unwrap();
+        let database = partial_dir.path().join(".atomic/atomic.redb");
+        let before = std::fs::read(&database).unwrap();
+        partial
+            .validate_span_git_prefix(partial.current_view(), &replayed_prefix)
+            .unwrap();
+        assert!(partial
+            .validate_span_git_prefix(partial.current_view(), &[])
+            .is_err());
+        let mut wrong_hash = replayed_prefix.clone();
+        wrong_hash[1].1 = atomic_core::types::Hash::of(b"different change");
+        assert!(partial
+            .validate_span_git_prefix(partial.current_view(), &wrong_hash)
+            .is_err());
+        let mut wrong_order = replayed_prefix.clone();
+        wrong_order.reverse();
+        assert!(partial
+            .validate_span_git_prefix(partial.current_view(), &wrong_order)
+            .is_err());
+        let mut unknown = replayed_prefix.clone();
+        unknown.push((
+            ordered[2].to_string(),
+            atomic_core::types::Hash::of(b"unimported change"),
+        ));
+        assert!(partial
+            .validate_span_git_prefix(partial.current_view(), &unknown)
+            .is_err());
+        assert!(partial
+            .validate_span_git_prefix("unrelated", &replayed_prefix)
+            .is_err());
+        assert_eq!(
+            std::fs::read(database).unwrap(),
+            before,
+            "prefix validation must be read-only"
+        );
+        let mut txn = partial.pristine().write_txn().unwrap();
+        let id = txn.get_by_git_sha(&replayed_prefix[1].0).unwrap().unwrap();
+        txn.put_change_deps(id, &[]).unwrap();
+        txn.commit().unwrap();
+        assert!(
+            partial
+                .validate_span_git_prefix(partial.current_view(), &replayed_prefix)
+                .is_err(),
+            "a damaged dependency index must not validate"
+        );
+    }
+
+    #[test]
+    fn incremental_span_private_stage_promotes_only_after_final_tree_proof() {
+        use atomic_core::operation::OperationScope;
+        use atomic_core::pristine::{GitShaIndexMutTxnT, GitShaIndexTxnT, MutTxnT};
+
+        for scenario in ["success", "failed-proof", "abandoned-stage"] {
+            let (_git_dir, git, tip, files) = fixture(5);
+            let mut prefix = tip;
+            for _ in 0..3 {
+                prefix = git.find_commit(prefix).unwrap().parent_id(0).unwrap();
+            }
+            let target = tempfile::tempdir().unwrap();
+            let mut repo = Repository::init(target.path()).unwrap();
+            let importer = ParallelImporter::new(
+                &git,
+                ParallelImportOptions {
+                    graph_only: true,
+                    span_stream: true,
+                    target_view: repo.current_view().into(),
+                    ..Default::default()
+                },
+            );
+            let limits = GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap();
+            importer
+                .import_graph_stream(&mut repo, prefix, limits)
+                .unwrap();
+            let wc = repo.require_working_copy_id().unwrap();
+            let before_state = repo.get_view_info(repo.current_view()).unwrap().state;
+            let before_history = repo.effective_history(None).unwrap();
+            let before_working = repo.working_copy_record(wc).unwrap();
+
+            let (git, policy, ordered) = importer.graph_stream_inputs(tip).unwrap();
+            let positions: HashMap<_, _> = ordered
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, oid)| (oid, index))
+                .collect();
+            let mut compiler = Compiler {
+                spans: Some(Default::default()),
+                ..Default::default()
+            };
+            let mut prefix_entries = Vec::new();
+            let mut suffix = Vec::new();
+            for (index, oid) in ordered.iter().copied().enumerate() {
+                let parsed = parse_commit_with_scope(&git, oid, index, &positions, false).unwrap();
+                let metadata =
+                    importer.build_git_metadata(&parsed, parsed.is_empty, parsed.is_merge);
+                let prepared = compiler.compile(&parsed, &policy, &[], metadata).unwrap();
+                if index < 2 {
+                    prefix_entries.push((oid.to_string(), prepared.hash()));
+                } else {
+                    suffix.push(prepared);
+                }
+            }
+            let baseline_tree =
+                import_expected_tree_oid(&git, git.find_commit(prefix).unwrap().tree_id(), &policy)
+                    .unwrap();
+            let staged_replay: Vec<_> = ordered[2..]
+                .iter()
+                .zip(&suffix)
+                .map(|(oid, change)| (oid.to_string(), change.hash()))
+                .collect();
+            let wrong_tree =
+                import_expected_tree_oid(&git, git.find_commit(tip).unwrap().tree_id(), &policy)
+                    .unwrap();
+            match GitGraphImportSession::begin_span_incremental(
+                &mut repo,
+                limits,
+                &prefix_entries,
+                &policy,
+                &wrong_tree,
+            ) {
+                Ok(_) => panic!("wrong Git baseline must be refused"),
+                Err(error) => assert!(
+                    error.to_string().contains("baseline tree mismatch"),
+                    "{error}"
+                ),
+            }
+            assert_eq!(
+                repo.get_view_info(repo.current_view()).unwrap().state,
+                before_state
+            );
+            assert_eq!(repo.working_copy_record(wc).unwrap(), before_working);
+            // An existing global SHA must never be silently rebound by staging.
+            let next_sha = ordered[2].to_string();
+            {
+                let mut txn = repo.pristine().write_txn().unwrap();
+                let existing = txn.get_by_git_sha(&prefix_entries[0].0).unwrap().unwrap();
+                txn.put_git_sha(&next_sha, existing).unwrap();
+                txn.commit().unwrap();
+            }
+            let before_collision = repo
+                .operation_log(OperationScope::WorkingCopy(wc), None, false)
+                .unwrap();
+            let before_global_collision = repo
+                .operation_log(OperationScope::Repository, None, false)
+                .unwrap();
+            {
+                let mut session = GitGraphImportSession::begin_span_incremental(
+                    &mut repo,
+                    limits,
+                    &prefix_entries,
+                    &policy,
+                    &baseline_tree,
+                )
+                .unwrap();
+                let error = session.publish(&suffix).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("already has a repository identity"),
+                    "{error}"
+                );
+            }
+            assert_eq!(
+                repo.operation_log(OperationScope::WorkingCopy(wc), None, false)
+                    .unwrap(),
+                before_collision
+            );
+            assert_eq!(
+                repo.operation_log(OperationScope::Repository, None, false)
+                    .unwrap(),
+                before_global_collision
+            );
+            {
+                let mut txn = repo.pristine().write_txn().unwrap();
+                assert!(txn.del_git_sha(&next_sha).unwrap());
+                txn.commit().unwrap();
+            }
+            let mut session = GitGraphImportSession::begin_span_incremental(
+                &mut repo,
+                limits,
+                &prefix_entries,
+                &policy,
+                &baseline_tree,
+            )
+            .unwrap();
+            session.publish(&suffix).unwrap();
+            if scenario == "abandoned-stage" {
+                drop(session);
+                assert_eq!(
+                    repo.get_view_info(repo.current_view()).unwrap().state,
+                    before_state
+                );
+                assert_eq!(repo.effective_history(None).unwrap(), before_history);
+                assert_eq!(repo.working_copy_record(wc).unwrap(), before_working);
+                drop(repo);
+                let mut reopened = Repository::open(target.path()).unwrap();
+                let before_retry = reopened
+                    .operation_log(OperationScope::WorkingCopy(wc), None, false)
+                    .unwrap();
+                let before_global_retry = reopened
+                    .operation_log(OperationScope::Repository, None, false)
+                    .unwrap();
+                match GitGraphImportSession::begin_span_incremental(
+                    &mut reopened,
+                    limits,
+                    &prefix_entries,
+                    &policy,
+                    &baseline_tree,
+                ) {
+                    Ok(_) => {
+                        panic!("abandoned private stage must not be mistaken for a clean baseline")
+                    }
+                    Err(error) => assert!(
+                        error
+                            .to_string()
+                            .contains("unchanged Git-only target and private stage"),
+                        "{error}"
+                    ),
+                }
+                assert_eq!(
+                    reopened
+                        .operation_log(OperationScope::WorkingCopy(wc), None, false)
+                        .unwrap(),
+                    before_retry
+                );
+                assert_eq!(
+                    reopened
+                        .operation_log(OperationScope::Repository, None, false)
+                        .unwrap(),
+                    before_global_retry
+                );
+                let mut wrong_staged = staged_replay.clone();
+                wrong_staged[0].1 = atomic_core::types::Hash::of(b"wrong staged change");
+                let refused = GitGraphImportSession::resume_span_incremental(
+                    &mut reopened,
+                    limits,
+                    &prefix_entries,
+                    &wrong_staged,
+                    &policy,
+                    &baseline_tree,
+                )
+                .is_err();
+                assert!(refused, "a mismatched staged suffix must not resume");
+                assert_eq!(
+                    reopened
+                        .operation_log(OperationScope::WorkingCopy(wc), None, false)
+                        .unwrap(),
+                    before_retry
+                );
+                assert_eq!(
+                    reopened
+                        .operation_log(OperationScope::Repository, None, false)
+                        .unwrap(),
+                    before_global_retry
+                );
+                let session = GitGraphImportSession::resume_span_incremental(
+                    &mut reopened,
+                    limits,
+                    &prefix_entries,
+                    &staged_replay,
+                    &policy,
+                    &baseline_tree,
+                )
+                .unwrap();
+                let outcome = finish_graph_stream(session, &git, &policy, tip).unwrap();
+                assert_eq!(outcome.commits, 3);
+                for (path, (bytes, _)) in &files {
+                    assert_eq!(
+                        reopened.get_file_content(path).unwrap(),
+                        Some(bytes.clone()),
+                        "{path}"
+                    );
+                }
+                drop(reopened);
+                let reopened_again = Repository::open(target.path()).unwrap();
+                for (path, (bytes, _)) in &files {
+                    assert_eq!(
+                        reopened_again.get_file_content(path).unwrap(),
+                        Some(bytes.clone()),
+                        "{path}"
+                    );
+                }
+                continue;
+            }
+            let result = finish_graph_stream(
+                session,
+                &git,
+                &policy,
+                if scenario == "failed-proof" {
+                    prefix
+                } else {
+                    tip
+                },
+            );
+            if scenario == "failed-proof" {
+                assert!(result.is_err(), "incorrect final tree must not publish");
+                assert_eq!(
+                    repo.get_view_info(repo.current_view()).unwrap().state,
+                    before_state
+                );
+                assert_eq!(repo.effective_history(None).unwrap(), before_history);
+                assert_eq!(repo.working_copy_record(wc).unwrap(), before_working);
+                assert_eq!(
+                    repo.get_file_content("hot.txt").unwrap(),
+                    Some(b"alpha\nchanged\nlast\n".to_vec())
+                );
+            } else {
+                let outcome = result.unwrap();
+                assert_eq!(outcome.commits, 3);
+                assert_eq!(repo.effective_history(None).unwrap().len(), 5);
+                for (path, (bytes, _)) in &files {
+                    assert_eq!(
+                        repo.get_file_content(path).unwrap(),
+                        Some(bytes.clone()),
+                        "{path}"
+                    );
+                }
+                let log = repo
+                    .operation_log(OperationScope::WorkingCopy(wc), None, false)
+                    .unwrap();
+                let original: std::collections::HashSet<_> = before_collision
+                    .entries
+                    .iter()
+                    .map(|entry| entry.operation.id())
+                    .collect();
+                let global = repo
+                    .operation_log(OperationScope::Repository, None, false)
+                    .unwrap();
+                let appended: Vec<_> = log
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        !original.contains(&entry.operation.id())
+                            && entry.operation.payload().kind
+                                == atomic_core::operation::OperationKind::SynthesizeGit
+                    })
+                    .collect();
+                assert_eq!(
+                    appended.len(),
+                    2,
+                    "one private batch and one final promotion"
+                );
+                for entry in appended {
+                    assert_eq!(
+                        entry.verification,
+                        atomic_repository::repository::OperationVerificationState::Verified
+                    );
+                    assert!(global
+                        .entries
+                        .iter()
+                        .any(|other| other.operation.id() == entry.operation.id()));
+                    assert!(!repo
+                        .operation_details(entry.operation.id())
+                        .unwrap()
+                        .receipts
+                        .is_empty());
+                }
+            }
+            drop(repo);
+            let mut reopened = Repository::open(target.path()).unwrap();
+            if scenario == "failed-proof" {
+                assert_eq!(
+                    reopened
+                        .get_view_info(reopened.current_view())
+                        .unwrap()
+                        .state,
+                    before_state
+                );
+                assert_eq!(
+                    reopened.get_file_content("hot.txt").unwrap(),
+                    Some(b"alpha\nchanged\nlast\n".to_vec())
+                );
+                let session = GitGraphImportSession::resume_span_incremental(
+                    &mut reopened,
+                    limits,
+                    &prefix_entries,
+                    &staged_replay,
+                    &policy,
+                    &baseline_tree,
+                )
+                .unwrap();
+                assert_eq!(
+                    finish_graph_stream(session, &git, &policy, tip)
+                        .unwrap()
+                        .commits,
+                    3
+                );
+                for (path, (bytes, _)) in &files {
+                    assert_eq!(
+                        reopened.get_file_content(path).unwrap(),
+                        Some(bytes.clone()),
+                        "{path}"
+                    );
+                }
+            } else {
+                for (path, (bytes, _)) in &files {
+                    assert_eq!(
+                        reopened.get_file_content(path).unwrap(),
+                        Some(bytes.clone()),
+                        "{path}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_span_private_stage_refuses_native_target_changes() {
+        use atomic_core::operation::OperationScope;
+        use atomic_core::pristine::{GitShaIndexTxnT, GraphTxnT};
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let limits = GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap();
+        importer
+            .import_graph_stream(&mut repo, tip, limits)
+            .unwrap();
+        let (git, policy, ordered) = importer.graph_stream_inputs(tip).unwrap();
+        let prefix: Vec<_> = {
+            let txn = repo.pristine().read_txn().unwrap();
+            ordered
+                .iter()
+                .map(|oid| {
+                    let id = txn.get_by_git_sha(&oid.to_string()).unwrap().unwrap();
+                    (oid.to_string(), txn.get_external(id).unwrap().unwrap())
+                })
+                .collect()
+        };
+        let tree = import_expected_tree_oid(&git, git.find_commit(tip).unwrap().tree_id(), &policy)
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        let path = target.path().join("native.txt");
+        std::fs::write(&path, b"native user work\n").unwrap();
+        repo.add(wc, "native.txt", Default::default()).unwrap();
+        repo.record(
+            wc,
+            ChangeHeader::new("native addition"),
+            atomic_repository::RecordOptions::new().add_path("native.txt"),
+        )
+        .unwrap();
+        let before_state = repo.get_view_info(repo.current_view()).unwrap().state;
+        let before_working = repo
+            .operation_log(OperationScope::WorkingCopy(wc), None, false)
+            .unwrap();
+        let before_global = repo
+            .operation_log(OperationScope::Repository, None, false)
+            .unwrap();
+        match GitGraphImportSession::begin_span_incremental(
+            &mut repo, limits, &prefix, &policy, &tree,
+        ) {
+            Ok(_) => panic!("native additions must not enter the restricted incremental path"),
+            Err(error) => assert!(
+                error.to_string().contains("unchanged Git-only target"),
+                "{error}"
+            ),
+        }
+        assert_eq!(
+            repo.get_view_info(repo.current_view()).unwrap().state,
+            before_state
+        );
+        assert_eq!(
+            repo.operation_log(OperationScope::WorkingCopy(wc), None, false)
+                .unwrap(),
+            before_working
+        );
+        assert_eq!(
+            repo.operation_log(OperationScope::Repository, None, false)
+                .unwrap(),
+            before_global
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"native user work\n");
+    }
+
+    #[test]
+    fn incremental_span_private_stage_accepts_two_successive_updates() {
+        let (_git_dir, git, tip, files) = fixture(7);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let limits = GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap();
+        let (git, policy, ordered) = importer.graph_stream_inputs(tip).unwrap();
+        assert_eq!(ordered.len(), 7);
+        importer
+            .import_graph_stream(&mut repo, ordered[1], limits)
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        let ignore = target.path().join(".atomicignore");
+        std::fs::write(&ignore, b"# native bootstrap\n").unwrap();
+        repo.add(wc, ".atomicignore", Default::default()).unwrap();
+        repo.record(
+            wc,
+            ChangeHeader::new("Initialize repository"),
+            atomic_repository::RecordOptions::new().add_path(".atomicignore"),
+        )
+        .unwrap();
+        let positions: HashMap<_, _> = ordered
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, oid)| (oid, index))
+            .collect();
+        let mut compiler = Compiler {
+            spans: Some(Default::default()),
+            ..Default::default()
+        };
+        let mut prefix = Vec::new();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        let mut middle_prefix = Vec::new();
+        for (index, oid) in ordered.iter().copied().enumerate() {
+            let parsed = parse_commit_with_scope(&git, oid, index, &positions, false).unwrap();
+            let metadata = importer.build_git_metadata(&parsed, parsed.is_empty, parsed.is_merge);
+            let prepared = compiler.compile(&parsed, &policy, &[], metadata).unwrap();
+            if index < 2 {
+                prefix.push((oid.to_string(), prepared.hash()));
+            } else if index < 5 {
+                middle_prefix.push((oid.to_string(), prepared.hash()));
+                first.push(prepared);
+            } else {
+                second.push(prepared);
+            }
+        }
+        let baseline = import_expected_tree_oid(
+            &git,
+            git.find_commit(ordered[1]).unwrap().tree_id(),
+            &policy,
+        )
+        .unwrap();
+        let mut session = GitGraphImportSession::begin_span_incremental(
+            &mut repo, limits, &prefix, &policy, &baseline,
+        )
+        .unwrap();
+        session.publish(&first).unwrap();
+        assert_eq!(
+            finish_graph_stream(session, &git, &policy, ordered[4])
+                .unwrap()
+                .commits,
+            3
+        );
+        prefix.extend(middle_prefix);
+        let middle = import_expected_tree_oid(
+            &git,
+            git.find_commit(ordered[4]).unwrap().tree_id(),
+            &policy,
+        )
+        .unwrap();
+        let mut session = GitGraphImportSession::begin_span_incremental(
+            &mut repo, limits, &prefix, &policy, &middle,
+        )
+        .unwrap();
+        session.publish(&second).unwrap();
+        assert_eq!(
+            finish_graph_stream(session, &git, &policy, tip)
+                .unwrap()
+                .commits,
+            2
+        );
+        assert_eq!(repo.effective_history(None).unwrap().len(), 8);
+        assert_eq!(
+            repo.get_file_content(".atomicignore").unwrap(),
+            Some(b"# native bootstrap\n".to_vec())
+        );
+        assert_eq!(std::fs::read(&ignore).unwrap(), b"# native bootstrap\n");
+        for (path, (bytes, _)) in &files {
+            assert_eq!(
+                repo.get_file_content(path).unwrap(),
+                Some(bytes.clone()),
+                "{path}"
+            );
+        }
+        drop(repo);
+        let reopened = Repository::open(target.path()).unwrap();
+        assert_eq!(
+            reopened.get_file_content(".atomicignore").unwrap(),
+            Some(b"# native bootstrap\n".to_vec())
+        );
+        for (path, (bytes, _)) in &files {
+            assert_eq!(
+                reopened.get_file_content(path).unwrap(),
+                Some(bytes.clone()),
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(feature = "experimental-span-import")]
+    #[test]
+    #[serial_test::file_serial]
+    fn incremental_span_private_stage_accepts_real_cli_bootstrap() {
+        use crate::commands::Command;
+        struct RestoreDirectory(std::path::PathBuf);
+        impl Drop for RestoreDirectory {
+            fn drop(&mut self) {
+                std::env::set_current_dir(&self.0).unwrap();
+            }
+        }
+
+        let (source, bare, tip, files) = fixture(5);
+        let mut prefix = tip;
+        for _ in 0..3 {
+            prefix = bare.find_commit(prefix).unwrap().parent_id(0).unwrap();
+        }
+        bare.set_head("refs/heads/main").unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let git = GitRepository::clone(source.path().to_str().unwrap(), target.path()).unwrap();
+        let commit = git.find_commit(prefix).unwrap();
+        git.branch("bootstrap", &commit, false).unwrap();
+        drop(commit);
+        git.set_head("refs/heads/bootstrap").unwrap();
+        git.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+            .unwrap();
+        let _directory = RestoreDirectory(std::env::current_dir().unwrap());
+        std::env::set_current_dir(target.path()).unwrap();
+        crate::commands::git::import::Import {
+            span: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        let ignore = target.path().join(".atomicignore");
+        let ignore_bytes = std::fs::read(&ignore).unwrap();
+        let user_ignore_bytes = b"# unrecorded user ignore settings\n";
+        std::fs::write(&ignore, user_ignore_bytes).unwrap();
+        let git_head = git.head().unwrap().target().unwrap();
+        let git_index = std::fs::read(git.path().join("index")).unwrap();
+        let working_bytes = std::fs::read(target.path().join("hot.txt")).unwrap();
+        let mut repo = Repository::open(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let (git, policy, ordered) = importer.graph_stream_inputs(tip).unwrap();
+        let limits = GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap();
+        let positions: HashMap<_, _> = ordered
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, oid)| (oid, index))
+            .collect();
+        let mut compiler = Compiler {
+            spans: Some(Default::default()),
+            ..Default::default()
+        };
+        let mut baseline = Vec::new();
+        let mut staged = Vec::new();
+        for (index, oid) in ordered.iter().copied().take(3).enumerate() {
+            let parsed = parse_commit_with_scope(&git, oid, index, &positions, false).unwrap();
+            let metadata = importer.build_git_metadata(&parsed, parsed.is_empty, parsed.is_merge);
+            let prepared = compiler.compile(&parsed, &policy, &[], metadata).unwrap();
+            if index < 2 {
+                baseline.push((oid.to_string(), prepared.hash()));
+            } else {
+                staged.push(prepared);
+            }
+        }
+        let baseline_tree =
+            import_expected_tree_oid(&git, git.find_commit(prefix).unwrap().tree_id(), &policy)
+                .unwrap();
+        let mut session = GitGraphImportSession::begin_span_incremental(
+            &mut repo,
+            limits,
+            &baseline,
+            &policy,
+            &baseline_tree,
+        )
+        .unwrap();
+        session.publish(&staged).unwrap();
+        drop(session);
+        drop(repo);
+        let mut repo = Repository::open(target.path()).unwrap();
+        assert_eq!(
+            importer
+                .import_span_incremental(&mut repo, tip, limits, &ordered, || Ok(()))
+                .unwrap()
+                .commits,
+            3
+        );
+        let wc = repo.require_working_copy_id().unwrap();
+        let before_noop = repo
+            .operation_log(
+                atomic_core::operation::OperationScope::WorkingCopy(wc),
+                None,
+                false,
+            )
+            .unwrap();
+        let before_global_noop = repo
+            .operation_log(
+                atomic_core::operation::OperationScope::Repository,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            importer
+                .import_span_incremental(&mut repo, tip, limits, &ordered, || Ok(()))
+                .unwrap()
+                .commits,
+            0
+        );
+        let mut wrong_order = ordered.clone();
+        wrong_order.reverse();
+        assert!(importer
+            .import_span_incremental(&mut repo, tip, limits, &wrong_order, || Ok(()))
+            .is_err());
+        assert_eq!(
+            repo.operation_log(
+                atomic_core::operation::OperationScope::WorkingCopy(wc),
+                None,
+                false
+            )
+            .unwrap(),
+            before_noop
+        );
+        assert_eq!(
+            repo.operation_log(
+                atomic_core::operation::OperationScope::Repository,
+                None,
+                false
+            )
+            .unwrap(),
+            before_global_noop
+        );
+        assert_eq!(
+            repo.get_file_content(".atomicignore").unwrap(),
+            Some(ignore_bytes.clone())
+        );
+        assert_eq!(std::fs::read(&ignore).unwrap(), user_ignore_bytes);
+        assert_eq!(
+            std::fs::read(target.path().join("hot.txt")).unwrap(),
+            working_bytes
+        );
+        assert_eq!(git.head().unwrap().target().unwrap(), git_head);
+        assert_eq!(std::fs::read(git.path().join("index")).unwrap(), git_index);
+        for (path, (bytes, _)) in &files {
+            assert_eq!(
+                repo.get_file_content(path).unwrap(),
+                Some(bytes.clone()),
+                "{path}"
+            );
+        }
+        drop(repo);
+        let reopened = Repository::open(target.path()).unwrap();
+        assert_eq!(
+            reopened.get_file_content(".atomicignore").unwrap(),
+            Some(ignore_bytes)
+        );
+        for (path, (bytes, _)) in &files {
+            assert_eq!(
+                reopened.get_file_content(path).unwrap(),
+                Some(bytes.clone()),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_span_git_observation_failure_keeps_target_and_resumes() {
+        let (_git_dir, git, tip, files) = fixture(5);
+        let mut prefix = tip;
+        for _ in 0..3 {
+            prefix = git.find_commit(prefix).unwrap().parent_id(0).unwrap();
+        }
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        let limits = GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap();
+        importer
+            .import_graph_stream(&mut repo, prefix, limits)
+            .unwrap();
+        let (_, _, ordered) = importer.graph_stream_inputs(tip).unwrap();
+        let before = repo.get_view_info(repo.current_view()).unwrap().state;
+        let wc = repo.require_working_copy_id().unwrap();
+        let before_working = repo.working_copy_record(wc).unwrap();
+        let checks = std::cell::Cell::new(0);
+        let error = importer
+            .import_span_incremental(&mut repo, tip, limits, &ordered, || {
+                let count = checks.get() + 1;
+                checks.set(count);
+                if count == 3 {
+                    Err(git_error("injected Git observation drift"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert_eq!(
+            checks.get(),
+            3,
+            "final check must be exercised after staging"
+        );
+        assert!(
+            error.to_string().contains("injected Git observation drift"),
+            "{error}"
+        );
+        assert_eq!(
+            repo.get_view_info(repo.current_view()).unwrap().state,
+            before
+        );
+        assert_eq!(repo.working_copy_record(wc).unwrap(), before_working);
+        drop(repo);
+        let mut reopened = Repository::open(target.path()).unwrap();
+        assert_eq!(
+            reopened
+                .get_view_info(reopened.current_view())
+                .unwrap()
+                .state,
+            before
+        );
+        assert_eq!(
+            importer
+                .import_span_incremental(&mut reopened, tip, limits, &ordered, || Ok(()))
+                .unwrap()
+                .commits,
+            3
+        );
+        for (path, (bytes, _)) in &files {
+            assert_eq!(
+                reopened.get_file_content(path).unwrap(),
+                Some(bytes.clone()),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn span_import_without_semantic_history_records_native_edit() {
+        use atomic_core::operation::OperationScope;
+
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        let before_state = repo.get_view_info(repo.current_view()).unwrap().state;
+        let before_ops = repo
+            .operation_log(OperationScope::WorkingCopy(wc), None, false)
+            .unwrap();
+        let path = target.path().join("hot.txt");
+        std::fs::write(&path, b"alpha\nworking edit\nlast\n").unwrap();
+        let outcome = repo
+            .record(
+                wc,
+                ChangeHeader::new("native edit"),
+                atomic_repository::RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(true)
+                    .apply_after_record(true),
+            )
+            .unwrap();
+        assert!(outcome.change().file_ops().iter().any(|ops| matches!(
+            ops.trunk_op(),
+            Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+        )));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"alpha\nworking edit\nlast\n"
+        );
+        assert_ne!(
+            repo.get_view_info(repo.current_view()).unwrap().state,
+            before_state
+        );
+        let after_ops = repo
+            .operation_log(OperationScope::WorkingCopy(wc), None, false)
+            .unwrap();
+        assert!(after_ops.entries.len() > before_ops.entries.len());
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap(),
+            Some(b"alpha\nworking edit\nlast\n".to_vec())
+        );
+        let (review, _) = atomic_repository::diff_engine::change_file_diffs(
+            &repo,
+            outcome.change(),
+            outcome.hash(),
+            &Default::default(),
+        )
+        .unwrap();
+        let review = review
+            .iter()
+            .find(|file| file.new_path == "hot.txt")
+            .unwrap();
+        assert!(review
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .any(|line| line.content == "changed"));
+        assert!(review
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .any(|line| line.content == "working edit"));
+        assert_imported_authored_ranges(&repo, b"alpha\nworking edit\nlast\n", 2);
+        let error = repo
+            .materialize_crdt_from_changes(Default::default())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be materialized as CRDT rows"),
+            "{error}"
+        );
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap(),
+            Some(b"alpha\nworking edit\nlast\n".to_vec())
+        );
+        drop(repo);
+        let mut repo = Repository::open(target.path()).unwrap();
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap(),
+            Some(b"alpha\nworking edit\nlast\n".to_vec())
+        );
+        std::fs::remove_file(&path).unwrap();
+        repo.materialize(wc).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"alpha\nworking edit\nlast\n");
+    }
+
+    #[test]
+    fn projected_native_span_edits_transfer_and_reopen() {
+        use atomic_core::pristine::MutTxnT;
+        let (_git_dir, git, tip, _) = fixture(2);
+        let source_dir = tempfile::tempdir().unwrap();
+        let mut source = Repository::init(source_dir.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: source.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut source,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = source.require_working_copy_id().unwrap();
+        source.materialize(wc).unwrap();
+        let path = source_dir.path().join("hot.txt");
+        for (message, bytes) in [
+            ("native one", b"alpha\nfirst native\nlast\n".as_slice()),
+            (
+                "native two",
+                b"alpha\nfirst native\nsecond native\n".as_slice(),
+            ),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            source
+                .record(
+                    wc,
+                    ChangeHeader::new(message),
+                    atomic_repository::RecordOptions::new()
+                        .with_all(true)
+                        .save_to_store(true)
+                        .apply_after_record(true),
+                )
+                .unwrap();
+        }
+        let expected = b"alpha\nfirst native\nsecond native\n";
+        let snapshot = assert_imported_authored_ranges(&source, expected, 3);
+        let history = source.effective_history(None).unwrap();
+        let native = history
+            .iter()
+            .map(|entry| entry.hash)
+            .find(|hash| source.load_change(hash).unwrap().hashed.header.message == "native two")
+            .unwrap();
+        {
+            use atomic_core::pristine::{
+                CapabilityTxnT, GitShaIndexTxnT, GraphTxnT, SPAN_PROJECTED_SEMANTICS_CAPABILITY,
+            };
+            use atomic_core::types::Base32;
+            let host_dir = tempfile::tempdir().unwrap();
+            let mut host = Repository::init(host_dir.path()).unwrap();
+            let source_txn = source.pristine().read_txn().unwrap();
+            let git_tip_id = source_txn
+                .get_by_git_sha(&tip.to_string())
+                .unwrap()
+                .unwrap();
+            let git_tip_hash = source_txn.get_external(git_tip_id).unwrap().unwrap();
+            drop(source_txn);
+            for entry in &history {
+                let change = source.load_change(&entry.hash).unwrap();
+                if matches!(
+                    change.origin(),
+                    atomic_core::change::ChangeOrigin::GitSynthesized { .. }
+                ) {
+                    let bytes =
+                        std::fs::read(source.change_store().change_path(&entry.hash)).unwrap();
+                    host.import_change_bytes(&entry.hash, &bytes).unwrap();
+                }
+            }
+            let parent = host.current_view().to_string();
+            host.create_draft_view("submitted", &parent).unwrap();
+            host.insert_change_rec(
+                &git_tip_hash,
+                atomic_repository::InsertOptions::default().view("submitted"),
+            )
+            .unwrap();
+            assert_eq!(
+                host.pristine()
+                    .read_txn()
+                    .unwrap()
+                    .required_capability_version(SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())
+                    .unwrap(),
+                None
+            );
+            let first_native = history
+                .iter()
+                .map(|entry| entry.hash)
+                .find(|hash| {
+                    source.load_change(hash).unwrap().hashed.header.message == "native one"
+                })
+                .unwrap();
+            let bytes = std::fs::read(source.change_store().change_path(&first_native)).unwrap();
+            let base = host
+                .sandbox_effective_state("submitted")
+                .unwrap()
+                .to_base32();
+            host.insert_submitted_change("submitted", &base, &first_native, &bytes)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                host.get_file_content_on_view("hot.txt", "submitted")
+                    .unwrap(),
+                Some(b"alpha\nfirst native\nlast\n".to_vec())
+            );
+            assert_eq!(
+                host.pristine()
+                    .read_txn()
+                    .unwrap()
+                    .required_capability_version(SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())
+                    .unwrap(),
+                Some(SPAN_PROJECTED_SEMANTICS_CAPABILITY.minimum_version())
+            );
+        }
+        {
+            use atomic_core::operation::OperationScope;
+            use atomic_core::pristine::{GitShaIndexMutTxnT, GitShaIndexTxnT};
+            let collision_dir = tempfile::tempdir().unwrap();
+            let mut collision = Repository::init(collision_dir.path()).unwrap();
+            for entry in &history {
+                let bytes = std::fs::read(source.change_store().change_path(&entry.hash)).unwrap();
+                collision.import_change_bytes(&entry.hash, &bytes).unwrap();
+            }
+            let (_, _, commits) = importer.graph_stream_inputs(tip).unwrap();
+            let sha = commits[0].to_string();
+            let fake = {
+                let mut txn = collision.pristine().write_txn().unwrap();
+                let fake = txn
+                    .register_change(&ContentHash::of(b"foreign Git identity"))
+                    .unwrap();
+                txn.put_git_sha(&sha, fake).unwrap();
+                txn.commit().unwrap();
+                fake
+            };
+            let parent = collision.current_view().to_string();
+            collision.create_draft_view("received", &parent).unwrap();
+            let wc = collision.require_working_copy_id().unwrap();
+            let before = collision.get_view_info("received").unwrap().state;
+            let working = collision
+                .operation_log(OperationScope::WorkingCopy(wc), None, false)
+                .unwrap();
+            let global = collision
+                .operation_log(OperationScope::Repository, None, false)
+                .unwrap();
+            let error = collision
+                .insert_change_rec(
+                    &native,
+                    atomic_repository::InsertOptions::default().view("received"),
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("different repository identity"),
+                "{error}"
+            );
+            assert_eq!(collision.get_view_info("received").unwrap().state, before);
+            assert_eq!(
+                collision
+                    .operation_log(OperationScope::WorkingCopy(wc), None, false)
+                    .unwrap(),
+                working
+            );
+            assert_eq!(
+                collision
+                    .operation_log(OperationScope::Repository, None, false)
+                    .unwrap(),
+                global
+            );
+            assert_eq!(
+                collision
+                    .pristine()
+                    .read_txn()
+                    .unwrap()
+                    .get_by_git_sha(&sha)
+                    .unwrap(),
+                Some(fake)
+            );
+        }
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let mut receiver = Repository::init(receiver_dir.path()).unwrap();
+        {
+            let mut txn = receiver.pristine().write_txn().unwrap();
+            txn.register_change(&ContentHash::of(b"receiver-only identity"))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        for entry in &history {
+            let bytes = std::fs::read(source.change_store().change_path(&entry.hash)).unwrap();
+            assert_eq!(
+                receiver.import_change_bytes(&entry.hash, &bytes).unwrap(),
+                entry.hash
+            );
+        }
+        let parent = receiver.current_view().to_string();
+        receiver.create_draft_view("received", &parent).unwrap();
+        receiver
+            .insert_change_rec(
+                &native,
+                atomic_repository::InsertOptions::default().view("received"),
+            )
+            .unwrap();
+        {
+            use atomic_core::pristine::{GitCommitClosureTxnT, GitShaIndexTxnT, GraphTxnT};
+            let source_txn = source.pristine().read_txn().unwrap();
+            let receiver_txn = receiver.pristine().read_txn().unwrap();
+            let (_, _, commits) = importer.graph_stream_inputs(tip).unwrap();
+            for oid in commits {
+                let sha = oid.to_string();
+                let original_id = source_txn.get_by_git_sha(&sha).unwrap().unwrap();
+                let received_id = receiver_txn.get_by_git_sha(&sha).unwrap().unwrap();
+                assert_eq!(
+                    source_txn.get_external(original_id).unwrap(),
+                    receiver_txn.get_external(received_id).unwrap(),
+                    "{sha}"
+                );
+                assert_eq!(
+                    source_txn.get_git_commit_closure(&sha).unwrap(),
+                    receiver_txn.get_git_commit_closure(&sha).unwrap(),
+                    "{sha}"
+                );
+            }
+        }
+        let wc = receiver.require_working_copy_id().unwrap();
+        std::fs::write(receiver_dir.path().join("untracked.txt"), b"user bytes\n").unwrap();
+        receiver.switch_view(wc, "received").unwrap();
+        assert_eq!(
+            std::fs::read(receiver_dir.path().join("hot.txt")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            std::fs::read(receiver_dir.path().join("untracked.txt")).unwrap(),
+            b"user bytes\n"
+        );
+        assert_eq!(
+            assert_imported_authored_ranges(&receiver, expected, 3),
+            snapshot
+        );
+        drop(receiver);
+        let receiver = Repository::open(receiver_dir.path()).unwrap();
+        assert_eq!(
+            receiver.get_file_content("hot.txt").unwrap(),
+            Some(expected.to_vec())
+        );
+        assert_eq!(
+            assert_imported_authored_ranges(&receiver, expected, 3),
+            snapshot
+        );
+        {
+            use atomic_core::pristine::{GitCommitClosureTxnT, GitShaIndexTxnT};
+            let source_txn = source.pristine().read_txn().unwrap();
+            let receiver_txn = receiver.pristine().read_txn().unwrap();
+            let (_, _, commits) = importer.graph_stream_inputs(tip).unwrap();
+            for oid in commits {
+                let sha = oid.to_string();
+                assert!(
+                    receiver_txn.get_by_git_sha(&sha).unwrap().is_some(),
+                    "{sha}"
+                );
+                assert_eq!(
+                    source_txn.get_git_commit_closure(&sha).unwrap(),
+                    receiver_txn.get_git_commit_closure(&sha).unwrap(),
+                    "{sha}"
+                );
+            }
+        }
+        {
+            use atomic_core::operation::OperationScope;
+            use atomic_core::pristine::{GitShaIndexMutTxnT, GitShaIndexTxnT};
+            let (_, _, commits) = importer.graph_stream_inputs(tip).unwrap();
+            let sha = commits[0].to_string();
+            let mut txn = receiver.pristine().write_txn().unwrap();
+            assert!(txn.del_git_sha(&sha).unwrap());
+            txn.commit().unwrap();
+            let wc = receiver.require_working_copy_id().unwrap();
+            let state = receiver
+                .get_view_info(receiver.current_view())
+                .unwrap()
+                .state;
+            let working = receiver
+                .operation_log(OperationScope::WorkingCopy(wc), None, false)
+                .unwrap();
+            let global = receiver
+                .operation_log(OperationScope::Repository, None, false)
+                .unwrap();
+            let error = receiver
+                .insert_change_rec(&native, atomic_repository::InsertOptions::default())
+                .unwrap_err();
+            assert!(error.to_string().contains("identity is missing"), "{error}");
+            assert_eq!(
+                receiver
+                    .get_view_info(receiver.current_view())
+                    .unwrap()
+                    .state,
+                state
+            );
+            assert_eq!(
+                receiver
+                    .operation_log(OperationScope::WorkingCopy(wc), None, false)
+                    .unwrap(),
+                working
+            );
+            assert_eq!(
+                receiver
+                    .operation_log(OperationScope::Repository, None, false)
+                    .unwrap(),
+                global
+            );
+            assert_eq!(
+                receiver
+                    .pristine()
+                    .read_txn()
+                    .unwrap()
+                    .get_by_git_sha(&sha)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                std::fs::read(receiver_dir.path().join("hot.txt")).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn projected_native_span_edits_compose_across_views_and_refuse_overlap() {
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        let parent = repo.current_view().to_string();
+        for name in ["left", "right", "overlap"] {
+            repo.create_draft_view(name, &parent).unwrap();
+        }
+        let path = target.path().join("hot.txt");
+        let options = || {
+            atomic_repository::RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true)
+        };
+        repo.switch_view(wc, "left").unwrap();
+        std::fs::write(&path, b"ALPHA\nchanged\nlast\n").unwrap();
+        repo.record(wc, ChangeHeader::new("left edit"), options())
+            .unwrap();
+        repo.switch_view(wc, "right").unwrap();
+        std::fs::write(&path, b"alpha\nchanged\nLAST\n").unwrap();
+        let right = *repo
+            .record(wc, ChangeHeader::new("right edit"), options())
+            .unwrap()
+            .hash();
+        repo.switch_view(wc, "overlap").unwrap();
+        std::fs::write(&path, b"different\nchanged\nlast\n").unwrap();
+        let overlap = *repo
+            .record(wc, ChangeHeader::new("overlapping edit"), options())
+            .unwrap()
+            .hash();
+        repo.switch_view(wc, "left").unwrap();
+        repo.insert_change_rec(
+            &right,
+            atomic_repository::InsertOptions::default().view("left"),
+        )
+        .unwrap();
+        let expected = b"ALPHA\nchanged\nLAST\n";
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap(),
+            Some(expected.to_vec())
+        );
+        let before = repo.get_view_info("left").unwrap().state;
+        let log = repo
+            .operation_log(
+                atomic_core::operation::OperationScope::WorkingCopy(wc),
+                None,
+                false,
+            )
+            .unwrap();
+        let error = repo
+            .insert_change_rec(
+                &overlap,
+                atomic_repository::InsertOptions::default().view("left"),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("overlap") || error.to_string().contains("ambiguous"),
+            "{error}"
+        );
+        assert_eq!(repo.get_view_info("left").unwrap().state, before);
+        assert_eq!(
+            repo.operation_log(
+                atomic_core::operation::OperationScope::WorkingCopy(wc),
+                None,
+                false
+            )
+            .unwrap(),
+            log
+        );
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap(),
+            Some(expected.to_vec())
+        );
+        drop(repo);
+        let reopened = Repository::open(target.path()).unwrap();
+        assert_eq!(
+            reopened.get_file_content("hot.txt").unwrap(),
+            Some(expected.to_vec())
+        );
+    }
+
+    #[test]
+    fn projected_native_record_undo_keeps_semantic_capability() {
+        use atomic_core::pristine::{
+            CapabilityMutTxnT, CapabilityTxnT, MutTxnT, SPAN_PROJECTED_SEMANTICS_CAPABILITY,
+        };
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        let path = target.path().join("hot.txt");
+        std::fs::write(&path, b"alpha\nworking edit\nlast\n").unwrap();
+        let outcome = repo
+            .record(
+                wc,
+                ChangeHeader::new("native edit"),
+                atomic_repository::RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(true)
+                    .apply_after_record(true),
+            )
+            .unwrap();
+        let hash = *outcome.hash();
+        let log = repo
+            .operation_log(
+                atomic_core::operation::OperationScope::WorkingCopy(wc),
+                None,
+                false,
+            )
+            .unwrap();
+        let recorded_operation = log
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.operation.payload().kind == atomic_core::operation::OperationKind::Record
+                    && entry.operation.payload().evidence.contains(&hash)
+            })
+            .unwrap()
+            .operation
+            .id();
+        repo.undo_operation(wc, None).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"alpha\nworking edit\nlast\n"
+        );
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap(),
+            Some(b"alpha\nchanged\nlast\n".to_vec())
+        );
+        assert_eq!(
+            repo.pristine()
+                .read_txn()
+                .unwrap()
+                .required_capability_version(SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())
+                .unwrap(),
+            Some(SPAN_PROJECTED_SEMANTICS_CAPABILITY.minimum_version())
+        );
+        assert!(repo.load_change(&hash).is_ok());
+        {
+            let mut txn = repo.pristine().write_txn().unwrap();
+            assert!(txn
+                .del_required_capability(SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())
+                .is_err());
+            txn.abort().unwrap();
+        }
+        repo.restore_operation(wc, recorded_operation).unwrap();
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap(),
+            Some(b"alpha\nworking edit\nlast\n".to_vec())
+        );
+        drop(repo);
+        let repo = Repository::open(target.path()).unwrap();
+        assert_eq!(
+            repo.pristine()
+                .read_txn()
+                .unwrap()
+                .required_capability_version(SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())
+                .unwrap(),
+            Some(SPAN_PROJECTED_SEMANTICS_CAPABILITY.minimum_version())
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"alpha\nworking edit\nlast\n");
+    }
+
+    #[test]
+    fn projected_native_edits_preserve_empty_binary_and_line_endings() {
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        let path = target.path().join("hot.txt");
+        let cases: &[&[u8]] = &[
+            b"",
+            b"no newline",
+            b"first\r\nsecond\r\n",
+            &[0, 255, 1, 0],
+            b"back to text\n",
+            b"",
+        ];
+        for (index, bytes) in cases.iter().enumerate() {
+            std::fs::write(&path, bytes).unwrap();
+            repo.record(
+                wc,
+                ChangeHeader::new(format!("projected {index}")),
+                atomic_repository::RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(true)
+                    .apply_after_record(true),
+            )
+            .unwrap_or_else(|error| panic!("case {index}: {error}"));
+            assert_eq!(
+                repo.get_file_content("hot.txt").unwrap().as_deref(),
+                Some(*bytes),
+                "case {index}"
+            );
+            drop(repo);
+            repo = Repository::open(target.path()).unwrap();
+            assert_eq!(
+                repo.get_file_content("hot.txt").unwrap().as_deref(),
+                Some(*bytes),
+                "reopen case {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn projected_token_edits_roundtrip_common_sequences() {
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        let path = target.path().join("hot.txt");
+        let cases: &[&str] = &[
+            "let count = 1;\n",
+            "let total = 1;\n",
+            "let total = 10;\n",
+            "pub let total = 10;\n",
+            "pub let total = 10; // text\n",
+            "pub let total = 10; // edited\n",
+            "pub let total = 10;\n",
+            "let total = 10;\nlet next = 2;\n",
+            "let total=10;\nlet next = 2;\n",
+            "let total=10;\r\nlet next = 2;\r\n",
+            "let total=10;\r\n",
+            "héllo αβ\n",
+            "héllo αβ!\n",
+            "héllo αβ!",
+            "x",
+            "",
+            "x y z\n",
+            "x z\n",
+            "x y z\n",
+            "x zz\n",
+        ];
+        for (index, text) in cases.iter().enumerate() {
+            std::fs::write(&path, text.as_bytes()).unwrap();
+            repo.record(
+                wc,
+                ChangeHeader::new(format!("token sequence {index}")),
+                atomic_repository::RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(true)
+                    .apply_after_record(true),
+            )
+            .unwrap_or_else(|error| panic!("case {index} {text:?}: {error}"));
+            assert_eq!(
+                repo.get_file_content("hot.txt").unwrap().as_deref(),
+                Some(text.as_bytes()),
+                "case {index}"
+            );
+            drop(repo);
+            repo = Repository::open(target.path()).unwrap();
+            assert_eq!(
+                repo.get_file_content("hot.txt").unwrap().as_deref(),
+                Some(text.as_bytes()),
+                "reopen case {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn projected_native_edit_retains_unchanged_token_authorship() {
+        use atomic_core::pristine::span_patch_storage::SpanRenderContext;
+        use atomic_core::pristine::{TreeTxnT, ViewTxnT};
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        let snapshot = |repo: &Repository| {
+            let txn = repo.pristine().read_txn().unwrap();
+            let view = txn.get_view(repo.current_view()).unwrap().unwrap();
+            let visibility = atomic_repository::graph_visibility_closure(&txn, &view).unwrap();
+            let inode = txn.get_inode("hot.txt").unwrap().unwrap();
+            SpanRenderContext::new(&txn, repo.change_store(), &visibility)
+                .unwrap()
+                .record_state(inode)
+                .unwrap()
+                .unwrap()
+                .semantic_snapshot()
+                .unwrap()
+        };
+        let before = snapshot(&repo);
+        assert_eq!(before.lines[1].tokens.len(), 2);
+        let original_word = before.lines[1].tokens[0].id;
+        let original_newline = before.lines[1].tokens[1].id;
+        let original_author = before.lines[1].tokens[0].authors[0].target.owner;
+        std::fs::write(
+            target.path().join("hot.txt"),
+            b"alpha\nchanged native\nlast\n",
+        )
+        .unwrap();
+        let native = *repo
+            .record(
+                wc,
+                ChangeHeader::new("append token"),
+                atomic_repository::RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(true)
+                    .apply_after_record(true),
+            )
+            .unwrap()
+            .hash();
+        let after = snapshot(&repo);
+        let tokens = &after.lines[1].tokens;
+        assert_eq!(tokens.len(), 4);
+        assert_eq!(tokens[0].id, original_word);
+        assert_eq!(tokens[0].authors[0].target.owner, original_author);
+        assert_eq!(tokens[1].authors[0].target.owner, native);
+        assert_eq!(tokens[2].authors[0].target.owner, native);
+        assert_eq!(tokens[3].id, original_newline);
+        assert_eq!(tokens[3].authors[0].target.owner, original_author);
+        drop(repo);
+        let repo = Repository::open(target.path()).unwrap();
+        let reopened = snapshot(&repo);
+        assert_eq!(reopened.id, after.id);
+        let options = || {
+            atomic_repository::RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true)
+        };
+        std::fs::write(target.path().join("hot.txt"), "α\n".as_bytes()).unwrap();
+        repo.record(wc, ChangeHeader::new("first scalar"), options())
+            .unwrap();
+        std::fs::write(target.path().join("hot.txt"), "β\n".as_bytes()).unwrap();
+        let beta = *repo
+            .record(wc, ChangeHeader::new("replace scalar"), options())
+            .unwrap()
+            .hash();
+        let unicode = snapshot(&repo);
+        assert_eq!(unicode.lines[0].tokens.len(), 3);
+        assert_eq!(unicode.lines[0].tokens[0].authors[0].target.owner, beta);
+        assert_eq!(unicode.lines[0].tokens[1].authors[0].target.owner, beta);
+    }
+
+    #[test]
+    fn projected_token_budget_refuses_before_record_publication() {
+        use atomic_core::operation::OperationScope;
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        let path = target.path().join("hot.txt");
+        let first = (0..1100)
+            .map(|index| format!("old{index} "))
+            .collect::<String>();
+        let second = (0..1100)
+            .map(|index| format!("new{index} "))
+            .collect::<String>();
+        let options = || {
+            atomic_repository::RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true)
+        };
+        std::fs::write(&path, &first).unwrap();
+        repo.record(wc, ChangeHeader::new("large first"), options())
+            .unwrap();
+        let state = repo.get_view_info(repo.current_view()).unwrap().state;
+        let working = repo
+            .operation_log(OperationScope::WorkingCopy(wc), None, false)
+            .unwrap();
+        let global = repo
+            .operation_log(OperationScope::Repository, None, false)
+            .unwrap();
+        std::fs::write(&path, &second).unwrap();
+        let error = repo
+            .record(wc, ChangeHeader::new("too large"), options())
+            .unwrap_err();
+        assert!(error.to_string().contains("safe memory budget"), "{error}");
+        assert_eq!(
+            repo.get_view_info(repo.current_view()).unwrap().state,
+            state
+        );
+        assert_eq!(
+            repo.operation_log(OperationScope::WorkingCopy(wc), None, false)
+                .unwrap(),
+            working
+        );
+        assert_eq!(
+            repo.operation_log(OperationScope::Repository, None, false)
+                .unwrap(),
+            global
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), second.as_bytes());
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap().as_deref(),
+            Some(first.as_bytes())
+        );
+    }
+
+    #[test]
+    fn projected_and_native_crdt_files_can_share_one_record() {
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        std::fs::write(
+            target.path().join("hot.txt"),
+            b"alpha\nnew imported edit\nlast\n",
+        )
+        .unwrap();
+        std::fs::write(target.path().join("native.txt"), b"native file\n").unwrap();
+        repo.add(wc, "native.txt", Default::default()).unwrap();
+        let options = || {
+            atomic_repository::RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true)
+        };
+        let result = repo
+            .record(wc, ChangeHeader::new("mixed edit"), options())
+            .unwrap();
+        assert!(result
+            .change()
+            .file_ops()
+            .iter()
+            .any(|ops| ops.path() == "hot.txt"
+                && matches!(
+                    ops.trunk_op(),
+                    Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+                )));
+        assert!(result
+            .change()
+            .file_ops()
+            .iter()
+            .any(|ops| ops.path() == "native.txt" && ops.is_create()));
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap(),
+            Some(b"alpha\nnew imported edit\nlast\n".to_vec())
+        );
+        assert_eq!(
+            repo.get_file_content("native.txt").unwrap(),
+            Some(b"native file\n".to_vec())
+        );
+        drop(repo);
+        let repo = Repository::open(target.path()).unwrap();
+        std::fs::write(target.path().join("native.txt"), b"native file edited\n").unwrap();
+        repo.record(wc, ChangeHeader::new("edit native file"), options())
+            .unwrap();
+        assert_eq!(
+            repo.get_file_content("native.txt").unwrap(),
+            Some(b"native file edited\n".to_vec())
+        );
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap(),
+            Some(b"alpha\nnew imported edit\nlast\n".to_vec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projected_edit_and_mode_change_share_one_record() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        let path = target.path().join("hot.txt");
+        std::fs::write(&path, b"alpha\nchanged plus\nlast\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = repo
+            .record(
+                wc,
+                ChangeHeader::new("content and mode"),
+                atomic_repository::RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(true)
+                    .apply_after_record(true),
+            )
+            .unwrap();
+        assert_eq!(
+            result
+                .change()
+                .file_ops()
+                .iter()
+                .filter(|ops| ops.path() == "hot.txt")
+                .count(),
+            1
+        );
+        assert!(result.change().hunks().iter().any(|op| matches!(op, atomic_core::change::GraphOp::SetAttr { path, value: atomic_core::change::InodeAttr::Mode(0o755), .. } if path == "hot.txt")));
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap(),
+            Some(b"alpha\nchanged plus\nlast\n".to_vec())
+        );
+        drop(repo);
+        let repo = Repository::open(target.path()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        repo.materialize(wc).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"alpha\nchanged plus\nlast\n"
+        );
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o111,
+            0
+        );
+    }
+
+    #[test]
+    fn projected_edit_with_wrong_baseline_or_path_refuses_before_publication() {
+        use atomic_core::change::span_patch::SpanProjectionId;
+        use atomic_core::crdt::TrunkOp;
+        use atomic_core::operation::OperationScope;
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        std::fs::write(target.path().join("hot.txt"), b"alpha\nnew content\nlast\n").unwrap();
+        let outcome = repo
+            .record(
+                wc,
+                ChangeHeader::new("valid native"),
+                atomic_repository::RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(true)
+                    .apply_after_record(true),
+            )
+            .unwrap();
+        let valid = outcome.change();
+        let stored_path = repo.change_store().change_path(outcome.hash());
+        let original_bytes = std::fs::read(&stored_path).unwrap();
+        assert_eq!(repo.save_change(valid).unwrap(), *outcome.hash());
+        assert_eq!(std::fs::read(&stored_path).unwrap(), original_bytes);
+        let mut alternate = valid.clone();
+        alternate.unhashed = Some(serde_json::json!({"different": "unhashed metadata"}));
+        assert_eq!(alternate.hash().unwrap(), *outcome.hash());
+        let error = repo.save_change(&alternate).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to overwrite"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&stored_path).unwrap(), original_bytes);
+        let marker = valid
+            .file_ops()
+            .iter()
+            .find(|ops| matches!(ops.trunk_op(), Some(TrunkOp::ProjectedSpanEdit { .. })))
+            .unwrap();
+        let (file, baseline) = match marker.trunk_op().unwrap() {
+            TrunkOp::ProjectedSpanEdit { file, baseline } => (file.clone(), *baseline),
+            _ => unreachable!(),
+        };
+        for (path, baseline, expected) in [
+            (
+                "hot.txt",
+                SpanProjectionId(ContentHash::of(b"wrong baseline")),
+                "baseline",
+            ),
+            ("not-hot.txt", baseline, "path"),
+        ] {
+            let mut forged = valid.clone();
+            forged.hashed.file_ops = vec![atomic_core::change::FileOps::projected_span_edit(
+                path.into(),
+                file.clone(),
+                baseline,
+            )];
+            let hash = repo.save_change(&forged).unwrap();
+            let state = repo.get_view_info(repo.current_view()).unwrap().state;
+            let working = repo
+                .operation_log(OperationScope::WorkingCopy(wc), None, false)
+                .unwrap();
+            let global = repo
+                .operation_log(OperationScope::Repository, None, false)
+                .unwrap();
+            let error = repo
+                .insert_change(&hash, atomic_repository::InsertOptions::default())
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(
+                repo.get_view_info(repo.current_view()).unwrap().state,
+                state
+            );
+            assert_eq!(
+                repo.operation_log(OperationScope::WorkingCopy(wc), None, false)
+                    .unwrap(),
+                working
+            );
+            assert_eq!(
+                repo.operation_log(OperationScope::Repository, None, false)
+                    .unwrap(),
+                global
+            );
+            assert_eq!(
+                std::fs::read(target.path().join("hot.txt")).unwrap(),
+                b"alpha\nnew content\nlast\n"
+            );
+        }
+    }
+
+    #[test]
+    fn projected_record_object_collision_aborts_prepared_operation() {
+        use atomic_core::operation::{OperationKind, OperationScope};
+        use atomic_core::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY;
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        let path = target.path().join("hot.txt");
+        std::fs::write(&path, b"alpha\nnew content\nlast\n").unwrap();
+        let header = ChangeHeader::new("deterministic collision");
+        let dry = repo
+            .record(
+                wc,
+                header.clone(),
+                atomic_repository::RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(false)
+                    .apply_after_record(false),
+            )
+            .unwrap();
+        repo.pristine()
+            .require_repository_capability(SPAN_PROJECTED_SEMANTICS_CAPABILITY)
+            .unwrap();
+        let mut alternate = dry.change().clone();
+        alternate.unhashed = Some(serde_json::json!({"retained": "user metadata"}));
+        assert_eq!(repo.save_change(&alternate).unwrap(), *dry.hash());
+        let stored = repo.change_store().change_path(dry.hash());
+        let before_bytes = std::fs::read(&stored).unwrap();
+        let before_state = repo.get_view_info(repo.current_view()).unwrap().state;
+        let error = repo
+            .record(
+                wc,
+                header,
+                atomic_repository::RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(true)
+                    .apply_after_record(true),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to overwrite"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&stored).unwrap(), before_bytes);
+        assert_eq!(std::fs::read(&path).unwrap(), b"alpha\nnew content\nlast\n");
+        assert_eq!(
+            repo.get_view_info(repo.current_view()).unwrap().state,
+            before_state
+        );
+        let working = repo
+            .operation_log(OperationScope::WorkingCopy(wc), None, false)
+            .unwrap();
+        let head = working.entries.iter().find(|entry| entry.is_head).unwrap();
+        assert_eq!(head.operation.payload().kind, OperationKind::Recover);
+        assert_eq!(
+            head.verification,
+            atomic_repository::repository::OperationVerificationState::Verified
+        );
+        assert!(!repo
+            .operation_details(head.operation.id())
+            .unwrap()
+            .receipts
+            .is_empty());
+        let global = repo
+            .operation_log(OperationScope::Repository, None, false)
+            .unwrap();
+        assert!(global
+            .entries
+            .iter()
+            .any(|entry| entry.operation.id() == head.operation.id()));
+        drop(repo);
+        let repo = Repository::open(target.path()).unwrap();
+        assert_eq!(
+            repo.get_view_info(repo.current_view()).unwrap().state,
+            before_state
+        );
+        assert_eq!(std::fs::read(stored).unwrap(), before_bytes);
+    }
+
+    #[test]
+    fn stale_projected_record_refuses_overlap_before_graph_commit() {
+        use atomic_core::operation::OperationScope;
+        let (_git_dir, git, tip, _) = fixture(2);
+        let target = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(target.path()).unwrap();
+        let importer = ParallelImporter::new(
+            &git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                target_view: repo.current_view().into(),
+                ..Default::default()
+            },
+        );
+        importer
+            .import_graph_stream(
+                &mut repo,
+                tip,
+                GitStreamLimits::new(3, 32 * 1024 * 1024).unwrap(),
+            )
+            .unwrap();
+        let wc = repo.require_working_copy_id().unwrap();
+        repo.materialize(wc).unwrap();
+        let path = target.path().join("hot.txt");
+        std::fs::write(&path, b"alpha\nleft\nlast\n").unwrap();
+        let pending = target.path().join("pending.txt");
+        std::fs::write(&pending, b"new user file\n").unwrap();
+        repo.add(wc, "pending.txt", Default::default()).unwrap();
+        let stale = repo
+            .record(
+                wc,
+                ChangeHeader::new("stale edit"),
+                atomic_repository::RecordOptions::new()
+                    .with_all(true)
+                    .save_to_store(false)
+                    .apply_after_record(false),
+            )
+            .unwrap();
+        assert!(stale.change().hunks().iter().any(|op| matches!(op, atomic_core::change::GraphOp::FileAdd { path, .. } if path == "pending.txt")));
+        std::fs::write(&path, b"alpha\nright\nlast\n").unwrap();
+        repo.record(
+            wc,
+            ChangeHeader::new("concurrent edit"),
+            atomic_repository::RecordOptions::new()
+                .add_path("hot.txt")
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+        assert_eq!(repo.save_change(stale.change()).unwrap(), *stale.hash());
+        let before = repo.get_view_info(repo.current_view()).unwrap().state;
+        let working = repo
+            .operation_log(OperationScope::WorkingCopy(wc), None, false)
+            .unwrap();
+        let global = repo
+            .operation_log(OperationScope::Repository, None, false)
+            .unwrap();
+        let journal = target.path().join(".atomic/deferred-tree-ops.json");
+        let before_journal = std::fs::read(&journal).ok();
+        let error = repo
+            .write_recorded(&stale, atomic_repository::InsertOptions::default())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("overlap") || error.to_string().contains("ambiguous"),
+            "{error}"
+        );
+        assert_eq!(
+            repo.get_view_info(repo.current_view()).unwrap().state,
+            before
+        );
+        assert_eq!(
+            repo.operation_log(OperationScope::WorkingCopy(wc), None, false)
+                .unwrap(),
+            working
+        );
+        assert_eq!(
+            repo.operation_log(OperationScope::Repository, None, false)
+                .unwrap(),
+            global
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"alpha\nright\nlast\n");
+        assert_eq!(std::fs::read(&pending).unwrap(), b"new user file\n");
+        assert_eq!(std::fs::read(&journal).ok(), before_journal);
+        assert_eq!(
+            repo.get_file_content("hot.txt").unwrap(),
+            Some(b"alpha\nright\nlast\n".to_vec())
+        );
+        drop(repo);
+        let reopened = Repository::open(target.path()).unwrap();
+        assert_eq!(
+            reopened.get_file_content("hot.txt").unwrap(),
+            Some(b"alpha\nright\nlast\n".to_vec())
+        );
     }
 
     #[test]

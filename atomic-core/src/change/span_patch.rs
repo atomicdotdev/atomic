@@ -38,6 +38,11 @@ pub struct ExternalSpan {
     pub end: u64,
 }
 
+/// Content-addressed identity of a derived span semantic projection. Unlike a
+/// CRDT ID, this does not attribute the projected item to one creating change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SpanProjectionId(pub Hash);
+
 /// A file root or an edit relative to an existing authored span.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpanOp {

@@ -121,6 +121,8 @@ message RecordRequest {
   // AI-assisted (vendor, model, tool, suggestion type, tokens, session);
   // absent → a human-authored record, provenance-free.
   optional RecordAiAuthorship ai_authorship = 8;
+  optional bool skip_binary = 9;
+  optional uint64 max_file_size = 10;
 }
 
 // One record's AI authorship (add-only): the string vocabularies
@@ -143,7 +145,14 @@ message RecordResponse {
   optional string view = 3;           // view the change landed on (add-only)
   optional RecordStatistics statistics = 4; // actual recorder statistics
   repeated string recorded_paths = 5;
+  repeated string skipped_paths = 6;
+  repeated RecordFileError file_errors = 7;
   ResponseMeta meta = 100;
+}
+
+message RecordFileError {
+  string path = 1;
+  string message = 2;
 }
 
 // Recorded graph and semantic counts. Older services may omit this message.

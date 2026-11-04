@@ -919,6 +919,55 @@ where
         + atomic_core::pristine::CapabilityTxnT,
     C: atomic_core::change::ChangeStore,
 {
+    if !has_visible_span_root(txn, store, inode, visibility)? {
+        return Ok(None);
+    }
+    atomic_core::pristine::span_patch_storage::SpanRenderContext::new(txn, store, visibility)
+        .and_then(|context| context.render(inode))
+        .map(Some)
+        .map_err(|error| RepositoryError::Database(error.to_string()))
+}
+
+pub(super) fn retrieve_span_bounded_if_present<T, C>(
+    txn: &T,
+    store: &C,
+    inode: Inode,
+    visibility: &GraphVisibilityClosure,
+    max_bytes: usize,
+) -> Result<Option<BoundedContent>, RepositoryError>
+where
+    T: atomic_core::pristine::span_patch_storage::SpanPatchReadTxn
+        + atomic_core::pristine::TreeTxnT
+        + atomic_core::pristine::CapabilityTxnT,
+    C: atomic_core::change::ChangeStore,
+{
+    use atomic_core::pristine::span_patch_storage::{BoundedSpanContent, SpanRenderContext};
+    if !has_visible_span_root(txn, store, inode, visibility)? {
+        return Ok(None);
+    }
+    let rendered = SpanRenderContext::new(txn, store, visibility)
+        .and_then(|context| context.render_bounded(inode, max_bytes))
+        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+    Ok(Some(match rendered {
+        BoundedSpanContent::Complete(bytes) => BoundedContent::Complete(bytes),
+        BoundedSpanContent::Oversized { retained_bytes } => {
+            BoundedContent::Oversized { retained_bytes }
+        }
+    }))
+}
+
+pub(super) fn has_visible_span_root<T, C>(
+    txn: &T,
+    store: &C,
+    inode: Inode,
+    visibility: &GraphVisibilityClosure,
+) -> Result<bool, RepositoryError>
+where
+    T: atomic_core::pristine::span_patch_storage::SpanPatchReadTxn
+        + atomic_core::pristine::TreeTxnT
+        + atomic_core::pristine::CapabilityTxnT,
+    C: atomic_core::change::ChangeStore,
+{
     use atomic_core::pristine::SPAN_RANGE_CAPABILITY;
     let capability = txn
         .required_capability_version(SPAN_RANGE_CAPABILITY.id())
@@ -949,7 +998,7 @@ where
                 }
             }
         }
-        return Ok(None);
+        return Ok(false);
     };
     if !matches!(capability, Some(2) | Some(3)) {
         return Err(RepositoryError::Database(
@@ -961,10 +1010,7 @@ where
             "span root is outside the requested view".into(),
         ));
     }
-    atomic_core::pristine::span_patch_storage::SpanRenderContext::new(txn, store, visibility)
-        .and_then(|context| context.render(inode))
-        .map(Some)
-        .map_err(|error| RepositoryError::Database(error.to_string()))
+    Ok(true)
 }
 
 pub(crate) fn retrieve_content_with_filter_fast<T, C>(

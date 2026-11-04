@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 40_git_shim_materialize_safety.sh — Offline shim-switch collision safety.
+# HISTORICAL: coverage migrated to ../40_git_shim_safety.sh.
 #
 # Exercises pre-materialization refusal for untracked path-shape collisions and
 # the explicit before-materialize failpoint. Mid-write rollback remains outside
@@ -17,7 +17,9 @@ begin_section "Prerequisites"
 require_git
 
 atomic_current_view() {
-    atomic view list 2>/dev/null | awk '/^\*/ { print $2 }'
+    local output
+    output="$(atomic view list --all --json 2>&1)" || return 1
+    printf '%s\n' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_view"])'
 }
 
 checkpoint_hash() {
@@ -46,8 +48,8 @@ snapshot_complete_files() {
 assert_clean_statuses() {
     local label="$1"
     local git_status atomic_status
-    git_status="$(git status --short)"
-    atomic_status="$(atomic status --short 2>/dev/null || true)"
+    if ! git_status="$(git status --short 2>&1)"; then _fail "$label: read Git status" "$git_status"; return; fi
+    if ! atomic_status="$(atomic status --short 2>&1)"; then _fail "$label: read Atomic status" "$atomic_status"; return; fi
     if [[ -z "$git_status" ]]; then
         _pass "$label: Git status is clean"
     else
@@ -148,9 +150,19 @@ git add README.md
 git commit --quiet -m "Initial main projection"
 MAIN="$(git_current_branch)"
 
-assert_success "import main into Atomic" atomic git import --no-vault
-assert_success "create feature view" atomic view create feature --draft --parent "$MAIN"
-assert_success "align feature view and Git branch" atomic view switch feature --force
+require_success "import main into Atomic" atomic git import --no-vault
+require_success "create feature view" atomic view create feature --draft --parent "$MAIN"
+require_success "align feature view and Git branch" atomic view switch feature --force
+if branch="$(git symbolic-ref --short HEAD 2>&1)" && [[ "$branch" == feature ]]; then
+    _pass "feature switch aligns Git branch"
+else
+    _fail "feature switch aligns Git branch" "expected feature, got $branch"
+    assert_current_view "feature switch preserves Atomic view" feature
+    assert_file_content "feature switch preserves source bytes" README.md 'shim materialize safety\n'
+    _skip "collision and failpoint scenarios" "feature Git branch not aligned"
+    print_summary || true
+    exit 1
+fi
 create_file "feature-marker.txt" "feature shim checkpoint\n"
 git add feature-marker.txt
 git commit --quiet -m "Establish feature shim checkpoint"

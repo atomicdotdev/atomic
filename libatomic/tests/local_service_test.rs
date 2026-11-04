@@ -242,10 +242,19 @@ async fn local_add_record_log_and_change_use_existing_handlers() {
 
 #[tokio::test]
 async fn local_record_reports_native_span_semantic_statistics() {
+    assert_local_record_reports_semantic_statistics(true).await;
+}
+
+#[tokio::test]
+async fn local_record_reports_native_graph_semantic_statistics() {
+    assert_local_record_reports_semantic_statistics(false).await;
+}
+
+async fn assert_local_record_reports_semantic_statistics(span: bool) {
     use atomic_core::pristine::{CapabilityMutTxnT, MutTxnT, SPAN_RANGE_CAPABILITY};
     let dir = tempfile::tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
-    {
+    if span {
         let mut txn = repo.pristine().write_txn().unwrap();
         txn.put_required_capability(SPAN_RANGE_CAPABILITY).unwrap();
         txn.commit().unwrap();

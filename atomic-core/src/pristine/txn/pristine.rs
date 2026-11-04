@@ -362,6 +362,7 @@ impl Pristine {
 
             // Persistent Git commit interpretation closures (CB-9B review R1)
             write_txn.open_table(GIT_COMMIT_CLOSURES)?;
+            write_txn.open_table(GIT_CLOSURE_NODES)?;
 
             // Immutable captured bridge hook events (CB-9B review R4)
             write_txn.open_table(BRIDGE_EVENT_CAPTURES)?;
@@ -602,6 +603,11 @@ impl Pristine {
 
         let mut write_txn = self.db.writable_db()?.begin_write()?;
         let _ = write_txn.set_durability(redb::Durability::Immediate);
+        if capabilities.iter().any(|capability| {
+            capability.id() == crate::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY.id()
+        }) {
+            crate::pristine::schema::require_projected_semantics_schema(&write_txn)?;
+        }
         let mut metadata = write_txn.open_table(PRISTINE_META)?;
 
         let mut existing_requirements = Vec::new();

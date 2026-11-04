@@ -17,7 +17,7 @@
 #
 # STATUS: the insert path is not implemented yet. Target-behavior checks are
 # gated on $EXPECT_INSERT:
-#   - unset/0 → reported as pending (skipped), suite stays green
+#   - unset/0 → reported as pending (skipped), suite is partial
 #   - 1       → hard assertions, so this file drives implementation red→green
 #
 # What already holds today (hard-asserted here, no gate):
@@ -63,9 +63,9 @@ assert_target() {
 #   * `main_has_record` matches the `hash` FIELD exactly (whole line), so a
 #     squash record's embedded trailer text can't produce a false positive.
 main_view_hashes() {
-    atomic log --view "$MAIN" -f json 2>/dev/null \
-        | grep -ao '"hash"[[:space:]]*:[[:space:]]*"[^"]*"' \
-        | sed -E 's/.*"([^"]+)"$/\1/'
+    local out
+    out="$(atomic log --view "$MAIN" -f json 2>&1)" || return 1
+    printf '%s\n' "$out" | python3 -c 'import json,sys; rows=json.load(sys.stdin); assert isinstance(rows,list); print("\n".join(r["hash"] for r in rows))'
 }
 main_has_record() {
     local out; out="$(main_view_hashes)"
@@ -78,7 +78,7 @@ tag_show_contains() {
 # Dry-run router recommendation for the current target (SPEC §4.4).
 dry_run_recommends_insert() {
     local out; out="$(atomic git import --incremental --branch "$MAIN" --dry-run 2>&1)"
-    grep -qaiE "squash|atomic header|insert" <<<"$out"
+    grep -qaiE '(recommend|route|use|will|would|should).*(insert|original)|(insert|original).*(recommend|route|instead)' <<<"$out"
 }
 # The shared view materializes `src/two.rs` after switching to it.
 shared_view_materializes_two() {
@@ -109,10 +109,10 @@ make_temp_repo "review-gate-insert"
 init_git_repo
 git_commit "Initial" "README.md" "# Project"
 
-assert_success "git import seeds the shared view" atomic git import --no-vault
+require_success "git import seeds the shared view" atomic git import --no-vault
 
 MAIN="$(git_default_branch)"
-_pass "shared view is '$MAIN'"
+assert_current_view "shared view is '$MAIN'" "$MAIN"
 
 # ════════════════════════════════════════════════════════════════════════
 # Section 3: Agent work in a draft view — the original change records
@@ -120,27 +120,25 @@ _pass "shared view is '$MAIN'"
 
 begin_section "Record originals in a draft view"
 
-assert_success "create + switch to draft" \
+require_success "create + switch to draft" \
     atomic view create agent --draft --parent "$MAIN" --switch
 
 # Two per-turn changes. Their on-disk content must match what the squash tree
 # will contain, so inserting them reproduces the squash exactly (SPEC §5/D1).
 create_file "src/one.rs" "fn one() {}"
-add_files "src/one.rs"
-record_change "feat: one" >/dev/null
+require_success "add one.rs" atomic add "src/one.rs"
+require_success "record one.rs" record_change "feat: one"
 
 create_file "src/two.rs" "fn two() {}"
-add_files "src/two.rs"
-record_change "feat: two" >/dev/null
+require_success "add two.rs" atomic add "src/two.rs"
+require_success "record two.rs" record_change "feat: two"
 
 # Capture the two originals' hashes (newest-first). The draft's own changes are
 # the two most recent, regardless of whether inherited history is shown.
+require_capture "read draft history" atomic log --view agent -f json
+require_capture "extract original change hashes" python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); assert len(rows)>=2 and rows[0]["message"]=="feat: two" and rows[1]["message"]=="feat: one"; print(rows[0]["hash"]); print(rows[1]["hash"])' "$COMMAND_OUTPUT"
 ORIG=()
-while IFS= read -r h; do
-    [[ -n "$h" ]] && ORIG+=("$h")
-done < <(atomic log --view agent -f json 2>/dev/null \
-            | grep -o '"hash"[[:space:]]*:[[:space:]]*"[^"]*"' \
-            | sed -E 's/.*"([^"]+)"$/\1/')
+while IFS= read -r h; do [[ -n "$h" ]] && ORIG+=("$h"); done <<< "$COMMAND_OUTPUT"
 
 HASH_TWO="${ORIG[0]:-}"   # newest  (feat: two)
 HASH_ONE="${ORIG[1]:-}"   # older   (feat: one)
@@ -162,7 +160,7 @@ begin_section "Simulate squash-merge commit with multi-block trailers"
 
 # Return to the shared view so the working copy is the shared baseline; the
 # draft-only files disappear, then we recreate them as the squash tree.
-switch_view "$MAIN" >/dev/null
+require_success "switch to shared view" switch_view "$MAIN"
 
 # The squash tree == shared baseline + both originals' content.
 create_file "src/one.rs" "fn one() {}"
@@ -207,12 +205,38 @@ assert_target "dry-run flags an insertable atomic squash" dry_run_recommends_ins
 
 begin_section "Incremental import: squash → shared view"
 
-MAIN_BEFORE="$(atomic log --view "$MAIN" 2>/dev/null | grep -c '^#' || true)"
+require_capture "count shared history before import" atomic log --view "$MAIN" -f json
+MAIN_BEFORE="$(printf '%s\n' "$COMMAND_OUTPUT" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
 
-assert_success "incremental import of squash" \
-    atomic git import --incremental --branch "$MAIN" --no-vault
+snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-review-gate-snapshot-XXXXXX")"
+_HARNESS_TMPDIRS+=("$snapshot_dir")
+cp src/one.rs "$snapshot_dir/one.rs"
+cp src/two.rs "$snapshot_dir/two.rs"
+require_capture "read shared history before squash import" atomic log --view "$MAIN" -f json
+history_before="$COMMAND_OUTPUT"
+require_capture "read draft history before squash import" atomic log --view agent -f json
+draft_before="$COMMAND_OUTPUT"
+require_capture "read Git HEAD before squash import" git rev-parse HEAD
+head_before="$COMMAND_OUTPUT"
+if import_out="$(atomic git import --incremental --branch "$MAIN" --no-vault 2>&1)"; then
+    _pass "incremental import of squash"
+else
+    _fail "incremental import of squash" "$import_out"
+    assert_success "refused import preserves one.rs bytes" cmp -s "$snapshot_dir/one.rs" src/one.rs
+    assert_success "refused import preserves two.rs bytes" cmp -s "$snapshot_dir/two.rs" src/two.rs
+    assert_current_view "refused import preserves shared view" "$MAIN"
+    require_capture "read shared history after refusal" atomic log --view "$MAIN" -f json
+    if [[ "$COMMAND_OUTPUT" == "$history_before" ]]; then _pass "refusal preserves shared history"; else _fail "refusal preserves shared history" "history changed"; fi
+    require_capture "read draft history after refusal" atomic log --view agent -f json
+    if [[ "$COMMAND_OUTPUT" == "$draft_before" ]]; then _pass "refusal preserves draft history"; else _fail "refusal preserves draft history" "history changed"; fi
+    require_capture "read Git HEAD after refusal" git rev-parse HEAD
+    if [[ "$COMMAND_OUTPUT" == "$head_before" ]]; then _pass "refusal preserves Git HEAD"; else _fail "refusal preserves Git HEAD" "HEAD changed"; fi
+    _skip "ReviewGate metadata, insertion and draft-deletion checks" "squash import refused"
+    print_summary || true
+    exit 1
+fi
 
-switch_view "$MAIN" >/dev/null
+require_success "switch to shared view after import" switch_view "$MAIN"
 
 # Always-true guarantees (both current and target behavior satisfy these):
 assert_file_content "shared view materializes one.rs" "src/one.rs" "fn one() {}"
@@ -239,7 +263,8 @@ assert_target "shared view contains original two.rs record" main_has_record "$HA
 
 # The squash must NOT add a brand-new change record: with insert, the shared
 # view grows by exactly the two originals (not by a single squash record).
-MAIN_AFTER="$(atomic log --view "$MAIN" 2>/dev/null | grep -c '^#' || true)"
+require_capture "count shared history after import" atomic log --view "$MAIN" -f json
+MAIN_AFTER="$(printf '%s\n' "$COMMAND_OUTPUT" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
 assert_target "shared view grew by exactly the two originals" \
     test "$MAIN_AFTER" -eq "$((MAIN_BEFORE + 2))"
 
@@ -257,13 +282,13 @@ begin_section "Target: draft is disposable, provenance survives (SPEC §1)"
 
 # Drafts must be deletable without losing the granular history: the shared view
 # now references the originals, so they stay alive and materializable.
-atomic view delete agent --force >/dev/null 2>&1 || \
-    atomic view delete agent >/dev/null 2>&1 || true
-
-assert_target "originals still in shared view after draft deletion" \
-    main_has_record "$HASH_ONE"
-assert_target "shared view still materializes after draft deletion" \
-    shared_view_materializes_two
+if main_has_record "$HASH_ONE" && main_has_record "$HASH_TWO"; then
+    require_success "delete draft after originals are present" atomic view delete agent --force
+    assert_target "originals still in shared view after draft deletion" main_has_record "$HASH_ONE"
+    assert_target "shared view still materializes after draft deletion" shared_view_materializes_two
+else
+    _skip "draft deletion and provenance survival" "originals not both present in shared view"
+fi
 
 # ── Summary ────────────────────────────────────────────────────────────────
 

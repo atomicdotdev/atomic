@@ -103,10 +103,10 @@ assert_file_contains() {
     fi
 }
 
-# Assert a file does NOT contain a substring (a missing file trivially passes).
+# Assert an existing file does NOT contain a substring.
 assert_file_not_contains() {
     local desc="$1" path="$2" needle="$3"
-    if [[ ! -f "$path" ]]; then _pass "$desc"; return; fi
+    if [[ ! -f "$path" ]]; then _fail "$desc" "file does not exist: $path"; return; fi
     if grep -qF "$needle" "$path"; then
         _fail "$desc" "'$needle' should not be in $path but was found"
     else
@@ -127,7 +127,18 @@ assert_present() {
 # Count substring (regex) occurrences; prints the count.
 count_occurrences() {
     local file="$1" pattern="$2"
-    grep -c "$pattern" "$file" 2>/dev/null || echo "0"
+    local count status
+    if count="$(grep -c -- "$pattern" "$file" 2>&1)"; then
+        printf '%s\n' "$count"
+    else
+        status=$?
+        if [[ $status -eq 1 ]]; then
+            printf '%s\n' "$count"
+        else
+            printf 'count failed (exit %s): %s\n' "$status" "$count" >&2
+            return "$status"
+        fi
+    fi
 }
 
 # Assert a regex/substring appears exactly N times (substring count).
@@ -135,7 +146,10 @@ assert_occurrence_count() {
     local desc="$1" file="$2" pattern="$3" expected="$4"
     if [[ ! -f "$file" ]]; then _fail "$desc" "file does not exist: $file"; return; fi
     local actual
-    actual="$(count_occurrences "$file" "$pattern")"
+    if ! actual="$(count_occurrences "$file" "$pattern" 2>&1)"; then
+        _fail "$desc" "$actual"
+        return
+    fi
     if [[ "$actual" -eq "$expected" ]]; then
         _pass "$desc"
     else
@@ -147,9 +161,8 @@ assert_occurrence_count() {
 assert_occurrences() {
     local desc="$1" path="$2" needle="$3" expected="$4"
     local actual=0
-    if [[ -f "$path" ]]; then
-        actual=$(grep -cxF "$needle" "$path" 2>/dev/null || true)
-    fi
+    if [[ ! -f "$path" ]]; then _fail "$desc" "file does not exist: $path"; return; fi
+    actual=$(grep -cxF "$needle" "$path" 2>/dev/null || true)
     if [[ "$actual" == "$expected" ]]; then
         _pass "$desc"
     else
@@ -197,8 +210,11 @@ assert_file_equals() {
     expected_file="$(mktemp "${TMPDIR:-/tmp}/harness-expected-XXXXXX")"
     printf '%s' "$expected" > "$expected_file"
     local diff_out diff_exit
-    diff_out="$(diff -u "$expected_file" "$path" 2>&1)"
-    diff_exit=$?
+    if diff_out="$(diff -u "$expected_file" "$path" 2>&1)"; then
+        diff_exit=0
+    else
+        diff_exit=$?
+    fi
     rm -f "$expected_file"
     case $diff_exit in
         0) _pass "$desc" ;;
@@ -231,12 +247,22 @@ assert_file_stable() {
 
 # The view name a fresh repo starts on (the one marked '*').
 current_view() {
-    atomic view list 2>/dev/null | awk '/^\*/{print $2}'
+    local output
+    if ! output="$(atomic view list --all --json 2>&1)"; then
+        printf 'view list failed: %s\n' "$output" >&2
+        return 1
+    fi
+    printf '%s\n' "$output" | python3 -c 'import json,sys; name=json.load(sys.stdin)["current_view"]; assert isinstance(name,str) and name; print(name)'
 }
 
 # Hash of the most recent change on a view.
 tip_hash() {
-    atomic log --view "$1" 2>/dev/null | grep -oE '=== [A-Z0-9]{12}' | head -1 | cut -d' ' -f2
+    local output
+    if ! output="$(atomic log --format json --count 1 --view "$1" 2>&1)"; then
+        printf 'log failed: %s\n' "$output" >&2
+        return 1
+    fi
+    printf '%s\n' "$output" | python3 -c 'import json,sys; rows=json.load(sys.stdin); assert len(rows)==1 and len(rows[0]["hash"])==52; print(rows[0]["hash"])'
 }
 # Backwards-compatible alias (27 spelling).
 tip_hash_of_view() { tip_hash "$1"; }
@@ -267,23 +293,46 @@ line5
 
     init_repo
     printf '%s' "$base_content" > f.txt
-    add_files f.txt >/dev/null
-    record_change "base" >/dev/null
+    require_success "add base file" atomic add f.txt
+    require_success "record base file" record_change "base"
 
-    BASE_VIEW="$(current_view)"
+    require_capture "read base view" current_view
+    BASE_VIEW="$COMMAND_OUTPUT"
 
-    new_view side-a >/dev/null
-    switch_view side-a >/dev/null
+    require_success "create side-a" new_view side-a
+    require_success "switch to side-a" switch_view side-a
     printf '%s' "$a_content" > f.txt
-    record_change "edit A" >/dev/null
+    require_success "record edit A" record_change "edit A"
     local hash_a
-    hash_a="$(tip_hash_of_view side-a)"
+    require_capture "read edit A hash" tip_hash_of_view side-a
+    hash_a="$COMMAND_OUTPUT"
 
-    switch_view "$BASE_VIEW" >/dev/null
+    require_success "switch back to base view" switch_view "$BASE_VIEW"
     printf '%s' "$b_content" > f.txt
-    record_change "edit B" >/dev/null
+    require_success "record edit B" record_change "edit B"
 
-    atomic insert "$hash_a" >/dev/null 2>&1
+    local snapshot_dir history_before output
+    snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-merge-builder-XXXXXX")"
+    _HARNESS_TMPDIRS+=("$snapshot_dir")
+    cp f.txt "$snapshot_dir/f.txt"
+    require_capture "read base history before insert" atomic log --format json --view "$BASE_VIEW" --all
+    history_before="$COMMAND_OUTPUT"
+    if output="$(atomic insert "$hash_a" 2>&1)"; then
+        _pass "insert edit A"
+    else
+        _fail "insert edit A" "$output"
+        assert_success "refused insert preserves file bytes" cmp -s "$snapshot_dir/f.txt" f.txt
+        assert_current_view "refused insert preserves base view" "$BASE_VIEW"
+        require_capture "read base history after refusal" atomic log --format json --view "$BASE_VIEW" --all
+        if [[ "$COMMAND_OUTPUT" == "$history_before" ]]; then
+            _pass "refused insert preserves base history"
+        else
+            _fail "refused insert preserves base history" "history changed"
+        fi
+        _skip "merge postconditions and later cases" "insert failed"
+        print_summary || true
+        exit 1
+    fi
 }
 
 # Build a base repo, a `feature` draft with edit A, and edit B on the base
@@ -294,20 +343,22 @@ build_case() {
     local base="$1" a="$2" b="$3"
     init_repo
     printf '%s' "$base" > f.txt
-    add_files f.txt >/dev/null
-    record_change "base" >/dev/null
-    BASE_VIEW="$(current_view)"
+    require_success "add base file" atomic add f.txt
+    require_success "record base file" record_change "base"
+    require_capture "read base view" current_view
+    BASE_VIEW="$COMMAND_OUTPUT"
 
-    new_view feature >/dev/null
-    switch_view feature >/dev/null
+    require_success "create feature" new_view feature
+    require_success "switch to feature" switch_view feature
     write_or_delete "$a"
-    record_change "edit A" >/dev/null
-    FEATURE_HASH="$(tip_hash feature)"
+    require_success "record edit A" record_change "edit A"
+    require_capture "read edit A hash" tip_hash feature
+    FEATURE_HASH="$COMMAND_OUTPUT"
 
-    switch_view "$BASE_VIEW" >/dev/null
+    require_success "switch to base view" switch_view "$BASE_VIEW"
     if [[ "$b" != "__UNCHANGED__" ]]; then
         write_or_delete "$b"
-        record_change "edit B" >/dev/null
+        require_success "record edit B" record_change "edit B"
     fi
 }
 
@@ -351,8 +402,14 @@ assert_honest() {
     local m s l
     if [[ -f "$path" ]] && grep -qE '^>>>>>>>' "$path" 2>/dev/null; then m=1; else m=0; fi
     local sstatus cshort esc
-    sstatus="$(atomic status --short 2>/dev/null || true)"
-    cshort="$(atomic conflicts --short 2>/dev/null || true)"
+    if ! sstatus="$(atomic status --short 2>&1)"; then
+        _fail "$desc" "status command failed: $sstatus"
+        return
+    fi
+    if ! cshort="$(atomic conflicts --short 2>&1)"; then
+        _fail "$desc" "conflicts command failed: $cshort"
+        return
+    fi
     esc="$(printf '%s' "$path" | sed 's/[].[^$*+?{}()|\\/]/\\&/g')"
     if echo "$sstatus" | grep -qE "^C[[:space:]]+${esc}$"; then s=1; else s=0; fi
     if echo "$cshort" | grep -qE "^${esc}:"; then l=1; else l=0; fi

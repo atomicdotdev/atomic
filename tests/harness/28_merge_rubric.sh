@@ -45,7 +45,7 @@ make_temp_repo rubric-a1b1
 build_case "$BASE_5" \
     $'alpha\nbeta-A\ngamma\ndelta\nepsilon\n' \
     $'alpha\nbeta\ngamma\ndelta-B\nepsilon\n'
-atomic insert "$FEATURE_HASH" >/dev/null 2>&1
+require_success "disjoint single-insert succeeds" atomic insert "$FEATURE_HASH"
 assert_no_markers  "disjoint single-insert: no markers"        f.txt
 assert_present     "disjoint single-insert: side A present"    f.txt "beta-A"
 assert_present     "disjoint single-insert: side B present"    f.txt "delta-B"
@@ -58,7 +58,7 @@ make_temp_repo rubric-a2b2
 build_case "$BASE_5" \
     $'alpha\nbeta-A\ngamma\ndelta\nepsilon\n' \
     $'alpha\nbeta\ngamma-B\ndelta\nepsilon\n'
-insert_from_view feature "$BASE_VIEW" >/dev/null 2>&1
+require_success "adjacent bulk-insert succeeds" insert_from_view feature "$BASE_VIEW"
 assert_no_markers  "adjacent bulk-insert: no markers"        f.txt
 assert_present     "adjacent bulk-insert: side A present"    f.txt "beta-A"
 assert_present     "adjacent bulk-insert: side B present"    f.txt "gamma-B"
@@ -71,7 +71,27 @@ make_temp_repo rubric-a3b2
 build_case "$BASE_5" \
     $'alpha\nSAME-EDIT\ngamma\ndelta\nepsilon\n' \
     $'alpha\nSAME-EDIT\ngamma\ndelta\nepsilon\n'
-insert_from_view feature "$BASE_VIEW" >/dev/null 2>&1
+snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-rubric-snapshot-XXXXXX")"
+_HARNESS_TMPDIRS+=("$snapshot_dir")
+cp f.txt "$snapshot_dir/f.txt"
+require_capture "read base history before identical insert" atomic log --format json --view "$BASE_VIEW" --all
+history_before="$COMMAND_OUTPUT"
+if insert_out="$(insert_from_view feature "$BASE_VIEW" 2>&1)"; then
+    _pass "identical concurrent insert succeeds"
+else
+    _fail "identical concurrent insert succeeds" "$insert_out"
+    assert_success "refused insert preserves file bytes" cmp -s "$snapshot_dir/f.txt" f.txt
+    assert_current_view "refused insert preserves base view" "$BASE_VIEW"
+    require_capture "read base history after refusal" atomic log --format json --view "$BASE_VIEW" --all
+    if [[ "$COMMAND_OUTPUT" == "$history_before" ]]; then
+        _pass "refused insert preserves base history"
+    else
+        _fail "refused insert preserves base history" "history changed"
+    fi
+    _skip "remaining merge-rubric cases" "identical concurrent edit refused"
+    print_summary || true
+    exit 1
+fi
 assert_no_markers  "identical edits: no markers"                 f.txt
 assert_occurrences "identical edits: deduped to a single copy"   f.txt "SAME-EDIT" 1
 assert_occurrences "identical edits: no tail dup"                f.txt "epsilon" 1

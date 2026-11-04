@@ -18,8 +18,8 @@ use redb::{
 
 use super::error::{PristineError, PristineResult};
 use super::schema::{
-    check_schema_version, table_names, visit_tables, TableVisitor, LEGACY_DIR_KEY, RETIRED_TABLES,
-    SCHEMA_VERSION, SCHEMA_VERSION_KEY,
+    check_schema_version, table_names, visit_tables, TableVisitor, BASE_SCHEMA_VERSION,
+    LEGACY_DIR_KEY, RETIRED_TABLES, SCHEMA_VERSION_KEY,
 };
 use super::tables::ATOMIC_META;
 use super::txn::{open_database, require_supported_repository_capabilities};
@@ -147,7 +147,14 @@ impl LegacyDatabases {
         let write = merged.begin_write()?;
         {
             let mut meta = write.open_table(ATOMIC_META)?;
-            meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_le_bytes().as_slice())?;
+            // Preserve a source's higher required schema; ordinary legacy
+            // repositories stay on the baseline rather than being upgraded
+            // merely because this build understands projected semantics.
+            let version = meta
+                .get(SCHEMA_VERSION_KEY)?
+                .map(|value| value.value().to_vec())
+                .unwrap_or_else(|| BASE_SCHEMA_VERSION.to_le_bytes().to_vec());
+            meta.insert(SCHEMA_VERSION_KEY, version.as_slice())?;
             meta.insert(LEGACY_DIR_KEY, legacy_dir.as_bytes())?;
             for (key, digest) in source_digests {
                 meta.insert(key.as_str(), digest.as_slice())?;
@@ -155,6 +162,7 @@ impl LegacyDatabases {
         }
         super::build_metadata::record_migration(&write)?;
         write.commit()?;
+        check_schema_version(&merged.begin_read()?)?;
         Ok(report)
     }
 

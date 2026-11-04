@@ -797,6 +797,42 @@ fn test_record_modified_file_has_crdt_ops() {
 }
 
 #[test]
+fn unterminated_file_edits_keep_targeted_hunks_and_complete_eof_bytes() {
+    for (old, new, expected) in [
+        ("first\nlast", "FIRST\nlast", "FIRST\n"),
+        ("first\nlast", "first\nLAST", "LAST"),
+        ("first\nlast", "first\nlast\n", "last\n"),
+        ("first\nlast\n", "first\nlast", "last"),
+    ] {
+        let wc = Memory::new();
+        wc.add_file("test.txt", new.as_bytes());
+        let recorded = record_modified_file(
+            &wc,
+            &DetectedFile::modified("test.txt"),
+            old.as_bytes(),
+            None,
+            &RecordingOptions::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(recorded.hunks().len(), 1, "{old:?} -> {new:?}");
+        let hunk = &recorded.hunks()[0];
+        assert!(
+            !hunk.deleted_lines.contains(&usize::MAX),
+            "must not rewrite unchanged lines"
+        );
+        let start = hunk.content_start.unwrap() as usize;
+        let end = hunk.content_end.unwrap() as usize;
+        assert_eq!(
+            &new.as_bytes()[start..end],
+            expected.as_bytes(),
+            "{old:?} -> {new:?}"
+        );
+    }
+}
+
+#[test]
 fn test_record_modified_file_crdt_stats_tracks_changes() {
     let wc = Memory::new();
     wc.add_file("test.rs", b"line1\nnew_line\nline3\n");

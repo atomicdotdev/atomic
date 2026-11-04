@@ -14,24 +14,30 @@ HOT_FILE_LINES="${HOT_FILE_LINES:-300}"
 HOT_FILE_IMPORT_MAX_SECONDS="${HOT_FILE_IMPORT_MAX_SECONDS:-30}"
 HOT_FILE_MODE="${HOT_FILE_MODE:-linear}"
 HOT_FILE_BRANCHES="${HOT_FILE_BRANCHES:-8}"
-HOT_FILE_ALLOWED_SKIPS="${HOT_FILE_ALLOWED_SKIPS:-3}"
 
 HOT_FILE_PATH="terraform/context_apply_test.go"
 
 count_imported_git_changes() {
-    local count=0
-    local hash
+    local count=0 hash log details
+    if ! log="$(atomic log --format short --no-color --full-hash 2>&1)"; then
+        printf 'atomic log failed: %s\n' "$log" >&2
+        return 1
+    fi
     while IFS= read -r hash; do
         [[ -z "$hash" ]] && continue
-        if atomic change "$hash" 2>/dev/null | grep -q 'Commit:'; then
+        if ! details="$(atomic change "$hash" --full-hash 2>&1)"; then
+            printf 'atomic change %s failed: %s\n' "$hash" "$details" >&2
+            return 1
+        fi
+        if printf '%s\n' "$details" | grep -qF 'Git source revision:'; then
             count=$((count + 1))
         fi
-    done < <(atomic log --format short --no-color --full-hash 2>/dev/null | awk '/^[A-Z2-7]{20,}/ { print $1 }')
+    done <<< "$(printf '%s\n' "$log" | awk '$1 ~ /^[A-Z2-7]+$/ && length($1) == 52 { print $1 }')"
     echo "$count"
 }
 
 git_first_parent_commit_count() {
-    git rev-list --first-parent --count HEAD 2>/dev/null || echo "0"
+    git rev-list --first-parent --count HEAD
 }
 
 write_hot_file() {
@@ -128,13 +134,15 @@ case "$HOT_FILE_MODE" in
         ;;
 esac
 
-expected_commits="$(git_first_parent_commit_count)"
+require_capture "count first-parent Git history" git_first_parent_commit_count
+expected_commits="$COMMAND_OUTPUT"
 if [[ "$HOT_FILE_MODE" == "branchy" ]]; then
-    expected_commits="$(git rev-list --all --count 2>/dev/null || echo "$expected_commits")"
+    require_capture "count all Git history" git rev-list --all --count
+    expected_commits="$COMMAND_OUTPUT"
 fi
 echo "  Synthetic history: mode=${HOT_FILE_MODE}, commits=${expected_commits}, lines=${HOT_FILE_LINES}, path=${HOT_FILE_PATH}"
 
-atomic init >/dev/null 2>&1
+require_success "initialize Atomic repository" atomic init
 
 start_time=$(date +%s)
 import_args=(git import)
@@ -142,31 +150,26 @@ if [[ "$HOT_FILE_MODE" == "branchy" ]]; then
     import_args+=(--all)
 fi
 
-import_out="$(atomic "${import_args[@]}" 2>&1)" || {
-    _fail "hot-file import succeeds" "$import_out"
-    print_summary
-    exit 1
-}
+require_capture "hot-file import succeeds" atomic "${import_args[@]}"
 end_time=$(date +%s)
 duration=$((end_time - start_time))
 
-_pass "hot-file import succeeds"
 echo "  Import took ${duration}s"
 
-actual="$(count_imported_git_changes)"
+require_capture "count imported Git changes" count_imported_git_changes
+actual="$COMMAND_OUTPUT"
 if [[ "$HOT_FILE_MODE" == "branchy" ]]; then
     if [[ "$actual" -ge 2 ]]; then
         _pass "branchy import produced git changes ($actual imported)"
     else
         _fail "branchy import produced git changes" "expected at least 2 imported git changes, got $actual"
     fi
+    _skip "verify all branch changes" "branch-wide unique change count is not checked"
 elif [[ "$actual" -eq "$expected_commits" ]]; then
     _pass "imported git change count matches ($actual vs $expected_commits)"
-elif [[ "$actual" -ge $((expected_commits - HOT_FILE_ALLOWED_SKIPS)) ]]; then
-    _pass "imported git change count within skip tolerance ($actual vs $expected_commits)"
 else
     _fail "imported git change count matches" \
-        "expected $expected_commits imported git changes, got $actual (allowed skips: $HOT_FILE_ALLOWED_SKIPS)"
+        "expected $expected_commits imported git changes, got $actual"
 fi
 
 if [[ "$duration" -le "$HOT_FILE_IMPORT_MAX_SECONDS" ]]; then
@@ -176,13 +179,8 @@ else
         "took ${duration}s; likely hot-file assembly traversal regression"
 fi
 
-status_out="$(atomic status --short 2>/dev/null || true)"
-hot_file_status="$(echo "$status_out" | grep -F "$HOT_FILE_PATH" || true)"
-if [[ -z "$hot_file_status" ]]; then
-    _pass "hot file clean after import"
-else
-    _fail "hot file clean after import" "$hot_file_status"
-fi
+assert_status_no_entry "hot file clean after import" "$HOT_FILE_PATH"
+assert_success "hot file still matches Git HEAD" git diff --exit-code HEAD -- "$HOT_FILE_PATH"
 
 expected_marker="hot-$(printf '%04d' "$HOT_FILE_COMMITS")"
 if [[ "$HOT_FILE_MODE" == "branchy" ]]; then

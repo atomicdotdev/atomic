@@ -8,6 +8,7 @@ use super::{
     CachedGraphTxn, EffectiveProjectionClosure, GraphTxnT, ReadTxn, ViewMembershipSet, ViewTxnT,
     WriteTxn,
 };
+pub use crate::change::span_patch::SpanProjectionId;
 use crate::change::span_patch::{ExternalFile, ExternalSpan, SpanOp, SpanPatch};
 use crate::change::{Change, ChangeStore};
 use crate::types::{Hash, Inode, NodeId};
@@ -17,12 +18,15 @@ use redb::{MultimapTableDefinition, ReadableMultimapTable, ReadableTable, TableD
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-const FILES: TableDefinition<&[u8; 36], u64> = TableDefinition::new("span_patch_files_v1");
-const ROOTS: TableDefinition<u64, &[u8; 24]> = TableDefinition::new("span_patch_roots_v1");
-const SPANS: TableDefinition<&[u8; 32], u8> = TableDefinition::new("span_patch_nodes_v1");
-const EDITS: MultimapTableDefinition<&[u8; 32], &[u8; 40]> =
+pub(super) const FILES: TableDefinition<&[u8; 36], u64> =
+    TableDefinition::new("span_patch_files_v1");
+pub(super) const ROOTS: TableDefinition<u64, &[u8; 24]> =
+    TableDefinition::new("span_patch_roots_v1");
+pub(super) const SPANS: TableDefinition<&[u8; 32], u8> =
+    TableDefinition::new("span_patch_nodes_v1");
+pub(super) const EDITS: MultimapTableDefinition<&[u8; 32], &[u8; 40]> =
     MultimapTableDefinition::new("span_patch_edits_v1");
-const APPLIED: TableDefinition<u64, u8> = TableDefinition::new("span_patch_applied_v1");
+pub(super) const APPLIED: TableDefinition<u64, u8> = TableDefinition::new("span_patch_applied_v1");
 
 fn file_key(file: &ExternalFile) -> [u8; 36] {
     let mut key = [0; 36];
@@ -83,6 +87,7 @@ pub fn index_change<S: ChangeStore>(
         txn,
         &ViewMembershipSet::from_ordered(dep_ids),
     )?;
+    validate_projected_semantics(txn, store, change, &dependencies)?;
     let already = txn.txn.open_table(APPLIED)?.get(id.get())?.is_some();
     if already {
         return Ok(());
@@ -247,6 +252,83 @@ pub fn index_change<S: ChangeStore>(
         }
     }
     txn.txn.open_table(APPLIED)?.insert(id.get(), 1)?;
+    Ok(())
+}
+
+/// Validate span-projected FileOps against the exact dependency closure before
+/// writing any span index entries. Generic CRDT application cannot apply these
+/// operations; their semantic state is derived from the verified span graph.
+pub fn validate_projected_semantics<S: ChangeStore, T: SpanPatchReadTxn + super::CapabilityTxnT>(
+    txn: &T,
+    store: &S,
+    change: &Change,
+    dependencies: &EffectiveProjectionClosure,
+) -> Result<()> {
+    use super::SPAN_PROJECTED_SEMANTICS_CAPABILITY;
+    use crate::crdt::{TrunkId, TrunkOp};
+    let projected: Vec<_> = change
+        .file_ops()
+        .iter()
+        .filter_map(|ops| match ops.trunk_op() {
+            Some(TrunkOp::ProjectedSpanEdit { file, baseline }) => Some((ops, file, baseline)),
+            _ => None,
+        })
+        .collect();
+    if projected.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        txn.required_capability_version(SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())?
+            == Some(SPAN_PROJECTED_SEMANTICS_CAPABILITY.minimum_version()),
+        "projected span semantic capability is missing or unsupported"
+    );
+    let patch = change
+        .hashed
+        .span
+        .as_ref()
+        .context("projected semantic edit requires a span patch")?;
+    let context = SpanRenderContext::new(txn, store, dependencies)?;
+    let mut files = BTreeSet::new();
+    for (ops, file, baseline) in projected {
+        ensure!(
+            ops.trunk_id() == TrunkId::ROOT && ops.line_ops().is_empty(),
+            "projected semantic edit cannot contain CRDT identities or line operations"
+        );
+        ensure!(
+            files.insert(file_key(file)),
+            "duplicate projected semantic edit for file"
+        );
+        ensure!(
+            change
+                .file_ops()
+                .iter()
+                .filter(|candidate| candidate.path() == ops.path())
+                .count()
+                == 1,
+            "projected semantic path has multiple FileOps"
+        );
+        ensure!(
+            patch
+                .ops
+                .iter()
+                .any(|op| matches!(op, SpanOp::Edit { file: edited, .. } if edited == file)),
+            "projected semantic edit has no matching span edit"
+        );
+        let inode = txn
+            .span_file_inode(file)?
+            .context("projected semantic file missing")?;
+        let state = context
+            .record_state(inode)?
+            .context("projected semantic file is outside the dependency closure")?;
+        ensure!(
+            state.file == *file,
+            "projected semantic file identity differs from span root"
+        );
+        ensure!(
+            state.semantic_baseline_id()? == *baseline,
+            "projected semantic baseline differs from dependency closure"
+        );
+    }
     Ok(())
 }
 
@@ -482,6 +564,13 @@ pub struct SpanRenderContext<'a, T: SpanPatchReadTxn> {
     proof: Option<CausalProof>,
 }
 
+/// A bounded render never retains more than the requested number of bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BoundedSpanContent {
+    Complete(Vec<u8>),
+    Oversized { retained_bytes: usize },
+}
+
 /// One visible portion of an authored span, in rendered file order.
 #[derive(Debug, Clone)]
 pub struct VisibleSpan {
@@ -505,6 +594,358 @@ pub struct SpanRecordState {
     pub spans: Vec<VisibleSpan>,
     /// Visible changes that edited this file and must remain causal parents.
     pub dependencies: Vec<Hash>,
+}
+
+fn projection_id(
+    file: &ExternalFile,
+    domain: &[u8],
+    spans: &[VisibleSpan],
+) -> Result<SpanProjectionId> {
+    let mut normalized: Vec<(&ExternalSpan, u64, u64)> = Vec::new();
+    for span in spans {
+        let length = u64::try_from(span.output.len())?;
+        ensure!(length != 0, "empty projected authored fragment");
+        let end = span
+            .target_start
+            .checked_add(length)
+            .context("projected fragment overflow")?;
+        if let Some((target, _, previous_end)) = normalized.last_mut() {
+            if *target == &span.target && *previous_end == span.target_start {
+                *previous_end = end;
+                continue;
+            }
+        }
+        normalized.push((&span.target, span.target_start, end));
+    }
+    ensure!(
+        !normalized.is_empty(),
+        "projected semantic identity has no authored bytes"
+    );
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"atomic.span.semantic.projection.v1\0");
+    bytes.extend_from_slice(domain);
+    bytes.push(0);
+    bytes.extend_from_slice(file.owner.as_bytes());
+    bytes.extend_from_slice(&file.ordinal.to_be_bytes());
+    bytes.extend_from_slice(&u64::try_from(normalized.len())?.to_be_bytes());
+    for (target, start, end) in normalized {
+        bytes.extend_from_slice(target.owner.as_bytes());
+        bytes.extend_from_slice(&target.start.to_be_bytes());
+        bytes.extend_from_slice(&target.end.to_be_bytes());
+        bytes.extend_from_slice(&start.to_be_bytes());
+        bytes.extend_from_slice(&end.to_be_bytes());
+    }
+    Ok(SpanProjectionId(Hash::of(&bytes)))
+}
+
+/// One token interpreted from a span-backed file, with its exact authored
+/// byte fragments. A token may cross changes and therefore has no fabricated
+/// single author or CRDT identity.
+#[derive(Debug, Clone)]
+pub struct SpanSemanticToken {
+    /// Identity derived from its authored byte fragments, independent of the
+    /// repository-local node IDs and rendered file position.
+    pub id: SpanProjectionId,
+    /// Token kind produced by the normal code tokenizer.
+    pub kind: crate::diff::token::TokenKind,
+    /// Byte range in the rendered file.
+    pub output: std::ops::Range<usize>,
+    /// Authored spans covering the token in byte order.
+    pub authors: Vec<VisibleSpan>,
+}
+
+/// One rendered line and its lossless token-level interpretation.
+#[derive(Debug, Clone)]
+pub struct SpanSemanticLine {
+    /// Identity derived from the line's authored byte fragments.
+    pub id: SpanProjectionId,
+    /// Byte range in the rendered file, including any line terminator.
+    pub output: std::ops::Range<usize>,
+    /// Tokens in source order, including the line terminator when present.
+    pub tokens: Vec<SpanSemanticToken>,
+}
+
+/// Semantic interpretation of one span-backed file on one view closure.
+/// The identity binds the ordered projected lines and the portable file
+/// identity; it does not claim authorship for the snapshot as a whole.
+#[derive(Debug, Clone)]
+pub struct SpanSemanticSnapshot {
+    /// Portable identity of the file represented by this snapshot.
+    pub file: ExternalFile,
+    /// Content-addressed semantic baseline identity.
+    pub id: SpanProjectionId,
+    /// Projected lines in file order.
+    pub lines: Vec<SpanSemanticLine>,
+}
+
+impl SpanRecordState {
+    /// Identity of the semantic baseline. Text includes line/token structure;
+    /// opaque bytes use a separate domain and retain their authored ranges
+    /// without inventing text tokens.
+    pub fn semantic_baseline_id(&self) -> Result<SpanProjectionId> {
+        if self.content.contains(&0) || std::str::from_utf8(&self.content).is_err() {
+            return projection_id(
+                &self.file,
+                b"opaque",
+                &self.authored_ranges(0..self.content.len())?,
+            );
+        }
+        Ok(self.semantic_snapshot()?.id)
+    }
+
+    /// Derive a portable semantic baseline for validating an edit on a
+    /// receiving repository. Identical visible authored spans produce the
+    /// same identity even if local node IDs or inode numbers differ. The v1
+    /// tokenizer, token-kind tags and identity encoding are wire contracts:
+    /// changes to them require a new projected-semantics capability version.
+    pub fn semantic_snapshot(&self) -> Result<SpanSemanticSnapshot> {
+        let lines = self.semantic_lines()?;
+        let mut seen = BTreeSet::new();
+        let mut seen_tokens = BTreeSet::new();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"atomic.span.semantic.snapshot.v1\0");
+        bytes.extend_from_slice(self.file.owner.as_bytes());
+        bytes.extend_from_slice(&self.file.ordinal.to_be_bytes());
+        bytes.extend_from_slice(&u64::try_from(lines.len())?.to_be_bytes());
+        for line in &lines {
+            ensure!(seen.insert(line.id.0), "duplicate projected line identity");
+            bytes.extend_from_slice(line.id.0.as_bytes());
+            bytes.extend_from_slice(&u64::try_from(line.tokens.len())?.to_be_bytes());
+            for token in &line.tokens {
+                ensure!(
+                    seen_tokens.insert(token.id.0),
+                    "duplicate projected token identity"
+                );
+                use crate::diff::token::TokenKind;
+                let kind = match token.kind {
+                    TokenKind::Word => 0u8,
+                    TokenKind::Whitespace => 1,
+                    TokenKind::Operator => 2,
+                    TokenKind::Punctuation => 3,
+                    TokenKind::String => 4,
+                    TokenKind::Number => 5,
+                    TokenKind::Comment => 6,
+                    TokenKind::Newline => 7,
+                    TokenKind::Other => 8,
+                };
+                bytes.extend_from_slice(token.id.0.as_bytes());
+                bytes.push(kind);
+            }
+        }
+        Ok(SpanSemanticSnapshot {
+            file: self.file.clone(),
+            id: SpanProjectionId(Hash::of(&bytes)),
+            lines,
+        })
+    }
+
+    /// Derive a lossless line/token view without creating CRDT rows or
+    /// assigning unchanged bytes to the current editor. Binary or invalid UTF-8
+    /// data is rejected; callers must handle it as opaque content.
+    pub fn semantic_lines(&self) -> Result<Vec<SpanSemanticLine>> {
+        use crate::diff::token::Tokenizer;
+        std::str::from_utf8(&self.content).context("span semantic content is not UTF-8")?;
+        ensure!(
+            !self.content.contains(&0),
+            "span semantic content is binary"
+        );
+        // Validate the complete map once, then walk it monotonically as
+        // tokens are emitted. Rescanning all spans per token is quadratic on
+        // files with many independently authored fragments.
+        let mut covered = 0usize;
+        for span in &self.spans {
+            ensure!(
+                span.output.start == covered
+                    && span.output.end > covered
+                    && span.output.end <= self.content.len(),
+                "authored spans do not uniquely cover semantic content"
+            );
+            let length = u64::try_from(span.output.end - span.output.start)?;
+            let target_len = span
+                .target
+                .end
+                .checked_sub(span.target.start)
+                .context("invalid authored span range")?;
+            ensure!(
+                span.target_start
+                    .checked_add(length)
+                    .is_some_and(|end| end <= target_len),
+                "visible bytes exceed the authored span"
+            );
+            covered = span.output.end;
+        }
+        ensure!(
+            covered == self.content.len(),
+            "authored spans do not cover semantic content"
+        );
+        let mut result = Vec::new();
+        let mut line_start = 0usize;
+        let mut span_index = 0usize;
+        for line in crate::diff::Line::from_bytes(&self.content) {
+            let bytes = line.content();
+            let line_end = line_start
+                .checked_add(bytes.len())
+                .context("semantic line offset overflow")?;
+            ensure!(
+                self.content.get(line_start..line_end) == Some(bytes),
+                "semantic lines do not cover the span content"
+            );
+            let mut token_end = 0usize;
+            let mut tokens = Vec::new();
+            let mut line_authors = Vec::new();
+            for token in Tokenizer::new(bytes) {
+                ensure!(
+                    token.offset() == token_end,
+                    "semantic tokens do not uniquely cover the line"
+                );
+                token_end = token_end
+                    .checked_add(token.content().len())
+                    .context("semantic token offset overflow")?;
+                ensure!(
+                    bytes.get(token.offset()..token_end) == Some(token.content()),
+                    "semantic token bytes differ from the line"
+                );
+                let start = line_start
+                    .checked_add(token.offset())
+                    .context("semantic token offset overflow")?;
+                let end = line_start
+                    .checked_add(token_end)
+                    .context("semantic token offset overflow")?;
+                let mut authors = Vec::new();
+                let mut cursor = start;
+                while cursor < end {
+                    let span = self
+                        .spans
+                        .get(span_index)
+                        .context("authored semantic span missing")?;
+                    ensure!(
+                        span.output.start <= cursor && cursor < span.output.end,
+                        "authored semantic span order changed"
+                    );
+                    let hi = end.min(span.output.end);
+                    let target_start = span
+                        .target_start
+                        .checked_add(u64::try_from(cursor - span.output.start)?)
+                        .context("authored span offset overflow")?;
+                    authors.push(VisibleSpan {
+                        output: cursor..hi,
+                        target: span.target.clone(),
+                        target_start,
+                    });
+                    cursor = hi;
+                    if cursor == span.output.end {
+                        span_index += 1;
+                    }
+                }
+                line_authors.extend(authors.iter().cloned());
+                tokens.push(SpanSemanticToken {
+                    id: projection_id(&self.file, b"token", &authors)?,
+                    kind: token.kind(),
+                    output: start..end,
+                    authors,
+                });
+            }
+            ensure!(
+                token_end == bytes.len(),
+                "semantic tokens do not cover the line"
+            );
+            result.push(SpanSemanticLine {
+                id: projection_id(&self.file, b"line", &line_authors)?,
+                output: line_start..line_end,
+                tokens,
+            });
+            line_start = line_end;
+        }
+        ensure!(
+            line_start == self.content.len(),
+            "semantic lines do not cover the span content"
+        );
+        Ok(result)
+    }
+
+    /// Resolve an insertion boundary to a verified authored span and offset.
+    /// Boundaries between spans use the preceding byte; empty files use their
+    /// original root. The offset is relative to the returned span.
+    pub fn authored_anchor(&self, position: usize) -> Result<(ExternalSpan, u64)> {
+        ensure!(
+            position <= self.content.len(),
+            "rendered span anchor is out of bounds"
+        );
+        if self.content.is_empty() {
+            ensure!(
+                self.root.start <= self.root.end,
+                "invalid authored root range"
+            );
+            return Ok((self.root.clone(), 0));
+        }
+        let (range, after) = if position == 0 {
+            (0..1, false)
+        } else {
+            (position - 1..position, true)
+        };
+        let segment = self
+            .authored_ranges(range)?
+            .into_iter()
+            .next()
+            .context("authored anchor missing")?;
+        let offset = segment.target_start + u64::from(after);
+        Ok((segment.target, offset))
+    }
+
+    /// Return the exact authored ranges covering a rendered byte interval.
+    /// A line or token can cross multiple spans; each result keeps its actual
+    /// change owner rather than assigning the entire interval to one author.
+    pub fn authored_ranges(&self, output: std::ops::Range<usize>) -> Result<Vec<VisibleSpan>> {
+        ensure!(
+            output.start <= output.end && output.end <= self.content.len(),
+            "rendered span interval is out of bounds"
+        );
+        if output.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut cursor = output.start;
+        let mut ranges = Vec::new();
+        for segment in &self.spans {
+            ensure!(
+                segment.output.start <= segment.output.end
+                    && segment.output.end <= self.content.len(),
+                "invalid visible span output range"
+            );
+            let lo = output.start.max(segment.output.start);
+            let hi = output.end.min(segment.output.end);
+            if lo >= hi {
+                continue;
+            }
+            ensure!(
+                lo == cursor,
+                "authored spans do not uniquely cover the requested interval"
+            );
+            let offset = segment
+                .target_start
+                .checked_add((lo - segment.output.start) as u64)
+                .context("authored span offset overflow")?;
+            let end = offset
+                .checked_add((hi - lo) as u64)
+                .context("authored span length overflow")?;
+            let target_len = segment
+                .target
+                .end
+                .checked_sub(segment.target.start)
+                .context("invalid authored span range")?;
+            ensure!(end <= target_len, "visible bytes exceed the authored span");
+            ranges.push(VisibleSpan {
+                output: lo..hi,
+                target: segment.target.clone(),
+                target_start: offset,
+            });
+            cursor = hi;
+        }
+        ensure!(
+            cursor == output.end,
+            "authored spans do not cover the requested interval"
+        );
+        Ok(ranges)
+    }
 }
 
 impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
@@ -627,7 +1068,8 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
             return Ok(None);
         }
         let mut spans = Vec::new();
-        let content = self.render_internal(inode, Some(&mut spans))?;
+        let (content, oversized) = self.render_internal(inode, Some(&mut spans), usize::MAX)?;
+        ensure!(!oversized, "span render exceeds addressable memory");
         let owner = self
             .txn
             .get_external(NodeId::new(root[0]))?
@@ -690,14 +1132,30 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
 
     /// Render the visible span tree for an inode.
     pub fn render(&self, inode: Inode) -> Result<Vec<u8>> {
-        self.render_internal(inode, None)
+        let (content, oversized) = self.render_internal(inode, None, usize::MAX)?;
+        ensure!(!oversized, "span render exceeds addressable memory");
+        Ok(content)
+    }
+
+    /// Render at most `max_bytes`, validating the complete span tree even when
+    /// the visible file is too large to retain.
+    pub fn render_bounded(&self, inode: Inode, max_bytes: usize) -> Result<BoundedSpanContent> {
+        let (content, oversized) = self.render_internal(inode, None, max_bytes)?;
+        if oversized {
+            Ok(BoundedSpanContent::Oversized {
+                retained_bytes: content.len(),
+            })
+        } else {
+            Ok(BoundedSpanContent::Complete(content))
+        }
     }
 
     fn render_internal(
         &self,
         inode: Inode,
         segments: Option<&mut Vec<VisibleSpan>>,
-    ) -> Result<Vec<u8>> {
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, bool)> {
         let root = self.txn.span_root(inode)?.context("span root missing")?;
         let root_id = NodeId::new(root[0]);
         ensure!(self.visible.contains(root_id), "span root outside view");
@@ -747,9 +1205,14 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
             observed == self.expected.get(&inode.get()).cloned().unwrap_or_default(),
             "visible span index differs from hashed changes"
         );
-        let mut out = Vec::new();
-        self.render_spans(inode, root, &mut out, segments)?;
-        Ok(out)
+        let mut out = RenderOutput {
+            bytes: Vec::new(),
+            limit: max_bytes,
+            oversized: false,
+            segments,
+        };
+        self.render_spans(inode, root, &mut out)?;
+        Ok((out.bytes, out.oversized))
     }
 
     fn depends_on(&self, author: u64, predecessor: u64) -> Result<bool> {
@@ -839,25 +1302,13 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
         })
     }
 
-    fn render_spans(
-        &self,
-        inode: Inode,
-        root: [u64; 3],
-        out: &mut Vec<u8>,
-        mut segments: Option<&mut Vec<VisibleSpan>>,
-    ) -> Result<()> {
+    fn render_spans(&self, inode: Inode, root: [u64; 3], out: &mut RenderOutput<'_>) -> Result<()> {
         let mut active = BTreeSet::new();
         active.insert(root);
         let mut stack = vec![self.frame(inode, root)?];
         while let Some(frame) = stack.last_mut() {
             if frame.next == frame.edits.len() {
-                append_visible(
-                    frame,
-                    frame.cursor,
-                    frame.end - frame.start,
-                    out,
-                    segments.as_deref_mut(),
-                );
+                append_visible(frame, frame.cursor, frame.end - frame.start, out);
                 active.remove(&frame.span);
                 stack.pop();
                 continue;
@@ -900,7 +1351,7 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
                 }
             }
             if !interior_gap {
-                append_visible(frame, frame.cursor, lo, out, segments.as_deref_mut());
+                append_visible(frame, frame.cursor, lo, out);
                 frame.cursor = hi;
             }
             if lo < hi {
@@ -930,21 +1381,27 @@ struct RenderFrame {
     covered: Option<(usize, usize, u64)>,
 }
 
-fn append_visible(
-    frame: &RenderFrame,
-    start: usize,
-    end: usize,
-    out: &mut Vec<u8>,
-    segments: Option<&mut Vec<VisibleSpan>>,
-) {
-    if start == end {
+struct RenderOutput<'a> {
+    bytes: Vec<u8>,
+    limit: usize,
+    oversized: bool,
+    segments: Option<&'a mut Vec<VisibleSpan>>,
+}
+
+fn append_visible(frame: &RenderFrame, start: usize, end: usize, out: &mut RenderOutput<'_>) {
+    if start == end || out.oversized {
         return;
     }
-    let output_start = out.len();
-    out.extend_from_slice(&frame.change.contents[frame.start + start..frame.start + end]);
-    if let Some(segments) = segments {
+    let content = &frame.change.contents[frame.start + start..frame.start + end];
+    if content.len() > out.limit.saturating_sub(out.bytes.len()) {
+        out.oversized = true;
+        return;
+    }
+    let output_start = out.bytes.len();
+    out.bytes.extend_from_slice(content);
+    if let Some(segments) = out.segments.as_deref_mut() {
         segments.push(VisibleSpan {
-            output: output_start..out.len(),
+            output: output_start..out.bytes.len(),
             target: ExternalSpan {
                 owner: frame.hash,
                 start: frame.span[1],
@@ -961,6 +1418,375 @@ mod tests {
     use crate::change::span_patch::ExternalSpan;
     use crate::change::{ChangeHeader, MemoryChangeStore};
     use crate::pristine::{MutTxnT, Pristine, ViewScope};
+
+    fn mapped_record_state() -> SpanRecordState {
+        let first = Hash::of(b"first");
+        let second = Hash::of(b"second");
+        let root = ExternalSpan {
+            owner: first,
+            start: 10,
+            end: 20,
+        };
+        SpanRecordState {
+            file: ExternalFile {
+                owner: first,
+                ordinal: 0,
+            },
+            root: root.clone(),
+            content: b"abcDEFghi".to_vec(),
+            spans: vec![
+                VisibleSpan {
+                    output: 0..3,
+                    target: root.clone(),
+                    target_start: 2,
+                },
+                VisibleSpan {
+                    output: 3..6,
+                    target: ExternalSpan {
+                        owner: second,
+                        start: 30,
+                        end: 33,
+                    },
+                    target_start: 0,
+                },
+                VisibleSpan {
+                    output: 6..9,
+                    target: root,
+                    target_start: 5,
+                },
+            ],
+            dependencies: vec![first, second],
+        }
+    }
+
+    #[test]
+    fn authored_ranges_preserve_owners_across_split_lines_and_tokens() -> Result<()> {
+        let state = mapped_record_state();
+        let ranges = state.authored_ranges(1..8)?;
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| range.output.clone())
+                .collect::<Vec<_>>(),
+            vec![1..3, 3..6, 6..8]
+        );
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| range.target_start)
+                .collect::<Vec<_>>(),
+            vec![3, 0, 5]
+        );
+        assert_eq!(ranges[0].target.owner, ranges[2].target.owner);
+        assert_ne!(ranges[0].target.owner, ranges[1].target.owner);
+        assert!(state.authored_ranges(3..3)?.is_empty());
+        assert_eq!(state.authored_ranges(3..6)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_projection_keeps_cross_change_token_authorship() -> Result<()> {
+        let state = mapped_record_state();
+        let lines = state.semantic_lines()?;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].output, 0..9);
+        assert_eq!(lines[0].tokens.len(), 1);
+        let token = &lines[0].tokens[0];
+        assert_eq!(token.kind, crate::diff::token::TokenKind::Word);
+        assert_eq!(token.output, 0..9);
+        assert_eq!(token.authors.len(), 3);
+        assert_eq!(token.authors[0].target.owner, token.authors[2].target.owner);
+        assert_ne!(token.authors[0].target.owner, token.authors[1].target.owner);
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_projection_ids_are_portable_across_offsets_and_fragment_splits() -> Result<()> {
+        let state = mapped_record_state();
+        let original = state.semantic_lines()?;
+        assert_ne!(original[0].id, original[0].tokens[0].id);
+        let encoded = postcard::to_allocvec(&original[0].id)?;
+        assert_eq!(
+            postcard::from_bytes::<SpanProjectionId>(&encoded)?,
+            original[0].id
+        );
+        let mut shifted = mapped_record_state();
+        shifted.content.splice(0..0, b"prefix\n".iter().copied());
+        for span in &mut shifted.spans {
+            span.output.start += 7;
+            span.output.end += 7;
+        }
+        let prefix_owner = Hash::of(b"prefix author");
+        shifted.spans.insert(
+            0,
+            VisibleSpan {
+                output: 0..7,
+                target: ExternalSpan {
+                    owner: prefix_owner,
+                    start: 0,
+                    end: 7,
+                },
+                target_start: 0,
+            },
+        );
+        let first = shifted.spans[1].clone();
+        shifted.spans[1].output.end = first.output.start + 1;
+        shifted.spans.insert(
+            2,
+            VisibleSpan {
+                output: first.output.start + 1..first.output.end,
+                target: first.target,
+                target_start: first.target_start + 1,
+            },
+        );
+        let later = shifted.semantic_lines()?;
+        assert_eq!(later.len(), 2);
+        assert_eq!(later[1].id, original[0].id);
+        assert_eq!(later[1].tokens[0].id, original[0].tokens[0].id);
+        shifted.file.ordinal += 1;
+        assert_ne!(shifted.semantic_lines()?[1].id, original[0].id);
+        Ok(())
+    }
+
+    #[test]
+    fn projected_semantic_v1_identity_reference_vector() -> Result<()> {
+        use crate::types::Base32;
+        let owner = Hash::of(b"projection reference owner");
+        let content = b"let x = 1;\n".to_vec();
+        let root = ExternalSpan {
+            owner,
+            start: 0,
+            end: content.len() as u64,
+        };
+        let state = SpanRecordState {
+            file: ExternalFile { owner, ordinal: 7 },
+            root: root.clone(),
+            spans: vec![VisibleSpan {
+                output: 0..content.len(),
+                target: root,
+                target_start: 0,
+            }],
+            content,
+            dependencies: vec![owner],
+        };
+        let snapshot = state.semantic_snapshot()?;
+        assert_eq!(
+            snapshot.id.0.to_base32(),
+            "TTHO66BQVUGLYVDJ7G7OXKX3KOWQQ5Z6UCEXT2Y65HXX245MXUKA"
+        );
+        assert_eq!(
+            snapshot.lines[0].id.0.to_base32(),
+            "GBBDUIMWT3HERMRPYH3GQ6XKIF3AFSGW5WKENDWEMD3N4WQ2R3ZQ"
+        );
+        let tokens: Vec<_> = snapshot.lines[0]
+            .tokens
+            .iter()
+            .map(|token| token.id.0.to_base32())
+            .collect();
+        assert_eq!(
+            tokens.first().unwrap(),
+            "XCWKLIVL4AZVFLMUICUOOPNGNS2POKIYY6KEOZN2EMB22ZTDBM3A"
+        );
+        assert_eq!(
+            tokens.last().unwrap(),
+            "OSUGQK2YZIJ527KIDII25BX7BU43YESF5ETZRI346QEHOZGZMFAQ"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_semantic_snapshots_keep_portable_file_identity() -> Result<()> {
+        let mut state = mapped_record_state();
+        state.content.clear();
+        state.spans.clear();
+        let snapshot = state.semantic_snapshot()?;
+        assert!(snapshot.lines.is_empty());
+        assert_eq!(snapshot.file, state.file);
+        assert_eq!(state.semantic_snapshot()?.id, snapshot.id);
+        state.file.ordinal += 1;
+        assert_ne!(state.semantic_snapshot()?.id, snapshot.id);
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_snapshot_refuses_duplicate_projected_line_identity() {
+        let mut state = mapped_record_state();
+        state.content = b"a\na\n".to_vec();
+        let target = state.root.clone();
+        state.spans = vec![
+            VisibleSpan {
+                output: 0..2,
+                target: target.clone(),
+                target_start: 0,
+            },
+            VisibleSpan {
+                output: 2..4,
+                target,
+                target_start: 0,
+            },
+        ];
+        let error = state.semantic_snapshot().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate projected line identity"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn semantic_projection_walks_many_fragments_without_changing_identities() -> Result<()> {
+        let owner = Hash::of(b"large fragmented source");
+        let content = b"alpha beta\n".repeat(1000);
+        let root = ExternalSpan {
+            owner,
+            start: 0,
+            end: content.len() as u64,
+        };
+        let state = SpanRecordState {
+            file: ExternalFile { owner, ordinal: 0 },
+            root: root.clone(),
+            spans: (0..content.len())
+                .map(|index| VisibleSpan {
+                    output: index..index + 1,
+                    target: root.clone(),
+                    target_start: index as u64,
+                })
+                .collect(),
+            content,
+            dependencies: vec![owner],
+        };
+        let snapshot = state.semantic_snapshot()?;
+        assert_eq!(snapshot.lines.len(), 1000);
+        assert_eq!(snapshot.lines[0].tokens.len(), 4);
+        for line in [&snapshot.lines[0], &snapshot.lines[999]] {
+            assert_eq!(
+                line.id,
+                projection_id(
+                    &state.file,
+                    b"line",
+                    &state.authored_ranges(line.output.clone())?
+                )?
+            );
+            for token in &line.tokens {
+                assert_eq!(
+                    token.id,
+                    projection_id(
+                        &state.file,
+                        b"token",
+                        &state.authored_ranges(token.output.clone())?
+                    )?
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_projection_preserves_split_crlf_and_refuses_binary_or_gaps() -> Result<()> {
+        let first = Hash::of(b"first newline author");
+        let second = Hash::of(b"second newline author");
+        let mut state = SpanRecordState {
+            file: ExternalFile {
+                owner: first,
+                ordinal: 0,
+            },
+            root: ExternalSpan {
+                owner: first,
+                start: 0,
+                end: 2,
+            },
+            content: b"a\r\nb\n".to_vec(),
+            spans: vec![
+                VisibleSpan {
+                    output: 0..2,
+                    target: ExternalSpan {
+                        owner: first,
+                        start: 0,
+                        end: 2,
+                    },
+                    target_start: 0,
+                },
+                VisibleSpan {
+                    output: 2..5,
+                    target: ExternalSpan {
+                        owner: second,
+                        start: 4,
+                        end: 7,
+                    },
+                    target_start: 0,
+                },
+            ],
+            dependencies: vec![first, second],
+        };
+        let lines = state.semantic_lines()?;
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.output.clone())
+                .collect::<Vec<_>>(),
+            vec![0..3, 3..5]
+        );
+        let newline = lines[0].tokens.last().unwrap();
+        assert_eq!(newline.kind, crate::diff::token::TokenKind::Newline);
+        assert_eq!(newline.output, 1..3);
+        assert_eq!(newline.authors.len(), 2);
+        assert_eq!(newline.authors[0].target.owner, first);
+        assert_eq!(newline.authors[1].target.owner, second);
+        state.spans[1].output.start = 3;
+        assert!(state.semantic_lines().is_err());
+        state.content = b"a\0".to_vec();
+        assert!(state.semantic_lines().is_err());
+        state.content = vec![0xff];
+        assert!(state.semantic_lines().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn authored_ranges_reject_gaps_overlaps_and_invalid_offsets() {
+        let mut state = mapped_record_state();
+        assert!(state.authored_ranges(4..10).is_err());
+        assert!(state
+            .authored_ranges(std::ops::Range { start: 3, end: 2 })
+            .is_err());
+        state.spans[1].output.start = 4;
+        assert!(state.authored_ranges(0..9).is_err());
+        state.spans[1].output.start = 2;
+        assert!(state.authored_ranges(0..9).is_err());
+        state.spans[1].output = 3..6;
+        state.spans[1].target_start = u64::MAX;
+        assert!(state.authored_ranges(3..6).is_err());
+        state.spans[1].target_start = 1;
+        assert!(state.authored_ranges(3..6).is_err());
+        state.spans[1].target.start = 34;
+        assert!(state.authored_ranges(3..6).is_err());
+    }
+
+    #[test]
+    fn authored_anchor_preserves_preceding_owner_and_empty_root() -> Result<()> {
+        let mut state = mapped_record_state();
+        let (first, offset) = state.authored_anchor(0)?;
+        assert_eq!(first, state.spans[0].target);
+        assert_eq!(offset, 2);
+        let (at_boundary, offset) = state.authored_anchor(3)?;
+        assert_eq!(at_boundary, state.spans[0].target);
+        assert_eq!(offset, 5);
+        let (second, offset) = state.authored_anchor(4)?;
+        assert_eq!(second, state.spans[1].target);
+        assert_eq!(offset, 1);
+        assert!(state.authored_anchor(10).is_err());
+        state.spans[1].target_start = u64::MAX;
+        assert!(state.authored_anchor(4).is_err());
+        state.content.clear();
+        state.spans.clear();
+        let (root, offset) = state.authored_anchor(0)?;
+        assert_eq!(root, state.root);
+        assert_eq!(offset, 0);
+        state.root.start = state.root.end + 1;
+        assert!(state.authored_anchor(0).is_err());
+        Ok(())
+    }
 
     fn add_change(
         repo: &Pristine,
@@ -998,6 +1824,39 @@ mod tests {
 
     #[test]
     fn independent_span_edits_render_in_both_insert_orders() -> Result<()> {
+        fn projection_ids(
+            repo: &Pristine,
+            store: &MemoryChangeStore,
+            view_name: &str,
+            inode: Inode,
+        ) -> Result<(
+            SpanProjectionId,
+            Vec<(SpanProjectionId, Vec<SpanProjectionId>)>,
+        )> {
+            let txn = repo.read_txn()?;
+            let view = txn.get_view(view_name)?.context("view missing")?;
+            let visible = EffectiveProjectionClosure::try_from_membership(
+                &txn,
+                &txn.view_membership_set(&view)?,
+            )?;
+            let state = SpanRenderContext::new(&txn, store, &visible)?
+                .record_state(inode)?
+                .context("span state missing")?;
+            let snapshot = state.semantic_snapshot()?;
+            Ok((
+                snapshot.id,
+                snapshot
+                    .lines
+                    .into_iter()
+                    .map(|line| {
+                        (
+                            line.id,
+                            line.tokens.into_iter().map(|token| token.id).collect(),
+                        )
+                    })
+                    .collect(),
+            ))
+        }
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("pristine.redb");
         let repo = Pristine::open(&path)?;
@@ -1056,6 +1915,10 @@ mod tests {
         let right = edit("right", b"GAMMA", 11, 16);
         let left_hash = add_change(&repo, &store, "left", left.clone(), BTreeMap::new())?;
         let right_hash = add_change(&repo, &store, "right", right.clone(), BTreeMap::new())?;
+        assert_ne!(
+            projection_ids(&repo, &store, "left", inode)?.0,
+            projection_ids(&repo, &store, "right", inode)?.0
+        );
         assert_eq!(
             render(&repo, &store, "left", inode)?,
             b"ALPHA\nbeta\ngamma\nomega"
@@ -1064,6 +1927,55 @@ mod tests {
             render(&repo, &store, "right", inode)?,
             b"alpha\nbeta\nGAMMA\nomega"
         );
+        for (view_name, expected_owners) in [
+            (
+                "left",
+                vec![
+                    vec![left_hash, root_hash],
+                    vec![root_hash],
+                    vec![root_hash],
+                    vec![root_hash],
+                ],
+            ),
+            (
+                "right",
+                vec![
+                    vec![root_hash],
+                    vec![root_hash],
+                    vec![right_hash, root_hash],
+                    vec![root_hash],
+                ],
+            ),
+        ] {
+            let txn = repo.read_txn()?;
+            let view = txn.get_view(view_name)?.context("view missing")?;
+            let visible = EffectiveProjectionClosure::try_from_membership(
+                &txn,
+                &txn.view_membership_set(&view)?,
+            )?;
+            let state = SpanRenderContext::new(&txn, &store, &visible)?
+                .record_state(inode)?
+                .context("span state missing")?;
+            let actual: Vec<Vec<Hash>> = state
+                .semantic_lines()?
+                .iter()
+                .map(|line| {
+                    let mut owners = Vec::new();
+                    for token in &line.tokens {
+                        for fragment in &token.authors {
+                            if !owners.contains(&fragment.target.owner) {
+                                owners.push(fragment.target.owner);
+                            }
+                        }
+                    }
+                    owners
+                })
+                .collect();
+            assert_eq!(
+                actual, expected_owners,
+                "{view_name} must exclude its sibling's edits"
+            );
+        }
         let expected = b"ALPHA\nbeta\nGAMMA\nomega";
         for (view, order) in [("both", [&left, &right]), ("reverse", [&right, &left])] {
             for change in order {
@@ -1081,6 +1993,47 @@ mod tests {
                     .render(inode)?,
                 expected
             );
+            let context = SpanRenderContext::new(&txn, &store, &visible)?;
+            let projected = context.record_state(inode)?.context("span state missing")?;
+            let lines = projected.semantic_lines()?;
+            assert_eq!(lines.len(), 4);
+            for (line, expected_owners) in lines.iter().zip([
+                vec![left_hash, root_hash],
+                vec![root_hash],
+                vec![right_hash, root_hash],
+                vec![root_hash],
+            ]) {
+                let mut owners = Vec::new();
+                let mut rendered = Vec::new();
+                for token in &line.tokens {
+                    for fragment in &token.authors {
+                        let owner = fragment.target.owner;
+                        if !owners.contains(&owner) {
+                            owners.push(owner);
+                        }
+                        let change = store.get_change(&owner)?;
+                        let start = usize::try_from(fragment.target.start + fragment.target_start)?;
+                        let end = start + fragment.output.len();
+                        rendered.extend_from_slice(&change.contents[start..end]);
+                    }
+                }
+                assert_eq!(owners, expected_owners);
+                assert_eq!(rendered, projected.content[line.output.clone()]);
+            }
+            assert_eq!(
+                context.render_bounded(inode, expected.len())?,
+                BoundedSpanContent::Complete(expected.to_vec())
+            );
+            match context.render_bounded(inode, expected.len() - 1)? {
+                BoundedSpanContent::Oversized { retained_bytes } => {
+                    assert!(retained_bytes < expected.len());
+                }
+                other => panic!("expected bounded oversized result, got {other:?}"),
+            }
+            assert_eq!(
+                context.render_bounded(inode, 0)?,
+                BoundedSpanContent::Oversized { retained_bytes: 0 }
+            );
         }
         let txn = repo.read_txn()?;
         assert_eq!(
@@ -1090,9 +2043,238 @@ mod tests {
         );
         assert_ne!(left_hash, right_hash);
         drop(txn);
+        let expected_ids = projection_ids(&repo, &store, "both", inode)?;
+        assert_eq!(
+            projection_ids(&repo, &store, "reverse", inode)?,
+            expected_ids
+        );
+        // The receiver allocates its own inode and local change IDs. Only
+        // immutable change content and portable file identity are transferred.
+        let receiver_path = dir.path().join("receiver.redb");
+        let receiver = Pristine::open(&receiver_path)?;
+        let receiver_inode = Inode::new(987);
+        {
+            let mut txn = receiver.write_txn()?;
+            txn.open_or_create_view("dev")?;
+            txn.register_change(&Hash::of(b"unrelated receiver allocation"))?;
+            txn.commit()?;
+        }
+        add_change(
+            &receiver,
+            &store,
+            "dev",
+            store.get_change(&root_hash)?,
+            BTreeMap::from([(0, receiver_inode)]),
+        )?;
+        add_change(&receiver, &store, "dev", left.clone(), BTreeMap::new())?;
+        add_change(&receiver, &store, "dev", right.clone(), BTreeMap::new())?;
+        assert_ne!(
+            repo.read_txn()?.get_internal(&root_hash)?,
+            receiver.read_txn()?.get_internal(&root_hash)?
+        );
+        assert_eq!(
+            projection_ids(&receiver, &store, "dev", receiver_inode)?,
+            expected_ids
+        );
+        drop(receiver);
+        let receiver = Pristine::open(receiver_path)?;
+        assert_eq!(
+            projection_ids(&receiver, &store, "dev", receiver_inode)?,
+            expected_ids
+        );
         drop(repo);
         let reopened = Pristine::open(path)?;
         assert_eq!(render(&reopened, &store, "both", inode)?, expected);
+        assert_eq!(
+            projection_ids(&reopened, &store, "both", inode)?,
+            expected_ids
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_projection_refuses_missing_visible_edit_index_after_reopen() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("pristine.redb");
+        let repo = Pristine::open(&path)?;
+        let store = MemoryChangeStore::new();
+        let inode = Inode::new(42);
+        {
+            let mut txn = repo.write_txn()?;
+            txn.open_or_create_view("dev")?;
+            txn.commit()?;
+        }
+        let mut root = Change::new(
+            ChangeHeader::new("root"),
+            vec![],
+            b"hello\n".to_vec(),
+            vec![],
+        );
+        root.hashed.span = Some(SpanPatch::new(
+            vec![],
+            vec![SpanOp::Root {
+                path: "file.txt".into(),
+                ordinal: 0,
+                start: 0,
+                end: 6,
+            }],
+        ));
+        let root_hash = add_change(&repo, &store, "dev", root, BTreeMap::from([(0, inode)]))?;
+        let mut edit = Change::new(
+            ChangeHeader::new("edit"),
+            vec![],
+            b"a".to_vec(),
+            vec![root_hash],
+        );
+        edit.hashed.span = Some(SpanPatch::new(
+            vec![],
+            vec![SpanOp::Edit {
+                file: ExternalFile {
+                    owner: root_hash,
+                    ordinal: 0,
+                },
+                target: ExternalSpan {
+                    owner: root_hash,
+                    start: 0,
+                    end: 6,
+                },
+                start: 1,
+                end: 2,
+                insert_start: 0,
+                insert_end: 1,
+            }],
+        ));
+        add_change(&repo, &store, "dev", edit, BTreeMap::new())?;
+        assert_eq!(render(&repo, &store, "dev", inode)?, b"hallo\n");
+        {
+            let txn = repo.write_txn()?;
+            let owner = txn.get_internal(&root_hash)?.context("root id missing")?;
+            let key = span_key(inode, owner, 0, 6);
+            let mut edits = txn.txn.open_multimap_table(EDITS)?;
+            assert_eq!(edits.remove_all(&key)?.count(), 1);
+            drop(edits);
+            txn.commit()?;
+        }
+        drop(repo);
+        let reopened = Pristine::open(path)?;
+        let txn = reopened.read_txn()?;
+        let view = txn.get_view("dev")?.context("view missing")?;
+        let visible = EffectiveProjectionClosure::try_from_membership(
+            &txn,
+            &txn.view_membership_set(&view)?,
+        )?;
+        let context = SpanRenderContext::new(&txn, &store, &visible)?;
+        let error = match context.record_state(inode) {
+            Err(error) => error,
+            Ok(_) => panic!("corrupt span index was accepted"),
+        };
+        assert!(
+            error.to_string().contains("visible span index differs"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn projected_semantic_edit_validates_capability_and_exact_dependency_snapshot() -> Result<()> {
+        use crate::pristine::{CapabilityMutTxnT, SPAN_PROJECTED_SEMANTICS_CAPABILITY};
+        let dir = tempfile::tempdir()?;
+        let repo = Pristine::open(dir.path().join("pristine.redb"))?;
+        let store = MemoryChangeStore::new();
+        let inode = Inode::new(42);
+        {
+            let mut txn = repo.write_txn()?;
+            txn.open_or_create_view("dev")?;
+            txn.commit()?;
+        }
+        let mut root = Change::new(
+            ChangeHeader::new("root"),
+            vec![],
+            b"hello\n".to_vec(),
+            vec![],
+        );
+        root.hashed.span = Some(SpanPatch::new(
+            vec![],
+            vec![SpanOp::Root {
+                path: "file.txt".into(),
+                ordinal: 0,
+                start: 0,
+                end: 6,
+            }],
+        ));
+        let root_hash = add_change(&repo, &store, "dev", root, BTreeMap::from([(0, inode)]))?;
+        let file = ExternalFile {
+            owner: root_hash,
+            ordinal: 0,
+        };
+        let baseline = {
+            let txn = repo.read_txn()?;
+            let view = txn.get_view("dev")?.unwrap();
+            let visible = EffectiveProjectionClosure::try_from_membership(
+                &txn,
+                &txn.view_membership_set(&view)?,
+            )?;
+            SpanRenderContext::new(&txn, &store, &visible)?
+                .record_state(inode)?
+                .unwrap()
+                .semantic_snapshot()?
+                .id
+        };
+        let make_edit = |baseline| {
+            let mut change = Change::new(
+                ChangeHeader::new("edit"),
+                vec![],
+                b"a".to_vec(),
+                vec![root_hash],
+            );
+            change.hashed.span = Some(SpanPatch::new(
+                vec![],
+                vec![SpanOp::Edit {
+                    file: file.clone(),
+                    target: ExternalSpan {
+                        owner: root_hash,
+                        start: 0,
+                        end: 6,
+                    },
+                    start: 1,
+                    end: 2,
+                    insert_start: 0,
+                    insert_end: 1,
+                }],
+            ));
+            change
+                .hashed
+                .file_ops
+                .push(crate::change::FileOps::projected_span_edit(
+                    "file.txt".into(),
+                    file.clone(),
+                    baseline,
+                ));
+            change
+        };
+        let valid = make_edit(baseline);
+        let error = add_change(&repo, &store, "dev", valid.clone(), BTreeMap::new()).unwrap_err();
+        assert!(error.to_string().contains("capability"), "{error:#}");
+        assert_eq!(render(&repo, &store, "dev", inode)?, b"hello\n");
+        {
+            let mut txn = repo.write_txn()?;
+            txn.put_required_capability(SPAN_PROJECTED_SEMANTICS_CAPABILITY)?;
+            txn.commit()?;
+        }
+        let wrong = make_edit(SpanProjectionId(Hash::of(b"wrong baseline")));
+        let error = add_change(&repo, &store, "dev", wrong, BTreeMap::new()).unwrap_err();
+        assert!(error.to_string().contains("baseline differs"), "{error:#}");
+        assert_eq!(render(&repo, &store, "dev", inode)?, b"hello\n");
+        {
+            let mut txn = repo.write_txn()?;
+            let id = txn.register_change(&Hash::of(b"generic apply attempt"))?;
+            let error =
+                crate::apply::apply_file_ops_batched(&mut txn, id, valid.file_ops()).unwrap_err();
+            assert!(error.to_string().contains("span-aware"), "{error}");
+            txn.abort()?;
+        }
+        add_change(&repo, &store, "dev", valid, BTreeMap::new())?;
+        assert_eq!(render(&repo, &store, "dev", inode)?, b"hallo\n");
         Ok(())
     }
 
@@ -1162,6 +2344,17 @@ mod tests {
         assert_eq!(render(&repo, &store, "left", inode)?, b"left\n");
         assert_eq!(render(&repo, &store, "right", inode)?, b"right\n");
         assert!(render(&repo, &store, "both", inode)
+            .unwrap_err()
+            .to_string()
+            .contains("overlapping"));
+        let txn = repo.read_txn()?;
+        let state = txn.get_view("both")?.unwrap();
+        let visible = EffectiveProjectionClosure::try_from_membership(
+            &txn,
+            &txn.view_membership_set(&state)?,
+        )?;
+        assert!(SpanRenderContext::new(&txn, &store, &visible)?
+            .render_bounded(inode, 0)
             .unwrap_err()
             .to_string()
             .contains("overlapping"));

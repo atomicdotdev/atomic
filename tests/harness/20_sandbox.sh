@@ -36,8 +36,8 @@ init_repo
 
 create_file "src/main.rs" "fn main() {}"
 create_file "Cargo.toml" "[package]"
-assert_success "add tracked files" atomic add src/main.rs Cargo.toml
-record_change "init" >/dev/null 2>&1 || true
+require_success "add tracked files" atomic add src/main.rs Cargo.toml
+require_success "record initial files" record_change "init"
 
 # Untracked build artifact (simulates npm install output)
 mkdir -p node_modules/lodash
@@ -48,12 +48,19 @@ create_file "node_modules/lodash/index.js" "module.exports = {}"
 SBROOT="$(mktemp -d "${TMPDIR:-/tmp}/atomic-sandboxes-XXXXXX")"
 _HARNESS_TMPDIRS+=("$SBROOT")
 SB="$SBROOT/agent-1"
-assert_success "sandbox create" atomic sandbox create agent-1 --dest "$SB"
+require_success "sandbox create" atomic sandbox create agent-1 --dest "$SB"
 
 assert_file_exists "tracked file cloned into sandbox" "$SB/src/main.rs"
 assert_file_exists "Cargo.toml cloned into sandbox" "$SB/Cargo.toml"
 assert_file_exists "untracked artifact cloned into sandbox" "$SB/node_modules/lodash/index.js"
-assert_dir_not_exists "graph .atomic NOT cloned into sandbox" "$SB/.atomic"
+assert_file_exists "sandbox has its own working-copy identity" "$SB/.atomic/working_copy_id"
+assert_file_not_exists "graph database NOT cloned into sandbox" "$SB/.atomic/atomic.redb"
+assert_dir_not_exists "change store NOT cloned into sandbox" "$SB/.atomic/changes"
+if [[ "$(cat "$SB/.atomic/working_copy_id")" != "$(cat "$CANON/.atomic/working_copy_id")" ]]; then
+    _pass "sandbox and canonical working-copy identities differ"
+else
+    _fail "sandbox and canonical working-copy identities differ" "identities are equal"
+fi
 assert_file_exists "sandbox pointer written" "$SB/.atomic-sandbox"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -77,7 +84,7 @@ begin_section "Sandbox: record inside lands in the canonical graph"
 # Edit a file inside the sandbox and record from there.
 overwrite_file "$SB/src/main.rs" "fn main() { println!(\"from sandbox\"); }"
 
-RECORD_OUT="$(cd "$SB" && "$ATOMIC_BIN" record -m "edit from sandbox" 2>&1)" || true
+require_success "record sandbox edit" bash -c 'cd "$1" && "$2" record -m "edit from sandbox"' _ "$SB" "$ATOMIC_BIN"
 
 # The change must be visible in the canonical repo's log.
 assert_output_contains \
@@ -97,7 +104,7 @@ begin_section "Sandbox: two sandboxes have independent artifacts"
 # ═══════════════════════════════════════════════════════════════════════════
 
 SB2="$SBROOT/agent-2"
-assert_success "second sandbox create" atomic sandbox create agent-2 --dest "$SB2"
+require_success "second sandbox create" atomic sandbox create agent-2 --dest "$SB2"
 
 # Agent 1 installs a dep that agent 2 does not.
 mkdir -p "$SB/node_modules/only-in-1"
@@ -114,18 +121,18 @@ begin_section "Sandbox: --from creates a per-agent draft view"
 # ═══════════════════════════════════════════════════════════════════════════
 
 SB3="$SBROOT/agent-3"
-assert_success "sandbox create --from dev" \
+require_success "sandbox create --from dev" \
     bash -c "cd '$CANON' && '$ATOMIC_BIN' sandbox create agent-3 --dest '$SB3' --from dev"
 
 # The new draft view exists in the canonical repo.
 assert_output_contains \
     "draft view 'agent-3' created" \
     "agent-3" \
-    bash -c "cd '$CANON' && '$ATOMIC_BIN' view list"
+    bash -c "cd '$CANON' && '$ATOMIC_BIN' view list --all"
 
 # Recording in the sandbox lands in the agent-3 draft, not in dev.
 overwrite_file "$SB3/src/main.rs" "fn main() { println!(\"draft work\"); }"
-(cd "$SB3" && "$ATOMIC_BIN" record -m "work in draft" >/dev/null 2>&1) || true
+require_success "record draft sandbox edit" bash -c 'cd "$1" && "$2" record -m "work in draft"' _ "$SB3" "$ATOMIC_BIN"
 
 assert_output_contains \
     "draft change visible on agent-3 view" \
@@ -137,7 +144,7 @@ begin_section "Sandbox: seal produces a valid OCI image layout"
 # ═══════════════════════════════════════════════════════════════════════════
 
 SEAL_OUT="$SBROOT/seal-dev"
-assert_success "seal dev view" \
+require_success "seal dev view" \
     bash -c "cd '$CANON' && '$ATOMIC_BIN' sandbox seal dev -o '$SEAL_OUT' --entrypoint /app/run --env PORT=8080"
 
 assert_file_exists "oci-layout written" "$SEAL_OUT/oci-layout"
@@ -147,20 +154,30 @@ assert_output_contains "oci-layout has version" "imageLayoutVersion" cat "$SEAL_
 
 # Every blob filename must equal the sha256 of its contents (content-addressed).
 BLOB_OK=1
+BLOB_COUNT=0
 for blob in "$SEAL_OUT"/blobs/sha256/*; do
+    if [[ ! -f "$blob" ]]; then
+        BLOB_OK=0
+        break
+    fi
+    BLOB_COUNT=$((BLOB_COUNT + 1))
     name="$(basename "$blob")"
     actual="$(shasum -a 256 "$blob" | awk '{print $1}')"
     [ "$name" = "$actual" ] || BLOB_OK=0
 done
-if [ "$BLOB_OK" = "1" ]; then
-    _pass "every blob is content-addressed (filename == sha256)"
+if [ "$BLOB_OK" = "1" ] && [ "$BLOB_COUNT" -gt 0 ]; then
+    _pass "every blob is content-addressed (filename == sha256; $BLOB_COUNT blobs)"
 else
     _fail "every blob is content-addressed (filename == sha256)" "a blob filename did not match its sha256"
 fi
 
 # The manifest the index points to must reference exactly one layer (flattened).
-INDEX_MANIFEST="$(grep -o 'sha256:[0-9a-f]\{64\}' "$SEAL_OUT/index.json" | head -1 | cut -d: -f2)"
+require_capture "read sealed manifest digest" python3 -c \
+    'import json,re,sys; a=json.load(open(sys.argv[1]))["manifests"]; assert len(a)==1; d=a[0]["digest"]; assert re.fullmatch(r"sha256:[0-9a-f]{64}",d); print(d.split(":")[1])' "$SEAL_OUT/index.json"
+INDEX_MANIFEST="$COMMAND_OUTPUT"
 assert_file_exists "index references a manifest blob" "$SEAL_OUT/blobs/sha256/$INDEX_MANIFEST"
+assert_success "sealed manifest has exactly one layer" python3 -c \
+    'import json,sys; assert len(json.load(open(sys.argv[1]))["layers"]) == 1' "$SEAL_OUT/blobs/sha256/$INDEX_MANIFEST"
 assert_output_contains \
     "sealed image carries provenance annotation" \
     "org.atomic.view" \
@@ -168,10 +185,12 @@ assert_output_contains \
 
 # Seal of the SHARED dev view must contain dev's recorded GRAPH content (not
 # the working tree on disk). Extract the single layer and inspect it.
-SEAL_LAYER="$(python3 -c "import json,sys; m=json.load(open('$SEAL_OUT/blobs/sha256/$INDEX_MANIFEST')); print(m['layers'][0]['digest'].split(':')[1])")"
+require_capture "read sealed layer digest" python3 -c \
+    'import json,re,sys; a=json.load(open(sys.argv[1]))["layers"]; assert len(a)==1; d=a[0]["digest"]; assert re.fullmatch(r"sha256:[0-9a-f]{64}",d); print(d.split(":")[1])' "$SEAL_OUT/blobs/sha256/$INDEX_MANIFEST"
+SEAL_LAYER="$COMMAND_OUTPUT"
 SEAL_EXTRACT="$SBROOT/seal-dev-extract"
 mkdir -p "$SEAL_EXTRACT"
-tar -xzf "$SEAL_OUT/blobs/sha256/$SEAL_LAYER" -C "$SEAL_EXTRACT" 2>/dev/null || true
+require_success "extract sealed dev layer" tar -xzf "$SEAL_OUT/blobs/sha256/$SEAL_LAYER" -C "$SEAL_EXTRACT"
 
 assert_file_exists "sealed dev layer contains src/main.rs" "$SEAL_EXTRACT/src/main.rs"
 assert_file_exists "sealed dev layer contains Cargo.toml" "$SEAL_EXTRACT/Cargo.toml"
@@ -195,19 +214,22 @@ begin_section "Sandbox: stage produces a two-layer (base + delta) image"
 
 # agent-3 has the "work in draft" change on top of dev — stage it as base+delta.
 STAGE_OUT="$SBROOT/stage-agent-3"
-assert_success "stage agent-3 over dev" \
+require_success "stage agent-3 over dev" \
     bash -c "cd '$CANON' && '$ATOMIC_BIN' sandbox stage agent-3 --base dev -o '$STAGE_OUT'"
 
 assert_file_exists "staged oci-layout written" "$STAGE_OUT/oci-layout"
 
 # The staged manifest must reference TWO layers (base + delta).
-STAGE_MANIFEST="$(grep -o 'sha256:[0-9a-f]\{64\}' "$STAGE_OUT/index.json" | head -1 | cut -d: -f2)"
-LAYER_COUNT="$(grep -o 'tar+gzip' "$STAGE_OUT/blobs/sha256/$STAGE_MANIFEST" | wc -l | tr -d ' ')"
-if [ "$LAYER_COUNT" = "2" ]; then
-    _pass "staged image has two layers (base + delta)"
-else
-    _fail "staged image has two layers (base + delta)" "expected 2 tar+gzip layers, got $LAYER_COUNT"
-fi
+require_capture "read staged manifest digest" python3 -c \
+    'import json,re,sys; a=json.load(open(sys.argv[1]))["manifests"]; assert len(a)==1; d=a[0]["digest"]; assert re.fullmatch(r"sha256:[0-9a-f]{64}",d); print(d.split(":")[1])' "$STAGE_OUT/index.json"
+STAGE_MANIFEST="$COMMAND_OUTPUT"
+require_capture "staged image has two layers (base + delta)" python3 -c \
+    'import json,re,sys; a=json.load(open(sys.argv[1]))["layers"]; assert len(a)==2; assert all("tar+gzip" in x["mediaType"] for x in a); d=a[1]["digest"]; assert re.fullmatch(r"sha256:[0-9a-f]{64}",d); print(d.split(":")[1])' "$STAGE_OUT/blobs/sha256/$STAGE_MANIFEST"
+STAGE_LAYER="$COMMAND_OUTPUT"
+STAGE_EXTRACT="$SBROOT/stage-delta-extract"
+mkdir -p "$STAGE_EXTRACT"
+require_success "extract staged delta layer" tar -xzf "$STAGE_OUT/blobs/sha256/$STAGE_LAYER" -C "$STAGE_EXTRACT"
+assert_file_content "staged delta contains draft span content" "$STAGE_EXTRACT/src/main.rs" 'fn main() { println!("draft work"); }'
 
 assert_output_contains \
     "staged image records base-view provenance" \

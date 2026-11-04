@@ -171,7 +171,7 @@ fn record_span_edit(
     state: &atomic_core::pristine::span_patch_storage::SpanRecordState,
     namespace_dependencies: Vec<Hash>,
     new: &[u8],
-    trunk: atomic_core::crdt::TrunkId,
+    trunk: Option<atomic_core::crdt::TrunkId>,
     branches: &[atomic_core::crdt::BranchId],
     algorithm: atomic_core::diff::Algorithm,
 ) -> Result<atomic_core::record::workflow::RecordedFile, String> {
@@ -189,6 +189,9 @@ fn record_span_edit(
         .position
         .ok_or_else(|| "span edit has no position".to_string())?;
     let old = state.content.as_slice();
+    if trunk.is_none() && cfg!(not(unix)) {
+        return Err("projected semantic recording is not supported on this platform".into());
+    }
     if atomic_core::record::workflow::compare::detect_encoding(old)
         == atomic_core::change::Encoding::Binary
         || atomic_core::record::workflow::compare::detect_encoding(new)
@@ -198,12 +201,25 @@ fn record_span_edit(
     }
     let old_lines = Line::from_bytes(old);
     let new_lines = Line::from_bytes(new);
-    if old_lines.len() != branches.len() {
+    if trunk.is_some() && old_lines.len() != branches.len() {
         return Err("semantic lines do not match the span baseline".into());
     }
+    let projection = if trunk.is_none() {
+        Some(
+            state
+                .semantic_snapshot()
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
     let mut old_offsets = vec![0usize];
     for line in &old_lines {
         old_offsets.push(old_offsets.last().copied().unwrap() + line.len());
+    }
+    let mut new_offsets = vec![0usize];
+    for line in &new_lines {
+        new_offsets.push(new_offsets.last().copied().unwrap() + line.len());
     }
     let mut blocks = Vec::new();
     let mut open: Option<(usize, usize)> = None;
@@ -261,30 +277,49 @@ fn record_span_edit(
     let mut content = Vec::new();
     let mut span_ops = Vec::new();
     let mut line_ranges = std::collections::BTreeMap::new();
+    let mut ranges = Vec::new();
     for (old_start, old_end, new_start, new_end) in blocks {
+        if trunk.is_none() {
+            let old_base = old_offsets[old_start];
+            let new_base = new_offsets[new_start];
+            let old_block = &old[old_base..old_offsets[old_end]];
+            let new_block = &new[new_base..new_offsets[new_end]];
+            ranges.extend(
+                projected_token_edit_ranges(old_block, new_block)?
+                    .into_iter()
+                    .map(|(a, b, c, d)| (old_base + a, old_base + b, new_base + c, new_base + d)),
+            );
+        } else {
+            ranges.push((
+                old_offsets[old_start],
+                old_offsets[old_end],
+                new_offsets[new_start],
+                new_offsets[new_end],
+            ));
+        }
+    }
+    for (start, end, new_start, new_end) in ranges {
         let insert_start = content.len() as u64;
-        for (index, line) in new_lines[new_start..new_end].iter().enumerate() {
-            let start = content.len() as u64;
-            content.extend_from_slice(line.content());
-            line_ranges.insert(new_start + index + 1, (start, content.len() as u64));
+        if trunk.is_some() {
+            let first_line = new_offsets
+                .binary_search(&new_start)
+                .map_err(|_| "new line boundary missing")?;
+            let end_line = new_offsets
+                .binary_search(&new_end)
+                .map_err(|_| "new line boundary missing")?;
+            for (index, line) in new_lines[first_line..end_line].iter().enumerate() {
+                let start = content.len() as u64;
+                content.extend_from_slice(line.content());
+                line_ranges.insert(first_line + index + 1, (start, content.len() as u64));
+            }
+        } else {
+            content.extend_from_slice(&new[new_start..new_end]);
         }
         let insert_end = content.len() as u64;
-        let start = old_offsets[old_start];
-        let end = old_offsets[old_end];
         if start == end {
-            let segment = state
-                .spans
-                .iter()
-                .find(|span| span.output.start < start && start <= span.output.end)
-                .or_else(|| state.spans.iter().find(|span| span.output.start == start));
-            let (target, offset) = match segment {
-                Some(segment) => (
-                    segment.target.clone(),
-                    segment.target_start + (start - segment.output.start) as u64,
-                ),
-                None if old.is_empty() && start == 0 => (state.root.clone(), 0),
-                None => return Err("no authored span anchors the insertion".into()),
-            };
+            let (target, offset) = state
+                .authored_anchor(start)
+                .map_err(|error| error.to_string())?;
             span_ops.push(SpanOp::Edit {
                 file: state.file.clone(),
                 target,
@@ -294,45 +329,46 @@ fn record_span_edit(
                 insert_end,
             });
         } else {
-            let mut cursor = start;
             let mut first = true;
-            for segment in &state.spans {
-                let lo = start.max(segment.output.start);
-                let hi = end.min(segment.output.end);
-                if lo >= hi {
-                    continue;
-                }
-                if lo != cursor {
-                    return Err("span baseline does not cover the edit".into());
-                }
-                let target_start = segment.target_start + (lo - segment.output.start) as u64;
+            for segment in state
+                .authored_ranges(start..end)
+                .map_err(|error| error.to_string())?
+            {
+                let target_start = segment.target_start;
                 span_ops.push(SpanOp::Edit {
                     file: state.file.clone(),
-                    target: segment.target.clone(),
+                    target: segment.target,
                     start: target_start,
-                    end: target_start + (hi - lo) as u64,
+                    end: target_start + (segment.output.end - segment.output.start) as u64,
                     insert_start: if first { insert_start } else { insert_end },
                     insert_end,
                 });
-                cursor = hi;
                 first = false;
-            }
-            if cursor != end {
-                return Err("span baseline does not cover the edit".into());
             }
         }
     }
     let encoding = atomic_core::record::workflow::compare::detect_encoding(new);
-    let context = RecipeContext {
-        path,
-        old_content: old,
-        new_content: new,
-        existing_branches: Some(branches),
-        existing_trunk_id: Some(trunk),
-        encoding,
-        algorithm,
+    let (mut ops, stats) = if let Some(trunk) = trunk {
+        let context = RecipeContext {
+            path,
+            old_content: old,
+            new_content: new,
+            existing_branches: Some(branches),
+            existing_trunk_id: Some(trunk),
+            encoding,
+            algorithm,
+        };
+        Recipe::InPlaceEdit.build_ops(&context)
+    } else {
+        (
+            atomic_core::change::FileOps::projected_span_edit(
+                path.to_string(),
+                state.file.clone(),
+                projection.unwrap().id,
+            ),
+            Default::default(),
+        )
     };
-    let (mut ops, stats) = Recipe::InPlaceEdit.build_ops(&context);
     let mut mapped = std::collections::BTreeSet::new();
     for line in ops.line_ops_mut() {
         if let Some(number) = line.new_line_num() {
@@ -349,7 +385,7 @@ fn record_span_edit(
             }
         }
     }
-    if mapped.len() != line_ranges.len() {
+    if trunk.is_some() && mapped.len() != line_ranges.len() {
         return Err("semantic edits do not cover the changed lines".into());
     }
     let mut recorded = RecordedFile::new(path);
@@ -371,12 +407,198 @@ fn record_span_edit(
     Ok(recorded)
 }
 
+/// Preserve equal tokens inside a changed line block; assigning the entire
+/// replacement line to the current editor would erase original token authors.
+fn projected_token_edit_ranges(
+    old: &[u8],
+    new: &[u8],
+) -> Result<Vec<(usize, usize, usize, usize)>, String> {
+    use atomic_core::diff::{word_diff, Tokenizer, WordDiffOp};
+    const MAX_LCS_CELLS: usize = 1_000_000;
+    let old_full: Vec<_> = Tokenizer::new(old).collect();
+    let new_full: Vec<_> = Tokenizer::new(new).collect();
+    for (bytes, tokens) in [(old, &old_full), (new, &new_full)] {
+        let mut cursor = 0usize;
+        for token in tokens {
+            let end = cursor
+                .checked_add(token.len())
+                .ok_or("projected semantic token offset overflow")?;
+            if token.offset() != cursor || bytes.get(cursor..end) != Some(token.content()) {
+                return Err("projected semantic tokenizer does not cover the content".into());
+            }
+            cursor = end;
+        }
+        if cursor != bytes.len() {
+            return Err("projected semantic tokenizer does not cover the content".into());
+        }
+    }
+    let prefix = old_full
+        .iter()
+        .zip(&new_full)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut suffix = 0usize;
+    while prefix + suffix < old_full.len()
+        && prefix + suffix < new_full.len()
+        && old_full[old_full.len() - suffix - 1] == new_full[new_full.len() - suffix - 1]
+    {
+        suffix += 1;
+    }
+    let old_begin = old_full
+        .get(prefix)
+        .map_or(old.len(), |token| token.offset());
+    let new_begin = new_full
+        .get(prefix)
+        .map_or(new.len(), |token| token.offset());
+    let old_end = old_full
+        .get(old_full.len() - suffix)
+        .map_or(old.len(), |token| token.offset());
+    let new_end = new_full
+        .get(new_full.len() - suffix)
+        .map_or(new.len(), |token| token.offset());
+    let old_middle = &old[old_begin..old_end];
+    let new_middle = &new[new_begin..new_end];
+    let old_count = Tokenizer::new(old_middle).count();
+    let new_count = Tokenizer::new(new_middle).count();
+    if old_count != 0
+        && new_count != 0
+        && old_count
+            .checked_mul(new_count)
+            .is_none_or(|cells| cells > MAX_LCS_CELLS)
+    {
+        return Err("projected semantic token diff exceeds the safe memory budget".into());
+    }
+    let diff = word_diff(old_middle, new_middle);
+    let old_tokens = diff.old_tokens();
+    let new_tokens = diff.new_tokens();
+    let old_offset = |index: usize| {
+        old_tokens
+            .get(index)
+            .map_or(old_end, |token| old_begin + token.offset())
+    };
+    let new_offset = |index: usize| {
+        new_tokens
+            .get(index)
+            .map_or(new_end, |token| new_begin + token.offset())
+    };
+    let (mut old_cursor, mut new_cursor) = (0usize, 0usize);
+    let mut open = None;
+    let mut ranges = Vec::new();
+    for op in diff.ops() {
+        let (old_start, old_end, new_start, new_end, equal) = match op {
+            WordDiffOp::Equal {
+                old_range,
+                new_range,
+            } => (
+                old_range.start,
+                old_range.end,
+                new_range.start,
+                new_range.end,
+                true,
+            ),
+            WordDiffOp::Insert { old_pos, new_range } => {
+                (*old_pos, *old_pos, new_range.start, new_range.end, false)
+            }
+            WordDiffOp::Delete { old_range, new_pos } => {
+                (old_range.start, old_range.end, *new_pos, *new_pos, false)
+            }
+            WordDiffOp::Replace {
+                old_range,
+                new_range,
+            } => (
+                old_range.start,
+                old_range.end,
+                new_range.start,
+                new_range.end,
+                false,
+            ),
+        };
+        if old_start != old_cursor
+            || new_start != new_cursor
+            || old_end > old_tokens.len()
+            || new_end > new_tokens.len()
+        {
+            return Err("invalid projected semantic token diff ordering".into());
+        }
+        if equal {
+            if let Some((a, c)) = open.take() {
+                ranges.push((
+                    old_offset(a),
+                    old_offset(old_cursor),
+                    new_offset(c),
+                    new_offset(new_cursor),
+                ));
+            }
+            if old.get(old_offset(old_start)..old_offset(old_end))
+                != new.get(new_offset(new_start)..new_offset(new_end))
+            {
+                return Err("projected semantic token diff changed equal bytes".into());
+            }
+        } else if open.is_none() {
+            open = Some((old_cursor, new_cursor));
+        }
+        old_cursor = old_end;
+        new_cursor = new_end;
+    }
+    if let Some((a, c)) = open {
+        ranges.push((
+            old_offset(a),
+            old_offset(old_cursor),
+            new_offset(c),
+            new_offset(new_cursor),
+        ));
+    }
+    if old_cursor != old_tokens.len() || new_cursor != new_tokens.len() {
+        return Err("projected semantic token diff does not cover the content".into());
+    }
+    let old_text = std::str::from_utf8(old).map_err(|error| error.to_string())?;
+    let new_text = std::str::from_utf8(new).map_err(|error| error.to_string())?;
+    let mut normalized: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for (mut a, mut b, mut c, mut d) in ranges {
+        // The language-agnostic tokenizer can emit individual UTF-8 bytes.
+        // Do not assign different authors to fragments of a newly changed
+        // scalar value simply because its leading bytes happened to match.
+        while !old_text.is_char_boundary(a) {
+            a -= 1;
+        }
+        while !old_text.is_char_boundary(b) {
+            b += 1;
+        }
+        while !new_text.is_char_boundary(c) {
+            c -= 1;
+        }
+        while !new_text.is_char_boundary(d) {
+            d += 1;
+        }
+        if let Some(previous) = normalized.last_mut() {
+            if a <= previous.1 || c <= previous.3 {
+                previous.1 = previous.1.max(b);
+                previous.3 = previous.3.max(d);
+                continue;
+            }
+        }
+        normalized.push((a, b, c, d));
+    }
+    let (mut old_at, mut new_at) = (0usize, 0usize);
+    for &(a, b, c, d) in &normalized {
+        if a < old_at || c < new_at || old.get(old_at..a) != new.get(new_at..c) {
+            return Err("projected semantic edits do not preserve equal UTF-8 bytes".into());
+        }
+        old_at = b;
+        new_at = d;
+    }
+    if old.get(old_at..) != new.get(new_at..) {
+        return Err("projected semantic edits do not preserve equal UTF-8 suffix".into());
+    }
+    Ok(normalized)
+}
+
 fn record_binary_span_edit(
     detected: &atomic_core::record::workflow::DetectedFile,
     state: &atomic_core::pristine::span_patch_storage::SpanRecordState,
     namespace_dependencies: Vec<Hash>,
     new: &[u8],
-    trunk: atomic_core::crdt::TrunkId,
+    trunk: Option<atomic_core::crdt::TrunkId>,
     branches: &[atomic_core::crdt::BranchId],
     algorithm: atomic_core::diff::Algorithm,
 ) -> Result<atomic_core::record::workflow::RecordedFile, String> {
@@ -387,6 +609,9 @@ fn record_binary_span_edit(
     use atomic_core::record::workflow::recipes::{Recipe, RecipeContext};
     use atomic_core::record::workflow::{DetectionKind, RecordedFile};
     use atomic_core::types::ChangePosition;
+    if trunk.is_none() && cfg!(not(unix)) {
+        return Err("projected semantic recording is not supported on this platform".into());
+    }
     let inode = detected
         .inode
         .ok_or_else(|| "span edit has no inode".to_string())?;
@@ -395,23 +620,20 @@ fn record_binary_span_edit(
         .ok_or_else(|| "span edit has no position".to_string())?;
     let mut edits = Vec::new();
     let mut cursor = 0usize;
-    for segment in &state.spans {
-        if segment.output.start != cursor {
-            return Err("binary span baseline is incomplete".into());
-        }
+    for segment in state
+        .authored_ranges(0..state.content.len())
+        .map_err(|error| error.to_string())?
+    {
         let length = segment.output.end - segment.output.start;
         edits.push(SpanOp::Edit {
             file: state.file.clone(),
-            target: segment.target.clone(),
+            target: segment.target,
             start: segment.target_start,
             end: segment.target_start + length as u64,
             insert_start: if cursor == 0 { 0 } else { new.len() as u64 },
             insert_end: new.len() as u64,
         });
         cursor = segment.output.end;
-    }
-    if cursor != state.content.len() {
-        return Err("binary span baseline is incomplete".into());
     }
     if edits.is_empty() {
         edits.push(SpanOp::Edit {
@@ -437,6 +659,17 @@ fn record_binary_span_edit(
     dependencies.sort();
     dependencies.dedup();
     recorded.set_span_dependencies(dependencies);
+    let Some(trunk) = trunk else {
+        let baseline = state
+            .semantic_baseline_id()
+            .map_err(|error| error.to_string())?;
+        recorded.set_crdt_ops(FileOps::projected_span_edit(
+            detected.path.clone(),
+            state.file.clone(),
+            baseline,
+        ));
+        return Ok(recorded);
+    };
     let mut ops = if encoding == Encoding::Binary {
         let mut ops = FileOps::edit(trunk, detected.path.clone());
         for branch in branches {
@@ -558,6 +791,28 @@ fn complete_semantic_replacement(
 #[cfg(test)]
 thread_local! {
     pub(super) static RECORD_APPLY_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, unix))]
+fn pause_projected_record_for_test(window: &str, operation: atomic_core::OperationId, hash: Hash) {
+    use atomic_core::types::Base32;
+    use std::io::Write;
+    if std::env::var("ATOMIC_TEST_PROJECTED_RECORD_WINDOW")
+        .ok()
+        .as_deref()
+        != Some(window)
+    {
+        return;
+    }
+    println!(
+        "ATOMIC_PROJECTED_RECORD_READY {} {}",
+        operation.to_base32(),
+        hash.to_base32()
+    );
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -858,6 +1113,9 @@ impl Repository {
             let file_ops = atomic_core::change::span_patch::localize_file_ops(&txn, &change)
                 .map_err(|error| error.to_string())?;
             for ops in &file_ops {
+                if matches!(ops.trunk_op(), Some(TrunkOp::ProjectedSpanEdit { .. })) {
+                    continue;
+                }
                 let raw = ops.trunk_id();
                 let trunk = if raw.change_id().is_root() {
                     TrunkId::new(id, raw.file_idx())
@@ -1107,8 +1365,11 @@ impl Repository {
         // anchoring corrupts the region. Force the sentinel whole-file
         // replace: tombstone every prior branch and rebuild fresh, so the
         // graph and semantic layers agree with the commit tree byte-exactly.
-        let branch_line_divergence =
-            existing_branches.len() != atomic_core::diff::Line::from_bytes(old_content).len();
+        // Graph-only Git history deliberately has no semantic trunk/branches.
+        // Absence is not divergence: forcing a full rewrite would replace
+        // unchanged lines and conflict with independent edits in child views.
+        let branch_line_divergence = existing_trunk_id.is_some()
+            && existing_branches.len() != atomic_core::diff::Line::from_bytes(old_content).len();
         let graph_line_divergence = self
             .alive_graph_lines_on_view_excluding(inode, position, view_name, excluded)?
             != atomic_core::diff::Line::from_bytes(old_content).len();
@@ -2532,6 +2793,10 @@ impl Repository {
                                     || crate::content_filter::looks_binary(&content));
                             if content.len() as u64 > options.max_file_size() && !opaque {
                                 if options.skip_binary() {
+                                    // No FileAdd will be assembled for this path, so its
+                                    // new-inode attributes must not be attached either.
+                                    // Attribute-only changes on other files remain intact.
+                                    pending_attributes.retain(|attribute| attribute.path != path);
                                     skipped_paths.push(path.clone());
                                     stats.files_skipped += 1;
                                     continue;
@@ -3063,9 +3328,6 @@ impl Repository {
                     if resolution.is_some() {
                         return ModifiedResult::Fatal(RecordError::Database(format!("span recording does not yet support this edit to '{path}'")));
                     }
-                    let Some(trunk) = existing_trunk_id else {
-                        return ModifiedResult::Fatal(RecordError::Database(format!("span recording requires semantic state for '{path}'")));
-                    };
                     let namespace_dependencies = match span_namespace_dependencies(&shared_txn, &shared_graph_visibility, &projected_present, path, file_inode) {
                         Ok(dependencies) => dependencies,
                         Err(error) => return ModifiedResult::Fatal(error),
@@ -3079,9 +3341,9 @@ impl Repository {
                         return ModifiedResult::Fatal(RecordError::Database(format!("span recording does not yet support this edit to '{path}'")));
                     }
                     let result = if binary {
-                        record_binary_span_edit(&detected, state, namespace_dependencies, &repository_bytes, trunk, &existing_branches, core_options.get_algorithm())
+                        record_binary_span_edit(&detected, state, namespace_dependencies, &repository_bytes, existing_trunk_id, &existing_branches, core_options.get_algorithm())
                     } else {
-                        record_span_edit(&detected, state, namespace_dependencies, &repository_bytes, trunk, &existing_branches, core_options.get_algorithm())
+                        record_span_edit(&detected, state, namespace_dependencies, &repository_bytes, existing_trunk_id, &existing_branches, core_options.get_algorithm())
                     };
                     return match result {
                         Ok(recorded) => ModifiedResult::Recorded(path.clone(), Box::new(recorded), None),
@@ -3293,14 +3555,14 @@ impl Repository {
                                 }
                             }
                         }
-                        if let Some(crdt) = recorded.crdt_stats() {
-                            stats.lines_added += crdt.lines_added;
-                            stats.lines_deleted += crdt.lines_deleted;
-                            stats.lines_modified += crdt.lines_modified;
-                            stats.tokens_added += crdt.tokens_added;
-                            stats.tokens_deleted += crdt.tokens_deleted;
-                            stats.tokens_replaced += crdt.tokens_replaced;
-                        }
+                    }
+                    if let Some(crdt) = recorded.crdt_stats() {
+                        stats.lines_added += crdt.lines_added;
+                        stats.lines_deleted += crdt.lines_deleted;
+                        stats.lines_modified += crdt.lines_modified;
+                        stats.tokens_added += crdt.tokens_added;
+                        stats.tokens_deleted += crdt.tokens_deleted;
+                        stats.tokens_replaced += crdt.tokens_replaced;
                     }
                     recorded_paths.push(path);
                     recorded_files.push(*recorded);
@@ -3425,6 +3687,12 @@ impl Repository {
         let semantic_trunks: std::collections::HashMap<String, atomic_core::crdt::TrunkId> = change
             .file_ops()
             .iter()
+            .filter(|ops| {
+                !matches!(
+                    ops.trunk_op(),
+                    Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+                )
+            })
             .map(|ops| (ops.path().to_string(), ops.trunk_id()))
             .collect();
         for pending in pending_attributes {
@@ -3727,6 +3995,38 @@ impl Repository {
                 }
                 let mut transitions = Vec::new();
                 let mut operation_changes = vec![computed_hash];
+                if outcome.change().file_ops().iter().any(|ops| {
+                    matches!(
+                        ops.trunk_op(),
+                        Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+                    )
+                }) {
+                    use atomic_core::pristine::{
+                        CapabilityTxnT, SPAN_PROJECTED_SEMANTICS_CAPABILITY,
+                    };
+                    let capability = txn
+                        .required_capability_version(SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())
+                        .map_err(|error| RecordError::Database(error.to_string()))?;
+                    match capability {
+                        None => transitions.push(MetadataTransition {
+                            target: MetadataTarget::Capability {
+                                id: SPAN_PROJECTED_SEMANTICS_CAPABILITY.id().to_string(),
+                            },
+                            expected_old: MetadataValue::Absent,
+                            expected_new: MetadataValue::Sequence(u64::from(
+                                SPAN_PROJECTED_SEMANTICS_CAPABILITY.minimum_version(),
+                            )),
+                        }),
+                        Some(version)
+                            if version == SPAN_PROJECTED_SEMANTICS_CAPABILITY.minimum_version() => {
+                        }
+                        Some(_) => {
+                            return Err(RecordError::Database(
+                                "unsupported projected semantic capability version".into(),
+                            ))
+                        }
+                    }
+                }
                 if let Some((removal_view_name, removed)) = removal {
                     let removal_view = txn
                         .get_view(removal_view_name)
@@ -3847,16 +4147,54 @@ impl Repository {
         // on disk matches the hash registered in the pristine graph.
         if options.get_save_to_store() {
             let save_start = std::time::Instant::now();
-            if let Some(v3_bytes) = outcome.v3_bytes() {
-                // Fast path: write the exact V3 bytes that produced computed_hash
-                self.save_change_bytes(&computed_hash, v3_bytes, outcome.change())
-                    .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
-            } else {
-                // Fallback: re-serialize (may produce different hash — legacy path)
-                self.save_change(outcome.change())
-                    .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+            let save_result = (|| -> Result<(), RecordError> {
+                if outcome.change().file_ops().iter().any(|ops| {
+                    matches!(
+                        ops.trunk_op(),
+                        Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+                    )
+                }) {
+                    // The change object may survive an interrupted or undone
+                    // record. Fence older readers before publishing its bytes;
+                    // the prepared metadata operation receipts this monotonic
+                    // capability when it completes.
+                    self.pristine
+                        .require_repository_capability(
+                            atomic_core::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY,
+                        )
+                        .map_err(|error| RecordError::Database(error.to_string()))?;
+                    #[cfg(all(test, unix))]
+                    if let Some((_, operation)) = &operation_context {
+                        pause_projected_record_for_test(
+                            "after-fence",
+                            operation.id(),
+                            computed_hash,
+                        );
+                    }
+                }
+                if let Some(v3_bytes) = outcome.v3_bytes() {
+                    // Fast path: write the exact V3 bytes that produced computed_hash
+                    self.save_change_bytes(&computed_hash, v3_bytes, outcome.change())
+                        .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+                } else {
+                    // Fallback: re-serialize (may produce different hash — legacy path)
+                    self.save_change(outcome.change())
+                        .map_err(|e| RecordError::ChangeStore(e.to_string()))?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = save_result {
+                if let Some((operation_lock, operation)) = &operation_context {
+                    self.abort_prepared_metadata_operation(operation_lock, operation)
+                        .map_err(RecordError::Repository)?;
+                }
+                return Err(error);
             }
             outcome.set_saved(true);
+            #[cfg(all(test, unix))]
+            if let Some((_, operation)) = &operation_context {
+                pause_projected_record_for_test("after-save", operation.id(), computed_hash);
+            }
             if trace_record {
                 eprintln!(
                     "[record] save_change complete elapsed={:?}",
@@ -3886,6 +4224,14 @@ impl Repository {
             };
             match apply_result {
                 Ok(apply_outcome) => {
+                    #[cfg(all(test, unix))]
+                    if let Some((_, operation)) = &operation_context {
+                        pause_projected_record_for_test(
+                            "after-apply",
+                            operation.id(),
+                            computed_hash,
+                        );
+                    }
                     outcome.set_applied(apply_outcome.new_state);
                     // Every marker this record observed is now consumed (it
                     // emitted its delete) or fulfilled by another route; none
@@ -4022,6 +4368,8 @@ impl Repository {
             if outcome.was_applied() {
                 self.finalize_operation_verified(&operation_lock, operation.id())
                     .map_err(RecordError::Repository)?;
+                #[cfg(all(test, unix))]
+                pause_projected_record_for_test("after-verified", operation.id(), computed_hash);
             } else {
                 self.abort_prepared_metadata_operation(&operation_lock, &operation)
                     .map_err(RecordError::Repository)?;
@@ -4952,4 +5300,47 @@ fn get_inode_position(
         .map_err(|e| format!("inode_position: {}", e))?
         .ok_or_else(|| format!("Position not found for {}", path))?;
     Ok((inode, position))
+}
+
+#[cfg(test)]
+mod projected_token_tests {
+    use super::projected_token_edit_ranges;
+
+    #[test]
+    fn long_equal_prefix_and_suffix_preserve_original_tokens() {
+        let prefix = "prefix ".repeat(2000);
+        let suffix = " suffix".repeat(2000);
+        let old = format!("{prefix}old{suffix}");
+        let new = format!("{prefix}new{suffix}");
+        let ranges = projected_token_edit_ranges(old.as_bytes(), new.as_bytes()).unwrap();
+        assert_eq!(
+            ranges,
+            vec![(
+                prefix.len(),
+                prefix.len() + 3,
+                prefix.len(),
+                prefix.len() + 3
+            )]
+        );
+    }
+
+    #[test]
+    fn token_diff_refuses_large_ambiguous_matrix() {
+        let old = (0..1100)
+            .map(|index| format!("old{index} "))
+            .collect::<String>();
+        let new = (0..1100)
+            .map(|index| format!("new{index} "))
+            .collect::<String>();
+        let error = projected_token_edit_ranges(old.as_bytes(), new.as_bytes()).unwrap_err();
+        assert!(error.contains("safe memory budget"), "{error}");
+    }
+
+    #[test]
+    fn changed_unicode_scalars_are_never_split_between_authors() {
+        let ranges = projected_token_edit_ranges("α\n".as_bytes(), "β\n".as_bytes()).unwrap();
+        assert_eq!(ranges, vec![(0, 2, 0, 2)]);
+        let ranges = projected_token_edit_ranges("aé!\n".as_bytes(), "aê!\n".as_bytes()).unwrap();
+        assert_eq!(ranges, vec![(1, 3, 1, 3)]);
+    }
 }
