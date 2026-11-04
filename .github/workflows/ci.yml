@@ -22,30 +22,35 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
 
+# There is no separate `cargo check` or MSRV job. Clippy type-checks the whole
+# workspace, and rust-toolchain.toml pins the same Rust (1.98) that every
+# crate declares as its rust-version, so both would repeat Clippy's work. A
+# `dtolnay/rust-toolchain@<version>` step cannot test an older Rust here
+# anyway: rust-toolchain.toml overrides the toolchain it installs. If the pin
+# ever moves above rust-version, add an MSRV job that runs
+# `cargo +<msrv> check` so the override does not apply.
+#
+# Format and Clippy run first; every other job waits for both to pass, so a PR
+# with a lint or formatting error does not also start the macOS and Windows
+# test runs. Clippy takes about a minute and a half with a warm cache.
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and dependency builds
-        uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
-
-      - name: cargo check
-        run: cargo check --workspace
-
   test:
-    name: Test (${{ matrix.os }})
+    needs: [fmt, clippy]
+    name: Test (${{ matrix.os }}${{ matrix.shards > 1 && format(' {0}/{1}', matrix.shard, matrix.shards) || '' }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS and Windows run in two halves: their nextest steps took 26
+        # and 22 minutes against 10.5 on Linux. Both halves of an OS share
+        # one rust-cache key and restore the same build. A second macOS job
+        # takes one more of the organization's few concurrent macOS runners.
+        include:
+          - { os: ubuntu-latest, shard: 1, shards: 1 }
+          - { os: macos-latest, shard: 1, shards: 2 }
+          - { os: macos-latest, shard: 2, shards: 2 }
+          - { os: windows-latest, shard: 1, shards: 2 }
+          - { os: windows-latest, shard: 2, shards: 2 }
     env:
       # Line tables keep file:line in backtraces but link far faster and keep
       # target/ (and the cache) much smaller than full debug info.
@@ -108,10 +113,22 @@ jobs:
         # (cfg(unix)); Linux/macOS still run them. Keep Windows native tests on.
         # Re-enable the shim suites after Windows support is defined and its
         # path/mode/locking behavior is validated; see the RFC platform policy.
-        run: cargo nextest run --workspace --features atomic-cli/adoption-test-injection --profile ci
+        #
+        # Two tests per CPU. The integration tests mostly wait on git and
+        # atomic subprocesses and the filesystem: on 4 CPUs, 86 of the git
+        # shim/adoption/anchor tests used 1.5 CPUs at one test per CPU and
+        # finished 1.8x faster at two. nextest's default of one per CPU left
+        # the 3-CPU macOS runner running exactly 3 tests at a time.
+        shell: bash
+        run: >-
+          cargo nextest run --workspace --features atomic-cli/adoption-test-injection --profile ci
+          --partition count:${{ matrix.shard }}/${{ matrix.shards }}
+          --test-threads $(( 2 * $(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc) ))
 
-      # nextest does not run doctests.
+      # nextest does not run doctests. They exercise the same code on every
+      # platform and took 4.5 minutes on Windows, so they run on Linux only.
       - name: Run doctests
+        if: matrix.os == 'ubuntu-latest'
         run: cargo test --workspace --doc --features atomic-cli/adoption-test-injection --no-fail-fast
 
       - name: Run CLI semantic diff harness
@@ -158,7 +175,12 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace -- -D warnings
 
+      # The DSSE export code is behind a feature the workspace run leaves off.
+      - name: cargo clippy (dsse-export feature)
+        run: cargo clippy --locked --no-deps -p atomic-canonical -p atomic-cli --features dsse-export -- -D warnings
+
   doc:
+    needs: [fmt, clippy]
     name: Documentation
     runs-on: ubuntu-latest
     steps:
@@ -177,6 +199,7 @@ jobs:
           RUSTDOCFLAGS: -Dwarnings
 
   conformance:
+    needs: [fmt, clippy]
     name: Conformance vectors
     runs-on: ubuntu-latest
     steps:
@@ -192,39 +215,45 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
+      # Not actions/cache: that saved a new full target/ from every PR that
+      # changed Cargo.lock, which only that PR could restore, and which counts
+      # against the repository's 10 GB cache limit that the test caches need.
+      - name: Cache cargo registry and dependency builds
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-conformance-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-conformance-
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
 
       - name: Replay the suite through the JSON admission
         run: cargo test -p atomic-canonical --test conformance_corpus -- --ignored
         env:
           AEV_SUITE: ${{ github.workspace }}/agent-evidence-vectors/vectors-ai-agent-action
 
-  msrv:
-    name: Minimum Supported Rust Version
+  # Formerly the separate "Provenance DSSE interoperability" workflow. Its
+  # feature lint now runs in the Clippy job.
+  export-consumer:
+    needs: [fmt, clippy]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.90
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: Cache cargo registry and dependency builds
         uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/dev' }}
 
-      - name: cargo check (shared library MSRV)
-        run: cargo check --workspace --exclude atomic-cli --exclude atomic-shacl --locked
+      - name: Install independent Ed25519 verifier
+        run: python -m pip install 'cryptography==50.0.0'
 
-      - uses: dtolnay/rust-toolchain@1.98
+      - name: Feature API tests and examples
+        run: cargo test --locked -p atomic-canonical --features dsse-export
 
-      - name: cargo check (CLI and SHACL MSRV)
-        run: cargo check -p atomic-cli -p atomic-shacl --locked
+      - name: Real CLI export and independent consumption
+        run: cargo test --locked -p atomic-cli --features dsse-export --test it provenance_integration_test
+        env:
+          ATOMIC_DSSE_PYTHON: python

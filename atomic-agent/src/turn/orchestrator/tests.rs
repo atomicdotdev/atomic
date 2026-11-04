@@ -1018,20 +1018,25 @@ async fn test_fully_idle_turn_end_creates_attestation() {
     let turn_result = orch.dispatch(agy_stop).await.unwrap();
     assert!(turn_result.change_recorded.is_some());
 
-    let repo = Repository::open(dir.path()).unwrap();
-    let attestations: Vec<_> = repo
-        .change_store()
-        .iter_attestations()
-        .filter_map(|r| r.ok())
-        .collect();
-    assert_eq!(
-        attestations.len(),
-        1,
-        "Stop with fullyIdle=true must create an attestation",
-    );
-    let attest = repo.load_attestation(&attestations[0]).unwrap();
-    assert_eq!(attest.session_id, "sess-agy-1");
-    assert_eq!(attest.changes_covered.len(), 1);
+    // Scoped so the handle is closed before the next dispatch: an open
+    // Repository holds the database lock, and the orchestrator's own opens
+    // would wait out ATOMIC_DB_LOCK_WAIT_MS (30s) behind it.
+    {
+        let repo = Repository::open(dir.path()).unwrap();
+        let attestations: Vec<_> = repo
+            .change_store()
+            .iter_attestations()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert_eq!(
+            attestations.len(),
+            1,
+            "Stop with fullyIdle=true must create an attestation",
+        );
+        let attest = repo.load_attestation(&attestations[0]).unwrap();
+        assert_eq!(attest.session_id, "sess-agy-1");
+        assert_eq!(attest.changes_covered.len(), 1);
+    }
 
     // A second idle Stop with no new changes must NOT create a duplicate.
     orch.dispatch(turn_start_event("sess-agy-1", "no-op turn"))
@@ -1044,6 +1049,7 @@ async fn test_fully_idle_turn_end_creates_attestation() {
     }));
     orch.dispatch(agy_stop_again).await.unwrap();
 
+    let repo = Repository::open(dir.path()).unwrap();
     let attestations_after: Vec<_> = repo
         .change_store()
         .iter_attestations()
