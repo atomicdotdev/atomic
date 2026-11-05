@@ -821,3 +821,31 @@ fn refused_writes_do_not_create_the_vault() {
     assert_eq!(f.instances("adr").len(), 1);
     assert!(vault_entries().contains(&"memory".to_string()));
 }
+
+/// The handle `kind new` prints is for people; only the KG id finds the node, so
+/// the summary has to carry it for a reader to reach `atomic query`.
+#[test]
+fn new_prints_the_kg_id_a_query_answers_to() {
+    let f = Fixture::new();
+    f.write_definition("adr", ADR_DEFINITION);
+    f.ok(&["vault", "sync"]);
+    let out = f.ok(&["kind", "new", "adr", "--title", "Findable"]);
+    let iri = out
+        .split_whitespace()
+        .find(|word| word.starts_with("urn:atomic:project:"))
+        .unwrap_or_else(|| panic!("no KG id in {out:?}"));
+    assert!(iri.contains(":concept:adr."), "{iri}");
+    let neighbors: serde_json::Value =
+        serde_json::from_str(&f.ok(&["query", "neighbors", iri, "--json"])).unwrap();
+    assert!(
+        neighbors["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|node| node["label"] == "Findable"),
+        "{neighbors:#}"
+    );
+
+    let help = f.ok(&["kind", "new", "--help"]);
+    assert!(help.contains("kg_id"), "{help}");
+}
