@@ -630,6 +630,7 @@ impl VaultProjection {
             Some(KindPath::Stray) | None => {}
         }
         graph.edges = merge_kind_edges(std::mem::take(&mut graph.edges), path);
+        graph.nodes = merge_kind_nodes(std::mem::take(&mut graph.nodes));
         graph
     }
 
@@ -996,6 +997,28 @@ fn merge_kind_edges(edges: Vec<KgEdge>, path: &str) -> Vec<KgEdge> {
             KgEdge::new(from, to, predicate).with_metadata(serde_json::Value::Object(metadata))
         })
         .collect()
+}
+
+/// One node per id, as storing all of them in order would leave it: the last the
+/// row owns, or else the first stub, because a stub lands only while the id is
+/// free. A body that repeats a link pushes a node each time, and every vault write
+/// stores every row's nodes again, so copies would make one file tax every write.
+fn merge_kind_nodes(nodes: Vec<KgNode>) -> Vec<KgNode> {
+    let owned = |node: &KgNode| {
+        node.metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.get("derived_from_vault_path").is_some())
+    };
+    let mut merged = BTreeMap::<String, KgNode>::new();
+    for node in nodes {
+        match merged.get(&node.id) {
+            Some(_) if !owned(&node) => {}
+            _ => {
+                merged.insert(node.id.clone(), node);
+            }
+        }
+    }
+    merged.into_values().collect()
 }
 
 fn links<'a>(fm: &'a serde_json::Value, field: &str) -> Vec<&'a str> {
