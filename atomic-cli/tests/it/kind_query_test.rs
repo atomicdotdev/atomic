@@ -658,8 +658,8 @@ fn a_plan_filters_a_kinds_instances_on_a_field() {
     );
 }
 
-/// `kind list` answers per view from files; the KG answers repository-wide. They
-/// agree here, where one view holds everything.
+/// `kind list` answers from the files in the working copy; the KG answers for what
+/// the last deflate saw. They agree here, where one view holds everything.
 #[test]
 fn kind_list_and_the_hub_agree_on_a_single_view() {
     let (f, hub, first, second) = recorded_adr_fixture();
@@ -753,4 +753,62 @@ fn query_text_printers_are_terminal_safe() {
 
     let raw = f.json(&["query", "search", "hostile", "--json"]);
     assert_eq!(raw[0]["label"], title, "{raw:#}");
+}
+
+/// The hub answers for whatever the last deflate saw: not one view, and not a
+/// union of views. A sibling view's record drops an instance its working copy
+/// does not hold, while `kind validate --view` still answers per view.
+#[test]
+fn the_hub_answers_for_the_last_deflate_and_not_for_every_view() {
+    let f = Fixture {
+        repo: TempDir::new().unwrap(),
+        home: TempDir::new().unwrap(),
+    };
+    f.ok(&["init", "--view", "dev"]);
+    f.ok(&["kind", "init", "adr"]);
+    f.ok(&["add", ".vault/kinds/adr/_kind.md"]);
+    f.ok(&[
+        "record",
+        "-m",
+        "feat: add adr kind",
+        ".vault/kinds/adr/_kind.md",
+    ]);
+    let hub = f.json(&["kind", "show", "adr", "--json"])["kg_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let instances = |f: &Fixture| -> usize {
+        f.json(&["query", "neighbors", &hub, "--json"])["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|node| node["metadata"]["kind_name"] == "adr")
+            .count()
+    };
+
+    f.ok(&[
+        "view", "create", "a", "--draft", "--parent", "dev", "--switch",
+    ]);
+    let created = f.json(&["kind", "new", "adr", "--title", "On view a", "--json"]);
+    let file = created["file"].as_str().unwrap();
+    f.ok(&["add", file]);
+    f.ok(&["record", "-m", "docs: an adr", file]);
+    assert_eq!(instances(&f), 1);
+
+    f.ok(&["view", "switch", "dev"]);
+    f.ok(&[
+        "view", "create", "b", "--draft", "--parent", "dev", "--switch",
+    ]);
+    fs::write(f.root().join("unrelated.txt"), "x\n").unwrap();
+    f.ok(&["add", "unrelated.txt"]);
+    f.ok(&["record", "-m", "chore: unrelated", "unrelated.txt"]);
+    assert_eq!(instances(&f), 0);
+
+    let on_a = f.json(&["kind", "validate", "--view", "a", "--json"]);
+    assert_eq!(on_a["kinds"][0]["instance_count"], 1, "{on_a:#}");
+
+    f.ok(&["view", "switch", "a"]);
+    assert_eq!(instances(&f), 0, "switching back does not deflate");
+    f.ok(&["vault", "sync"]);
+    assert_eq!(instances(&f), 1);
 }
