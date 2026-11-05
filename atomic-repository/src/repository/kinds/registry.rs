@@ -41,6 +41,16 @@ impl KindDefinition {
         }
     }
 
+    /// A definition whose file is there but could not be read.
+    fn unreadable(name: &str, problem: &str) -> KindDefinition {
+        KindDefinition {
+            name: name.to_string(),
+            def_path: kind_definition_path(name),
+            status: KindStatus::Invalid(vec![problem.to_string()]),
+            guidance: String::new(),
+        }
+    }
+
     /// Parse the definition of kind `name` from its file's bytes.
     ///
     /// A missing frontmatter block, a YAML error, a conflict marker anywhere
@@ -205,15 +215,24 @@ impl KindRegistry {
             }
         }
         for kind in definitions {
-            if let Some(definition) = Self::load_kind(files, &kind)? {
-                registry.kinds.insert(
-                    kind.clone(),
-                    KindEntry {
-                        definition,
-                        instances: instances.remove(&kind).unwrap_or_default(),
-                    },
-                );
-            }
+            // The walk found this path, so an answer of "no such file" means it
+            // holds no regular file. Either way the kind stays visible and
+            // invalid, and one bad definition does not stop the others.
+            let definition = match Self::load_kind(files, &kind) {
+                Ok(Some(definition)) => definition,
+                Ok(None) => KindDefinition::unreadable(
+                    &kind,
+                    "not a regular file (a symlink, which is never followed, or something else)",
+                ),
+                Err(e) => KindDefinition::unreadable(&kind, &format!("could not be read: {e}")),
+            };
+            registry.kinds.insert(
+                kind.clone(),
+                KindEntry {
+                    definition,
+                    instances: instances.remove(&kind).unwrap_or_default(),
+                },
+            );
         }
         registry.unregistered = instances;
         Ok(registry)
