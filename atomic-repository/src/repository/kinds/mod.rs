@@ -224,13 +224,11 @@ impl<'r> KindFiles<'r> {
     }
 
     /// Does the vault-relative `path` name a regular file in this source?
-    /// On disk, a symlink is not followed and does not count.
+    /// On disk, a symlink anywhere along the path is not followed, and the
+    /// path does not count.
     pub fn exists(&self, path: &str) -> bool {
         match &self.inner {
-            FilesInner::WorkingCopy { vault_dir } => {
-                safe_relative(path)
-                    && std::fs::symlink_metadata(vault_dir.join(path)).is_ok_and(|m| m.is_file())
-            }
+            FilesInner::WorkingCopy { vault_dir } => is_plain_file(vault_dir, path),
             FilesInner::View { paths, .. } => paths.contains(path),
         }
     }
@@ -282,7 +280,9 @@ impl<'r> KindFiles<'r> {
     }
 
     /// Every file under `kinds/`, vault-relative and sorted. Symlinks on
-    /// disk are listed (they are stray) but never followed. In a view, a
+    /// disk are listed but never followed: the registry reports a link at a
+    /// definition or instance path as unreadable, and any other as stray. In a
+    /// view, a
     /// name-conflicted file path is listed although it cannot be read (see
     /// [`KindFiles::name_conflict`]), so the kind it belongs to is not lost.
     pub fn list_kind_files(&self) -> Result<Vec<String>, RepositoryError> {
