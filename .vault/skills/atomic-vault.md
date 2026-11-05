@@ -138,7 +138,7 @@ atomic kind list adr
 
 # Create an instance (validated before anything is written)
 atomic kind new adr --title "Sign changes with Ed25519" \
-  --set status=accepted --set intent=PIMO-12 --body-file decision.md
+  --set status=accepted --set intent=1 --body-file decision.md
 
 # Check definitions and instances
 atomic kind validate
