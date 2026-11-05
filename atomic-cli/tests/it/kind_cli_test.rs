@@ -780,3 +780,44 @@ fn reads_do_not_create_the_vault_and_writes_do() {
         .unwrap()
         .is_some());
 }
+
+/// A refused `kind new` or `kind init` leaves a vaultless repository without a
+/// vault: the vault is created when the write goes ahead, not before.
+#[test]
+fn refused_writes_do_not_create_the_vault() {
+    let f = Fixture::initialized_with(&["init", "--no-vault"]);
+    let vault = f.root().join(".vault");
+    assert!(!vault.exists());
+
+    let out = f.fails(&["kind", "new", "adr", "--title", "x"], 3);
+    assert!(out.contains("kind not found"), "{out}");
+    assert!(!out.contains("Initialized vault"), "{out}");
+    assert!(!vault.exists());
+
+    // A hand-written definition is all the vault there is until a write lands.
+    f.write_definition("adr", ADR_DEFINITION);
+    let vault_entries = || -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&vault)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    };
+    let out = f.fails(&["kind", "new", "adr", "--set", "status=nope"], 2);
+    assert!(out.contains("Nothing was written."), "{out}");
+    assert!(!out.contains("Initialized vault"), "{out}");
+    assert_eq!(vault_entries(), ["kinds"]);
+    assert!(f.instances("adr").is_empty());
+
+    let out = f.fails(&["kind", "init", "adr"], 2);
+    assert!(out.contains("already exists"), "{out}");
+    assert!(!out.contains("Initialized vault"), "{out}");
+    assert_eq!(vault_entries(), ["kinds"]);
+
+    let out = f.run(&["kind", "new", "adr", "--title", "First"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("Initialized vault"));
+    assert_eq!(f.instances("adr").len(), 1);
+    assert!(vault_entries().contains(&"memory".to_string()));
+}

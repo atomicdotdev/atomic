@@ -31,9 +31,7 @@ use clap::Subcommand;
 use atomic_canonical::kind_spec::is_unsafe_text_char;
 use atomic_repository::{KindDefinition, KindStatus, Repository};
 
-use crate::commands::{
-    find_repository_root, open_readonly_repository, open_repository_with_vault, Command,
-};
+use crate::commands::{find_repository_root, open_readonly_repository, Command};
 use crate::error::{CliError, CliResult};
 
 pub mod init;
@@ -101,9 +99,11 @@ pub(crate) fn open_for_read() -> CliResult<Repository> {
 }
 
 /// Open the repository the current directory is in, for a command that writes
-/// to the vault, creating the vault when it does not exist yet.
+/// to the vault. It creates no vault: the command calls
+/// [`ensure_vault_exists`](crate::commands::ensure_vault_exists) once it is past
+/// every check that can refuse it, so a refused command leaves no vault behind.
 pub(crate) fn open_for_write() -> CliResult<Repository> {
-    open_repository_with_vault(&find_repository_root()?)
+    Repository::open(find_repository_root()?).map_err(CliError::from)
 }
 
 /// A user-fixable authoring failure: exit code 2, like `memory validate`.

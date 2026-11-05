@@ -22,7 +22,7 @@ use super::init::{ingest, write_new_file};
 use super::{
     display_path, display_text, kind_not_found, open_for_write, record_hint, validation_failed,
 };
-use crate::commands::Command;
+use crate::commands::{ensure_vault_exists, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{error, success, warning};
 
@@ -289,6 +289,7 @@ impl KindNew {
             }
         }
 
+        ensure_vault_exists(&repo)?;
         let rel = kind_instance_path(&self.kind, &uid);
         let path = repo.vault_dir().join(&rel);
         write_new_file(&path, &document)?;

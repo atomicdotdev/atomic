@@ -6,7 +6,7 @@ use atomic_canonical::kind_spec::{is_reserved_kind_name, is_valid_kind_name};
 use atomic_repository::{kind_definition_path, KindDefinition, KindStatus, Repository};
 
 use super::{display_path, open_for_write, record_hint};
-use crate::commands::Command;
+use crate::commands::{ensure_vault_exists, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{hint, success};
 
@@ -44,6 +44,7 @@ impl Command for KindInit {
             });
         }
 
+        ensure_vault_exists(&repo)?;
         let content = starter_definition(kind);
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
