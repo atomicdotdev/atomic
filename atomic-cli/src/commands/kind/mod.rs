@@ -20,16 +20,20 @@
 //! ```
 //!
 //! Nothing here records. `init` and `new` write a file and ingest it into
-//! the vault index; recording it is a separate, deliberate step (and the
-//! definition should be recorded before its instances, so instance changes
-//! depend on it).
+//! the vault index, creating the vault on first use; recording it is a
+//! separate, deliberate step (and the definition should be recorded before its
+//! instances, so instance changes depend on it). `list`, `show` and `validate`
+//! open the repository read-only: they read kinds from files, so they neither
+//! need nor cause a knowledge-graph rebuild.
 
 use clap::Subcommand;
 
 use atomic_canonical::kind_spec::is_unsafe_text_char;
 use atomic_repository::{KindDefinition, KindStatus, Repository};
 
-use crate::commands::{find_repository_root, Command};
+use crate::commands::{
+    find_repository_root, open_readonly_repository, open_repository_with_vault, Command,
+};
 use crate::error::{CliError, CliResult};
 
 pub mod init;
@@ -89,10 +93,17 @@ impl Command for Kind {
     }
 }
 
-/// Open the repository the current directory is in.
-pub(crate) fn open_repository() -> CliResult<Repository> {
+/// Open the repository the current directory is in, for a command that only
+/// reads.
+pub(crate) fn open_for_read() -> CliResult<Repository> {
     let root = find_repository_root()?;
-    Repository::open(&root).map_err(CliError::Repository)
+    open_readonly_repository(&root).map_err(CliError::Repository)
+}
+
+/// Open the repository the current directory is in, for a command that writes
+/// to the vault, creating the vault when it does not exist yet.
+pub(crate) fn open_for_write() -> CliResult<Repository> {
+    open_repository_with_vault(&find_repository_root()?)
 }
 
 /// A user-fixable authoring failure: exit code 2, like `memory validate`.

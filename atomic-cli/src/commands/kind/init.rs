@@ -5,7 +5,7 @@ use clap::Parser;
 use atomic_canonical::kind_spec::{is_reserved_kind_name, is_valid_kind_name};
 use atomic_repository::{kind_definition_path, KindDefinition, KindStatus, Repository};
 
-use super::{display_path, open_repository, record_hint};
+use super::{display_path, open_for_write, record_hint};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{hint, success};
@@ -32,7 +32,7 @@ impl Command for KindInit {
         let kind = self.kind.as_str();
         check_new_kind_name(kind)?;
 
-        let repo = open_repository()?;
+        let repo = open_for_write()?;
         let rel = kind_definition_path(kind);
         let file = repo.vault_dir().join(&rel);
         if std::fs::symlink_metadata(&file).is_ok() {
@@ -116,12 +116,8 @@ pub(crate) fn write_new_file(path: &std::path::Path, content: &str) -> CliResult
 }
 
 /// Deflate one just-written vault file into the vault index, through the
-/// same path `atomic vault sync` uses for files on disk. A repository
-/// without a vault has no index to update.
+/// same path `atomic vault sync` uses for files on disk.
 pub(crate) fn ingest(repo: &Repository, vault_relative: &str, content: &str) -> CliResult<()> {
-    if !repo.has_vault().map_err(CliError::Repository)? {
-        return Ok(());
-    }
     repo.vault_record_files(&[(vault_relative.to_string(), Some(content.to_string()))])
         .map_err(CliError::Repository)?;
     Ok(())
