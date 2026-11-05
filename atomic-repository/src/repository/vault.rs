@@ -5,7 +5,7 @@ use atomic_core::pristine::vault::{
 };
 use atomic_core::types::{Hash, Merkle};
 
-use super::kinds::{KindPath, KINDS_DIR};
+use super::kinds::{is_plain_file, KindPath, KINDS_DIR};
 pub(crate) use super::vault_frontmatter::parse_vault_frontmatter_at;
 use super::vault_frontmatter::write_frontmatter_field;
 
@@ -623,6 +623,13 @@ impl Repository {
     /// - Their body hash or user frontmatter differs from the stored entry
     ///
     /// Ignores non-`.md` files and `_manifest.json`.
+    ///
+    /// Under `kinds/` the rules of [`KindFiles`] hold
+    /// here too: anything but a regular file is skipped unread (a symlink is
+    /// never followed), and a file that cannot be read is logged and skipped
+    /// rather than failing the scan. `atomic kind validate` reports both. A
+    /// skipped link has no row, and a file that is there but unreadable keeps
+    /// the row it has.
     pub fn vault_scan_working_copy(&self) -> Result<Vec<VaultFileChange>, RepositoryError> {
         let vault_dir = self.vault_dir();
         if !vault_dir.exists() {
@@ -664,8 +671,22 @@ impl Repository {
             // Normalize to forward slashes (for Windows compat)
             let rel_path_str = rel_path_str.replace('\\', "/");
 
+            let is_kind_file = KindPath::classify(&rel_path_str).is_some();
+            if is_kind_file && !entry.file_type().is_file() {
+                continue;
+            }
+
             // Read file content
-            let file_content = std::fs::read_to_string(path)?;
+            let file_content = match std::fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(e) if is_kind_file => {
+                    log::warn!(
+                        "vault: skipping {rel_path_str}: {e}; `atomic kind validate` reports it"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             if let Some(change) = self.vault_file_change(rel_path_str, &file_content)? {
                 changes.push(change);
             }
@@ -674,8 +695,12 @@ impl Repository {
         // Also check for deleted entries (in redb but not on disk)
         let all_entries = self.vault_list("", None)?;
         for meta in all_entries {
-            let disk_path = vault_dir.join(&meta.path);
-            if !disk_path.exists() {
+            let on_disk = if KindPath::classify(&meta.path).is_some() {
+                is_plain_file(&vault_dir, &meta.path)
+            } else {
+                vault_dir.join(&meta.path).exists()
+            };
+            if !on_disk {
                 changes.push(VaultFileChange {
                     path: meta.path,
                     change_type: VaultChangeType::Deleted,
