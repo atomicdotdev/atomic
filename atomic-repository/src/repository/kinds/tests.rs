@@ -24,11 +24,11 @@ fields:
   supersedes:
     type: ref[]
     target: [adr]
-    edge: SUPERSEDES
+    edge: supersedes
   intent:
     type: ref
     target: [intent]
-    edge: IMPLEMENTS
+    edge: implements
   memo:
     type: ref
     target: [memory]
@@ -142,7 +142,7 @@ fn kinds_working_copy_registry() {
     let adr = registry.get("adr").unwrap();
     let spec = adr.spec().expect("adr registers");
     assert!(spec.embed);
-    assert_eq!(spec.edges(), ["adr.IMPLEMENTS", "adr.SUPERSEDES"]);
+    assert_eq!(spec.edges(), ["implements", "supersedes"]);
     assert_eq!(adr.definition.def_path, "kinds/adr/_kind.md");
     assert!(adr.definition.guidance.starts_with("# How to write an ADR"));
     assert_eq!(adr.instances, [format!("kinds/adr/{UID}.md")]);
@@ -413,7 +413,10 @@ fn kinds_resolve_refs_to_instances_memory_and_intents() {
         Some("memory/storage.md")
     );
     assert_eq!(resolver.resolve("memory", "../memory/storage"), None);
-    assert_eq!(resolver.resolve("adr", UID2), Some(format!("adr:{UID2}")));
+    assert_eq!(
+        resolver.resolve("adr", UID2),
+        Some(format!("kinds/adr/{UID2}.md"))
+    );
     assert_eq!(resolver.resolve("adr", &UID2.to_lowercase()), None);
     assert_eq!(resolver.resolve("rfc", UID2), None);
 
@@ -437,7 +440,7 @@ fn kinds_resolve_refs_to_instances_memory_and_intents() {
     let InstanceCheck::Checked { report, .. } = check_instance(spec, UID, &bytes, &resolver) else {
         panic!("instance must parse");
     };
-    let adr2 = format!("adr:{UID2}");
+    let adr2 = format!("kinds/adr/{UID2}.md");
     let edges: Vec<_> = report
         .resolved_refs
         .iter()
@@ -446,11 +449,35 @@ fn kinds_resolve_refs_to_instances_memory_and_intents() {
     assert_eq!(
         edges,
         [
-            (Some("adr.IMPLEMENTS"), intent_subject.as_str()),
+            (Some("implements"), intent_subject.as_str()),
             (None, "memory/storage.md"),
-            (Some("adr.SUPERSEDES"), adr2.as_str()),
+            (Some("supersedes"), adr2.as_str()),
         ]
     );
+}
+
+/// Field names the old projection reserved are ordinary fields: they survive
+/// the vault's frontmatter handling and validate like any other.
+#[test]
+fn kinds_fields_named_after_kg_metadata_keys_validate() {
+    let (dir, repo) = vault_repo();
+    let root = dir.path();
+    write(
+        root,
+        "kinds/thing/_kind.md",
+        "---\nname: thing\nspecVersion: 1\nfields:\n  kind:\n    type: string\n  conforms:\n    type: boolean\n  vault_path:\n    type: string\n  violation_codes:\n    type: string[]\n  urn:\n    type: string\n---\n",
+    );
+    write(
+        root,
+        &format!("kinds/thing/{UID}.md"),
+        &format!(
+            "---\nuid: {UID}\nkind: a\nconforms: false\nvault_path: b\nviolation_codes: [c]\nurn: d\n---\nbody\n"
+        ),
+    );
+    let report = repo.kind_validate(&KindSource::WorkingCopy, None).unwrap();
+    assert!(report.ok, "{report:?}");
+    assert_eq!(report.kinds[0].field_count, 5);
+    assert!(report.kinds[0].instances[0].conforms, "{report:?}");
 }
 
 #[test]
@@ -460,7 +487,7 @@ fn kinds_ref_to_unregistered_or_invalid_kind_does_not_resolve() {
     write(
         root,
         "kinds/rfc/_kind.md",
-        "---\nname: rfc\nspecVersion: 1\nfields:\n  decidedBy:\n    type: ref\n    target: [adr]\n    edge: DECIDED_BY\n---\n",
+        "---\nname: rfc\nspecVersion: 1\nfields:\n  decidedBy:\n    type: ref\n    target: [adr]\n    edge: decidedBy\n---\n",
     );
     write(
         root,

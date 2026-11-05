@@ -80,7 +80,7 @@ impl Command for KindInit {
     }
 }
 
-/// Reject a name that is malformed or reserved for a built-in vault kind.
+/// Reject a name that is malformed or reserved.
 fn check_new_kind_name(kind: &str) -> CliResult<()> {
     if !is_valid_kind_name(kind) {
         return Err(CliError::InvalidArgument {
@@ -92,7 +92,7 @@ fn check_new_kind_name(kind: &str) -> CliResult<()> {
     }
     if is_reserved_kind_name(kind) {
         return Err(CliError::InvalidArgument {
-            message: format!("kind name {kind:?} is reserved for a built-in vault kind"),
+            message: format!("kind name {kind:?} is reserved"),
         });
     }
     Ok(())
@@ -161,8 +161,8 @@ The frontmatter above is the schema. Each field has a `type` (`string`,\n\
 `integer`, `boolean`, `enum` or `ref`, each with a `[]` suffix for a list)\n\
 and may set `required`, `default` and `description`. An `enum` lists its\n\
 `values`; a `ref` names its `target` kinds (`intent`, `memory`, or another\n\
-custom kind) and may declare an `edge` (UPPER_SNAKE_CASE), projected into the\n\
-knowledge graph as `{kind}.<EDGE>`. Instances may only use declared fields.\n"
+custom kind) and may declare an `edge` (lowerCamelCase), the label its link\n\
+carries in the knowledge graph. Instances may only use declared fields.\n"
     )
 }
 
@@ -189,6 +189,8 @@ mod tests {
         assert!(check_new_kind_name("adr").is_ok());
         assert!(check_new_kind_name("intent").is_err());
         assert!(check_new_kind_name("kind").is_err());
+        assert!(check_new_kind_name("tool-result").is_err());
+        assert!(check_new_kind_name("layer").is_ok());
         assert!(check_new_kind_name("Adr").is_err());
         assert!(check_new_kind_name("1adr").is_err());
     }

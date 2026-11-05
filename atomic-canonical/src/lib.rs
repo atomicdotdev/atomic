@@ -53,10 +53,10 @@ pub mod vocab;
 pub use error::{CanonicalError, Result};
 pub use gate::{validate_intent, validate_memory, ValidationReport, Violation};
 pub use kind_spec::{
-    apply_defaults, has_conflict_markers, instance_kg_id, instance_urn, namespaced_edge,
-    parse_set_value, validate_instance, BaseType, BodySpec, FieldSpec, FieldType, InstanceReport,
-    KindSpec, KindSpecError, KindViolation, KindViolationCode, ParseValueError, RefResolver,
-    ResolvedRef, ShaclRow, RESERVED_FIELD_NAMES, RESERVED_KIND_NAMES,
+    apply_defaults, has_conflict_markers, parse_set_value, validate_instance, BaseType, BodySpec,
+    FieldSpec, FieldType, InstanceReport, KindSpec, KindSpecError, KindViolation,
+    KindViolationCode, ParseValueError, RefResolver, ResolvedRef, RESERVED_FIELD_NAMES,
+    RESERVED_KIND_NAMES,
 };
 pub use memory::MemoryNode;
 pub use node::{

@@ -1,4 +1,4 @@
-//! `atomic kind show <k>` — a kind's schema, status and SHACL-Core summary.
+//! `atomic kind show <k>` — a kind's schema and status.
 
 use clap::Parser;
 use serde_json::Value;
@@ -14,7 +14,7 @@ use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{emphasis, error, Column, KeyValueTable, Table};
 
-/// Show a kind's schema, status and SHACL-Core summary.
+/// Show a kind's schema and status.
 #[derive(Parser, Debug)]
 #[command(name = "show")]
 pub struct KindShow {
@@ -60,7 +60,6 @@ impl KindShow {
             "instance_count": entry.instances.len(),
             "spec": spec,
             "edges": spec.map(KindSpec::edges).unwrap_or_default(),
-            "shacl": spec.map(KindSpec::summary_rows).unwrap_or_default(),
         });
         if self.guidance {
             out["guidance"] =
@@ -112,22 +111,6 @@ impl KindShow {
                 } else {
                     println!("{}", fields_table(spec));
                 }
-                println!();
-                println!("{}", emphasis("SHACL-Core"));
-                let mut shacl = Table::new();
-                shacl.set_columns(vec![
-                    Column::new("SUBJECT"),
-                    Column::new("CONSTRUCT"),
-                    Column::new("SHACL"),
-                ]);
-                for row in spec.summary_rows() {
-                    shacl.add_row([
-                        display_text(&row.subject),
-                        display_text(&row.construct),
-                        display_text(&row.shacl),
-                    ]);
-                }
-                println!("{shacl}");
             }
         }
 
@@ -162,7 +145,7 @@ fn fields_table(spec: &KindSpec) -> Table {
             field
                 .edge
                 .as_deref()
-                .map_or_else(|| "-".to_string(), |e| spec_edge(spec, e)),
+                .map_or_else(|| "-".to_string(), str::to_string),
             field
                 .description
                 .as_deref()
@@ -183,10 +166,6 @@ fn values_or_target(field: &FieldSpec) -> String {
     } else {
         list.join(", ")
     }
-}
-
-fn spec_edge(spec: &KindSpec, edge: &str) -> String {
-    atomic_canonical::kind_spec::namespaced_edge(&spec.name, edge)
 }
 
 fn compact(value: &Value) -> String {
