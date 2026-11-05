@@ -7,7 +7,7 @@ use atomic_repository::{
     KindProblemCode, KindReportStatus, KindSource, KindValidationReport, RepositoryError,
 };
 
-use super::{display_path, display_text, kind_not_found, open_repository, validation_failed};
+use super::{display_path, display_text, kind_not_found, open_for_read, validation_failed};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{error, success};
@@ -34,7 +34,7 @@ pub struct KindValidate {
 
 impl Command for KindValidate {
     fn run(&self) -> CliResult<()> {
-        let repo = open_repository()?;
+        let repo = open_for_read()?;
         let source = match &self.view {
             Some(view) => KindSource::View(view.clone()),
             None => KindSource::WorkingCopy,
