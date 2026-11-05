@@ -2054,3 +2054,160 @@ fn scale_probe_deflate() {
         }
     }
 }
+
+// ── What deflate may read under kinds/ ──────────────────────────
+
+/// Deflate holds the rule `KindFiles` states: a link under `kinds/` is never
+/// followed, so what it names reaches neither redb nor the KG.
+#[cfg(unix)]
+#[test]
+fn deflate_never_follows_a_link_under_kinds() {
+    let (dir, repo) = projected_repo();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(outside.join("adr")).unwrap();
+    std::fs::write(outside.join("instance.md"), adr(K1, "")).unwrap();
+    std::fs::write(outside.join("_kind.md"), RFC_SPEC).unwrap();
+    std::fs::write(outside.join("adr/_kind.md"), ADR_SPEC).unwrap();
+    std::fs::write(outside.join("adr").join(format!("{K2}.md")), adr(K2, "")).unwrap();
+    let link = |target: &std::path::Path, rel: &str| {
+        let path = repo.vault_dir().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(target, path).unwrap();
+    };
+    let instance = instance_path("adr", K1);
+    let instance_id = concept(&repo, &format!("adr.{K1}"));
+
+    write_vault(&repo, &hub_path("adr"), ADR_SPEC);
+    link(&outside.join("instance.md"), &instance);
+    link(&outside.join("_kind.md"), &hub_path("rfc"));
+    sync(&repo);
+    assert!(repo.vault_retrieve(&instance).unwrap().is_none());
+    assert!(repo.vault_retrieve(&hub_path("rfc")).unwrap().is_none());
+    assert!(node(&repo, &instance_id).is_none());
+    assert!(node(&repo, &concept(&repo, "kind.rfc")).is_none());
+
+    // A stored file swapped for a link takes its row and node with it: the row
+    // no longer says what the path holds.
+    remove_vault(&repo, &instance);
+    write_vault(&repo, &instance, adr(K1, ""));
+    sync(&repo);
+    assert!(node(&repo, &instance_id).is_some());
+    remove_vault(&repo, &instance);
+    link(&outside.join("instance.md"), &instance);
+    sync(&repo);
+    assert!(repo.vault_retrieve(&instance).unwrap().is_none());
+    assert!(node(&repo, &instance_id).is_none());
+
+    // So does a kind directory swapped for a link, whatever lies behind it.
+    remove_vault(&repo, &instance);
+    write_vault(&repo, &instance, adr(K1, ""));
+    sync(&repo);
+    assert!(repo.vault_retrieve(&hub_path("adr")).unwrap().is_some());
+    std::fs::remove_dir_all(repo.vault_dir().join("kinds/adr")).unwrap();
+    link(&outside.join("adr"), "kinds/adr");
+    sync(&repo);
+    assert!(repo.vault_retrieve(&hub_path("adr")).unwrap().is_none());
+    assert!(repo.vault_retrieve(&instance).unwrap().is_none());
+    assert!(repo
+        .vault_retrieve(&instance_path("adr", K2))
+        .unwrap()
+        .is_none());
+}
+
+/// Reading a link to a device or a named pipe never returns, and a deflate runs
+/// inside `record`.
+#[cfg(unix)]
+#[test]
+fn deflate_does_not_block_on_what_is_not_a_file_under_kinds() {
+    let (_dir, repo) = projected_repo();
+    write_vault(&repo, &hub_path("adr"), ADR_SPEC);
+    write_vault(&repo, MEMORY_PATH, labelled_memory("x"));
+    std::os::unix::fs::symlink("/dev/zero", repo.vault_dir().join(instance_path("adr", K1)))
+        .unwrap();
+    let fifo = repo.vault_dir().join(instance_path("adr", K2));
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+
+    let updated = sync(&repo);
+    assert!(updated.contains(&MEMORY_PATH.to_string()), "{updated:?}");
+    assert!(repo
+        .vault_retrieve(&instance_path("adr", K1))
+        .unwrap()
+        .is_none());
+    assert!(repo
+        .vault_retrieve(&instance_path("adr", K2))
+        .unwrap()
+        .is_none());
+}
+
+/// One bad file is `kind validate`'s to report: every other row still deflates,
+/// and a file that is there is not taken for deleted.
+#[test]
+fn a_kind_file_that_cannot_be_read_does_not_stop_the_deflate() {
+    let (_dir, repo) = projected_repo();
+    let stored = instance_path("adr", K1);
+    write_vault(&repo, &hub_path("adr"), ADR_SPEC);
+    write_vault(&repo, &stored, adr(K1, ""));
+    sync(&repo);
+    let before = repo.vault_retrieve(&stored).unwrap().unwrap();
+
+    let not_utf8 = |uid: &str| {
+        let mut bytes = format!("---\nuid: {uid}\nstatus: accepted\ntitle: caf").into_bytes();
+        bytes.push(0xE9);
+        bytes.extend_from_slice(b"\n---\nBody.\n");
+        bytes
+    };
+    write_vault(&repo, &stored, not_utf8(K1));
+    write_vault(&repo, &instance_path("adr", K2), not_utf8(K2));
+    write_vault(&repo, MEMORY_PATH, labelled_memory("x"));
+    let updated = sync(&repo);
+    assert!(updated.contains(&MEMORY_PATH.to_string()), "{updated:?}");
+
+    let after = repo.vault_retrieve(&stored).unwrap().unwrap();
+    assert_eq!(after.content_hash, before.content_hash);
+    assert!(node(&repo, &concept(&repo, &format!("adr.{K1}"))).is_some());
+    assert!(repo
+        .vault_retrieve(&instance_path("adr", K2))
+        .unwrap()
+        .is_none());
+    let report = repo
+        .kind_validate(&KindSource::WorkingCopy, Some("adr"))
+        .unwrap();
+    assert!(!report.ok, "{report:?}");
+    assert_eq!(report.problems.len(), 2, "{report:?}");
+}
+
+/// The same containment for a file with no read permission and a dangling link.
+#[cfg(unix)]
+#[test]
+fn a_kind_file_with_no_permission_or_target_does_not_stop_the_deflate() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, repo) = projected_repo();
+    let stored = instance_path("adr", K1);
+    write_vault(&repo, &hub_path("adr"), ADR_SPEC);
+    write_vault(&repo, &stored, adr(K1, ""));
+    sync(&repo);
+
+    let file = repo.vault_dir().join(&stored);
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::os::unix::fs::symlink(
+        "/nonexistent/target.md",
+        repo.vault_dir().join(instance_path("adr", K2)),
+    )
+    .unwrap();
+    write_vault(&repo, MEMORY_PATH, labelled_memory("x"));
+    let updated = repo.vault_record_working_copy();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let updated = updated.unwrap();
+    assert!(updated.contains(&MEMORY_PATH.to_string()), "{updated:?}");
+    assert!(repo.vault_retrieve(&stored).unwrap().is_some());
+    assert!(repo
+        .vault_retrieve(&instance_path("adr", K2))
+        .unwrap()
+        .is_none());
+}
