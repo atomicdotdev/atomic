@@ -27,7 +27,7 @@
 
 use clap::Parser;
 
-use atomic_repository::Repository;
+use atomic_repository::{KindPath, Repository};
 
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
@@ -48,6 +48,19 @@ pub struct Materialize {
 
 impl Command for Materialize {
     fn run(&self) -> CliResult<()> {
+        // The domain call refuses this too. Refusing here makes it the usage
+        // error it is, where the service would surface an internal one.
+        if let Some(path) = self.path.as_deref() {
+            if KindPath::classify(path).is_some() {
+                return Err(CliError::InvalidArgument {
+                    message: format!(
+                        "'{path}' is a kind file: the file in .vault/ is authoritative and is \
+                         never overwritten from the vault index"
+                    ),
+                });
+            }
+        }
+
         // Route every form through the service layer (the handler runs the
         // same vault_materialize/_all domain calls).
         if crate::commands::rpc::vault_materialize(self)? {

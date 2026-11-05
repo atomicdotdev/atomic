@@ -886,3 +886,18 @@ fn list_keeps_going_past_an_unreadable_instance() {
     assert!(table.contains("Readable"), "{table}");
     assert!(table.contains("01JD8ZK3"), "{table}");
 }
+
+/// Refusing to overwrite a kind file is the design working, so it reads as a
+/// usage error and not as a bug to report.
+#[test]
+fn materializing_a_kind_file_is_refused_as_a_usage_error() {
+    let f = Fixture::new();
+    f.ok(&["kind", "init", "adr"]);
+    let definition = f.kind_dir("adr").join("_kind.md");
+    fs::write(&definition, ADR_DEFINITION).unwrap();
+
+    let out = f.fails(&["vault", "materialize", "-p", "kinds/adr/_kind.md"], 2);
+    assert!(out.contains("authoritative"), "{out}");
+    assert!(!out.contains("appears to be a bug"), "{out}");
+    assert_eq!(fs::read_to_string(&definition).unwrap(), ADR_DEFINITION);
+}
