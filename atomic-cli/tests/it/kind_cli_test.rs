@@ -1,6 +1,7 @@
 //! `atomic kind` driven through the binary: init, validate, new, list, show.
 #![cfg(not(windows))]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -42,11 +43,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::initialized_with(&["init"])
+    }
+
+    fn initialized_with(init: &[&str]) -> Self {
         let fixture = Fixture {
             repo: TempDir::new().unwrap(),
             home: TempDir::new().unwrap(),
         };
-        fixture.ok(&["init"]);
+        fixture.ok(init);
         fixture
     }
 
@@ -547,4 +552,227 @@ fn repository_text_is_printed_terminal_safe() {
         shown.contains("fields.status.description: contains a control character (U+000A)"),
         "{shown}"
     );
+}
+
+/// Every path under `root`, with the bytes of each file.
+fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.insert(path.clone(), None);
+                walk(&path, out);
+            } else {
+                out.insert(path.clone(), Some(fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, &mut out);
+    out
+}
+
+/// Assert that two snapshots match, naming the paths that differ: the database
+/// bytes are too long to print.
+fn assert_unchanged(
+    before: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+    after: &BTreeMap<PathBuf, Option<Vec<u8>>>,
+) {
+    let differing: Vec<_> = before
+        .keys()
+        .chain(after.keys().filter(|path| !before.contains_key(*path)))
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect();
+    assert!(differing.is_empty(), "changed by a read: {differing:?}");
+}
+
+/// Roll the database back to what a binary from before project identity and
+/// the current knowledge-graph generation left: no identity, an older
+/// generation, and no KG capability.
+fn age_repository(root: &Path) {
+    use atomic_core::pristine::tables::{KG_INDEX_META, PRISTINE_META, PROJECT_IDENTITY};
+
+    let db = redb::Database::open(root.join(".atomic/atomic.redb")).unwrap();
+    let txn = db.begin_write().unwrap();
+    txn.open_table(KG_INDEX_META)
+        .unwrap()
+        .insert("kg_generation", 1)
+        .unwrap();
+    txn.open_table(PROJECT_IDENTITY).unwrap().remove(0).unwrap();
+    txn.open_table(PRISTINE_META)
+        .unwrap()
+        .remove("required-capability/kg-semweb-v1")
+        .unwrap();
+    txn.commit().unwrap();
+}
+
+/// `list`, `show` and `validate` read kinds from files, so they answer on a
+/// repository whose writable open would first mint an identity and rebuild the
+/// knowledge graph, and they change nothing.
+#[test]
+fn reads_answer_on_a_repository_needing_a_kg_rebuild_and_change_nothing() {
+    use atomic_core::kg::KG_GENERATION;
+    use atomic_repository::{KindSource, Repository};
+
+    let f = Fixture::new();
+    f.write_definition("adr", ADR_DEFINITION);
+    f.ok(&["add", ".vault/kinds/adr/_kind.md"]);
+    f.ok(&[
+        "record",
+        "-m",
+        "feat: add adr kind",
+        ".vault/kinds/adr/_kind.md",
+    ]);
+    let intent = f.ok(&["intent", "new", "Sign changes"]);
+    let intent = intent
+        .lines()
+        .find_map(|line| line.strip_prefix("Created intent: "))
+        .unwrap();
+    fs::write(f.root().join("decision.md"), "We sign.\n").unwrap();
+    let created: serde_json::Value = serde_json::from_str(&f.ok(&[
+        "kind",
+        "new",
+        "adr",
+        "--title",
+        "Sign changes with Ed25519",
+        "--set",
+        &format!("intent={intent}"),
+        "--body-file",
+        "decision.md",
+        "--json",
+    ]))
+    .unwrap();
+    let instance = created["file"].as_str().unwrap();
+    f.ok(&["add", instance]);
+    f.ok(&["record", "-m", "docs: first adr", instance]);
+
+    age_repository(f.root());
+    let view = {
+        let repo = Repository::open_readonly(f.root()).unwrap();
+        assert!(repo.project_identity().unwrap().is_none());
+        let generation = repo.pristine().read_txn().unwrap().kg_generation().unwrap();
+        assert_ne!(generation, KG_GENERATION);
+        repo.current_view().to_string()
+    };
+    let before = snapshot(f.root());
+
+    let kinds = f.ok(&["kind", "list"]);
+    assert!(kinds.contains("adr   registered  1"), "{kinds}");
+    let instances = f.ok(&["kind", "list", "adr"]);
+    assert!(instances.contains("Sign changes with"), "{instances}");
+    let shown = f.ok(&["kind", "show", "adr"]);
+    assert!(shown.contains("implements"), "{shown}");
+    let list_json: serde_json::Value =
+        serde_json::from_str(&f.ok(&["kind", "list", "adr", "--json"])).unwrap();
+    assert_eq!(list_json["instances"][0]["conforms"], true, "{list_json}");
+    f.ok(&["kind", "validate"]);
+    for args in [
+        vec!["kind", "validate", "--json"],
+        vec!["kind", "validate", "adr", "--json"],
+        vec!["kind", "validate", "--view", &view, "--json"],
+    ] {
+        let report: serde_json::Value = serde_json::from_str(&f.ok(&args)).unwrap();
+        assert_eq!(report["ok"], true, "{args:?}: {report}");
+        assert_eq!(
+            report["kinds"][0]["instance_count"], 1,
+            "{args:?}: {report}"
+        );
+        assert_eq!(
+            report["kinds"][0]["instances"][0]["conforms"], true,
+            "{args:?}: {report}"
+        );
+    }
+    let bad_view = f.fails(&["kind", "validate", "--view", "nope"], 3);
+    assert!(bad_view.contains("nope"), "{bad_view}");
+
+    // The view registry cache needs no write access either.
+    {
+        let repo = Repository::open_readonly(f.root()).unwrap();
+        let source = KindSource::View(view.clone());
+        let first = repo.kind_registry(&source).unwrap();
+        let second = repo.kind_registry(&source).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(first.get("adr").is_some());
+    }
+    assert_unchanged(&before, &snapshot(f.root()));
+
+    // The control: a writable open does what the reads were spared.
+    let repo = Repository::open(f.root()).unwrap();
+    assert!(repo.project_identity().unwrap().is_some());
+    assert_eq!(
+        repo.pristine().read_txn().unwrap().kg_generation().unwrap(),
+        KG_GENERATION
+    );
+    drop(repo);
+    assert_ne!(before, snapshot(f.root()));
+}
+
+/// A checkout from before working-copy identities cannot be opened read-only.
+/// The read refuses with the typed migration error and changes nothing, like
+/// every other read-only command; the next write migrates it.
+#[test]
+fn reads_refuse_an_unregistered_working_copy_and_change_nothing() {
+    let f = Fixture::new();
+    f.write_definition("adr", ADR_DEFINITION);
+    fs::remove_file(f.root().join(".atomic/working_copy_id")).unwrap();
+    let before = snapshot(f.root());
+
+    for args in [
+        vec!["kind", "list"],
+        vec!["kind", "show", "adr"],
+        vec!["kind", "validate"],
+    ] {
+        let out = f.run(&args);
+        assert!(!out.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("requires writable migration"), "{stderr}");
+        assert_unchanged(&before, &snapshot(f.root()));
+    }
+
+    f.ok(&["kind", "init", "rfc"]);
+    let kinds = f.ok(&["kind", "list"]);
+    assert!(kinds.contains("adr") && kinds.contains("rfc"), "{kinds}");
+}
+
+/// A read leaves a repository without a vault without one, and the first write
+/// creates it and reaches the vault index instead of skipping it.
+#[test]
+fn reads_do_not_create_the_vault_and_writes_do() {
+    use atomic_repository::Repository;
+
+    let f = Fixture::initialized_with(&["init", "--no-vault"]);
+    let vault = f.root().join(".vault");
+    assert!(!vault.exists());
+    let before = snapshot(f.root());
+
+    let kinds: serde_json::Value =
+        serde_json::from_str(&f.ok(&["kind", "list", "--json"])).unwrap();
+    assert_eq!(kinds["kinds"], serde_json::json!([]), "{kinds}");
+    let report: serde_json::Value =
+        serde_json::from_str(&f.ok(&["kind", "validate", "--json"])).unwrap();
+    assert_eq!(report["ok"], true, "{report}");
+    f.fails(&["kind", "show", "adr"], 3);
+    assert_unchanged(&before, &snapshot(f.root()));
+    assert!(!vault.exists());
+
+    let out = f.run(&["kind", "init", "adr", "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Initialized vault at"), "{stderr}");
+    let created: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(created["registered"], true, "{created}");
+    {
+        let repo = Repository::open_readonly(f.root()).unwrap();
+        assert!(repo.has_vault().unwrap());
+        assert!(repo.stored_kind_definition("adr").unwrap().is_some());
+    }
+
+    let created: serde_json::Value =
+        serde_json::from_str(&f.ok(&["kind", "new", "adr", "--title", "First", "--json"])).unwrap();
+    let uid = created["uid"].as_str().unwrap();
+    let repo = Repository::open_readonly(f.root()).unwrap();
+    assert!(repo
+        .vault_retrieve(&format!("kinds/adr/{uid}.md"))
+        .unwrap()
+        .is_some());
 }

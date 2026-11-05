@@ -10,7 +10,7 @@ use atomic_repository::{
 };
 
 use super::{
-    display_path, display_text, kind_not_found, open_repository, status_label, status_problems,
+    display_path, display_text, kind_not_found, open_for_read, status_label, status_problems,
     Guidance,
 };
 use crate::commands::Command;
@@ -42,7 +42,7 @@ pub struct KindList {
 
 impl Command for KindList {
     fn run(&self) -> CliResult<()> {
-        let repo = open_repository()?;
+        let repo = open_for_read()?;
         let registry = repo
             .kind_registry(&KindSource::WorkingCopy)
             .map_err(CliError::Repository)?;

@@ -20,7 +20,7 @@ use atomic_repository::{
 
 use super::init::{ingest, write_new_file};
 use super::{
-    display_path, display_text, kind_not_found, open_repository, record_hint, validation_failed,
+    display_path, display_text, kind_not_found, open_for_write, record_hint, validation_failed,
 };
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
@@ -162,7 +162,7 @@ impl Command for KindNew {
 
 impl KindNew {
     fn create(&self) -> CliResult<()> {
-        let repo = open_repository()?;
+        let repo = open_for_write()?;
         let registry = repo
             .kind_registry(&KindSource::WorkingCopy)
             .map_err(CliError::Repository)?;

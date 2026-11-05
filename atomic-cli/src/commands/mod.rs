@@ -423,9 +423,9 @@ pub(crate) fn open_readonly_repository(
 /// creating the vault when it does not exist yet.
 ///
 /// Vault *writes* — `goal start/stop/resume`, `materialize`, `sync`,
-/// `intent new/update/delete/link/attest`, `memory new/write/attest` — open
-/// through this helper so a repository created without a vault
-/// (`atomic init --no-vault`, or one that never ran `atomic vault init`)
+/// `intent new/update/delete/link/attest`, `memory new/write/attest`,
+/// `kind init/new` — open through this helper so a repository created without
+/// a vault (`atomic init --no-vault`, or one that never ran `atomic vault init`)
 /// works on first use instead of failing with "Vault not initialized".
 ///
 /// Read-only commands deliberately do NOT use this helper: they open with
