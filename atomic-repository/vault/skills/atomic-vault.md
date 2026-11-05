@@ -146,6 +146,11 @@ atomic kind validate
 - Do **not** create or edit `_kind.md` definitions unless a human asks you
   to. A definition change must be recorded as its own change, before any
   instance that relies on it.
+- `atomic kind new --json` and `atomic kind show --json` report `kg_id`: the
+  node's IRI in the knowledge graph, for `atomic query neighbors "$kg_id"`.
+  It is local to this clone, so use it in a query and never write it into a
+  file. In frontmatter, refer to an instance by its ULID. A custom relation
+  shows up as `references` with its label: `references implements`.
 
 ## Version Control (Read-Only)
 

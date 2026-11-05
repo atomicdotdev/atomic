@@ -1363,12 +1363,35 @@ impl Command for QueryNeighbors {
             for edge in &subgraph.edges {
                 println!(
                     "  {} \u{2192}[{}]\u{2192} {}",
-                    edge.from_id, edge.kind, edge.to_id
+                    edge.from_id,
+                    edge_relation(edge),
+                    edge.to_id
                 );
             }
         }
 
         Ok(())
+    }
+}
+
+/// An edge's relation for the text printers: its predicate, then the labels of
+/// the custom relations it stands for. Every `atomic kind` relation shares one
+/// predicate, so the labels are what tell them apart. No other edge has any.
+pub(crate) fn edge_relation(edge: &atomic_core::KgEdge) -> String {
+    let labels: Vec<String> = edge
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("edges"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(crate::commands::kind::display_text)
+        .collect();
+    if labels.is_empty() {
+        edge.kind.to_string()
+    } else {
+        format!("{} {}", edge.kind, labels.join(","))
     }
 }
 
@@ -2157,6 +2180,42 @@ impl Command for QueryAsk {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod edge_relation_tests {
+    use super::edge_relation;
+    use atomic_core::kg::ontology::Predicate;
+    use atomic_core::KgEdge;
+
+    #[test]
+    fn labels_follow_the_predicate_and_nothing_else_changes() {
+        let plain = KgEdge::new("a", "b", Predicate::References);
+        assert_eq!(edge_relation(&plain), Predicate::References.to_string());
+
+        let other = plain
+            .clone()
+            .with_metadata(serde_json::json!({"derived_from_vault_path": "memory/x.md"}));
+        assert_eq!(edge_relation(&other), Predicate::References.to_string());
+
+        let labelled = plain.with_metadata(serde_json::json!({"edges": ["implements", "tracks"]}));
+        assert_eq!(
+            edge_relation(&labelled),
+            format!("{} implements,tracks", Predicate::References)
+        );
+    }
+
+    #[test]
+    fn labels_cannot_break_out_of_the_line() {
+        let edge = KgEdge::new("a", "b", Predicate::References)
+            .with_metadata(serde_json::json!({"edges": ["x\n\u{1b}[31my", 7]}));
+        let relation = edge_relation(&edge);
+        assert!(
+            !relation.contains('\n') && !relation.contains('\u{1b}'),
+            "{relation}"
+        );
+        assert!(relation.ends_with(" x [31my"), "{relation}");
     }
 }
 
