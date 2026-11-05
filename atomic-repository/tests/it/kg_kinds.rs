@@ -2259,3 +2259,54 @@ fn a_repeated_link_projects_one_copy_of_each_node() {
         describe_difference(&incremental, &rebuilt)
     );
 }
+
+/// A ref to a file that cannot be a node is unresolved on both sides. The gate
+/// must not pass what the KG marks: it stays the stricter of the two.
+#[test]
+fn the_gate_rejects_a_ref_to_an_instance_that_cannot_project() {
+    for (name, target) in [
+        ("no uid", "---\ntitle: No uid\nstatus: accepted\n---\nBody.\n".to_string()),
+        ("no frontmatter", "Body only.\n".to_string()),
+        ("bad frontmatter", "---\nuid: [unclosed\n---\nBody.\n".to_string()),
+        (
+            "conflict markers",
+            format!("---\nuid: {K2}\nstatus: accepted\n---\n<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs\n"),
+        ),
+    ] {
+        let (_dir, repo) = projected_repo();
+        write_vault(&repo, &hub_path("adr"), ADR_SPEC);
+        write_vault(&repo, &instance_path("adr", K2), target);
+        write_vault(
+            &repo,
+            &instance_path("adr", K1),
+            adr(K1, &format!("supersedes: [\"adr:{K2}\"]\n")),
+        );
+        sync(&repo);
+
+        let report = repo
+            .kind_validate(&KindSource::WorkingCopy, Some("adr"))
+            .unwrap();
+        let referrer = report.kinds[0]
+            .instances
+            .iter()
+            .find(|instance| instance.uid == K1)
+            .unwrap();
+        assert!(!referrer.conforms, "{name}: {report:?}");
+        assert_eq!(
+            referrer.violations[0].code.as_str(),
+            "UNRESOLVED_REF",
+            "{name}: {report:?}"
+        );
+
+        let subject = concept(&repo, &format!("adr.{K1}"));
+        assert_eq!(
+            violation_codes(&repo, &subject),
+            serde_json::json!(["UNRESOLVED_REF"]),
+            "{name}"
+        );
+        assert!(
+            references(&repo, &subject, &concept(&repo, &format!("adr.{K2}"))).is_none(),
+            "{name}"
+        );
+    }
+}

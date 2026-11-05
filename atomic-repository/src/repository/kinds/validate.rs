@@ -22,9 +22,10 @@ use crate::RepositoryError;
 ///
 /// - A custom kind `k`: `raw` must be a ULID, `k` must be **registered** in
 ///   the same source (its `_kind.md` parses into a valid spec), and
-///   `kinds/k/<raw>.md` must exist there; resolves to that vault path. An
-///   instance of an unregistered or invalid kind is not a node, so a ref to it
-///   does not resolve.
+///   `kinds/k/<raw>.md` must exist there and be able to project; resolves to
+///   that vault path. An instance of an unregistered or invalid kind, or a file
+///   with no parseable frontmatter, no `uid` or a conflict marker, is not a
+///   node, so a ref to it does not resolve.
 /// - `memory`: `memory/<raw>.md` must exist in the source; resolves to that
 ///   vault path.
 /// - `intent`: `raw` must be the intent's full ULID (any case) or its full
@@ -87,11 +88,30 @@ impl RefResolver for KindRefResolver<'_, '_> {
             }
             kind if is_valid_kind_name(kind) && is_valid_ulid(raw) => {
                 let path = kind_instance_path(kind, raw);
-                (self.is_registered(kind) && self.files.exists(&path)).then_some(path)
+                let projectable = || {
+                    self.files
+                        .read(&path)
+                        .is_ok_and(|bytes| bytes.is_some_and(|b| instance_file_can_project(&b)))
+                };
+                (self.is_registered(kind) && projectable()).then_some(path)
             }
             _ => None,
         }
     }
+}
+
+/// Whether an instance file would be a KG node: the file-side reading of the
+/// rule projection applies to its stored row. The gate must not pass a ref that
+/// the KG marks unresolved. It reads the whole file for conflict markers, as
+/// [`check_instance`] does, so it stays the stricter side.
+fn instance_file_can_project(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    !has_conflict_markers(text)
+        && split_frontmatter(text)
+            .and_then(|(yaml, _)| parse_frontmatter_strict(yaml).ok())
+            .is_some_and(|frontmatter| frontmatter.contains_key("uid"))
 }
 
 /// The outcome of [`check_instance`].
