@@ -747,3 +747,110 @@ fn kinds_view_source_and_merkle_cache() {
         .unwrap();
     assert_eq!(child_after.get("adr").unwrap().instances.len(), 3);
 }
+
+/// A linked definition cannot be trusted and cannot be ignored: its kind is
+/// invalid, with the reason, even with no instance beside it to give it away.
+#[cfg(unix)]
+#[test]
+fn kinds_linked_definition_is_invalid_not_hidden() {
+    let (dir, repo) = vault_repo();
+    let root = dir.path();
+    write(root, "memory/elsewhere.md", ADR_DEF);
+    std::fs::create_dir_all(root.join(".vault/kinds/adr")).unwrap();
+    std::os::unix::fs::symlink(
+        root.join(".vault/memory/elsewhere.md"),
+        root.join(".vault/kinds/adr/_kind.md"),
+    )
+    .unwrap();
+
+    let report = repo.kind_validate(&KindSource::WorkingCopy, None).unwrap();
+    assert!(!report.ok, "{report:?}");
+    assert_eq!(report.kinds[0].status, KindReportStatus::Invalid);
+    assert!(
+        report.kinds[0].spec_problems[0].contains("never followed"),
+        "{report:?}"
+    );
+    assert_eq!(
+        codes(&report),
+        [(
+            KindProblemCode::KindInvalid,
+            "kinds/adr/_kind.md".to_string()
+        )]
+    );
+
+    write(root, &format!("kinds/adr/{UID}.md"), &adr_instance(UID, ""));
+    let report = repo.kind_validate(&KindSource::WorkingCopy, None).unwrap();
+    assert_eq!(
+        codes(&report),
+        [
+            (
+                KindProblemCode::KindInvalid,
+                "kinds/adr/_kind.md".to_string()
+            ),
+            (KindProblemCode::KindInvalid, format!("kinds/adr/{UID}.md")),
+        ]
+    );
+}
+
+/// A definition with no read permission is an invalid kind too, not a failure of
+/// every kind command in the repository.
+#[cfg(unix)]
+#[test]
+fn kinds_unreadable_definition_is_invalid_and_contained() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, repo) = vault_repo();
+    let root = dir.path();
+    write(root, "kinds/adr/_kind.md", ADR_DEF);
+    write(
+        root,
+        "kinds/rfc/_kind.md",
+        &ADR_DEF.replace("name: adr", "name: rfc"),
+    );
+    let file = root.join(".vault/kinds/adr/_kind.md");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let report = repo.kind_validate(&KindSource::WorkingCopy, None);
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let report = report.unwrap();
+    assert!(!report.ok, "{report:?}");
+    let status = |name: &str| {
+        report
+            .kinds
+            .iter()
+            .find(|kind| kind.name == name)
+            .map(|kind| kind.status)
+    };
+    assert_eq!(status("adr"), Some(KindReportStatus::Invalid), "{report:?}");
+    assert_eq!(
+        status("rfc"),
+        Some(KindReportStatus::Registered),
+        "{report:?}"
+    );
+}
+
+/// `exists` and `read` do not reach a file through a linked directory either, so
+/// neither a definition nor a ref target can be read from behind one.
+#[cfg(unix)]
+#[test]
+fn kinds_files_are_not_reached_through_a_linked_directory() {
+    let (dir, repo) = vault_repo();
+    let root = dir.path();
+    write(root, "memory/elsewhere/_kind.md", ADR_DEF);
+    write(
+        root,
+        &format!("memory/elsewhere/{UID}.md"),
+        &adr_instance(UID, ""),
+    );
+    std::fs::create_dir_all(root.join(".vault/kinds")).unwrap();
+    std::os::unix::fs::symlink(
+        root.join(".vault/memory/elsewhere"),
+        root.join(".vault/kinds/adr"),
+    )
+    .unwrap();
+
+    let files = repo.kind_files(&KindSource::WorkingCopy).unwrap();
+    assert!(!files.exists("kinds/adr/_kind.md"));
+    assert_eq!(files.read("kinds/adr/_kind.md").unwrap(), None);
+    assert_eq!(KindRefResolver::new(&files).resolve("adr", UID), None);
+}
