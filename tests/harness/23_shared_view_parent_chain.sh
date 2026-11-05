@@ -1,14 +1,7 @@
 #!/usr/bin/env bash
-# 23_shared_view_parent_chain.sh — Shared view parent chain filter tests.
-#
-# The CLI creates draft children only; promotion produces a shared root.
-# The shared-child scenario cannot be constructed through this CLI and must
-# not be counted as passed. The draft-chain cases below remain useful coverage.
-#
-# Bug: collect_visible_change_ids only walks parent chain for draft views.
-# Shared views with parents (e.g. staging → dev) only see their own
-# VIEW_CHANGES, missing ancestor changes.  This could produce incomplete
-# content or conflict markers.
+# Native hierarchy contract: Draft chains inherit; Shared views are roots.
+# Keep the historical filename for runner compatibility. Shared children are
+# not a supported repository identity and are not fabricated in this harness.
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
@@ -68,8 +61,6 @@ assert_draft_parent() {
         'import json,sys; rows=json.loads(sys.argv[1])["views"]; assert any(x["name"] == sys.argv[2] and x["scope"] == "draft" and x["parent"] == sys.argv[3] for x in rows)' \
         "$COMMAND_OUTPUT" "$name" "$parent"
 }
-
-_skip "shared-scope child parent-chain coverage" "CLI creates draft children; promotion clears the parent"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Case 1: Draft child chain dev → staging"
@@ -212,6 +203,45 @@ assert_file_exists "library.rs on dev" "library.rs"
 assert_file_contains "dev has 42" "library.rs" "42"
 assert_no_conflict_markers "no markers on dev" "library.rs"
 
-# ═══════════════════════════════════════════════════════════════════════════
-
+begin_section "Case 4: Promotion creates an independent Shared root"
+# staging explicitly holds the baseline references inserted above. Promotion
+# must preserve them while severing parent inheritance, not invent a Shared
+# child that the native repository API deliberately disallows.
+require_capture "read staging history before promotion" atomic log --view staging --all --format json
+staging_history="$COMMAND_OUTPUT"
+require_success "promote staging to Shared root" atomic view promote staging
+require_capture "read promoted staging metadata" atomic view list --all --json
+assert_success "promoted staging is Shared with no parent" python3 -c \
+    'import json,sys; rows=json.loads(sys.argv[1])["views"]; view=next(x for x in rows if x["name"]=="staging"); assert view["scope"]=="shared" and view["parent"] is None' \
+    "$COMMAND_OUTPUT"
+require_capture "read staging history after promotion" atomic log --view staging --all --format json
+assert_success "promotion preserves original change identities" python3 -c \
+    'import json,sys; before=json.loads(sys.argv[1]); after=json.loads(sys.argv[2]); assert [r["hash"] for r in before]==[r["hash"] for r in after]' \
+    "$staging_history" "$COMMAND_OUTPUT"
+create_file late-dev.txt 'new dev-only history'
+require_success "add later dev path" atomic add late-dev.txt
+require_success "record later dev path" record_change 'later dev change'
+require_success "switch to promoted Shared root" switch_view staging
+assert_file_content "promoted root retains baseline content" library.rs 'pub fn core_fn() -> i32 { 42 }'
+assert_file_not_exists "Shared root does not inherit later former-parent change" late-dev.txt
+require_success "create child anchored on promoted root" new_view staging-child --draft --parent staging
+assert_draft_parent staging-child staging
+create_file shared-only.txt 'owned by staging root'
+require_success "add Shared root change" atomic add shared-only.txt
+require_success "record Shared root change after child creation" record_change 'shared root update'
+require_success "switch to child of promoted root" switch_view staging-child
+assert_file_content "child inherits later Shared-parent change" shared-only.txt 'owned by staging root'
+assert_file_not_exists "child does not inherit former root ancestors" late-dev.txt
+assert_file_content "child sees correct baseline" library.rs 'pub fn core_fn() -> i32 { 42 }'
+require_capture "child is clean after inherited materialization" atomic status --short --no-untracked
+if [[ -z "$COMMAND_OUTPUT" ]]; then _pass "child working copy is clean"; else _fail "child working copy is clean" "$COMMAND_OUTPUT"; fi
+require_success "return to original Shared root" switch_view dev
+assert_file_content "dev retains its later change" late-dev.txt 'new dev-only history'
+assert_file_not_exists "independent Shared-root change does not leak into dev" shared-only.txt
+require_capture "snapshot view metadata before missing-parent refusal" atomic view list --all --json
+views_before="$COMMAND_OUTPUT"
+assert_failure "missing parent cannot create a partial view" atomic view create invalid-child --parent missing-parent
+require_capture "read view metadata after missing-parent refusal" atomic view list --all --json
+assert_success "missing-parent refusal preserves view identities" python3 -c \
+    'import json,sys; assert json.loads(sys.argv[1])==json.loads(sys.argv[2])' "$views_before" "$COMMAND_OUTPUT"
 print_summary

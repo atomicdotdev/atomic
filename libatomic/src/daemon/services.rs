@@ -399,16 +399,16 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
         self.state.log_rpc("Log", Some(&handle));
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
-        let view = if request.all_views {
-            None
-        } else {
-            Some(
-                request
-                    .view
-                    .clone()
-                    .unwrap_or_else(|| handle.current_view()),
-            )
-        };
+        // `all_views` is the legacy wire name for CLI --all: include the
+        // selected view's inherited history, not discard its explicit target.
+        // Dropping `view` here made `log --view dev --all` read the current
+        // Draft instead, falsely showing unpromoted records on the Shared view.
+        let view = Some(
+            request
+                .view
+                .clone()
+                .unwrap_or_else(|| handle.current_view()),
+        );
         let include_inherited = request.all_views;
         let tags_only = request.tags_only;
         let path_filter = request.path_filter.clone();

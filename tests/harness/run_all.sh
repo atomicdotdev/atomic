@@ -104,6 +104,7 @@ if [[ $# -gt 0 ]]; then
         # current contract, never the archived historical expectations.
         alias_targets=()
         case "${arg%.sh}" in
+            native-workflows) alias_targets=(40_switch_transactionality 32_review_gate_insert 23_shared_view_parent_chain) ;;
             shim) alias_targets=(35_git_shim_serialization 39_git_shim_workflow 40_git_shim_safety 41_git_shim_hooks 42_git_shim_guard 43_git_shim_operation_recovery) ;;
             19|19_git_shadow) alias_targets=(39_git_shim_workflow 41_git_shim_hooks) ;;
             33|33_shadow_push_conflict_markers|34|34_shadow_provenance_guard|36|36_shadow_coherence_v2|38|38_shadow_drift_v3|40_git_shim_materialize_safety) alias_targets=(40_git_shim_safety) ;;

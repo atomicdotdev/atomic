@@ -241,6 +241,63 @@ async fn local_add_record_log_and_change_use_existing_handlers() {
 }
 
 #[tokio::test]
+async fn local_log_all_preserves_explicit_view_and_includes_ancestors() {
+    use atomic_core::change::ChangeHeader;
+    use atomic_repository::RecordOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let mut repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let record = |repo: &Repository, message: &str| {
+        repo.record(
+            wc,
+            ChangeHeader::new(message),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+    };
+    std::fs::write(dir.path().join("base.txt"), b"base\n").unwrap();
+    repo.add(wc, "base.txt", Default::default()).unwrap();
+    record(&repo, "shared baseline");
+    // Seed baseline membership so --all retains inherited entries that the
+    // ordinary Draft-only log hides, while still honoring an explicit view.
+    repo.create_view_from("agent", "dev").unwrap();
+    repo.switch_view(wc, "agent").unwrap();
+    std::fs::write(dir.path().join("draft.txt"), b"draft\n").unwrap();
+    repo.add(wc, "draft.txt", Default::default()).unwrap();
+    record(&repo, "draft only");
+    drop(repo);
+    let service = LocalService::new();
+    let repository = resolve(&service, dir.path()).await;
+    for (view, all, expected) in [
+        (Some("dev"), true, vec!["shared baseline"]),
+        (Some("agent"), true, vec!["draft only", "shared baseline"]),
+        (Some("agent"), false, vec!["draft only"]),
+        (None, true, vec!["draft only", "shared baseline"]),
+    ] {
+        let response: proto::LogResponse = invoke(
+            &service,
+            "/atomic.RepositoryQueryService/Log",
+            &proto::LogRequest {
+                repository: Some(repository.clone()),
+                view: view.map(str::to_string),
+                all_views: all,
+                ..Default::default()
+            },
+        )
+        .await;
+        let messages: Vec<_> = response
+            .entries
+            .iter()
+            .map(|entry| entry.message.as_deref().unwrap())
+            .collect();
+        assert_eq!(messages, expected, "view={view:?}, all={all}");
+    }
+}
+
+#[tokio::test]
 async fn local_record_reports_native_span_semantic_statistics() {
     assert_local_record_reports_semantic_statistics(true).await;
 }

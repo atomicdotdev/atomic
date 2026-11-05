@@ -73,7 +73,10 @@ Select canonical names if you do not want every suite sharing a numeric prefix.
 The original scripts are preserved verbatim apart from their archival headers
 under `legacy-shadow/`; they are reference material, not executable active
 contracts. Initial/imported Git history fidelity stays in suites 10/13; squash
-classification and review evidence stay in 32 (known failures are not removed).
+classification and review-evidence scenarios from the old 32 are retained in
+`legacy-shadow/32_review_gate_insert.sh` as the historical Git-squash proposal;
+its bare trailers are not accepted proof. Active suite 32 is now the native
+signed-review and original-record insertion workflow described in `native.md`.
 The old 19 dirty-background-import fixture manually mixed divergent Git index
 and draft bytes, and its recovery fixture edited `.atomic/current_view` plus a
 legacy pending marker. Those are not valid setup for today's working-copy

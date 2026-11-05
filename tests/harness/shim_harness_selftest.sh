@@ -12,6 +12,7 @@ expected = ['35_git_shim_serialization.sh','39_git_shim_workflow.sh',
             '40_git_shim_safety.sh','41_git_shim_hooks.sh','42_git_shim_guard.sh',
             '43_git_shim_operation_recovery.sh']
 assert selected('shim') == expected
+assert selected('native-workflows') == ['40_switch_transactionality.sh','32_review_gate_insert.sh','23_shared_view_parent_chain.sh']
 assert selected('33','34','36','38','40_git_shim_materialize_safety') == ['40_git_shim_safety.sh']
 assert selected('37','39_git_shim_mvp','39_git_shim_workflow') == ['39_git_shim_workflow.sh']
 assert selected('35_shadow_concurrent_push') == ['35_git_shim_serialization.sh']
@@ -20,5 +21,5 @@ all_suites = selected()
 assert len(all_suites) == len(set(all_suites))
 assert not any('shadow' in name or name in ('39_git_shim_mvp.sh','40_git_shim_materialize_safety.sh') for name in all_suites)
 assert set(expected) <= set(all_suites)
-print('7 shim harness selector/discovery checks passed')
+print('8 native/shim harness selector/discovery checks passed')
 PY
