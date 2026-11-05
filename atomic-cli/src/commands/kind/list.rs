@@ -174,9 +174,19 @@ impl KindList {
                 conforms: false,
                 fields: Map::new(),
             };
-            if let (Some(spec), Some(bytes)) =
-                (spec, files.read(path).map_err(CliError::Repository)?)
-            {
+            // One unreadable instance is one row that does not conform, as a
+            // symlink is, and `kind validate` says why.
+            let bytes = files.read(path).unwrap_or_else(|e| {
+                eprintln!(
+                    "{} {}: {}; see `atomic kind validate {}`",
+                    warning("⚠"),
+                    display_path(path),
+                    display_text(&e.to_string()),
+                    def.name
+                );
+                None
+            });
+            if let (Some(spec), Some(bytes)) = (spec, bytes) {
                 if let InstanceCheck::Checked {
                     frontmatter,
                     report,
