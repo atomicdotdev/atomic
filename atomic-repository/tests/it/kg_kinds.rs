@@ -2310,3 +2310,26 @@ fn the_gate_rejects_a_ref_to_an_instance_that_cannot_project() {
         );
     }
 }
+
+/// A blank spec title is no title: the hub keeps a usable label, as an instance
+/// falls back to its uid.
+#[test]
+fn a_blank_spec_title_falls_back_to_the_kind_name() {
+    let (_dir, repo) = projected_repo();
+    for (kind, title) in [("empty", "\"\""), ("spaces", "\"   \"")] {
+        write_vault(
+            &repo,
+            &hub_path(kind),
+            format!(
+                "---\nname: {kind}\nspecVersion: 1\ntitle: {title}\nfields:\n  f:\n    type: string\n---\n"
+            ),
+        );
+    }
+    sync(&repo);
+    for kind in ["empty", "spaces"] {
+        let hub = node(&repo, &concept(&repo, &format!("kind.{kind}"))).unwrap();
+        assert_eq!(hub.label, kind);
+        assert_eq!(hub.summary, None);
+        assert_eq!(meta(&hub, "definition_status"), "registered");
+    }
+}

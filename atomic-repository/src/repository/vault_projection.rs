@@ -674,26 +674,24 @@ impl VaultProjection {
             KindStatus::Registered(_) => &[][..],
             KindStatus::Invalid(problems) => problems.as_slice(),
         };
-        let mut node = KgNode::new(
-            subject,
-            C::Concept,
-            spec.and_then(|spec| spec.title.as_deref()).unwrap_or(kind),
-            "vault",
-        )
-        .with_metadata(serde_json::json!({
-            "kind_definition": kind,
-            "definition_status": if spec.is_some() { "registered" } else { "invalid" },
-            "declared_fields": spec.map(|spec| spec.fields.keys().collect::<Vec<_>>()),
-            "declared_edges": spec.map(KindSpec::edges),
-            "embed": spec.map(|spec| spec.embed),
-            "context": spec.map(|spec| spec.context),
-            "problems": problems,
-            "vault_path": path,
-            "derived_from_vault_path": path,
-            "created_at": entry.created_at,
-            "updated_at": entry.updated_at,
-        }));
-        if let Some(title) = spec.and_then(|spec| spec.title.as_deref()) {
+        let title = spec
+            .and_then(|spec| spec.title.as_deref())
+            .filter(|title| !title.trim().is_empty());
+        let mut node = KgNode::new(subject, C::Concept, title.unwrap_or(kind), "vault")
+            .with_metadata(serde_json::json!({
+                "kind_definition": kind,
+                "definition_status": if spec.is_some() { "registered" } else { "invalid" },
+                "declared_fields": spec.map(|spec| spec.fields.keys().collect::<Vec<_>>()),
+                "declared_edges": spec.map(KindSpec::edges),
+                "embed": spec.map(|spec| spec.embed),
+                "context": spec.map(|spec| spec.context),
+                "problems": problems,
+                "vault_path": path,
+                "derived_from_vault_path": path,
+                "created_at": entry.created_at,
+                "updated_at": entry.updated_at,
+            }));
+        if let Some(title) = title {
             node = node.with_summary(title);
         }
         graph.nodes.push(node);
