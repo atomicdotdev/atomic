@@ -339,7 +339,7 @@ impl Clone {
             .danger_accept_invalid_certs(self.insecure);
 
         // Clone uses the URL directly — identity inferred from subdomain only.
-        crate::commands::auth::attach_identity(config, &self.url, None).await
+        atomic_remote::auth::attach_identity(config, &self.url, None).await
     }
 
     /// CB-10B Git-transport bootstrap (RFC §7.3/§8.6): `git clone` the

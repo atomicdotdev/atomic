@@ -29,12 +29,14 @@ message PushChangesRequest {
   string remote = 3;
   repeated string views = 4;          // empty = current view manifest chain
   optional ExpectedState expected = 5; // CAS-on-prev precondition
-  // `atomic push`'s flag surface (add-only). The network sync IS domain —
-  // the handler performs it end to end; the client resolves auth
-  // CLIENT-SIDE (identity store + config are file reads, not redb) and
-  // ships the headers, so the handler never touches the caller's
-  // identities. `remote_url` carries the client-resolved remote URL (the
-  // ListRemotes read); `remote` stays the configured name for the report.
+  // `atomic push`'s flag surface (add-only). Network sync is domain work:
+  // the handler performs it end to end without ambient identity-store reads.
+  // Transport callers resolve authentication client-side and supply headers
+  // and remote_url; remote stays the configured name for the report.
+  // Trusted LocalService callers instead supply remote (empty = configured
+  // default) and optional identity. That boundary resolves the configured URL
+  // and local credentials, rejecting caller-supplied auth_headers/remote_url,
+  // before internally invoking the same handler.
   optional string to_view = 6;
   optional string from_view = 7;
   bool dry_run = 8;
@@ -44,6 +46,8 @@ message PushChangesRequest {
   uint64 timeout_secs = 12;
   map<string, string> auth_headers = 13;
   optional string remote_url = 14;
+  // Trusted LocalService identity selector; transport authentication uses headers.
+  optional string identity = 15;
 }
 message PushChangesResponse {
   uint64 pushed_changes = 1;
@@ -136,15 +140,18 @@ message PullChangesRequest {
                                         // apply (default true)
   // Imports update repository/view state only. Host materialization is a
   // separately authorized working-copy operation, not a hidden pull effect.
-  // `atomic pull`'s flag surface (add-only) — same client-side auth model
-  // as PushChanges (headers resolved from the identity store, never redb).
+  // `atomic pull`'s flag surface (add-only) — same authentication boundary
+  // as PushChanges: transport callers supply headers; trusted LocalService
+  // resolves the configured remote and identity selector locally and rejects
+  // caller-supplied auth_headers/remote_url. Domain handlers never read the
+  // caller's ambient identity store.
   optional string to_view = 5;
   optional string from_view = 6;
   bool dry_run = 7;
   bool all = 8;
   bool insecure = 9;
   uint64 timeout_secs = 10;
-  optional string identity = 11;      // informational; auth rides headers
+  optional string identity = 11;      // LocalService selector; transport auth uses headers
   bool download_only = 12;
   map<string, string> auth_headers = 13;
   optional string remote_url = 14;

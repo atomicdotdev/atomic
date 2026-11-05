@@ -117,7 +117,7 @@ impl Repo {
             CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {e}"))
         })?;
         let (project_id, previous) = rt.block_on(async {
-            let config = crate::commands::auth::attach_identity(
+            let config = atomic_remote::auth::attach_identity(
                 HttpRemoteConfig::default(),
                 &entry.url,
                 None,

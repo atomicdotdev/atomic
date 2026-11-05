@@ -408,7 +408,7 @@ impl Push {
             .with_timeout(Duration::from_secs(self.timeout))
             .danger_accept_invalid_certs(self.insecure);
 
-        crate::commands::auth::attach_identity(config, remote_url, identity_hint).await
+        atomic_remote::auth::attach_identity(config, remote_url, identity_hint).await
     }
 
     /// Display the dry run preview: per-view manifest sync plans.
@@ -569,7 +569,7 @@ impl Push {
         // deliberately masked), which surfaces as a misleading "view not found".
         // Catching the missing credential here gives the user an accurate,
         // actionable error instead.
-        crate::commands::auth::check_push_credentials(&remote_url, identity_hint.as_deref())?;
+        atomic_remote::auth::check_push_credentials(&remote_url, identity_hint.as_deref())?;
 
         // Build the local ancestor chain, root → leaf. A draft's parent must
         // exist on the remote before the draft's manifest can reference it,

@@ -26,7 +26,7 @@ use atomic_canonical::delegation as cert;
 use atomic_identity::IdentityStore;
 use atomic_remote::storage_types::RevokeDelegationRequest;
 
-use crate::commands::delegation::load_for_delegate;
+use atomic_remote::auth::delegation::load_for_delegate;
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_success, print_warning};

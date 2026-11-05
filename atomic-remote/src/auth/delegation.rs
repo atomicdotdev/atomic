@@ -25,7 +25,7 @@ use atomic_identity::delegation::{
 use atomic_identity::{Identity, IdentityStore};
 use serde_json::Value;
 
-use crate::error::{CliError, CliResult};
+use super::{AuthError, AuthResult};
 
 /// Environment variable carrying an encoded grant.
 ///
@@ -70,9 +70,9 @@ impl ResolvedDelegation {
 pub fn load_for_delegate(
     store: &IdentityStore,
     identity: &Identity,
-) -> CliResult<Vec<ResolvedDelegation>> {
+) -> AuthResult<Vec<ResolvedDelegation>> {
     let stored = cert::load_for_delegate(store, identity)
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to load delegations: {e}")))?;
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("Failed to load delegations: {e}")))?;
 
     Ok(stored
         .into_iter()
@@ -101,7 +101,7 @@ pub fn active_for(
     store: &IdentityStore,
     identity: &Identity,
     server: Option<&str>,
-) -> CliResult<ResolvedDelegation> {
+) -> AuthResult<ResolvedDelegation> {
     // A grant handed over out of band wins. It is the mechanism for machines
     // with no store to populate, and the freshest thing the caller has.
     if let Some(resolved) = from_environment(identity)? {
@@ -111,7 +111,7 @@ pub fn active_for(
     let all = load_for_delegate(store, identity)?;
 
     if all.is_empty() {
-        return Err(CliError::DelegationError {
+        return Err(AuthError::DelegationError {
             message: format!(
                 "'{}' is an agent identity with no delegation certificate on this machine.\n  \
                  Issue one with:  atomic identity delegate {} --can read,record,push",
@@ -177,7 +177,7 @@ pub fn active_for(
         },
     };
 
-    Err(CliError::DelegationError { message })
+    Err(AuthError::DelegationError { message })
 }
 
 /// A grant supplied through [`DELEGATION_ENV`], verified and checked to belong
@@ -187,7 +187,7 @@ pub fn active_for(
 /// Falling back to the store there would be worse than failing: the operator
 /// asked for a specific grant, and silently using a different one is how you
 /// get an agent acting under a scope nobody intended.
-fn from_environment(identity: &Identity) -> CliResult<Option<ResolvedDelegation>> {
+fn from_environment(identity: &Identity) -> AuthResult<Option<ResolvedDelegation>> {
     let Ok(encoded) = std::env::var(DELEGATION_ENV) else {
         return Ok(None);
     };
@@ -196,12 +196,12 @@ fn from_environment(identity: &Identity) -> CliResult<Option<ResolvedDelegation>
         return Ok(None);
     }
 
-    let document = cert::decode_from_transport(encoded).map_err(|e| CliError::DelegationError {
+    let document = cert::decode_from_transport(encoded).map_err(|e| AuthError::DelegationError {
         message: format!("{DELEGATION_ENV} is not a usable grant: {e}"),
     })?;
 
     let delegation =
-        cert::verify_self_contained(&document).map_err(|e| CliError::DelegationError {
+        cert::verify_self_contained(&document).map_err(|e| AuthError::DelegationError {
             message: format!("The grant in {DELEGATION_ENV} does not verify: {e}"),
         })?;
 
@@ -210,7 +210,7 @@ fn from_environment(identity: &Identity) -> CliResult<Option<ResolvedDelegation>
         // called `alice+claude` on different machines are different keys, and
         // an error reading "issued to 'alice+claude', not 'alice+claude'" tells
         // the reader nothing.
-        return Err(CliError::DelegationError {
+        return Err(AuthError::DelegationError {
             message: format!(
                 "The grant in {DELEGATION_ENV} was issued to a different key.\n  \
                  Grant is for  {} ({})\n  \
@@ -224,7 +224,7 @@ fn from_environment(identity: &Identity) -> CliResult<Option<ResolvedDelegation>
     }
 
     if delegation.is_expired() {
-        return Err(CliError::DelegationError {
+        return Err(AuthError::DelegationError {
             message: format!(
                 "The grant in {DELEGATION_ENV} expired {}. Ask for a fresh one.",
                 delegation
@@ -252,7 +252,7 @@ pub fn check_permission(
     permission: DelegationPermission,
     resource: &ResourceRef<'_>,
     identity_name: &str,
-) -> CliResult<()> {
+) -> AuthResult<()> {
     if resolved.delegation.allows(permission, resource) {
         return Ok(());
     }
@@ -286,7 +286,7 @@ pub fn check_permission(
         "\n  Widen it with:  atomic identity delegate {identity_name} --can {permission}"
     ));
 
-    Err(CliError::DelegationError { message })
+    Err(AuthError::DelegationError { message })
 }
 
 #[cfg(test)]

@@ -46,7 +46,7 @@ use atomic_remote::{HttpRemote, HttpRemoteConfig, RemoteViewInfo};
 use atomic_repository::repository::ViewInfo;
 use atomic_repository::Repository;
 
-use crate::commands::auth::attach_identity;
+use atomic_remote::auth::attach_identity;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{hint, view as style_view};

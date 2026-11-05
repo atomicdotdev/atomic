@@ -7,23 +7,29 @@
 use std::sync::Arc;
 
 use prost::Message;
+use atomic_remote::{auth, HttpRemoteConfig};
 use tonic::{Request, Status};
 
 use crate::atomic::{
     attestation_service_server::AttestationService, daemon_service_server::DaemonService,
     knowledge_service_server::KnowledgeService,
     repository_mutation_service_server::RepositoryMutationService,
-    repository_query_service_server::RepositoryQueryService, vault_service_server::VaultService,
+    repository_query_service_server::RepositoryQueryService, sync_service_server::SyncService,
+    vault_service_server::VaultService,
     view_service_server::ViewService, AddFilesRequest, CreateViewRequest, DeleteViewRequest,
-    GetChangeRequest, GetVaultContextRequest, GetVaultEntryRequest, ListVaultEntriesRequest,
-    ListViewsRequest, LogRequest, PreviewRestoreRequest, QueryGraphRequest, RecordRequest,
-    ResolveRepositoryRequest, StatusRequest, SwitchViewRequest, VerifyAttestationRequest,
+    GetChangeRequest, GetVaultContextRequest, GetVaultEntryRequest, GetWorkflowSnapshotRequest,
+    ListVaultEntriesRequest, ListViewsRequest, LogRequest, PreviewRestoreRequest,
+    QueryGraphRequest, RecordRequest, ResolveRepositoryRequest, StatusRequest, SwitchViewRequest,
+    VerifyAttestationRequest, InsertChangesRequest, PushChangesRequest, PullChangesRequest,
+    ListRemotesRequest, ManageRemotesRequest,
 };
 use crate::daemon::{
     services::{DaemonImpl, MutationImpl, QueryImpl},
     services_agent::{AttestationImpl, KnowledgeImpl, VaultImpl},
     services_query::ViewImpl,
+    services_sync::SyncImpl,
     state::DaemonState,
+    state::repository_error,
 };
 
 /// Embedded service session for trusted local callers.
@@ -33,6 +39,7 @@ use crate::daemon::{
 /// This is not a replacement for remote authentication middleware.
 ///
 /// Supports repository resolution, basic working-copy/change/view operations,
+/// change insertion, configured remote registry management and authenticated push/pull,
 /// read-only restore previews (including recorded file bytes),
 /// read-only knowledge queries, vault get/list/context, and attestation verification. View-scoped
 /// vault reads are not supported; unsupported methods fail explicitly with
@@ -132,6 +139,57 @@ impl LocalService {
                 }
                 .record(Request::new(request))
                 .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.RepositoryMutationService/InsertChanges" => {
+                let request = decode::<InsertChangesRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = MutationImpl { state: self.state.clone() }
+                    .insert_changes(Request::new(request)).await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.SyncService/ListRemotes" => {
+                let request = decode::<ListRemotesRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = SyncImpl { state: self.state.clone() }
+                    .list_remotes(Request::new(request)).await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.SyncService/ManageRemotes" => {
+                let request = decode::<ManageRemotesRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = SyncImpl { state: self.state.clone() }
+                    .manage_remotes(Request::new(request)).await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.SyncService/PushChanges" => {
+                let mut request = decode::<PushChangesRequest>(request)?;
+                require_repository(&request.repository)?;
+                reject_transport_credentials(&request.auth_headers, &request.remote_url)?;
+                let (name, url, config) = self.sync_credentials(
+                    request.repository.as_ref().unwrap(), &request.remote,
+                    request.identity.clone(), true,
+                ).await?;
+                request.remote = name;
+                request.remote_url = Some(url);
+                request.auth_headers = config.extra_headers.into_iter().collect();
+                let response = SyncImpl { state: self.state.clone() }
+                    .push_changes(Request::new(request)).await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
+            "/atomic.SyncService/PullChanges" => {
+                let mut request = decode::<PullChangesRequest>(request)?;
+                require_repository(&request.repository)?;
+                reject_transport_credentials(&request.auth_headers, &request.remote_url)?;
+                let (name, url, config) = self.sync_credentials(
+                    request.repository.as_ref().unwrap(), &request.remote,
+                    request.identity.clone(), false,
+                ).await?;
+                request.remote = name;
+                request.remote_url = Some(url);
+                request.auth_headers = config.extra_headers.into_iter().collect();
+                let response = SyncImpl { state: self.state.clone() }
+                    .pull_changes(Request::new(request)).await?;
                 Ok(response.into_inner().encode_to_vec())
             }
             "/atomic.RepositoryQueryService/Log" => {
@@ -244,6 +302,16 @@ impl LocalService {
                 .await?;
                 Ok(response.into_inner().encode_to_vec())
             }
+            "/atomic.KnowledgeService/GetWorkflowSnapshot" => {
+                let request = decode::<GetWorkflowSnapshotRequest>(request)?;
+                require_repository(&request.repository)?;
+                let response = KnowledgeImpl {
+                    state: self.state.clone(),
+                }
+                .get_workflow_snapshot(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
             "/atomic.AttestationService/VerifyAttestation" => {
                 let request = decode::<VerifyAttestationRequest>(request)?;
                 require_repository(&request.repository)?;
@@ -258,6 +326,67 @@ impl LocalService {
                 "local method is not supported: {method}"
             ))),
         }
+    }
+
+    /// Resolve all ambient configuration only at the trusted local boundary.
+    async fn sync_credentials(
+        &self,
+        repository: &crate::atomic::RepositoryRef,
+        remote: &str,
+        identity: Option<String>,
+        push: bool,
+    ) -> Result<(String, String, HttpRemoteConfig), Status> {
+        let handle = self.state.resolve(repository)?;
+        let remote = (!remote.is_empty()).then(|| remote.to_owned());
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let repo = handle.repository_readonly()?;
+            let name = remote.unwrap_or_else(|| {
+                repo.get_default_remote()
+                    .map(|(name, _)| name)
+                    .unwrap_or_else(|_| "origin".to_owned())
+            });
+            let url = if name.contains("://") {
+                name.clone()
+            } else {
+                repo.get_remote(&name).map_err(|error| match error {
+                    atomic_repository::RepositoryError::RemoteNotFound { .. } =>
+                        crate::daemon::state::domain_status(
+                            crate::atomic::ErrorCode::NotFound, format!("remote '{name}' not found"),
+                        ),
+                    other => repository_error(other),
+                })?.url
+            };
+            if push {
+                auth::check_push_credentials(&url, identity.as_deref()).map_err(auth_status)?;
+            }
+            drop(repo);
+            let config = runtime.block_on(auth::attach_identity(
+                HttpRemoteConfig::new(), &url, identity.as_deref(),
+            ));
+            Ok::<_, Status>((name, url, config))
+        }).await.map_err(|e| Status::internal(format!("credentials task failed: {e}")))?
+    }
+}
+
+fn reject_transport_credentials(
+    headers: &std::collections::HashMap<String, String>,
+    url: &Option<String>,
+) -> Result<(), Status> {
+    if !headers.is_empty() || url.is_some() {
+        return Err(Status::invalid_argument(
+            "trusted local sync does not accept auth_headers or remote_url",
+        ));
+    }
+    Ok(())
+}
+
+fn auth_status(error: auth::AuthError) -> Status {
+    match error {
+        auth::AuthError::Internal(error) => Status::internal(error.to_string()),
+        auth::AuthError::AuthenticationFailed { remote } =>
+            Status::unauthenticated(format!("authentication failed for {remote}")),
+        auth::AuthError::DelegationError { message } => Status::permission_denied(message),
     }
 }
 

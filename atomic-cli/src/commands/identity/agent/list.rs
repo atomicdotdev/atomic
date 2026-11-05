@@ -6,7 +6,7 @@ use serde_json::json;
 use atomic_identity::delegation::DelegationStatus;
 use atomic_identity::{IdentityStore, IdentityType};
 
-use crate::commands::delegation::{load_for_delegate, ResolvedDelegation};
+use atomic_remote::auth::delegation::{load_for_delegate, ResolvedDelegation};
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::print_hint;
