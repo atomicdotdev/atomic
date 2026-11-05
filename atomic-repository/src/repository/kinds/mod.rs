@@ -320,6 +320,33 @@ impl<'r> KindFiles<'r> {
     }
 }
 
+/// Is the vault-relative `path` a regular file reached through no symlink?
+///
+/// Each component is checked, because a link anywhere along the path would
+/// take the path out of the vault as surely as a link at the end of it.
+pub(crate) fn is_plain_file(vault_dir: &Path, path: &str) -> bool {
+    if !safe_relative(path) {
+        return false;
+    }
+    let mut at = vault_dir.to_path_buf();
+    let mut components = path.split('/').peekable();
+    while let Some(component) = components.next() {
+        at.push(component);
+        let Ok(metadata) = std::fs::symlink_metadata(&at) else {
+            return false;
+        };
+        let wanted = if components.peek().is_some() {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        };
+        if !wanted {
+            return false;
+        }
+    }
+    true
+}
+
 /// A relative path with no `..`, `.` or empty components, so joining it
 /// onto the vault directory cannot leave it.
 fn safe_relative(path: &str) -> bool {
