@@ -65,6 +65,8 @@ mod intent_graph_test;
 mod intent_turn_binding_test;
 mod json_output_contract_test;
 mod kg_service_integration_test;
+mod kind_cli_test;
+mod kind_view_test;
 mod logging_integration_test;
 mod memory_compatibility_test;
 mod native_index_doctor_integration_test;
