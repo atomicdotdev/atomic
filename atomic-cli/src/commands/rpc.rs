@@ -3195,7 +3195,9 @@ pub fn query_neighbors(args: &super::query::QueryNeighbors) -> CliResult<bool> {
     for edge in &edges {
         println!(
             "  {} \u{2192}[{}]\u{2192} {}",
-            edge.from_id, edge.kind, edge.to_id
+            edge.from_id,
+            super::query::edge_relation(edge),
+            edge.to_id
         );
     }
     Ok(true)
