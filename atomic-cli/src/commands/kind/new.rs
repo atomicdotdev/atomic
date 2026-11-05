@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use serde_json::{Map, Value};
 
-use atomic_canonical::kind_spec::{apply_defaults, instance_kg_id, parse_set_value};
+use atomic_canonical::kind_spec::{apply_defaults, parse_set_value};
 use atomic_repository::{
     check_instance, kind_definition_path, kind_instance_path, mint_kind_uid,
     render_frontmatter_document, InstanceCheck, KindRefResolver, KindSource, KindStatus,
@@ -56,7 +56,7 @@ pub struct KindNew {
     pub body_stdin: bool,
 
     /// Emit JSON instead of the human summary: on success
-    /// `{"written": true, "uid", "kind", "file", "kg_id"}`; on failure
+    /// `{"written": true, "uid", "kind", "file"}`; on failure
     /// `{"written": false, "kind", ...}` with either `violations` (the
     /// instance does not conform) or `error` (anything else).
     #[arg(long)]
@@ -297,18 +297,21 @@ impl KindNew {
 
         warn_if_definition_unrecorded(&repo, &self.kind)?;
 
-        let kg_id = instance_kg_id(&self.kind, &uid);
         if self.json {
             let out = serde_json::json!({
                 "written": true,
                 "uid": uid,
                 "kind": self.kind,
                 "file": display_path(&rel),
-                "kg_id": kg_id,
             });
             println!("{out}");
         } else {
-            println!("{} {}  ({kg_id})", success("Created"), display_path(&rel));
+            println!(
+                "{} {}  ({}:{uid})",
+                success("Created"),
+                display_path(&rel),
+                self.kind
+            );
         }
         Ok(())
     }

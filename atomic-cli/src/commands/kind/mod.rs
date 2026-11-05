@@ -50,7 +50,7 @@ pub enum KindCommands {
     /// List the declared kinds, or one kind's instances.
     List(KindList),
 
-    /// Show a kind's schema, status and SHACL-Core summary.
+    /// Show a kind's schema and status.
     Show(KindShow),
 
     /// Write a starter definition at `.vault/kinds/<k>/_kind.md`.
@@ -68,9 +68,8 @@ pub enum KindCommands {
 /// A kind is a repository-defined vault node type: its definition at
 /// `.vault/kinds/<k>/_kind.md` carries the schema in its frontmatter and
 /// guidance prose in its body; instances live at `.vault/kinds/<k>/<ULID>.md`
-/// and are projected into the knowledge graph as `<k>:<ULID>`. This is the
-/// "user-defined vault kinds" concept from the atomicdotdev/atomic#276
-/// discussion.
+/// and are referred to as `<k>:<ULID>`. This is the "user-defined vault kinds"
+/// concept from the atomicdotdev/atomic#276 discussion.
 #[derive(Debug, clap::Args)]
 #[command(name = "kind")]
 pub struct Kind {
