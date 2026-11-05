@@ -17,11 +17,10 @@
 //! ([`RESERVED_KIND_NAMES`]), so a custom kind can neither shadow nor extend
 //! them. A ref may *point at* the built-in `intent` and `memory` kinds.
 //!
-//! The constructs are a small, data-driven subset of SHACL-Core
-//! ([`KindSpec::summary_rows`] lists the mapping): `required` is
-//! `sh:minCount 1`, a scalar field is `sh:maxCount 1`, the datatypes are
-//! `sh:datatype`, `enum` is `sh:in`, `ref` is `sh:class`, and the whole shape
-//! is `sh:closed true`. There is deliberately no regex (`pattern`) or other
+//! The constructs are modelled on a small subset of SHACL-Core: `required`
+//! corresponds to `sh:minCount 1`, a scalar field to `sh:maxCount 1`, the
+//! datatypes to `sh:datatype`, `enum` to `sh:in`, `ref` to `sh:class`, and the
+//! whole shape to `sh:closed true`. There is deliberately no regex (`pattern`) or other
 //! content constraint: like the built-in gate, presence and shape are enforced
 //! and content is left honest.
 //!
@@ -41,76 +40,58 @@ use thiserror::Error;
 /// The only `specVersion` this module understands.
 pub const SPEC_VERSION: u64 = 1;
 
-/// Kind names a definition may not claim: the built-in node types, the vault's
-/// own directories and entry types, and their plurals; every node-id prefix
-/// and node kind atomic writes to the knowledge graph; and the CURIE and URI
-/// prefixes those ids share the graph with. An instance's KG id is
-/// `<k>:<ULID>`, so any of these as `<k>` would land in a built-in namespace.
+/// Kind names a definition may not claim, in normalized form: lowercase, with
+/// `-` and `_` dropped. Use [`is_reserved_kind_name`], which normalizes first.
+///
+/// The classes of the closed workflow ontology are reserved because `ref`
+/// targets and built-in nodes share one namespace, and a custom kind must not
+/// read as a parallel `change` or `memory`. This crate cannot depend on
+/// `atomic-core`, so `reserved_kind_names_track_the_ontology` in
+/// `atomic-repository/tests/it/kg_kinds.rs` holds this list and
+/// `kg::ontology::Class::ALL` in lockstep.
 pub const RESERVED_KIND_NAMES: &[&str] = &[
+    // The local name of every member of `Class::ALL`.
+    "workintent",
+    "featureintent",
+    "bugintent",
+    "reviewintent",
+    "managedintent",
     "goal",
-    "session",
-    "intent",
     "memory",
     "skill",
-    "tool",
-    "tool_result",
-    "scratch",
-    "attestation",
-    "vault",
-    "concept",
-    "identity",
-    "todo",
-    "ac",
-    "acceptance_criterion",
+    "toolresult",
     "task",
-    "scope",
+    "acceptancecriterion",
+    "scopeitem",
     "constraint",
-    "ref",
+    "todo",
+    "session",
+    "sessionturn",
+    "managedturn",
+    "provenancegraph",
+    "attestation",
+    "finding",
     "change",
-    "provgraph",
-    "activity",
-    "agent",
-    "triage",
-    "delegation",
-    "file",
-    "module",
-    "entity",
     "view",
-    "embedding",
-    "test",
-    "prompts",
-    "goals",
-    "intents",
-    "skills",
-    "attestations",
-    "sessions",
-    "kinds",
+    "file",
+    "identity",
+    "concept",
+    "project",
+    "projectidentity",
+    "verificationstatus",
+    // `intent` is the built-in ref target, though no class has that local name.
+    "intent",
+    // The word for a kind definition and the directory they live in.
     "kind",
-    // Other KG node-id prefixes and node kinds: session ledger
-    // (`provenance:<hash>`, `session_turn`), read-content results
-    // (`content:<path>`), triage walkthrough layers (`layer:<dir>`), and agent
-    // reasoning journal events (`reasoning:<n>`).
-    "provenance",
-    "session_turn",
-    "content",
-    "layer",
-    "reasoning",
-    // Ontology CURIE prefixes (`pristine::ontology::ns`; `vault` is above) and
-    // the URI schemes used as node ids (`urn:atomic:…`, `did:atomic:…`).
-    "atom",
-    "prov",
-    "skos",
-    "dc",
-    "rdf",
+    "kinds",
+    // `<k>:<id>` is a qualified ref, so these would read as URIs.
     "urn",
     "did",
 ];
 
 /// Field names a definition may not declare. `uid` and `title` have fixed
-/// meaning on every instance; `entry_type` and the timestamps are owned by
-/// the vault index; and `kind`, `conforms`, `vault_path`, `violation_codes`
-/// and `urn` are the metadata keys the knowledge-graph projection writes on
-/// every instance node, which a same-named field would otherwise shadow.
+/// meaning on every instance, and `entry_type` and the timestamps are owned by
+/// the vault index.
 pub const RESERVED_FIELD_NAMES: &[&str] = &[
     "uid",
     "title",
@@ -118,11 +99,6 @@ pub const RESERVED_FIELD_NAMES: &[&str] = &[
     "content_hash",
     "created_at",
     "updated_at",
-    "kind",
-    "conforms",
-    "vault_path",
-    "violation_codes",
-    "urn",
 ];
 
 /// The most characters a spec string (a title, a field description, an enum
@@ -173,8 +149,15 @@ pub fn is_valid_kind_name(name: &str) -> bool {
             .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
 }
 
+/// Whether `name` is reserved: compared after lowercasing and dropping `-` and
+/// `_`, so `tool-result`, `tool_result` and `toolresult` are the same name.
 pub fn is_reserved_kind_name(name: &str) -> bool {
-    RESERVED_KIND_NAMES.contains(&name)
+    let normalized: String = name
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    RESERVED_KIND_NAMES.contains(&normalized.as_str())
 }
 
 /// `^[a-z][a-zA-Z0-9_]*$` — syntax only; see [`RESERVED_FIELD_NAMES`].
@@ -187,14 +170,11 @@ pub fn is_valid_field_name(name: &str) -> bool {
             .all(|&c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
-/// `^[A-Z][A-Z0-9_]*$`.
+/// `^[a-z][a-zA-Z0-9_]*$`. An edge name is a label on a relation, not a graph
+/// predicate. The grammar leaves no way to spell an upper-case term or a label
+/// that starts with `@`.
 pub fn is_valid_edge_name(name: &str) -> bool {
-    let b = name.as_bytes();
-    !b.is_empty()
-        && b[0].is_ascii_uppercase()
-        && b[1..]
-            .iter()
-            .all(|&c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
+    is_valid_field_name(name)
 }
 
 /// A 26-character uppercase Crockford base32 ULID whose value fits 128 bits
@@ -273,26 +253,6 @@ fn check_spec_text(path: &str, s: &str, p: &mut Problems) -> bool {
 fn is_ref_target_name(name: &str) -> bool {
     BUILTIN_REF_TARGETS.contains(&name)
         || (is_valid_kind_name(name) && !is_reserved_kind_name(name))
-}
-
-// ---------------------------------------------------------------------------
-// Identifiers
-// ---------------------------------------------------------------------------
-
-/// The projected KG edge kind for a custom edge: `"<kind>.<EDGE>"`.
-pub fn namespaced_edge(kind: &str, edge: &str) -> String {
-    format!("{kind}.{edge}")
-}
-
-/// The KG node id of an instance: `"<kind>:<uid>"`.
-pub fn instance_kg_id(kind: &str, uid: &str) -> String {
-    format!("{kind}:{uid}")
-}
-
-/// The JSON-LD `@id` of an instance: `urn:atomic:<kind>:<uid>`, the same
-/// shape the intent lift uses.
-pub fn instance_urn(kind: &str, uid: &str) -> String {
-    crate::lift::as_urn(kind, uid)
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +354,7 @@ pub struct FieldSpec {
     /// value; empty otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target: Vec<String>,
-    /// The un-namespaced edge a resolved ref projects (refs only).
+    /// The label on the relation a resolved ref projects (refs only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge: Option<String>,
     /// Written into new instances by [`apply_defaults`]; never applied when
@@ -446,17 +406,6 @@ pub struct KindSpecError {
     pub problems: Vec<String>,
 }
 
-/// A row of [`KindSpec::summary_rows`]: one construct and its SHACL-Core
-/// equivalent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShaclRow {
-    /// A field name, `body`, or `(kind)` for shape-level constructs.
-    pub subject: String,
-    /// The construct as written in the definition.
-    pub construct: String,
-    pub shacl: String,
-}
-
 #[derive(Default)]
 struct Problems(Vec<String>);
 
@@ -498,96 +447,14 @@ impl KindSpec {
         self.fields.get(name)
     }
 
-    /// Every namespaced edge (`<kind>.<EDGE>`) this kind can project, sorted
-    /// and de-duplicated.
+    /// Every edge label this kind declares, sorted and de-duplicated.
     pub fn edges(&self) -> Vec<String> {
         self.fields
             .values()
-            .filter_map(|f| f.edge.as_deref())
-            .map(|e| namespaced_edge(&self.name, e))
+            .filter_map(|f| f.edge.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
-    }
-
-    /// Each construct of the spec beside its SHACL-Core equivalent, for
-    /// display (`atomic kind show`).
-    pub fn summary_rows(&self) -> Vec<ShaclRow> {
-        let row = |subject: &str, construct: String, shacl: String| ShaclRow {
-            subject: subject.to_string(),
-            construct,
-            shacl,
-        };
-        let mut rows = vec![row(
-            "(kind)",
-            "closed: undeclared keys are violations".into(),
-            "sh:closed true ; sh:ignoredProperties ( uid title )".into(),
-        )];
-        for (name, f) in &self.fields {
-            let ft = f.field_type;
-            rows.push(row(
-                name,
-                format!("type: {ft}"),
-                match ft.base {
-                    BaseType::String => "sh:datatype xsd:string".into(),
-                    BaseType::Integer => "sh:datatype xsd:integer".into(),
-                    BaseType::Boolean => "sh:datatype xsd:boolean".into(),
-                    BaseType::Enum => format!(
-                        "sh:in ( {} )",
-                        f.values
-                            .iter()
-                            .map(|v| format!("{v:?}"))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    ),
-                    BaseType::Ref => match f.target.as_slice() {
-                        [one] => format!("sh:class {one}"),
-                        many => format!(
-                            "sh:or ( {} )",
-                            many.iter()
-                                .map(|t| format!("[ sh:class {t} ]"))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        ),
-                    },
-                },
-            ));
-            if f.required {
-                rows.push(row(name, "required: true".into(), "sh:minCount 1".into()));
-            }
-            if !ft.list {
-                rows.push(row(name, "single value".into(), "sh:maxCount 1".into()));
-            }
-            if let Some(edge) = &f.edge {
-                rows.push(row(
-                    name,
-                    format!("edge: {edge}"),
-                    format!("sh:path {}", namespaced_edge(&self.name, edge)),
-                ));
-            }
-            if let Some(description) = &f.description {
-                rows.push(row(
-                    name,
-                    format!("description: {description}"),
-                    format!("sh:description {description:?}"),
-                ));
-            }
-            if let Some(default) = &f.default {
-                rows.push(row(
-                    name,
-                    format!("default: {default}"),
-                    format!("sh:defaultValue {default}"),
-                ));
-            }
-        }
-        if self.body.required {
-            rows.push(row(
-                "body",
-                "required: true".into(),
-                "(none; atomic extension: non-blank body)".into(),
-            ));
-        }
-        rows
     }
 }
 
@@ -861,7 +728,7 @@ fn check_field(name: &str, spec: &Value, p: &mut Problems) {
             if !is_valid_edge_name(e) {
                 p.at(
                     &format!("{path}.edge"),
-                    format_args!("{e:?} is not a valid edge name (^[A-Z][A-Z0-9_]*$)"),
+                    format_args!("{e:?} is not a valid edge name (^[a-z][a-zA-Z0-9_]*$)"),
                 );
             }
         }
@@ -996,8 +863,8 @@ impl fmt::Display for KindViolation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedRef {
     pub field: String,
-    /// The namespaced edge (`<kind>.<EDGE>`) to project, or `None` when the
-    /// field declares no `edge` (the ref was existence-checked only).
+    /// The field's edge label, or `None` when the field declares no `edge`
+    /// (the ref was existence-checked only).
     pub edge: Option<String>,
     /// The KG node id the resolver returned.
     pub target_id: String,
@@ -1276,10 +1143,7 @@ pub fn validate_instance(
                     if seen.insert(target_id.clone()) {
                         resolved_refs.push(ResolvedRef {
                             field: name.clone(),
-                            edge: field
-                                .edge
-                                .as_deref()
-                                .map(|e| namespaced_edge(&spec.name, e)),
+                            edge: field.edge.clone(),
                             target_id,
                         });
                     }
@@ -1442,8 +1306,8 @@ mod tests {
                     "required": true,
                     "default": "proposed"
                 },
-                "supersedes": {"type": "ref[]", "target": ["adr"], "edge": "SUPERSEDES"},
-                "intent": {"type": "ref", "target": ["intent"], "edge": "IMPLEMENTS"}
+                "supersedes": {"type": "ref[]", "target": ["adr"], "edge": "supersedes"},
+                "intent": {"type": "ref", "target": ["intent"], "edge": "implements"}
             },
             "body": {"required": true},
             "embed": true,
@@ -1496,7 +1360,7 @@ mod tests {
             }
         );
         assert!(!sup.required, "required defaults to false");
-        assert_eq!(spec.edges(), ["adr.IMPLEMENTS", "adr.SUPERSEDES"]);
+        assert_eq!(spec.edges(), ["implements", "supersedes"]);
     }
 
     #[test]
@@ -1545,7 +1409,7 @@ mod tests {
             "fields": {
                 "a": {"type": "float"},
                 "b": {"type": "enum"},
-                "c": {"type": "ref", "edge": "lower"}
+                "c": {"type": "ref", "edge": "UPPER"}
             }
         }));
         let err = KindSpec::from_frontmatter("bad", &fm).unwrap_err();
@@ -1558,7 +1422,7 @@ mod tests {
             "embed: expected a boolean, got string",
             "fields.b.values: required for enum fields",
             "fields.c.target: required for ref fields",
-            r#"fields.c.edge: "lower" is not a valid edge name (^[A-Z][A-Z0-9_]*$)"#,
+            r#"fields.c.edge: "UPPER" is not a valid edge name (^[a-z][a-zA-Z0-9_]*$)"#,
         ] {
             assert!(
                 err.problems.iter().any(|p| p == needle),
@@ -1651,26 +1515,29 @@ mod tests {
     }
 
     #[test]
-    fn kg_metadata_keys_are_reserved_field_names() {
-        // The projection writes these on every instance node; a field of the
-        // same name would be silently shadowed.
-        for key in [
-            "kind",
-            "conforms",
-            "vault_path",
-            "violation_codes",
-            "urn",
-            "uid",
-            "title",
-        ] {
-            assert!(RESERVED_FIELD_NAMES.contains(&key), "{key}");
-            assert_rejected_with(
+    fn index_owned_and_fixed_keys_are_the_only_reserved_field_names() {
+        assert_eq!(
+            RESERVED_FIELD_NAMES,
+            [
+                "uid",
+                "title",
+                "entry_type",
+                "content_hash",
+                "created_at",
+                "updated_at"
+            ]
+        );
+        // Custom values are written as `field.<name>` and the grammar forbids
+        // `.`, so these names can no longer shadow a KG metadata key.
+        for key in ["kind", "conforms", "vault_path", "violation_codes", "urn"] {
+            assert!(
                 KindSpec::from_frontmatter(
                     "thing",
                     &obj(json!({"name": "thing", "specVersion": 1,
                                 "fields": {key: {"type": "string"}}})),
-                ),
-                &format!("fields.{key}: {key:?} is a reserved field name"),
+                )
+                .is_ok(),
+                "{key}"
             );
         }
     }
@@ -1876,17 +1743,17 @@ mod tests {
             r#"fields.f: "target" is only allowed on ref fields"#,
         );
         assert_rejected_with(
-            one_field(json!({"type": "enum", "values": ["a"], "edge": "X"})),
+            one_field(json!({"type": "enum", "values": ["a"], "edge": "x"})),
             r#"fields.f: "edge" is only allowed on ref fields"#,
         );
-        for bad in ["supersedes", "1X", "X-Y", "", "Xy"] {
+        for bad in ["SUPERSEDES", "1x", "x-y", "", "Xy", "x.y", "@kind", "@body"] {
             assert!(
                 one_field(json!({"type": "ref", "target": ["adr"], "edge": bad})).is_err(),
                 "{bad:?}"
             );
         }
-        let spec = one_field(json!({"type": "ref[]", "target": ["adr"], "edge": "HAS_TASK2"}));
-        assert_eq!(spec.unwrap().edges(), ["thing.HAS_TASK2"]);
+        let spec = one_field(json!({"type": "ref[]", "target": ["adr"], "edge": "hasTask_2"}));
+        assert_eq!(spec.unwrap().edges(), ["hasTask_2"]);
     }
 
     #[test]
@@ -1991,7 +1858,7 @@ mod tests {
     impl FakeResolver {
         fn with(mut self, kind: &str, raw: &str) -> Self {
             self.0
-                .insert((kind.into(), raw.into()), instance_kg_id(kind, raw));
+                .insert((kind.into(), raw.into()), format!("{kind}:{raw}"));
             self
         }
     }
@@ -2043,7 +1910,7 @@ mod tests {
             r.resolved_refs,
             [ResolvedRef {
                 field: "intent".into(),
-                edge: Some("adr.IMPLEMENTS".into()),
+                edge: Some("implements".into()),
                 target_id: "intent:PIMO-12".into(),
             }]
         );
@@ -2262,18 +2129,10 @@ mod tests {
             spec.field("f").unwrap().description.as_deref(),
             Some("One-line summary.")
         );
-        assert!(spec
-            .summary_rows()
-            .iter()
-            .any(|r| r.subject == "f" && r.shacl == r#"sh:description "One-line summary.""#));
         assert_rejected_with(
             one_field(json!({"type": "string", "description": 3})),
             "fields.f.description: expected a string, got integer",
         );
-        assert!(!adr()
-            .summary_rows()
-            .iter()
-            .any(|r| r.shacl.starts_with("sh:description")));
     }
 
     #[test]
@@ -2323,7 +2182,7 @@ mod tests {
     #[test]
     fn bare_ref_tries_targets_in_order() {
         let spec =
-            one_field(json!({"type": "ref", "target": ["memory", "intent"], "edge": "ABOUT"}))
+            one_field(json!({"type": "ref", "target": ["memory", "intent"], "edge": "about"}))
                 .unwrap();
         let both = FakeResolver::default()
             .with("memory", "k")
@@ -2334,7 +2193,7 @@ mod tests {
         let intent_only = FakeResolver::default().with("intent", "k");
         let r = validate_instance(&spec, UID, &fm, "", &intent_only);
         assert_eq!(r.resolved_refs[0].target_id, "intent:k");
-        assert_eq!(r.resolved_refs[0].edge.as_deref(), Some("thing.ABOUT"));
+        assert_eq!(r.resolved_refs[0].edge.as_deref(), Some("about"));
         let r = validate_instance(&spec, UID, &fm, "", &FakeResolver::default());
         assert_eq!(
             only(&r).message,
@@ -2366,9 +2225,7 @@ mod tests {
             .filter(|r| r.field == "supersedes")
             .collect();
         assert_eq!(sup.len(), 2, "duplicates collapse");
-        assert!(sup
-            .iter()
-            .all(|r| r.edge.as_deref() == Some("adr.SUPERSEDES")));
+        assert!(sup.iter().all(|r| r.edge.as_deref() == Some("supersedes")));
         assert_eq!(sup[0].target_id, format!("adr:{UID2}"));
         assert_eq!(sup[1].target_id, format!("adr:{UID3}"));
         assert_eq!(
@@ -2387,7 +2244,7 @@ mod tests {
         let spec = KindSpec::from_frontmatter(
             "adr",
             &obj(json!({"name": "adr", "specVersion": 1,
-                        "fields": {"parent": {"type": "ref", "target": ["adr"], "edge": "PARENT_OF_ADR"}}})),
+                        "fields": {"parent": {"type": "ref", "target": ["adr"], "edge": "parentOfAdr"}}})),
         )
         .unwrap();
         let fm = obj(json!({"uid": UID, "parent": UID2}));
@@ -2429,13 +2286,6 @@ mod tests {
     }
 
     // -- helpers ------------------------------------------------------------
-
-    #[test]
-    fn identifiers() {
-        assert_eq!(namespaced_edge("adr", "SUPERSEDES"), "adr.SUPERSEDES");
-        assert_eq!(instance_kg_id("adr", UID), format!("adr:{UID}"));
-        assert_eq!(instance_urn("adr", UID), format!("urn:atomic:adr:{UID}"));
-    }
 
     #[test]
     fn apply_defaults_fills_only_absent_fields() {
@@ -2503,49 +2353,6 @@ mod tests {
     }
 
     #[test]
-    fn summary_rows_map_constructs_to_shacl() {
-        let rows = adr().summary_rows();
-        let has = |subject: &str, shacl: &str| {
-            rows.iter()
-                .any(|r| r.subject == subject && r.shacl == shacl)
-        };
-        assert!(has(
-            "(kind)",
-            "sh:closed true ; sh:ignoredProperties ( uid title )"
-        ));
-        assert!(has("status", "sh:minCount 1"));
-        assert!(has("status", "sh:maxCount 1"));
-        assert!(has(
-            "status",
-            r#"sh:in ( "proposed" "accepted" "superseded" )"#
-        ));
-        assert!(has("status", r#"sh:defaultValue "proposed""#));
-        assert!(has("intent", "sh:class intent"));
-        assert!(has("intent", "sh:path adr.IMPLEMENTS"));
-        assert!(has("supersedes", "sh:class adr"));
-        assert!(!has("supersedes", "sh:maxCount 1"), "lists are unbounded");
-        assert!(has("body", "(none; atomic extension: non-blank body)"));
-
-        let spec = KindSpec::from_frontmatter(
-            "thing",
-            &obj(json!({"name": "thing", "specVersion": 1, "fields": {
-                "s": {"type": "string"}, "n": {"type": "integer"}, "b": {"type": "boolean[]"},
-                "r": {"type": "ref", "target": ["adr", "intent"]}
-            }})),
-        )
-        .unwrap();
-        let rows = spec.summary_rows();
-        for shacl in [
-            "sh:datatype xsd:string",
-            "sh:datatype xsd:integer",
-            "sh:datatype xsd:boolean",
-            "sh:or ( [ sh:class adr ] [ sh:class intent ] )",
-        ] {
-            assert!(rows.iter().any(|r| r.shacl == shacl), "{shacl}");
-        }
-    }
-
-    #[test]
     fn reserved_lists_are_self_consistent() {
         for k in RESERVED_KIND_NAMES {
             assert!(
@@ -2559,18 +2366,57 @@ mod tests {
         for t in BUILTIN_REF_TARGETS {
             assert!(is_reserved_kind_name(t) && is_ref_target_name(t));
         }
-        // KG namespaces that once slipped through.
-        for k in [
-            "layer",
-            "provenance",
-            "reasoning",
-            "session_turn",
-            "content",
-        ] {
-            assert!(is_reserved_kind_name(k), "{k}");
+        for k in RESERVED_KIND_NAMES {
+            assert_eq!(
+                k.replace(['-', '_'], ""),
+                k.to_ascii_lowercase(),
+                "{k} is not in normalized form"
+            );
         }
         let unique: BTreeSet<_> = RESERVED_KIND_NAMES.iter().collect();
         assert_eq!(unique.len(), RESERVED_KIND_NAMES.len(), "duplicates");
-        assert_eq!(RESERVED_KIND_NAMES.len(), 51);
+        assert_eq!(RESERVED_KIND_NAMES.len(), 33);
+    }
+
+    #[test]
+    fn reserved_kind_names_ignore_case_and_separators() {
+        for k in [
+            "tool-result",
+            "tool_result",
+            "toolresult",
+            "session-turn",
+            "scope_item",
+            "acceptance-criterion",
+            "project-identity",
+            "work_intent",
+            "finding",
+            "project",
+            "t-o-d-o",
+        ] {
+            assert!(is_reserved_kind_name(k), "{k}");
+        }
+    }
+
+    #[test]
+    fn names_with_no_atomic_class_are_legal_kinds() {
+        for k in [
+            "module",
+            "entity",
+            "layer",
+            "content",
+            "test",
+            "agent",
+            "scope",
+            "tool",
+            "vault",
+            "provenance",
+            "runbook",
+        ] {
+            assert!(!is_reserved_kind_name(k), "{k}");
+            assert!(
+                KindSpec::from_frontmatter(k, &obj(json!({"name": k, "specVersion": 1}))).is_ok(),
+                "{k}"
+            );
+        }
     }
 }

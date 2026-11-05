@@ -1,8 +1,8 @@
 //! Reference resolution and the read-only kind validation report.
 
 use atomic_canonical::kind_spec::{
-    has_conflict_markers, instance_kg_id, is_valid_kind_name, is_valid_ulid, validate_instance,
-    BaseType, FieldSpec, InstanceReport, KindSpec, KindViolation, KindViolationCode, RefResolver,
+    has_conflict_markers, is_valid_kind_name, is_valid_ulid, validate_instance, BaseType,
+    FieldSpec, InstanceReport, KindSpec, KindViolation, KindViolationCode, RefResolver,
     BUILTIN_REF_TARGETS,
 };
 use serde::{Deserialize, Serialize};
@@ -22,9 +22,9 @@ use crate::RepositoryError;
 ///
 /// - A custom kind `k`: `raw` must be a ULID, `k` must be **registered** in
 ///   the same source (its `_kind.md` parses into a valid spec), and
-///   `kinds/k/<raw>.md` must exist there; resolves to `k:<raw>`. An instance
-///   of an unregistered or invalid kind is not a node, so a ref to it does
-///   not resolve.
+///   `kinds/k/<raw>.md` must exist there; resolves to that vault path. An
+///   instance of an unregistered or invalid kind is not a node, so a ref to it
+///   does not resolve.
 /// - `memory`: `memory/<raw>.md` must exist in the source; resolves to that
 ///   vault path.
 /// - `intent`: `raw` must be the intent's full ULID (any case) or its full
@@ -85,9 +85,10 @@ impl RefResolver for KindRefResolver<'_, '_> {
                 let path = format!("memory/{raw}.md");
                 (name_ok && self.files.exists(&path)).then_some(path)
             }
-            kind if is_valid_kind_name(kind) && is_valid_ulid(raw) => (self.is_registered(kind)
-                && self.files.exists(&kind_instance_path(kind, raw)))
-            .then(|| instance_kg_id(kind, raw)),
+            kind if is_valid_kind_name(kind) && is_valid_ulid(raw) => {
+                let path = kind_instance_path(kind, raw);
+                (self.is_registered(kind) && self.files.exists(&path)).then_some(path)
+            }
             _ => None,
         }
     }
@@ -266,7 +267,7 @@ pub struct KindReport {
     pub spec_problems: Vec<String>,
     /// Declared fields; zero when the definition did not register.
     pub field_count: usize,
-    /// The namespaced edges (`<kind>.<EDGE>`) the kind can project.
+    /// The edge labels the kind's ref fields declare.
     pub edges: Vec<String>,
     pub instance_count: usize,
     pub instances: Vec<InstanceResult>,

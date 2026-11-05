@@ -184,7 +184,7 @@ fn instance_change_depends_on_definition_change() {
     assert_eq!(s.f.dependencies(&s.instance), vec![s.definition.clone()]);
 
     let shown = s.f.ok(&["change", &s.instance, "--show-deps"]);
-    assert!(shown.contains("Dependencies: 1"), "{shown}");
+    assert!(shown.contains("Dependencies (1)"), "{shown}");
     assert!(shown.contains("feat: add adr kind"), "{shown}");
 }
 
