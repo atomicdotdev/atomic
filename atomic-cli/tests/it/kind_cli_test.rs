@@ -901,3 +901,24 @@ fn materializing_a_kind_file_is_refused_as_a_usage_error() {
     assert!(!out.contains("appears to be a bug"), "{out}");
     assert_eq!(fs::read_to_string(&definition).unwrap(), ADR_DEFINITION);
 }
+
+/// The example the skill teaches has to work as written, in both copies of it.
+#[test]
+fn the_skill_doc_intent_ref_example_resolves() {
+    for doc in [
+        include_str!("../../../atomic-repository/vault/skills/atomic-vault.md"),
+        include_str!("../../../.vault/skills/atomic-vault.md"),
+    ] {
+        let value = doc
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix("intent="))
+            .expect("the skill shows an intent ref");
+        let f = Fixture::new();
+        f.write_definition("adr", ADR_DEFINITION);
+        f.ok(&["intent", "new", "Adopt kinds"]);
+        let set = format!("intent={value}");
+        let created: serde_json::Value =
+            serde_json::from_str(&f.ok(&["kind", "new", "adr", "--set", &set, "--json"])).unwrap();
+        assert_eq!(created["written"], true, "{created}");
+    }
+}
