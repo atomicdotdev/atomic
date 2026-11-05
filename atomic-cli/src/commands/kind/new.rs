@@ -56,7 +56,8 @@ pub struct KindNew {
     pub body_stdin: bool,
 
     /// Emit JSON instead of the human summary: on success
-    /// `{"written": true, "uid", "kind", "file"}`; on failure
+    /// `{"written": true, "uid", "kind", "kg_id", "file"}`, where `kg_id` is
+    /// null while this clone has no project identity; on failure
     /// `{"written": false, "kind", ...}` with either `violations` (the
     /// instance does not conform) or `error` (anything else).
     #[arg(long)]
@@ -298,10 +299,10 @@ impl KindNew {
 
         warn_if_definition_unrecorded(&repo, &self.kind)?;
 
+        let kg_id = repo
+            .kind_instance_iri(&self.kind, &uid)
+            .map_err(CliError::Repository)?;
         if self.json {
-            let kg_id = repo
-                .kind_instance_iri(&self.kind, &uid)
-                .map_err(CliError::Repository)?;
             let out = serde_json::json!({
                 "written": true,
                 "uid": uid,
@@ -317,6 +318,10 @@ impl KindNew {
                 display_path(&rel),
                 self.kind
             );
+            // `<kind>:<uid>` names the instance in refs; `atomic query` takes this.
+            if let Some(kg_id) = kg_id {
+                println!("  KG id: {kg_id}");
+            }
         }
         Ok(())
     }
