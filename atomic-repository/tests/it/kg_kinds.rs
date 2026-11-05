@@ -2211,3 +2211,51 @@ fn a_kind_file_with_no_permission_or_target_does_not_stop_the_deflate() {
         .unwrap()
         .is_none());
 }
+
+/// A row's nodes are stored one upsert at a time, against every other row's, on
+/// every vault write: a thousand copies of one link must cost one. The merge
+/// keeps what storing every copy would have left.
+#[test]
+fn a_repeated_link_projects_one_copy_of_each_node() {
+    let (_dir, repo) = projected_repo();
+    write_vault(&repo, &hub_path("adr"), ADR_SPEC);
+    write_vault(&repo, MEMORY_PATH, labelled_memory("x"));
+    let path = instance_path("adr", K1);
+    write_vault(
+        &repo,
+        &path,
+        format!(
+            "---\nuid: {K1}\ntitle: Links\nstatus: accepted\nsupersedes: [{K1}]\n---\n{}",
+            "[[nowhere]] [[notes]] [[elsewhere]] ".repeat(500)
+        ),
+    );
+    sync(&repo);
+
+    let entry = repo.vault_retrieve(&path).unwrap().unwrap();
+    let (nodes, _) = repo.vault_extract_kg(&path, &entry).unwrap();
+    let ids: Vec<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
+    let distinct: BTreeSet<&str> = ids.iter().copied().collect();
+    assert_eq!(ids.len(), distinct.len(), "{ids:#?}");
+
+    // Its own node survives its own ref to itself, and the unresolved links keep
+    // their one finding.
+    let subject = concept(&repo, &format!("adr.{K1}"));
+    assert_eq!(meta(&node(&repo, &subject).unwrap(), "kind_name"), "adr");
+    assert!(references(&repo, &subject, &subject).is_some());
+    assert!(node(
+        &repo,
+        &iri::mint_finding(&repo.project_id().unwrap(), "UnresolvedReference", &subject)
+    )
+    .is_some());
+
+    let incremental = repo.workflow_snapshot().unwrap();
+    assert_closed(&incremental, "repeated links");
+    assert!(repo.rebuild_kg(true).unwrap());
+    let rebuilt = repo.workflow_snapshot().unwrap();
+    assert_eq!(
+        incremental.identity,
+        rebuilt.identity,
+        "{}",
+        describe_difference(&incremental, &rebuilt)
+    );
+}
