@@ -656,6 +656,10 @@ fn reads_answer_on_a_repository_needing_a_kg_rebuild_and_change_nothing() {
     };
     let before = snapshot(f.root());
 
+    let shown: serde_json::Value =
+        serde_json::from_str(&f.ok(&["kind", "show", "adr", "--json"])).unwrap();
+    assert!(shown["kg_id"].is_null(), "no project identity: {shown}");
+
     let kinds = f.ok(&["kind", "list"]);
     assert!(kinds.contains("adr   registered  1"), "{kinds}");
     let instances = f.ok(&["kind", "list", "adr"]);

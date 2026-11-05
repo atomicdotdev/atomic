@@ -298,10 +298,14 @@ impl KindNew {
         warn_if_definition_unrecorded(&repo, &self.kind)?;
 
         if self.json {
+            let kg_id = repo
+                .kind_instance_iri(&self.kind, &uid)
+                .map_err(CliError::Repository)?;
             let out = serde_json::json!({
                 "written": true,
                 "uid": uid,
                 "kind": self.kind,
+                "kg_id": kg_id,
                 "file": display_path(&rel),
             });
             println!("{out}");

@@ -40,7 +40,10 @@ impl Command for KindShow {
             .get(&self.kind)
             .ok_or_else(|| kind_not_found(&self.kind))?;
         if self.json {
-            self.print_json(entry);
+            let kg_id = repo
+                .kind_hub_iri(entry.name())
+                .map_err(CliError::Repository)?;
+            self.print_json(entry, kg_id.as_deref());
         } else {
             self.print_human(entry);
         }
@@ -49,11 +52,12 @@ impl Command for KindShow {
 }
 
 impl KindShow {
-    fn print_json(&self, entry: &KindEntry) {
+    fn print_json(&self, entry: &KindEntry, kg_id: Option<&str>) {
         let def = &entry.definition;
         let spec = entry.spec();
         let mut out = serde_json::json!({
             "kind": def.name,
+            "kg_id": kg_id,
             "status": status_label(def),
             "problems": status_problems(def),
             "def_path": display_path(&def.def_path),

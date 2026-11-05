@@ -32,6 +32,7 @@ use atomic_canonical::kind_spec::{is_valid_kind_name, is_valid_ulid};
 use atomic_core::pristine::ViewTxnT;
 use atomic_core::types::Merkle;
 
+use super::vault_projection::{kind_hub_name, kind_instance_name};
 use super::Repository;
 use crate::RepositoryError;
 
@@ -381,6 +382,35 @@ impl Repository {
         Ok(self
             .vault_retrieve(&kind_definition_path(kind))?
             .map(|entry| KindDefinition::from_stored(kind, &entry)))
+    }
+
+    /// The knowledge-graph IRI of `kind`'s definition, or `None` while this
+    /// clone has no project identity.
+    ///
+    /// The IRI is local to this clone: adopting another clone's identity rewrites
+    /// it. Hand it to a query, and never store it in a file.
+    pub fn kind_hub_iri(&self, kind: &str) -> Result<Option<String>, RepositoryError> {
+        self.kind_concept_iri(&kind_hub_name(kind))
+    }
+
+    /// The knowledge-graph IRI of instance `uid` of `kind`. See
+    /// [`Repository::kind_hub_iri`].
+    pub fn kind_instance_iri(
+        &self,
+        kind: &str,
+        uid: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        self.kind_concept_iri(&kind_instance_name(kind, uid))
+    }
+
+    fn kind_concept_iri(&self, name: &str) -> Result<Option<String>, RepositoryError> {
+        Ok(match self.project_identity()? {
+            Some(_) => Some(atomic_core::kg::iri::mint_concept(
+                &self.project_id()?,
+                name,
+            )),
+            None => None,
+        })
     }
 
     /// Open a reader over `source`.
