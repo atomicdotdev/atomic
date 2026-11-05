@@ -849,3 +849,40 @@ fn new_prints_the_kg_id_a_query_answers_to() {
     let help = f.ok(&["kind", "new", "--help"]);
     assert!(help.contains("kg_id"), "{help}");
 }
+
+/// One unreadable instance is one row: `kind list` goes on, as `kind validate`
+/// does, and points there for the reason.
+#[test]
+fn list_keeps_going_past_an_unreadable_instance() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    f.write_definition("adr", ADR_DEFINITION);
+    let readable: serde_json::Value =
+        serde_json::from_str(&f.ok(&["kind", "new", "adr", "--title", "Readable", "--json"]))
+            .unwrap();
+    let uid = "01JD8ZK3M6W2Q4V7X9B5N1C3W1";
+    let path = f.kind_dir("adr").join(format!("{uid}.md"));
+    fs::write(
+        &path,
+        format!("---\nuid: {uid}\nstatus: proposed\n---\nBody.\n"),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let json = f.run(&["kind", "list", "adr", "--json"]);
+    let text = f.run(&["kind", "list", "adr"]);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert!(json.status.success(), "{json:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let rows = listed["instances"].as_array().unwrap();
+    let row = |id: &str| rows.iter().find(|row| row["uid"] == id).unwrap();
+    assert_eq!(row(uid)["conforms"], false, "{listed:#}");
+    assert_eq!(row(readable["uid"].as_str().unwrap())["conforms"], true);
+    assert!(String::from_utf8_lossy(&json.stderr).contains("kind validate"));
+
+    assert!(text.status.success(), "{text:?}");
+    let table = String::from_utf8_lossy(&text.stdout);
+    assert!(table.contains("Readable"), "{table}");
+    assert!(table.contains("01JD8ZK3"), "{table}");
+}
