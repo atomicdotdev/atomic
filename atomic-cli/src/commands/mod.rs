@@ -423,10 +423,11 @@ pub(crate) fn open_readonly_repository(
 /// creating the vault when it does not exist yet.
 ///
 /// Vault *writes* — `goal start/stop/resume`, `materialize`, `sync`,
-/// `intent new/update/delete/link/attest`, `memory new/write/attest`,
-/// `kind init/new` — open through this helper so a repository created without
-/// a vault (`atomic init --no-vault`, or one that never ran `atomic vault init`)
-/// works on first use instead of failing with "Vault not initialized".
+/// `intent new/update/delete/link/attest`, `memory new/write/attest` — open
+/// through this helper so a repository created without a vault
+/// (`atomic init --no-vault`, or one that never ran `atomic vault init`) works
+/// on first use instead of failing with "Vault not initialized". `kind init/new`
+/// call [`ensure_vault_exists`] themselves, once they are past their checks.
 ///
 /// Read-only commands deliberately do NOT use this helper: they open with
 /// [`open_readonly_repository`], so a read never mutates a checkout — an
@@ -444,7 +445,7 @@ pub fn open_repository_with_vault(root: &Path) -> CliResult<Repository> {
 
 /// One-time implicit vault initialization, announced on stderr so `--json`
 /// output stays parseable.
-fn ensure_vault_exists(repo: &Repository) -> CliResult<()> {
+pub(crate) fn ensure_vault_exists(repo: &Repository) -> CliResult<()> {
     if repo.ensure_vault().map_err(CliError::from)? {
         eprintln!("Initialized vault at {}", repo.vault_dir().display());
     }
