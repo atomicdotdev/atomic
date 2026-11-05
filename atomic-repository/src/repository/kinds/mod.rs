@@ -15,7 +15,8 @@
 //!
 //! KG projection and the embedding policy are the exception: they are
 //! derived from redb, so they read the stored definition instead (see
-//! [`Repository::stored_kind_definition`]).
+//! [`KindDefinition::from_stored`]). Projection itself lives with every other
+//! vault row's, in `vault_projection.rs`.
 
 mod registry;
 mod validate;
@@ -363,11 +364,11 @@ impl Repository {
     /// `kind` is not a valid kind name. See [`KindDefinition::from_stored`].
     ///
     /// The KG is a projection of redb's vault entries in which the last
-    /// deflate wins, so KG projection and the embedding policy take an
-    /// instance's spec from here: the instance and its spec must come from
-    /// the same layer, not from whatever the working copy holds (which a
-    /// sandbox deflating a view's files may not even have, and which a
-    /// case-insensitive filesystem would let `kinds/adr/_KIND.md` stand in
+    /// deflate wins, so the embedding policy takes an instance's spec from
+    /// here, and KG projection reads the same rows: the instance and its spec
+    /// must come from the same layer, not from whatever the working copy holds
+    /// (which a sandbox deflating a view's files may not even have, and which
+    /// a case-insensitive filesystem would let `kinds/adr/_KIND.md` stand in
     /// for). The per-view gate (`kind validate`, `kind new`) still reads
     /// files through [`Repository::kind_files`].
     pub fn stored_kind_definition(
