@@ -105,6 +105,30 @@ pub trait ChangeStore: Send + Sync {
     /// Returns an error if the change is not found or cannot be loaded.
     fn get_change(&self, hash: &Hash) -> Result<Change, Self::Error>;
 
+    /// Load an immutable identity-bound value. Custom stores keep conservative
+    /// canonical hash verification unless they provide a checked encoded reader.
+    fn get_verified_change(
+        &self,
+        hash: &Hash,
+    ) -> Result<super::VerifiedChange, super::VerifiedLoadError<Self::Error>> {
+        let change = self
+            .get_change(hash)
+            .map_err(super::VerifiedLoadError::Store)?;
+        let verified = super::VerifiedChange::from_change(change)?;
+        verified.check_hash(hash)?;
+        Ok(verified)
+    }
+
+    /// Revalidate a cache hit against current backing data. The default reloads
+    /// and verifies; stores must not trust a pathname, mtime or a prior receipt.
+    fn revalidate_verified_change(
+        &self,
+        hash: &Hash,
+        _cached: &super::VerifiedChange,
+    ) -> Result<super::VerifiedChange, super::VerifiedLoadError<Self::Error>> {
+        self.get_verified_change(hash)
+    }
+
     /// Check if a change exists.
     ///
     /// # Arguments

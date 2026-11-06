@@ -3,8 +3,8 @@
 //! This bridges the repository's filesystem-backed `ChangeStore` with the
 //! core library's content retrieval functions (like `retrieve_content`).
 
-use atomic_core::change::ChangeHeader;
 use atomic_core::change::ChangeStore as ChangeStoreTrait;
+use atomic_core::change::{ChangeHeader, VerifiedChange, VerifiedLoadError};
 use atomic_core::types::{GraphNode, Hash, NodeId};
 
 use super::{ChangeStore, ChangeStoreError};
@@ -14,6 +14,23 @@ impl ChangeStoreTrait for ChangeStore {
 
     fn get_change(&self, hash: &Hash) -> Result<atomic_core::change::Change, Self::Error> {
         self.load_change(hash)
+    }
+
+    fn get_verified_change(
+        &self,
+        hash: &Hash,
+    ) -> Result<VerifiedChange, VerifiedLoadError<Self::Error>> {
+        self.load_verified_change(hash, None)
+            .map_err(VerifiedLoadError::Store)
+    }
+
+    fn revalidate_verified_change(
+        &self,
+        hash: &Hash,
+        cached: &VerifiedChange,
+    ) -> Result<VerifiedChange, VerifiedLoadError<Self::Error>> {
+        self.load_verified_change(hash, Some(cached))
+            .map_err(VerifiedLoadError::Store)
     }
 
     fn has_change(&self, hash: &Hash) -> bool {

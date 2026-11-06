@@ -20,6 +20,10 @@ struct MaterializationPlanEntry {
     expected_new: EffectValue,
 }
 
+type MaterializationVerifiedChanges<'a> =
+    atomic_core::change::VerifiedChangeCache<'a, crate::changestore::ChangeStore>;
+const MAX_MATERIALIZATION_VERIFIED_CHANGES: usize = 4096;
+
 #[cfg(unix)]
 fn materialized_directory_mode() -> u32 {
     0o755
@@ -627,7 +631,25 @@ impl Repository {
         path: &str,
         view_name: &str,
     ) -> Result<Option<Vec<u8>>, RepositoryError> {
-        let normalized = normalize_path(Path::new(path));
+        let mut bytes = None;
+        self.for_each_switch_target_file(&[path.to_string()], view_name, |_, rendered| {
+            bytes = rendered;
+            Ok(())
+        })?;
+        Ok(bytes)
+    }
+
+    /// Stream lease bytes from one read snapshot, sharing verified span history
+    /// across ordinary files. Nothing survives this call's transaction or gets
+    /// reused by execution/recovery; the visitor must not mutate repository state.
+    pub(super) fn for_each_switch_target_file(
+        &self,
+        paths: &[String],
+        view_name: &str,
+        mut visit: impl FnMut(&str, Option<Vec<u8>>) -> Result<(), RepositoryError>,
+    ) -> Result<(), RepositoryError> {
+        use atomic_core::pristine::span_patch_storage::SpanRenderContext;
+
         let txn = self
             .pristine
             .read_txn()
@@ -659,74 +681,102 @@ impl Repository {
         let inode_graph_table = txn
             .open_inode_graph_table()
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
-        if projection.name_conflicts.contains_key(&normalized) {
-            let selected = std::collections::HashSet::from([normalized.clone()]);
-            let prepared = prepare_name_conflict_output(
+        let mut span_context = None;
+        for path in paths {
+            let normalized = normalize_path(Path::new(path));
+            if projection.name_conflicts.contains_key(&normalized) {
+                let selected = std::collections::HashSet::from([normalized.clone()]);
+                let prepared = prepare_name_conflict_output(
+                    &txn,
+                    &self.change_store,
+                    &inode_graph_table,
+                    &visibility,
+                    &external_hashes,
+                    &projection.name_conflicts,
+                    Some(&selected),
+                )?;
+                let bytes = match prepared.files.as_slice() {
+                    [entry] => Ok(entry.bytes().map(ToOwned::to_owned)),
+                    [] if prepared.directories == [normalized] => Ok(None),
+                    _ => Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "switch conflict renderer produced an ambiguous result for '{path}'"
+                        ),
+                    }),
+                }?;
+                visit(path, bytes)?;
+                continue;
+            }
+
+            let Some(item) = projection
+                .present
+                .get(&normalized)
+                .filter(|item| !item.is_directory)
+            else {
+                visit(path, None)?;
+                continue;
+            };
+            let materialization = atomic_core::output::project_inode_attributes(
+                &txn,
+                item.position,
+                visibility.attribute_visibility(),
+            )
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            if materialization.is_conflicted() {
+                return Err(RepositoryError::Output(format!(
+                    "cannot switch '{}' with conflicting inode attributes",
+                    path
+                )));
+            }
+            let kind = materialization.materialization.kind;
+            // The lease must hash the same semantic rendering used by materialize.
+            // The fast content reader can retain forks resolved by that renderer.
+            let repository_bytes = if super::content::has_visible_span_root(
                 &txn,
                 &self.change_store,
-                &inode_graph_table,
+                item.inode,
                 &visibility,
-                &external_hashes,
-                &projection.name_conflicts,
-                Some(&selected),
-            )?;
-            return match prepared.files.as_slice() {
-                [entry] => Ok(entry.bytes().map(ToOwned::to_owned)),
-                [] if prepared.directories == [normalized] => Ok(None),
-                _ => Err(RepositoryError::InvalidOperation {
-                    message: format!(
-                        "switch conflict renderer produced an ambiguous result for '{path}'"
-                    ),
-                }),
+            )? {
+                if span_context.is_none() {
+                    span_context = Some(
+                        SpanRenderContext::new(&txn, &self.change_store, &visibility)
+                            .map_err(|error| RepositoryError::Database(error.to_string()))?,
+                    );
+                }
+                span_context
+                    .as_ref()
+                    .unwrap()
+                    .render(item.inode)
+                    .map_err(|error| RepositoryError::Output(format!("{path}: span: {error}")))?
+            } else {
+                render_name_conflict_side(
+                    &txn,
+                    &self.change_store,
+                    &inode_graph_table,
+                    &visibility,
+                    &external_hashes,
+                    path,
+                    item.inode,
+                    item.position,
+                )
+                .map_err(RepositoryError::Output)?
             };
+            if kind != atomic_core::change::InodeKind::Regular
+                || first_conflict_marker_line(&repository_bytes).is_some()
+            {
+                visit(path, Some(repository_bytes))?;
+                continue;
+            }
+            use crate::content_filter::ContentFilter;
+            let filtered = crate::content_filter::GitAttributesFilter::for_repository(&self.root)
+                .smudge(Path::new(path), &repository_bytes)
+                .map_err(|error| RepositoryError::Output(error.to_string()))?;
+            for warning in &filtered.warnings {
+                log::warn!("switch: {warning}");
+            }
+            visit(path, Some(filtered.bytes))?;
         }
-
-        let Some(item) = projection
-            .present
-            .get(&normalized)
-            .filter(|item| !item.is_directory)
-        else {
-            return Ok(None);
-        };
-        let materialization = atomic_core::output::project_inode_attributes(
-            &txn,
-            item.position,
-            visibility.attribute_visibility(),
-        )
-        .map_err(|error| RepositoryError::Database(error.to_string()))?;
-        if materialization.is_conflicted() {
-            return Err(RepositoryError::Output(format!(
-                "cannot switch '{}' with conflicting inode attributes",
-                path
-            )));
-        }
-        let kind = materialization.materialization.kind;
-        // The lease must hash the same semantic rendering used by materialize.
-        // The fast content reader can retain forks resolved by that renderer.
-        let repository_bytes = render_name_conflict_side(
-            &txn,
-            &self.change_store,
-            &inode_graph_table,
-            &visibility,
-            &external_hashes,
-            path,
-            item.inode,
-            item.position,
-        )
-        .map_err(RepositoryError::Output)?;
-        if kind != atomic_core::change::InodeKind::Regular
-            || first_conflict_marker_line(&repository_bytes).is_some()
-        {
-            return Ok(Some(repository_bytes));
-        }
-        use crate::content_filter::ContentFilter;
-        let filtered = crate::content_filter::GitAttributesFilter::for_repository(&self.root)
-            .smudge(Path::new(path), &repository_bytes)
-            .map_err(|error| RepositoryError::Output(error.to_string()))?;
-        for warning in &filtered.warnings {
-            log::warn!("switch: {warning}");
-        }
-        Ok(Some(filtered.bytes))
+        Ok(())
     }
 
     fn remove_absent_entries(
@@ -1190,11 +1240,19 @@ impl Repository {
                 })?;
             (graph_visibility_closure(&txn, &view)?, view.id, view.state)
         };
+        // Only immutable decoded bytes are reused across plan/execution. Each
+        // new context still checks its own dependency/span indexes, and cache
+        // hits re-read and fingerprint the actual change files.
+        let verified_changes = MaterializationVerifiedChanges::new(
+            &self.change_store,
+            visibility.len().min(MAX_MATERIALIZATION_VERIFIED_CHANGES),
+        );
         let plan = self.plan_materialization_with_visibility(
             working_copy,
             only_paths.clone(),
             visibility.clone(),
             view_id,
+            Some(&verified_changes),
         )?;
         let mut effects = Vec::new();
         for entry in plan {
@@ -1308,12 +1366,15 @@ impl Repository {
             prepared.operation().clone(),
         );
         executor.complete_preparatory(&view_name)?;
-        let result = self.materialize_parallel_with_visibility_journaled(
+        let result = self.materialize_parallel_with_visibility_mode(
             working_copy,
             only_paths,
             visibility,
             view_id,
-            &mut executor,
+            true,
+            Some(&mut executor),
+            None,
+            Some(&verified_changes),
         )?;
         executor.complete_remaining(&view_name)?;
         drop(executor);
@@ -1359,6 +1420,7 @@ impl Repository {
             true,
             Some(executor),
             None,
+            None,
         )
     }
 
@@ -1378,6 +1440,7 @@ impl Repository {
             false,
             None,
             None,
+            None,
         )
         .map(|_| ())
     }
@@ -1388,6 +1451,7 @@ impl Repository {
         only_paths: Option<std::collections::HashSet<String>>,
         visibility: GraphVisibilityClosure,
         view_id: u64,
+        verified_changes: Option<&MaterializationVerifiedChanges<'_>>,
     ) -> Result<Vec<MaterializationPlanEntry>, RepositoryError> {
         let mut plan = Vec::new();
         self.materialize_parallel_with_visibility_mode(
@@ -1398,6 +1462,7 @@ impl Repository {
             false,
             None,
             Some(&mut plan),
+            verified_changes,
         )?;
         Ok(plan)
     }
@@ -1412,6 +1477,7 @@ impl Repository {
         execute: bool,
         mut effect_executor: Option<&mut dyn MaterializationEffectExecutor>,
         plan: Option<&mut Vec<MaterializationPlanEntry>>,
+        verified_changes: Option<&MaterializationVerifiedChanges<'_>>,
     ) -> Result<MaterializeResult, RepositoryError> {
         self.validate_working_copy(working_copy)?;
         use atomic_core::output::repo::OutputItem;
@@ -1509,8 +1575,11 @@ impl Repository {
         }
         let span_context = if has_visible_spans {
             Some(
-                SpanRenderContext::new(&txn, &self.change_store, &visibility)
-                    .map_err(|error| RepositoryError::Database(error.to_string()))?,
+                match verified_changes {
+                    Some(store) => SpanRenderContext::new(&txn, store, &visibility),
+                    None => SpanRenderContext::new(&txn, &self.change_store, &visibility),
+                }
+                .map_err(|error| RepositoryError::Database(error.to_string()))?,
             )
         } else {
             None
@@ -1600,12 +1669,18 @@ impl Repository {
                             context
                         ))
                     })?;
-                store.load_change(&hash).map_err(|error| {
-                    RepositoryError::Output(format!(
-                        "failed to load {} ({}) while pre-warming materialization: {}",
-                        context, hash, error
-                    ))
-                })?;
+                // Span construction already verified every visible immutable
+                // source. Do not decode the same closure again solely to warm
+                // the graph LRU. Mixed graph files retain checked lazy reads;
+                // non-visible origins retain the original preload check.
+                if span_context.is_none() || !visibility.contains(*node_id) {
+                    store.load_change(&hash).map_err(|error| {
+                        RepositoryError::Output(format!(
+                            "failed to load {} ({}) while pre-warming materialization: {}",
+                            context, hash, error
+                        ))
+                    })?;
+                }
                 hashes.insert(*node_id, hash);
             }
             if trace_mat {
@@ -2595,6 +2670,9 @@ impl Repository {
         }))
     }
 }
+
+#[cfg(test)]
+mod verified_tests;
 
 #[cfg(test)]
 mod conflict_marker_tests {

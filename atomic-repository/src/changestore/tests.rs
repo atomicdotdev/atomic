@@ -44,6 +44,72 @@ fn create_test_change_with_content(message: &str, content: &[u8]) -> Change {
 // LRU Cache Tests
 
 #[test]
+fn verified_operation_cache_reuses_decode_but_rechecks_actual_files() {
+    use atomic_core::change::{ChangeStore as CoreChangeStore, VerifiedChangeCache};
+    let (store, _temp) = create_test_store();
+    let change = create_test_change_with_content("verified", b"original bytes");
+    let hash = store.save_change(&change).unwrap();
+    let path = store.change_path(&hash);
+    let original = fs::read(&path).unwrap();
+    let cache = VerifiedChangeCache::new(&store, 4);
+    let first = cache.get_verified_change(&hash).unwrap();
+    let second = cache.get_verified_change(&hash).unwrap();
+    assert!(
+        std::ptr::eq(first.change(), second.change()),
+        "identical source should reuse its immutable decode"
+    );
+
+    let other = store
+        .save_change(&create_test_change_with_content("other", b"replacement"))
+        .unwrap();
+    fs::write(&path, fs::read(store.change_path(&other)).unwrap()).unwrap();
+    assert!(
+        cache.get_verified_change(&hash).is_err(),
+        "valid bytes for another identity must refuse"
+    );
+    fs::write(&path, &original).unwrap();
+    cache.get_verified_change(&hash).unwrap();
+
+    let mut corrupt = original.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 1;
+    fs::write(&path, &corrupt).unwrap();
+    assert!(cache.get_verified_change(&hash).is_err());
+    assert!(
+        store.load_change(&hash).is_ok(),
+        "ordinary LRU is deliberately stale in this fixture"
+    );
+    fs::write(&path, &original).unwrap();
+    cache.get_verified_change(&hash).unwrap();
+    fs::remove_file(&path).unwrap();
+    assert!(
+        cache.get_verified_change(&hash).is_err(),
+        "deletion must not hide behind a cached witness"
+    );
+}
+
+#[test]
+fn verified_operation_cache_reloads_changed_unhashed_notes_without_rewriting_identity() {
+    use atomic_core::change::{ChangeStore as CoreChangeStore, VerifiedChangeCache};
+    let (store, _temp) = create_test_store();
+    let mut change = create_test_change_with_content("same author", b"authored bytes");
+    change.unhashed = Some(serde_json::json!({"note":"old"}));
+    let hash = store.save_change(&change).unwrap();
+    let cache = VerifiedChangeCache::new(&store, 4);
+    let first = cache.get_verified_change(&hash).unwrap();
+    change.unhashed = Some(serde_json::json!({"note":"new"}));
+    let mut bytes = Vec::new();
+    assert_eq!(change.serialize(&mut bytes).unwrap(), hash);
+    fs::write(store.change_path(&hash), &bytes).unwrap();
+    let updated = cache.get_verified_change(&hash).unwrap();
+    assert_eq!(updated.hash(), hash);
+    assert_eq!(updated.change().unhashed, change.unhashed);
+    assert!(!std::ptr::eq(first.change(), updated.change()));
+    let reused = cache.get_verified_change(&hash).unwrap();
+    assert!(std::ptr::eq(updated.change(), reused.change()));
+}
+
+#[test]
 fn test_lru_cache_basic_operations() {
     let mut cache: LruCache<u32, String> = LruCache::new(3);
 

@@ -10,13 +10,14 @@ use super::{
 };
 pub use crate::change::span_patch::SpanProjectionId;
 use crate::change::span_patch::{ExternalFile, ExternalSpan, SpanOp, SpanPatch};
-use crate::change::{Change, ChangeStore};
+use crate::change::{Change, ChangeStore, VerifiedChange};
 use crate::types::{Hash, Inode, NodeId};
 use anyhow::{bail, ensure, Context, Result};
 use rayon::prelude::*;
 use redb::{MultimapTableDefinition, ReadableMultimapTable, ReadableTable, TableDefinition};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub(super) const FILES: TableDefinition<&[u8; 36], u64> =
     TableDefinition::new("span_patch_files_v1");
@@ -462,6 +463,81 @@ struct RenderChange {
 type ExpectedEdits = HashMap<u64, BTreeSet<([u8; 32], [u8; 40])>>;
 const MAX_PROOF_BYTES: usize = 4 * 1024 * 1024;
 
+/// Wall-clock construction phases and transaction-local lookup counts.
+///
+/// Loading includes the store's checked identity verification. The separate
+/// `verify_hashes` stage binds its immutable witness to the requested hash and
+/// extracts render data; it no longer recompresses filesystem-backed changes.
+/// Times are bounded parallel-batch wall time, not summed worker CPU time.
+/// `total` also includes allocation and loop overhead.
+/// These metrics describe one context, not an entire materialization operation.
+#[derive(Clone, Debug, Default)]
+pub struct SpanContextBuildMetrics {
+    /// Version 2 uses checked loading plus witness binding; the original phase
+    /// instrumentation (version 1) reserialized changes in `verify_hashes`.
+    pub pipeline_version: u8,
+    pub resolve_changes: Duration,
+    pub load_changes: Duration,
+    pub verify_hashes: Duration,
+    pub validate_dependencies: Duration,
+    pub assemble_edits: Duration,
+    pub causal_proof: Duration,
+    pub total: Duration,
+    pub changes: usize,
+    pub edits: usize,
+    pub dependency_reads: usize,
+    pub internal_lookups: usize,
+    pub internal_hits: usize,
+    pub file_lookups: usize,
+    pub file_hits: usize,
+}
+
+/// Never seed inverse IDs from EXTERNAL: INTERNAL must still be checked at
+/// least once per referenced hash in this exact borrowed transaction.
+#[derive(Default)]
+struct SpanBuildLookups {
+    internal: HashMap<Hash, NodeId>,
+    files: HashMap<(Hash, u32), Inode>,
+}
+
+impl SpanBuildLookups {
+    fn internal<T: SpanPatchReadTxn>(
+        &mut self,
+        txn: &T,
+        hash: &Hash,
+        missing: &'static str,
+        metrics: &mut SpanContextBuildMetrics,
+    ) -> Result<NodeId> {
+        if let Some(id) = self.internal.get(hash) {
+            metrics.internal_hits += 1;
+            return Ok(*id);
+        }
+        metrics.internal_lookups += 1;
+        let id = txn.get_internal(hash)?.context(missing)?;
+        self.internal.insert(*hash, id);
+        Ok(id)
+    }
+
+    fn file<T: SpanPatchReadTxn>(
+        &mut self,
+        txn: &T,
+        file: &ExternalFile,
+        metrics: &mut SpanContextBuildMetrics,
+    ) -> Result<Inode> {
+        let key = (file.owner, file.ordinal);
+        if let Some(inode) = self.files.get(&key) {
+            metrics.file_hits += 1;
+            return Ok(*inode);
+        }
+        metrics.file_lookups += 1;
+        let inode = txn
+            .span_file_inode(file)?
+            .context("span file mapping missing")?;
+        self.files.insert(key, inode);
+        Ok(inode)
+    }
+}
+
 // Transaction-local exact reachability; never use local NodeId ordering as
 // causality. When the bounded proof does not fit, use checked graph walks.
 struct CausalProof {
@@ -471,15 +547,15 @@ struct CausalProof {
 }
 
 impl CausalProof {
-    fn build<T: SpanPatchReadTxn>(
-        txn: &T,
-        visible: &EffectiveProjectionClosure,
+    fn build(
+        order: &[NodeId],
+        dependencies: &HashMap<NodeId, Vec<NodeId>>,
         budget: usize,
     ) -> Result<Option<Self>> {
         if budget == 0 {
             return Ok(None);
         }
-        let count = visible.len();
+        let count = order.len();
         let words = count.div_ceil(64);
         let Some(cells) = count.checked_mul(words) else {
             return Ok(None);
@@ -494,7 +570,6 @@ impl CausalProof {
         if bytes > budget.min(MAX_PROOF_BYTES) {
             return Ok(None);
         }
-        let order: Vec<_> = visible.iter_dependency_first().copied().collect();
         let mut ranks: Vec<_> = order
             .iter()
             .enumerate()
@@ -514,10 +589,10 @@ impl CausalProof {
             let (earlier, rest) = bits.split_at_mut(rank * words);
             let row = &mut rest[..words];
             row[rank / 64] |= 1u64 << (rank % 64);
-            for dep in txn.get_change_deps(id)? {
-                let dep_id = txn
-                    .get_internal(&dep)?
-                    .context("span causal proof dependency missing")?;
+            for dep_id in dependencies
+                .get(&id)
+                .context("span causal proof dependencies missing")?
+            {
                 let index = ranks
                     .binary_search_by_key(&dep_id.get(), |(id, _)| id.get())
                     .map_err(|_| anyhow::anyhow!("span causal proof closure is incomplete"))?;
@@ -562,6 +637,7 @@ pub struct SpanRenderContext<'a, T: SpanPatchReadTxn> {
     changes: HashMap<Hash, Arc<RenderChange>>,
     expected: ExpectedEdits,
     proof: Option<CausalProof>,
+    metrics: SpanContextBuildMetrics,
 }
 
 /// A bounded render never retains more than the requested number of bytes.
@@ -965,12 +1041,22 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
         visible: &'a EffectiveProjectionClosure,
         budget: usize,
     ) -> Result<Self> {
+        let trace = std::env::var_os("ATOMIC_TRACE_SPAN_RENDER").is_some();
+        let started = Instant::now();
+        let mut metrics = SpanContextBuildMetrics {
+            pipeline_version: 2,
+            ..Default::default()
+        };
         let mut changes = HashMap::new();
         let mut expected = ExpectedEdits::new();
         let ids: Vec<_> = visible.iter_dependency_first().copied().collect();
+        metrics.changes = ids.len();
+        let mut dependencies = HashMap::with_capacity(ids.len());
+        let mut lookups = SpanBuildLookups::default();
         // Hashing and reads may run in parallel, but report errors in the
         // dependency order and limit speculative work after a bad object.
         for batch in ids.chunks(64) {
+            let phase = Instant::now();
             let hashes: Vec<_> = batch
                 .iter()
                 .map(|id| {
@@ -979,25 +1065,39 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
                         .and_then(|hash| hash.context("visible hash missing"))
                 })
                 .collect();
-            let loaded: Vec<Result<(Hash, Arc<RenderChange>)>> = hashes
+            metrics.resolve_changes += phase.elapsed();
+            let phase = Instant::now();
+            let loaded: Vec<Result<(Hash, VerifiedChange)>> = hashes
                 .into_par_iter()
                 .map(|hash| {
                     let hash = hash?;
-                    let mut change = store.get_change(&hash)?;
-                    ensure!(change.hash()? == hash, "change hash mismatch");
+                    Ok((hash, store.get_verified_change(&hash)?))
+                })
+                .collect();
+            metrics.load_changes += phase.elapsed();
+            let phase = Instant::now();
+            let loaded: Vec<Result<(Hash, Arc<RenderChange>)>> = loaded
+                .into_par_iter()
+                .map(|loaded| {
+                    let (hash, verified) = loaded?;
+                    verified.check_hash(&hash)?;
+                    let change = verified.change();
                     Ok((
                         hash,
                         Arc::new(RenderChange {
-                            contents: std::mem::take(&mut change.contents),
-                            dependencies: std::mem::take(&mut change.hashed.dependencies),
-                            span: change.hashed.span.take(),
+                            contents: change.contents.clone(),
+                            dependencies: change.hashed.dependencies.clone(),
+                            span: change.hashed.span.clone(),
                         }),
                     ))
                 })
                 .collect();
+            metrics.verify_hashes += phase.elapsed();
             for (id, loaded) in batch.iter().zip(loaded) {
                 let (hash, change) = loaded?;
+                let phase = Instant::now();
                 let mut indexed = txn.get_change_deps(*id)?;
+                metrics.dependency_reads += 1;
                 let mut declared = change.dependencies.clone();
                 indexed.sort();
                 declared.sort();
@@ -1005,7 +1105,26 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
                     indexed == declared,
                     "dependency index differs from hashed change"
                 );
+                let resolved = indexed
+                    .iter()
+                    .map(|dep| {
+                        let dep_id = lookups.internal(
+                            txn,
+                            dep,
+                            "span causal proof dependency missing",
+                            &mut metrics,
+                        )?;
+                        ensure!(
+                            visible.contains(dep_id),
+                            "span causal proof closure is incomplete"
+                        );
+                        Ok(dep_id)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                dependencies.insert(*id, resolved);
+                metrics.validate_dependencies += phase.elapsed();
                 changes.insert(hash, Arc::clone(&change));
+                let phase = Instant::now();
                 if let Some(patch) = &change.span {
                     for op in &patch.ops {
                         if let SpanOp::Edit {
@@ -1017,12 +1136,13 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
                             insert_end,
                         } = op
                         {
-                            let inode = txn
-                                .span_file_inode(file)?
-                                .context("span file mapping missing")?;
-                            let owner = txn
-                                .get_internal(&target.owner)?
-                                .context("span target missing")?;
+                            let inode = lookups.file(txn, file, &mut metrics)?;
+                            let owner = lookups.internal(
+                                txn,
+                                &target.owner,
+                                "span target missing",
+                                &mut metrics,
+                            )?;
                             ensure!(visible.contains(owner), "span target outside view");
                             let key = span_key(inode, owner, target.start, target.end);
                             let row: [u8; 40] =
@@ -1033,19 +1153,38 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
                                 expected.entry(inode.get()).or_default().insert((key, row)),
                                 "duplicate hashed span edit"
                             );
+                            metrics.edits += 1;
                         }
                     }
                 }
+                metrics.assemble_edits += phase.elapsed();
             }
         }
-        let proof = CausalProof::build(txn, visible, budget)?;
+        let phase = Instant::now();
+        let proof = CausalProof::build(&ids, &dependencies, budget)?;
+        metrics.causal_proof = phase.elapsed();
+        metrics.total = started.elapsed();
+        if trace {
+            eprintln!(
+                "[span context] changes={} elapsed={:?} metrics={:?}",
+                ids.len(),
+                metrics.total,
+                metrics,
+            );
+        }
         Ok(Self {
             txn,
             visible,
             changes,
             expected,
             proof,
+            metrics,
         })
+    }
+
+    /// Construction costs for this context's exact transaction and visibility.
+    pub fn build_metrics(&self) -> &SpanContextBuildMetrics {
+        &self.metrics
     }
 
     /// Render an indexed root when its creating change is visible.
@@ -1411,6 +1550,9 @@ fn append_visible(frame: &RenderFrame, start: usize, end: usize, out: &mut Rende
         });
     }
 }
+
+#[cfg(test)]
+mod build_tests;
 
 #[cfg(test)]
 mod tests {

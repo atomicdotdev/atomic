@@ -557,6 +557,8 @@ impl Repository {
         self.validate_working_copy(working_copy)?;
         let old_view_name = self.desired_view_name(working_copy)?;
         let before_record = self.working_copy_record(working_copy)?;
+        let trace_switch = std::env::var_os("ATOMIC_TRACE_SWITCH").is_some();
+        let phase_start = std::time::Instant::now();
 
         // Resolve both views and validate both dependency closures before the
         // switch publishes a pointer or mutates TREE-derived state.
@@ -705,12 +707,26 @@ impl Repository {
         // shelving ignored files, or removing tracked paths. This does not make
         // filesystem execution crash-safe, but it guarantees graph/preload/
         // content errors refuse the switch before its first external effect.
+        if trace_switch {
+            eprintln!(
+                "[switch timing] namespace elapsed={:?}",
+                phase_start.elapsed()
+            );
+        }
+        let phase_start = std::time::Instant::now();
         self.validate_materialization_with_visibility(
             working_copy,
             None,
             new_visibility.clone(),
             new_view_id,
         )?;
+        if trace_switch {
+            eprintln!(
+                "[switch timing] preflight_render elapsed={:?}",
+                phase_start.elapsed()
+            );
+        }
+        let phase_start = std::time::Instant::now();
 
         let mut tracked_paths: HashSet<String> = old_files.union(&new_files).cloned().collect();
         tracked_paths.extend(old_directories.iter().cloned());
@@ -833,8 +849,17 @@ impl Repository {
 
         let mut files_to_write: Vec<String> = new_files.iter().cloned().collect();
         files_to_write.sort();
-        for path in files_to_write {
-            let target = EffectTarget::FilesystemPath { path: path.clone() };
+        if trace_switch {
+            eprintln!(
+                "[switch timing] nonfile_planning elapsed={:?}",
+                phase_start.elapsed()
+            );
+        }
+        let phase_start = std::time::Instant::now();
+        self.for_each_switch_target_file(&files_to_write, view, |path, bytes| {
+            let target = EffectTarget::FilesystemPath {
+                path: path.to_string(),
+            };
             let mut expected_old = effects
                 .iter()
                 .rev()
@@ -853,15 +878,13 @@ impl Repository {
                 });
                 expected_old = EffectValue::Absent;
             }
-            let bytes = self
-                .switch_target_file_bytes(&path, view)?
-                .ok_or_else(|| RepositoryError::InvalidOperation {
-                    message: format!(
-                        "target view '{view}' projects '{path}' as a file without materialized content"
-                    ),
-                })?;
+            let bytes = bytes.ok_or_else(|| RepositoryError::InvalidOperation {
+                message: format!(
+                    "target view '{view}' projects '{path}' as a file without materialized content"
+                ),
+            })?;
             let materialization = new_file_materialization
-                .get(&path)
+                .get(path)
                 .copied()
                 .unwrap_or_default();
             let kind = match materialization.kind {
@@ -891,8 +914,17 @@ impl Repository {
                     expected_new,
                 });
             }
-        }
+            Ok(())
+        })?;
 
+        if trace_switch {
+            eprintln!(
+                "[switch timing] file_leases files={} elapsed={:?}",
+                new_files.len(),
+                phase_start.elapsed()
+            );
+        }
+        let phase_start = std::time::Instant::now();
         for path in &restore_paths {
             self.plan_restore_ignored_paths(working_copy, view, path, &mut effects)?;
         }
@@ -916,6 +948,13 @@ impl Repository {
             operation_timestamp_ms(),
         )?;
         let operation_id = prepared.operation().id();
+        if trace_switch {
+            eprintln!(
+                "[switch timing] prepare_operation elapsed={:?}",
+                phase_start.elapsed()
+            );
+        }
+        let phase_start = std::time::Instant::now();
         let initial_effect = prepared
             .operation()
             .payload()
@@ -1043,6 +1082,12 @@ impl Repository {
         )?;
         filesystem_executor.complete_remaining(view)?;
         drop(filesystem_executor);
+        if trace_switch {
+            eprintln!(
+                "[switch timing] execute elapsed={:?}",
+                phase_start.elapsed()
+            );
+        }
 
         if std::env::var_os("ATOMIC_TEST_FAIL_SWITCH_AFTER_MATERIALIZE").is_some() {
             return Err(RepositoryError::InvalidOperation {

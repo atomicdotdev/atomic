@@ -108,6 +108,7 @@ pub mod session;
 pub mod signing;
 pub mod span_patch;
 mod store;
+mod verified;
 
 // Re-export all public types
 // Allow deprecated types - these are re-exported for backward compatibility
@@ -139,6 +140,7 @@ pub use provenance::{
     AITool, AIVendor, AuthorshipParts, Cost, PromptContent, Provenance, SuggestionType, TokenUsage,
 };
 pub use store::{ChangeStore, MemoryChangeStore, MemoryStoreError};
+pub use verified::{VerifiedChange, VerifiedChangeCache, VerifiedLoadError};
 
 #[cfg(test)]
 mod tests {

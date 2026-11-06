@@ -74,7 +74,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use atomic_core::change::Change;
+use atomic_core::change::{Change, VerifiedChange};
 use atomic_core::types::{Base32, Hash};
 
 // Re-export iterator types used by the public API
@@ -443,6 +443,36 @@ impl ChangeStore {
         }
 
         Ok(change)
+    }
+
+    /// Read the current source even on an operation-local cache hit. Identical
+    /// bytes reuse the immutable checked decode; changed notes, corruption,
+    /// replacement and deletion cannot hide behind the ordinary decoded LRU.
+    pub(crate) fn load_verified_change(
+        &self,
+        hash: &Hash,
+        cached: Option<&VerifiedChange>,
+    ) -> ChangeStoreResult<VerifiedChange> {
+        let bytes = fs::read(self.change_path(hash)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ChangeStoreError::NotFound {
+                    hash: hash.to_base32(),
+                }
+            } else {
+                ChangeStoreError::Io(error)
+            }
+        })?;
+        let verified = match cached.filter(|cached| cached.matches_source_bytes(&bytes)) {
+            Some(cached) => cached.clone(),
+            None => VerifiedChange::from_bytes(&bytes)?,
+        };
+        if verified.hash() != *hash {
+            return Err(ChangeStoreError::HashMismatch {
+                expected: hash.to_base32(),
+                computed: verified.hash().to_base32(),
+            });
+        }
+        Ok(verified)
     }
 
     /// Hold `bytes` as `hash`'s content at `start..start + bytes.len()`.

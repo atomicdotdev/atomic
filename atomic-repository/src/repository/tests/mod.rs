@@ -50,6 +50,7 @@ mod snapshot_tests;
 mod stale_conflict_reconcile_tests;
 mod status_tests;
 mod switch_file_loss_tests;
+mod switch_lease_render_tests;
 mod synthesis_tests;
 mod tag_projection_tests;
 mod tracking_tests;
