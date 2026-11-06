@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Regression contract for interruption-safe shim switching.
-#
-# The assertions are the original expected-red CB-1B contract, now promoted
-# unchanged into the numbered integration harness.
+# Returned-error recovery contract for shim switching and publication.
+# Named fault seams must fire; this is not SIGKILL or power-loss evidence.
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
+source "$HARNESS_DIR/shim_helpers.sh"
 
 echo ""
 echo "${BOLD}══════════════════════════════════════════════════════════════${RESET}"
@@ -62,8 +61,14 @@ UNINSTRUMENTED_FAILPOINTS=0
 assert_clean_statuses() {
     local label="$1"
     local git_status atomic_status
-    git_status="$(git status --short)"
-    atomic_status="$(atomic status --short 2>/dev/null || true)"
+    if ! git_status="$(git status --short 2>&1)"; then
+        _fail "$label: read Git status" "$git_status"
+        return
+    fi
+    if ! atomic_status="$(atomic status --short 2>&1)"; then
+        _fail "$label: read Atomic status" "$atomic_status"
+        return
+    fi
     if [[ -z "$git_status" ]]; then
         _pass "$label: Git status is clean"
     else
@@ -77,21 +82,16 @@ assert_clean_statuses() {
 }
 
 begin_section "Create offline main and feature projections"
-make_temp_repo "red-switch-partial-removal"
-init_git_repo
-create_file "shared.txt" "shared projection\n"
-create_file "target-only.txt" "main target-only content\n"
-git add shared.txt target-only.txt
-git commit --quiet -m "Main projection"
+shim_fixture shim-operation-recovery
+# Start from the imported Git baseline, as the original recovery contract did.
+# tracked.txt is shared; base-only.txt is the target-only path restored on retry.
 MAIN="$(git_current_branch)"
 
-assert_success "import main into Atomic without network or vault" atomic git import --no-vault
-assert_success "create feature view" atomic view create feature --draft --parent "$MAIN"
-assert_success "align feature view and Git branch" atomic view switch feature --force
+require_success "create a real Git feature branch" git switch -qc feature
 
 # Two lexically sorted source-only tracked paths guarantee that the failpoint
 # after the first tracked removal observes a genuinely partial materialization.
-rm target-only.txt
+rm base-only.txt
 create_file "source-only/01-first.txt" "first source-only tracked file\n"
 create_file "source-only/02-second.txt" "second source-only tracked file\n"
 git add -A
@@ -116,10 +116,10 @@ set +e
 FAIL_OUTPUT="$(ATOMIC_FAIL_SWITCH_AFTER_FIRST_TRACKED_REMOVAL=1 atomic git shim switch "$MAIN" 2>&1)"
 FAIL_RC=$?
 set -e
-if [[ "$FAIL_RC" -ne 0 ]]; then
+if [[ "$FAIL_RC" -ne 0 && "$FAIL_OUTPUT" == *"debug failpoint: switch failed after first tracked-path removal"* ]]; then
     _pass "failpoint makes shim switch fail"
 else
-    _fail "failpoint makes shim switch fail" "command unexpectedly succeeded: $FAIL_OUTPUT"
+    _fail "failpoint makes shim switch fail" "requested seam did not fire (exit $FAIL_RC): $FAIL_OUTPUT"
 fi
 
 ACTUAL_HEAD="$(git_head_sha_full)"
@@ -127,8 +127,9 @@ ACTUAL_BRANCH="$(git_current_branch)"
 ACTUAL_VIEW="$(atomic_current_view)"
 ACTUAL_CHECKPOINT="$(checkpoint_hash)"
 ACTUAL_GIT_STATUS="$(git status --short)"
-ACTUAL_ATOMIC_STATUS="$(atomic status --short 2>/dev/null || true)"
+# Capture paths before a normal status boundary could perform recovery.
 snapshot_complete_state "$AFTER_FAILURE_STATE"
+ACTUAL_ATOMIC_STATUS="$(atomic status --short 2>&1)"
 
 begin_section "Rollback contract"
 assert_equal "source Git HEAD is restored" "$SOURCE_HEAD" "$ACTUAL_HEAD"
@@ -157,21 +158,21 @@ assert_equal "retry aligns Atomic view to target" "$MAIN" "$(atomic_current_view
 assert_clean_statuses "target projection after retry"
 assert_success "shim verify succeeds after retry" atomic git shim verify
 
-begin_section "CB-8B: journaled projection publication recovers at its crash points"
+begin_section "CB-8B: journaled projection publication recovers at returned-error seams"
 # The record-path projection journals its ref/HEAD publication before
-# visibility (RFC §7.2 step 3/4, CB-8B). Each named failpoint crashes the
+# visibility (RFC §7.2 step 3/4, CB-8B). Each named failpoint interrupts the
 # journaled publication at a phase boundary; the retry must complete or roll
 # back under the same leases — the original switch assertions above stay
 # unchanged, and these are ADDITIONAL Git-specific crash points.
 #
 # CB-13A R4 crash-evidence contract: an instrumented run must PROVE the
 # expected seam was reached (`debug failpoint: <NAME>` in the output) before
-# any of this counts as a crash pass. A missing seam or an ordinary command
+# any of this counts as an injected-failure pass. A missing seam or an ordinary command
 # error is never credited as a failpoint success, and an uninstrumented
 # (shipping) build is reported as an explicit documented limitation — never
 # as a passing crash check.
 for FAILPOINT_NAME in ATOMIC_FAIL_PROJECTION_BEFORE_REF ATOMIC_FAIL_PROJECTION_AFTER_EFFECTS; do
-    begin_section "Projection publication crash point: $FAILPOINT_NAME"
+    begin_section "Projection publication failure point: $FAILPOINT_NAME"
     atomic view switch "$MAIN" --force >/dev/null 2>&1 || true
     # Unique content per crash point: a previous iteration's successful
     # record (uninstrumented build) must not leave the tree looking clean.
@@ -203,7 +204,7 @@ for FAILPOINT_NAME in ATOMIC_FAIL_PROJECTION_BEFORE_REF ATOMIC_FAIL_PROJECTION_A
         fi
     else
         _skip "projection publication failpoint: $FAILPOINT_NAME" \
-            "uninstrumented build — the $FAILPOINT_NAME seam never triggered (record succeeded); crash point NOT exercised (documented limitation)"
+            "uninstrumented build — the $FAILPOINT_NAME seam never triggered (record succeeded); failure point NOT exercised"
         UNINSTRUMENTED_FAILPOINTS=$((UNINSTRUMENTED_FAILPOINTS + 1))
         git reset -q 2>/dev/null || true
         continue
@@ -211,10 +212,10 @@ for FAILPOINT_NAME in ATOMIC_FAIL_PROJECTION_BEFORE_REF ATOMIC_FAIL_PROJECTION_A
     # The journaled publication must leave the Git repository intact: the
     # ref exists, HEAD resolves, and the ODB is clean (no force overwrite,
     # no torn refs).
-    if git rev-parse --verify --quiet refs/heads/master >/dev/null; then
+    if git rev-parse --verify --quiet "refs/heads/$MAIN" >/dev/null; then
         _pass "projection ref survives the interruption: $FAILPOINT_NAME"
     else
-        _fail "projection ref survives the interruption: $FAILPOINT_NAME" "refs/heads/master missing"
+        _fail "projection ref survives the interruption: $FAILPOINT_NAME" "refs/heads/$MAIN missing"
     fi
     if git fsck --no-progress >/dev/null 2>&1; then
         _pass "Git object database intact after interruption: $FAILPOINT_NAME"

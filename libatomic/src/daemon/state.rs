@@ -139,6 +139,25 @@ impl RepoHandle {
         let deadline = std::time::Instant::now() + database_open_wait();
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if mode == WorkspaceTxnMode::Reconcile {
+                if let Some(remediation) = Repository::preflight_workspace_boundary(&self.root)
+                    .map_err(repository_error)?
+                {
+                    let retry_completed_switch = matches!(
+                        &remediation,
+                        WorkspaceRemediation::Unanchored {
+                            state: UnanchoredWorkspace::AtomicCheckpointDrift { desired_view, .. },
+                            ..
+                        } if target == Some(desired_view.as_str())
+                    );
+                    if !retry_completed_switch {
+                        return Err(domain_status(
+                            ErrorCode::PreconditionFailed,
+                            format!("workspace reconciliation required: {}\nInspect with 'atomic status --no-reconcile'; then run 'atomic git shim reconcile' before retrying.", remediation.describe()),
+                        ));
+                    }
+                }
+            }
             let mut repo = match mode {
                 WorkspaceTxnMode::Observe => Repository::open_readonly_wait(&self.root, remaining),
                 WorkspaceTxnMode::Reconcile => {
@@ -169,7 +188,7 @@ impl RepoHandle {
                     return Err(domain_status(
                         ErrorCode::PreconditionFailed,
                         format!(
-                            "workspace reconciliation required: {}",
+                            "workspace reconciliation required: {}\nInspect with 'atomic status --no-reconcile'; then run 'atomic git shim reconcile' before retrying.",
                             remediation.describe()
                         ),
                     ))
@@ -255,7 +274,7 @@ pub(super) fn enter_workspace(
         atomic_repository::WorkspaceTxnStart::Remediation(remediation) => Err(domain_status(
             ErrorCode::PreconditionFailed,
             format!(
-                "workspace reconciliation required: {}",
+                "workspace reconciliation required: {}\nInspect with 'atomic status --no-reconcile'; then run 'atomic git shim reconcile' before retrying.",
                 remediation.describe()
             ),
         )),

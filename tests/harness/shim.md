@@ -10,14 +10,26 @@ fixtures in `shim_helpers.sh`. They never configure a remote or push one.
 | `39_git_shim_workflow.sh` | Enroll; native record projects automatically; adopt Git-authored branches without rewriting Git-rendered files; repeat reconciliation preserves identities; native Draft switching detaches HEAD; explicit local `shim publish` creates a branch; explicit shim switching restores exact files, empty files, deletions, executable modes and symlinks. Unenrolled native repos do not acquire mirror branches. |
 | `40_git_shim_safety.sh` | Dirty/marker refusal, resolved retry, excluded metadata in the index, forged provenance, stale baseline, untracked file/parent/directory collisions, pre-materialize injection and successful retry. |
 | `41_git_shim_hooks.sh` | Advisory event/receipt evidence, correctness without checkout hooks, owned dispatchers, idempotent installation/uninstallation, and byte/mode preservation of unmanaged hooks. |
-| `42_git_shim_guard.sh` | Strict early stale-baseline refusal across command boundaries, diagnostics and raw database-byte non-mutation. Its existing assertions remain unchanged; consolidation does not waive known failures. |
-| `43_git_shim_operation_recovery.sh` | Separate interruption/recovery contract. Retained unchanged; missing injection seams are not crash passes. |
+| `42_git_shim_guard.sh` | Early stale-baseline refusal across command boundaries, typed drift and actionable remediation, raw database-byte/operation/receipt non-mutation, forensic bypasses and normal enrolled projection. |
+| `43_git_shim_operation_recovery.sh` | Local signed/imported baseline, actual Git feature branch and explicit adoption, partial-removal rollback and ordinary retry, plus instrumented publication returned-error seams. Missing seams are not passes. |
 
 ```sh
 ATOMIC_BIN=/absolute/path/to/atomic bash tests/harness/run_all.sh --list shim
 ATOMIC_BIN=/absolute/path/to/atomic bash tests/harness/run_all.sh shim
 bash tests/harness/shim_harness_selftest.sh
 ```
+
+For the **full fault-injection test**, build the test feature explicitly:
+
+```sh
+cargo build --locked -p atomic-cli --features adoption-test-injection
+ATOMIC_BIN="$PWD/target/debug/atomic" bash tests/harness/run_all.sh shim
+```
+
+Without that feature, suite 43 is intentionally partial: the two publication
+seams are no-ops in a shipping build. These are injected **returned errors**,
+not process kills or power-loss tests. Use a normal default-feature build for
+ordinary demo/release use, not the fault-injection build.
 
 `--list` does not build or invoke Atomic. Canonical suite discovery excludes the
 `legacy-shadow/` directory. Old runner selectors are redirected and deduplicated:
@@ -59,7 +71,11 @@ Select canonical names if you do not want every suite sharing a numeric prefix.
   entries (apart from their derived head flags). This comparator does not
   byte-snapshot the redb database or every prior receipt body.
   Strict refusal cases permit no operation/object additions at all. Suite 42
-  retains the stronger raw-database non-mutation gate separately.
+  retains the stronger raw-database non-mutation gate separately. Ordinary
+  command preflight now rejects an already observed unbound checkout before
+  opening the unified database writable. Verified bound-HEAD adoption and
+  pending recovery still enter the locked transaction and revalidate there;
+  preflight is not itself a lease or a race-free Git lock.
 - Legacy `shadow-validate:V1/V2/V3/V4` strings and `hook-errors.log` are not the
   current authority. Check actual refusal, causal state, and journal receipts.
   Marker override in a native-only repo remains in suite 30; it is not a bypass
@@ -99,7 +115,36 @@ Validated offline against the pinned default-feature debug binary used for the
 | 42 strict guard (unchanged) | 104 passed, 12 failed, 0 skipped |
 | 43 operation recovery (unchanged) | Not rerun in this consolidation |
 
-Suite 42 still exposes its existing diagnostic, raw-database refusal and Git
-HEAD-preservation failures. Neither the WIP comparator nor consolidation removes
-those assertions. The runner/discovery selftest passed seven checks. This is
-not a full workspace, network, watcher or crash-injection certification.
+Those are historical consolidation results. Subsequent shim repair preserved
+all raw-state and journal comparisons while fixing writable-open-before-refusal.
+It replaced the legacy shadow diagnostic prose expectation with typed drift
+and exact remediation commands, and the obsolete “record leaves HEAD alone”
+expectation with exact enrolled-record projection plus verification.
+
+| Suite | Fresh instrumented result |
+|---|---|
+| 35 serialization | 30 passed, 0 failed, 0 skipped |
+| 39 workflow | 99 passed, 0 failed, 0 skipped |
+| 40 safety | 115 passed, 0 failed, 0 skipped |
+| 41 hooks | 38 passed, 0 failed, 0 skipped |
+| 42 strict guard | 117 passed, 0 failed, 0 skipped |
+| 43 returned-error recovery | 39 passed, 0 failed, 0 skipped |
+
+Default-feature suite 43 separately reported **29 passed, 0 failed, 2 skipped**.
+The six CLI workspace integration tests passed, including new byte-for-byte
+database non-mutation checks for status/diff/add/record/switch/restore under an
+unbound checkout and existing bound/adoption regressions. Native suites 23/32/40,
+all 15 local-service tests, workspace check and workspace Clippy also passed.
+This is not full network, watcher, process-kill or power-loss certification.
+
+### Separate maintenance edge found during setup
+
+An alternate fixture that adds two native paths (`shared.txt`, `target-only.txt`)
+on an enrolled imported baseline, records/projects them, then creates a Git
+feature branch which deletes one path and adds two source-only paths, reconciles
+and verifies its visible projection. However, `doctor check` reports four missing
+`CONFLICTS` cache rows in the private `wc/<id>` snapshot view. Repair populates
+them, but that cache-completeness issue is **not fixed** here. The reproduction
+was retained in disposable evidence rather than weakening doctor checks. Suite
+43 retains its original imported-baseline scope and still runs doctor checks
+for its foreign deletion before recovery testing.

@@ -42,6 +42,204 @@ fn inode_graph_keys(repo: &Repository) -> Vec<(Inode, atomic_core::types::GraphN
 }
 
 #[test]
+fn inherited_name_conflict_cache_tracks_publication_and_unrecord() {
+    use atomic_core::pristine::{StoredConflict, StoredConflictKind};
+    let (temp, mut repo) = create_temp_repo();
+    let root = temp.path();
+    std::fs::write(root.join("base.txt"), b"base\n").unwrap();
+    repo.add("base.txt", TrackingOptions::default()).unwrap();
+    record_all(&repo, "base");
+    repo.create_draft_view("child", "dev").unwrap();
+    repo.switch_view("child").unwrap();
+    std::fs::write(root.join("same.txt"), b"child\n").unwrap();
+    repo.add("same.txt", TrackingOptions::default()).unwrap();
+    let child_change = record_all(&repo, "child claimant");
+    repo.switch_view("dev").unwrap();
+    std::fs::write(root.join("same.txt"), b"parent\n").unwrap();
+    repo.add("same.txt", TrackingOptions::default()).unwrap();
+    let parent_change = record_all(&repo, "parent claimant");
+    let txn = repo.pristine.read_txn().unwrap();
+    let child = txn.get_view("child").unwrap().unwrap();
+    let parent = txn.get_view("dev").unwrap().unwrap();
+    let rows = txn.iter_conflicts(child.id).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "both inherited name-conflict sides must be cached before child materialization"
+    );
+    assert!(rows.iter().all(|(_, records)| records
+        .iter()
+        .all(|record| record.kind == StoredConflictKind::Name && record.line.is_none())));
+    let child_members = txn
+        .iter_changes(&child, 0)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    drop(txn);
+    let report = repo.verify_native_derived_indexes().unwrap();
+    assert!(report.is_healthy(), "{:?}", report.problems);
+
+    repo.create_draft_view("grandchild", "child").unwrap();
+    let grandchild = repo
+        .pristine
+        .read_txn()
+        .unwrap()
+        .get_view("grandchild")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        repo.pristine
+            .read_txn()
+            .unwrap()
+            .iter_conflicts(grandchild.id)
+            .unwrap(),
+        rows,
+        "a newly created descendant must inherit the correct name-conflict cache"
+    );
+
+    // Refresh only the derived Name rows. An existing Order observation must
+    // survive byte-for-byte, and an aborted refresh must publish nothing.
+    let order = StoredConflict {
+        kind: StoredConflictKind::Order,
+        path: "same.txt".into(),
+        line: Some(7),
+        sides: Vec::new(),
+    };
+    let inode = rows[0].0;
+    let mut txn = repo.pristine.write_txn().unwrap();
+    let mut mixed = rows[0].1.clone();
+    mixed.push(order.clone());
+    txn.put_conflicts(child.id, inode, &mixed).unwrap();
+    super::super::name_resolution::refresh_name_conflict_caches(&mut txn, parent.id).unwrap();
+    let refreshed = txn.iter_conflicts(child.id).unwrap();
+    assert!(refreshed
+        .iter()
+        .any(|(key, records)| *key == inode && records.contains(&order)));
+    assert_eq!(
+        txn.iter_changes(&child, 0)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        child_members
+    );
+    txn.abort().unwrap();
+    assert_eq!(
+        repo.pristine
+            .read_txn()
+            .unwrap()
+            .iter_conflicts(child.id)
+            .unwrap(),
+        rows
+    );
+
+    // Invalid marker observations are corruption, not evidence that a conflict
+    // was rendered. Doctor must detect them and repair without inventing one.
+    let mut txn = repo.pristine.write_txn().unwrap();
+    let mut invalid = rows[0].1.clone();
+    invalid[0].line = Some(99);
+    txn.put_conflicts(child.id, inode, &invalid).unwrap();
+    txn.commit().unwrap();
+    let report = repo.verify_native_derived_indexes().unwrap();
+    assert!(report
+        .problems
+        .iter()
+        .any(|problem| problem.index == NativeIndex::Conflicts
+            && problem.kind == NativeIndexProblemKind::Mismatched));
+    repo.repair_native_derived_indexes().unwrap();
+    assert_eq!(
+        repo.pristine
+            .read_txn()
+            .unwrap()
+            .iter_conflicts(child.id)
+            .unwrap(),
+        rows
+    );
+
+    repo.unrecord(
+        parent_change.hash(),
+        crate::unrecord::UnrecordOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        repo.pristine
+            .read_txn()
+            .unwrap()
+            .iter_conflicts(child.id)
+            .unwrap()
+            .is_empty(),
+        "retiring a parent reference must clear obsolete inherited Name rows"
+    );
+    assert!(repo
+        .pristine
+        .read_txn()
+        .unwrap()
+        .iter_conflicts(grandchild.id)
+        .unwrap()
+        .is_empty());
+    repo.reinsert_change(parent_change.hash(), None).unwrap();
+    assert_eq!(
+        repo.pristine
+            .read_txn()
+            .unwrap()
+            .iter_conflicts(child.id)
+            .unwrap(),
+        rows
+    );
+    assert_eq!(
+        repo.pristine
+            .read_txn()
+            .unwrap()
+            .iter_conflicts(grandchild.id)
+            .unwrap(),
+        rows
+    );
+    repo.set_view_scope("child", ViewScope::Shared).unwrap();
+    assert!(repo
+        .pristine
+        .read_txn()
+        .unwrap()
+        .iter_conflicts(child.id)
+        .unwrap()
+        .is_empty());
+    assert!(repo
+        .pristine
+        .read_txn()
+        .unwrap()
+        .iter_conflicts(grandchild.id)
+        .unwrap()
+        .is_empty());
+    repo.set_view_identity("child", ViewScope::Draft, Some("dev"))
+        .unwrap();
+    assert_eq!(
+        repo.pristine
+            .read_txn()
+            .unwrap()
+            .iter_conflicts(child.id)
+            .unwrap(),
+        rows
+    );
+    assert_eq!(
+        repo.pristine
+            .read_txn()
+            .unwrap()
+            .iter_conflicts(grandchild.id)
+            .unwrap(),
+        rows
+    );
+    assert!(repo.load_change(child_change.hash()).is_ok());
+    drop(repo);
+    let repo = Repository::open(root).unwrap();
+    assert_eq!(
+        repo.pristine
+            .read_txn()
+            .unwrap()
+            .iter_conflicts(child.id)
+            .unwrap(),
+        rows
+    );
+}
+
+#[test]
 fn native_index_verifier_accepts_healthy_nested_projection() {
     let (temp, repo) = create_temp_repo();
     let file = temp.path().join("src/domain/model.rs");
@@ -682,6 +880,14 @@ fn name_conflict_ambiguity_survives_repair_without_tree_winner() {
     let before = std::fs::read(temp.path().join("same.txt")).unwrap();
     assert!(before.windows(7).any(|window| window == b">>>>>>>"));
     assert_eq!(repo.get_file_inode("same.txt").unwrap(), None);
+    assert!(repo.verify_native_derived_indexes().unwrap().is_healthy());
+    // Publication now maintains the inactive descendant's cache. Deliberately
+    // corrupt it instead of relying on the old producer bug for a missing row.
+    let mut txn = repo.pristine.write_txn().unwrap();
+    let feature = txn.get_view("feature").unwrap().unwrap();
+    assert!(!txn.iter_conflicts(feature.id).unwrap().is_empty());
+    txn.del_conflicts_prefix(feature.id).unwrap();
+    txn.commit().unwrap();
     let report = repo.verify_native_derived_indexes().unwrap();
     assert!(report.problems.iter().any(|problem| {
         problem.index == NativeIndex::Conflicts && problem.kind == NativeIndexProblemKind::Missing

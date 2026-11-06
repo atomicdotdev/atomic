@@ -135,7 +135,10 @@ impl Repository {
             .map_err(|error| RepositoryError::Database(error.to_string()))?
             .into_iter()
             .flat_map(|(_, records)| records)
-            .filter(|record| record.kind == atomic_core::pristine::StoredConflictKind::Name)
+            .filter(|record| {
+                record.kind == atomic_core::pristine::StoredConflictKind::Name
+                    && record.line.is_some()
+            })
             .map(|record| record.path)
             .collect();
 

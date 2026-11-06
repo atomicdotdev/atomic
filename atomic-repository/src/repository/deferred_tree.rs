@@ -989,6 +989,7 @@ impl Repository {
         } else {
             self.apply_deferred_tree_ops_in_txn(txn, &journal, &visibility)?
         };
+        super::name_resolution::refresh_name_conflict_caches(txn, view.id)?;
         if changed {
             self.persist_deferred_tree_journal(&journal)?;
         }
@@ -1604,7 +1605,9 @@ impl Repository {
             &*txn,
             &super::filter::view_membership(txn, &view)?,
         )?;
-        self.apply_deferred_tree_ops_in_txn(txn, &journal, &visibility)
+        let affected = self.apply_deferred_tree_ops_in_txn(txn, &journal, &visibility)?;
+        super::name_resolution::refresh_name_conflict_caches(txn, view.id)?;
+        Ok(affected)
     }
 
     fn apply_deferred_tree_ops_in_txn(

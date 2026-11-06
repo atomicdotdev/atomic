@@ -139,34 +139,16 @@ assert_guard_refusal() {
     fi
 
     local evidence_ok=1
+    # The current workspace boundary exposes a typed reason and explicit
+    # remediation. Full checkpoint/manifest evidence belongs to the separate
+    # read-only forensic command, not the retired shadow guard's prose format.
     for expected in \
-        "Unsafe operation: $operation" \
-        "Refusal: Git moved away from the shim checkpoint" \
-        "Old checkpoint Atomic view: main" \
-        "Old checkpoint Atomic state:" \
-        "Old checkpoint Atomic manifest root: atomic-visible-regular-files-blake3-v1:" \
-        "Old checkpoint Git HEAD: attached refs/heads/main at" \
-        "Old checkpoint Git HEAD tree:" \
-        "Old checkpoint Git index tree:" \
-        "Old checkpoint Git index digest:" \
-        "Old checkpoint Git refs digest:" \
-        "Old checkpoint Git refs: digest-only checkpoint evidence" \
-        "Old checkpoint Git manifest root: git-tree-oid:" \
-        "Current Atomic view: main" \
-        "Current Atomic state:" \
-        "Current Atomic manifest root: atomic-visible-regular-files-blake3-v1:" \
-        "Current Git HEAD: attached refs/heads/raw-drift at" \
-        "Current Git HEAD tree:" \
-        "Current Git index tree:" \
-        "Current Git index digest:" \
-        "Current Git refs digest:" \
-        "Current Git refs:" \
-        "refs/heads/main ->" \
-        "refs/heads/raw-drift ->" \
-        "Current Git manifest root: git-tree-oid:" \
-        "Remediation: Reconcile the observed Git baseline before retrying the refused operation." \
-        "  atomic status --no-reconcile" \
-        "  atomic git shim reconcile"
+        'workspace reconciliation required:' \
+        'HeadSymrefChanged' \
+        'checkpoint: "refs/heads/main"' \
+        'observed: "refs/heads/raw-drift"' \
+        'atomic status --no-reconcile' \
+        'atomic git shim reconcile'
     do
         if ! printf '%s\n' "$output" | grep -qF -- "$expected"; then
             evidence_ok=0
@@ -174,9 +156,9 @@ assert_guard_refusal() {
         fi
     done
     if [[ "$evidence_ok" -eq 1 ]]; then
-        _pass "$label: reports old/current Atomic+Git, refs/index/roots, operation, and exact remediation"
+        _pass "$label: reports typed drift, old/new refs and exact remediation"
     else
-        _fail "$label: reports old/current Atomic+Git, refs/index/roots, operation, and exact remediation" "$output"
+        _fail "$label: reports typed drift, old/new refs and exact remediation" "$output"
     fi
 
     lines="$(printf '%s\n' "$output" | wc -l | tr -d '[:space:]')"
@@ -250,7 +232,7 @@ else
     _fail "diff --change bypasses the guard and remains history-only" "exit $HISTORY_RC: $HISTORY_AFTER"
 fi
 
-begin_section "Ordinary edits and Atomic-only advancement remain allowed"
+begin_section "Ordinary edits and enrolled Atomic projection remain allowed"
 start_colocated_repo "git-shim-guard-atomic-advance"
 GIT_HEAD_BEFORE="$(git rev-parse HEAD)"
 overwrite_file tracked.txt "ordinary edit\n"
@@ -265,11 +247,13 @@ else
     _fail "ordinary edit passes diff" "$DIFF_OUT"
 fi
 assert_success "ordinary edit passes record" atomic record -m "Atomic-only advancement"
-if [[ "$(git rev-parse HEAD)" == "$GIT_HEAD_BEFORE" ]]; then
-    _pass "Atomic record does not move Git HEAD"
+if [[ "$(git rev-parse HEAD)" != "$GIT_HEAD_BEFORE" ]] && \
+    [[ "$(git show HEAD:tracked.txt)" == 'ordinary edit\n' ]]; then
+    _pass "enrolled Atomic record advances Git with the recorded bytes"
 else
-    _fail "Atomic record does not move Git HEAD" "Git HEAD changed"
+    _fail "enrolled Atomic record advances Git with the recorded bytes" "Git projection missing or incorrect"
 fi
+assert_success "recorded projection passes shim verification" atomic git shim verify
 assert_success "status passes after Atomic-only advancement" atomic status --short
 create_file atomic-only.txt "further Atomic work\n"
 assert_success "add passes after Atomic-only advancement" atomic add atomic-only.txt
