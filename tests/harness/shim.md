@@ -137,14 +137,40 @@ unbound checkout and existing bound/adoption regressions. Native suites 23/32/40
 all 15 local-service tests, workspace check and workspace Clippy also passed.
 This is not full network, watcher, process-kill or power-loss certification.
 
-### Separate maintenance edge found during setup
+### Doctor conflict-cache maintenance correction
 
-An alternate fixture that adds two native paths (`shared.txt`, `target-only.txt`)
-on an enrolled imported baseline, records/projects them, then creates a Git
-feature branch which deletes one path and adds two source-only paths, reconciles
-and verifies its visible projection. However, `doctor check` reports four missing
-`CONFLICTS` cache rows in the private `wc/<id>` snapshot view. Repair populates
-them, but that cache-completeness issue is **not fixed** here. The reproduction
-was retained in disposable evidence rather than weakening doctor checks. Suite
-43 retains its original imported-baseline scope and still runs doctor checks
-for its foreign deletion before recovery testing.
+The retained native-add/foreign-branch fixture reproduced four missing
+`CONFLICTS` rows in a private `wc/<id>` view. The failure already existed after
+the native record: the parent advanced, so the private view inherited a new
+claimant, but its cache had not been refreshed because it was not materialized.
+
+Name-conflict rows are now refreshed for affected views and descendants in the
+same transaction as graph/membership publication and native realignment.
+Creation, snapshot-view setup, scope changes and reparenting maintain them too.
+This changes derived cache rows only: snapshot membership, immutable change
+bytes and unrelated Order observations are retained.
+
+A derived name conflict is not proof that markers were rendered. New derived
+Name rows carry no observed marker line; materialization can supply one, and
+an unchanged valid observation is preserved. `status` therefore still reports
+unmaterialized competing claims as Conflicted even if one side's marker-free
+bytes is on disk. Doctor re-derives required rows/claimant sides, validates
+observed locations and still reports missing, mismatched or malformed cache
+rows. Explicit repair does not fabricate missing marker observations.
+
+The new CLI regression failed before the correction and now passes after
+native recording, explicit corruption/repair, reopen and Git reconciliation.
+It verifies snapshot membership/state and change bytes are preserved. The
+repository regression also exercises descendant creation, unrecord/reinsert,
+promotion/reparenting, retained Order records and aborted transactions.
+
+Validation: **1,553 repository library tests passed, 0 failed, 3 ignored**;
+all seven CLI workspace tests passed. Native 23/32/40 and shim 35/39/40/41/42
+passed without skips; instrumented recovery 43 passed 39/39. Workspace check,
+workspace Clippy and Rust 1.90 core/repository checks passed. No power-loss or
+network certification is implied.
+
+Repositories that already have the missing cache rows may still need explicit
+`atomic doctor repair-native-indexes` with the corrected binary, followed by
+`atomic doctor check`. Checking remains read-only; upgrading does not silently
+repair or discard their private snapshots. No repair was run on the demo checkout.
