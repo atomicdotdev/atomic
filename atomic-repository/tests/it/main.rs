@@ -15,6 +15,7 @@ mod equivalence_cb4b_test;
 mod implementation_declaration;
 mod intent_graph;
 mod kg_change_availability;
+mod kg_kinds;
 mod kg_projection;
 mod kg_recorded_impact;
 mod legacy_database_merge_test;

@@ -2960,7 +2960,9 @@ pub fn query_neighbors(args: &super::query::QueryNeighbors) -> CliResult<bool> {
     for edge in &edges {
         println!(
             "  {} \u{2192}[{}]\u{2192} {}",
-            edge.from_id, edge.kind, edge.to_id
+            edge.from_id,
+            super::query::edge_relation(edge),
+            edge.to_id
         );
     }
     Ok(true)
@@ -6699,10 +6701,13 @@ pub fn query_plan(args: &super::query::PlanExec) -> CliResult<bool> {
                 print!(
                     "  [{}] {}",
                     atomic_core::kg::ontology::compact(node.primary_type()),
-                    node.label
+                    super::kind::display_text(&node.label)
                 );
                 if let Some(summary) = &node.summary {
-                    let short: String = summary.chars().take(60).collect();
+                    let short: String = super::kind::display_text(summary)
+                        .chars()
+                        .take(60)
+                        .collect();
                     print!(": {}", short);
                 }
                 println!();
@@ -6720,8 +6725,8 @@ pub fn query_plan(args: &super::query::PlanExec) -> CliResult<bool> {
         if !result.content.is_empty() {
             println!("\nContent ({} entries):", result.content.len());
             for (path, text) in &result.content {
-                let preview: String = text.chars().take(100).collect();
-                println!("  {}: {}...", path, preview.replace('\n', " "));
+                let preview: String = super::kind::display_text(text).chars().take(100).collect();
+                println!("  {}: {}...", super::kind::display_text(path), preview);
             }
         }
     }

@@ -5,6 +5,10 @@ use atomic_core::pristine::vault::{
 };
 use atomic_core::types::{Hash, Merkle};
 
+use super::kinds::{is_plain_file, KindPath, KINDS_DIR};
+pub(crate) use super::vault_frontmatter::parse_vault_frontmatter_at;
+use super::vault_frontmatter::write_frontmatter_field;
+
 /// Directory name for the vault at the project root.
 const VAULT_DIR: &str = ".vault";
 
@@ -340,24 +344,40 @@ impl Repository {
     /// Called as a side effect of `vault_store` and `vault_store_entry`.
     /// Best-effort — logs on failure but never fails the parent operation.
     fn vault_auto_index(&self, path: &str) {
-        // Signed documents contribute typed workflow links, but their serialized
-        // JSON/proof bytes do not belong in semantic content embeddings.
-        let is_attestation = matches!(
-            self.vault_retrieve(path),
-            Ok(Some(e)) if e.entry_type == VaultEntryType::Attestation
-        );
-
         // Re-resolve references as a set: adding/removing a target can repair
         // another entry's historical gap without changing that source entry.
         if let Err(e) = self.vault_reindex_kg() {
             log::debug!("Auto KG index for {}: {}", path, e);
         }
+        self.vault_auto_embed(path);
+    }
 
-        if is_attestation {
-            return; // do NOT embed
+    /// Embed one vault entry with the resolved provider, if the embedding
+    /// policy allows it. Best-effort, like [`Self::vault_auto_index`].
+    pub(super) fn vault_auto_embed(&self, path: &str) {
+        // `kinds/**` follows the kind's spec, here and in `vault_embed_all`
+        // alike. Only `kinds/` is reconciled: other Scratch entries are still
+        // embedded here and skipped by `vault_embed_all`.
+        match self.kind_embed_policy(path) {
+            Some(true) => {}
+            Some(false) => {
+                self.vault_drop_embeddings(path);
+                return;
+            }
+            None => {
+                // Signed documents contribute typed workflow links, but their
+                // serialized JSON/proof bytes do not belong in semantic content
+                // embeddings.
+                let is_attestation = matches!(
+                    self.vault_retrieve(path),
+                    Ok(Some(e)) if e.entry_type == VaultEntryType::Attestation
+                );
+                if is_attestation {
+                    return; // do NOT embed
+                }
+            }
         }
 
-        // Embedding
         let provider = crate::ai::resolve_embedding_provider();
         let config = EmbedConfig {
             max_chunk_tokens: 512,
@@ -498,9 +518,20 @@ impl Repository {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - `path` is under `kinds/`: kind files are authoritative on disk and
+    ///   their redb rows only a projection, so they are never written back
+    ///   (as [`Self::vault_materialize_all`] skips them)
     /// - The entry doesn't exist in redb
     /// - The file can't be written (permissions, disk full, etc.)
     pub fn vault_materialize(&self, path: &str) -> Result<(), RepositoryError> {
+        if KindPath::classify(path).is_some() {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "'{path}' is a kind file: the file in .vault/ is authoritative and is never \
+                     overwritten from the vault index"
+                ),
+            });
+        }
         let entry = self
             .vault_retrieve(path)?
             .ok_or_else(|| RepositoryError::FileNotFound {
@@ -532,6 +563,12 @@ impl Repository {
         let mut count = 0;
 
         for meta in &entries {
+            // Kind files are authoritative on disk; their redb rows are only a
+            // projection, so writing them back could clobber an edit not yet
+            // deflated. Deflate still scans them (and notices deletions).
+            if KindPath::classify(&meta.path).is_some() {
+                continue;
+            }
             self.vault_materialize(&meta.path)?;
             count += 1;
         }
@@ -586,6 +623,13 @@ impl Repository {
     /// - Their body hash or user frontmatter differs from the stored entry
     ///
     /// Ignores non-`.md` files and `_manifest.json`.
+    ///
+    /// Under `kinds/` the rules of [`KindFiles`] hold
+    /// here too: anything but a regular file is skipped unread (a symlink is
+    /// never followed), and a file that cannot be read is logged and skipped
+    /// rather than failing the scan. `atomic kind validate` reports both. A
+    /// skipped link has no row, and a file that is there but unreadable keeps
+    /// the row it has.
     pub fn vault_scan_working_copy(&self) -> Result<Vec<VaultFileChange>, RepositoryError> {
         let vault_dir = self.vault_dir();
         if !vault_dir.exists() {
@@ -627,8 +671,22 @@ impl Repository {
             // Normalize to forward slashes (for Windows compat)
             let rel_path_str = rel_path_str.replace('\\', "/");
 
+            let is_kind_file = KindPath::classify(&rel_path_str).is_some();
+            if is_kind_file && !entry.file_type().is_file() {
+                continue;
+            }
+
             // Read file content
-            let file_content = std::fs::read_to_string(path)?;
+            let file_content = match std::fs::read_to_string(path) {
+                Ok(content) => content,
+                Err(e) if is_kind_file => {
+                    log::warn!(
+                        "vault: skipping {rel_path_str}: {e}; `atomic kind validate` reports it"
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             if let Some(change) = self.vault_file_change(rel_path_str, &file_content)? {
                 changes.push(change);
             }
@@ -637,8 +695,12 @@ impl Repository {
         // Also check for deleted entries (in redb but not on disk)
         let all_entries = self.vault_list("", None)?;
         for meta in all_entries {
-            let disk_path = vault_dir.join(&meta.path);
-            if !disk_path.exists() {
+            let on_disk = if KindPath::classify(&meta.path).is_some() {
+                is_plain_file(&vault_dir, &meta.path)
+            } else {
+                vault_dir.join(&meta.path).exists()
+            };
+            if !on_disk {
                 changes.push(VaultFileChange {
                     path: meta.path,
                     change_type: VaultChangeType::Deleted,
@@ -660,7 +722,8 @@ impl Repository {
     ) -> Result<Option<VaultFileChange>, RepositoryError> {
         {
             // Parse into frontmatter + body
-            let (frontmatter_json, body) = parse_markdown_frontmatter(file_content);
+            let (frontmatter_json, body) =
+                parse_vault_frontmatter_at(Some(&rel_path_str), file_content);
 
             // Body hashes remain useful for content/embedding caches, but
             // frontmatter is also knowledge: status, labels, identity, and
@@ -793,7 +856,36 @@ impl Repository {
         // intents exist in redb but never show up in `intent list`.
         self.vault_reconcile_intent_manifest()?;
 
+        self.vault_reembed_changed_kinds(changes);
+
         Ok(updated_paths)
+    }
+
+    /// Re-apply the embedding policy to every kind whose definition a deflate
+    /// batch added, changed or deleted.
+    ///
+    /// Each entry was embedded as it was stored, and only that path. An
+    /// `embed` flip in a `_kind.md` therefore reaches none of its unchanged
+    /// instances, and an instance stored before its sibling definition was
+    /// judged against stale state.
+    fn vault_reembed_changed_kinds(&self, changes: &[VaultFileChange]) {
+        let respecced: std::collections::BTreeSet<String> = changes
+            .iter()
+            .filter_map(|change| match KindPath::classify(&change.path) {
+                Some(KindPath::Definition { kind }) => Some(kind),
+                _ => None,
+            })
+            .collect();
+        for kind in &respecced {
+            match self.vault_list(&format!("{KINDS_DIR}/{kind}/"), None) {
+                Ok(entries) => {
+                    for meta in entries {
+                        self.vault_auto_embed(&meta.path);
+                    }
+                }
+                Err(e) => log::warn!("Failed to re-embed kind {kind}: {e}"),
+            }
+        }
     }
 
     /// Record-time T5b grant-lapse for an intent deflated from disk (gap #2).
@@ -1338,53 +1430,6 @@ pub(crate) fn render_entry_to_markdown(entry: &VaultEntry) -> String {
     output
 }
 
-/// Write a single frontmatter field in YAML format.
-fn write_frontmatter_field(output: &mut String, key: &str, value: &serde_json::Value) {
-    use std::fmt::Write;
-    match value {
-        serde_json::Value::String(s) => {
-            // Keep simple strings readable, but quote values that our parser
-            // would otherwise reinterpret as another scalar/container type.
-            // JSON string syntax is valid YAML and preserves escapes.
-            let parsed_unquoted = parse_yaml_value(s);
-            let has_edge_whitespace = s.chars().next().is_some_and(char::is_whitespace)
-                || s.chars().last().is_some_and(char::is_whitespace);
-            if parsed_unquoted != serde_json::Value::String(s.clone())
-                || s.contains(": ")
-                || s.contains('#')
-                || s.contains('\n')
-                || s.starts_with('{')
-                || s.starts_with('[')
-                || s.starts_with('"')
-                || s.starts_with('\'')
-                || has_edge_whitespace
-            {
-                let rendered = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
-                let _ = writeln!(output, "{}: {}", key, rendered);
-            } else {
-                let _ = writeln!(output, "{}: {}", key, s);
-            }
-        }
-        serde_json::Value::Number(n) => {
-            let _ = writeln!(output, "{}: {}", key, n);
-        }
-        serde_json::Value::Bool(b) => {
-            let _ = writeln!(output, "{}: {}", key, b);
-        }
-        serde_json::Value::Array(arr) => {
-            let rendered = serde_json::to_string(arr).unwrap_or_else(|_| "[]".to_string());
-            let _ = writeln!(output, "{}: {}", key, rendered);
-        }
-        serde_json::Value::Object(_) => {
-            // Inline JSON for nested objects
-            let _ = writeln!(output, "{}: {}", key, value);
-        }
-        serde_json::Value::Null => {
-            let _ = writeln!(output, "{}: null", key);
-        }
-    }
-}
-
 // ── Deflation helpers ───────────────────────────────────────────────────
 
 /// Type of change detected in the vault working copy.
@@ -1408,55 +1453,6 @@ pub struct VaultFileChange {
     pub content: Vec<u8>,
 }
 
-/// Parse a markdown file's YAML frontmatter and body.
-///
-/// Expects the file to optionally start with `---\n...\n---\n`.
-/// Returns `(frontmatter_json, body)` where frontmatter_json is the
-/// YAML frontmatter converted to a JSON string, and body is everything
-/// after the closing `---`.
-///
-/// If there's no frontmatter, returns `("{}", full_content)`.
-/// Parse vault markdown frontmatter. Public within the crate so that
-/// `vault_intent_update` can read disk content before storing.
-pub(crate) fn parse_vault_frontmatter(content: &str) -> (String, String) {
-    parse_markdown_frontmatter(content)
-}
-
-fn parse_markdown_frontmatter(content: &str) -> (String, String) {
-    // Check for frontmatter delimiter
-    if !content.starts_with("---\n") && !content.starts_with("---\r\n") {
-        return ("{}".to_string(), content.to_string());
-    }
-
-    // Find closing delimiter
-    let after_first = if content.starts_with("---\r\n") { 5 } else { 4 };
-    let rest = &content[after_first..];
-
-    let (close_idx, skip_len) = if let Some(idx) = rest.find("\n---\n") {
-        (idx, 5) // "\n---\n" is 5 bytes
-    } else if let Some(idx) = rest.find("\n---\r\n") {
-        (idx, 6) // "\n---\r\n" is 6 bytes
-    } else if rest.ends_with("\n---") {
-        (rest.len() - 3, 3)
-    } else {
-        // No closing delimiter — treat entire content as body
-        return ("{}".to_string(), content.to_string());
-    };
-
-    let yaml_str = &rest[..close_idx];
-    let body_start = after_first + close_idx + skip_len;
-    let body = if body_start <= content.len() {
-        content[body_start..].to_string()
-    } else {
-        String::new()
-    };
-
-    // Convert YAML frontmatter to JSON
-    let frontmatter_json = yaml_frontmatter_to_json(yaml_str);
-
-    (frontmatter_json, body)
-}
-
 fn frontmatter_json_equal(left: &str, right: &str) -> bool {
     match (
         serde_json::from_str::<serde_json::Value>(left),
@@ -1465,115 +1461,6 @@ fn frontmatter_json_equal(left: &str, right: &str) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
-}
-
-/// Convert simple YAML frontmatter to a JSON string.
-///
-/// Handles common YAML patterns:
-/// - `key: value` -> `{"key": "value"}`
-/// - `key: 123` -> `{"key": 123}`
-/// - `key: true/false` -> `{"key": true/false}`
-/// - `key: [a, b, c]` -> `{"key": ["a", "b", "c"]}`
-/// - `key: {json}` -> `{"key": {json}}`
-///
-/// This is intentionally simple — we don't need a full YAML parser.
-/// The frontmatter is our own output (from materialization), so we
-/// know the format.
-fn yaml_frontmatter_to_json(yaml: &str) -> String {
-    let mut map = serde_json::Map::new();
-
-    for line in yaml.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Split on first ': '
-        let Some(colon_idx) = line.find(": ") else {
-            // Handle `key:` with no value (treated as empty string)
-            if let Some(key) = line.strip_suffix(':') {
-                map.insert(
-                    key.trim().to_string(),
-                    serde_json::Value::String(String::new()),
-                );
-            }
-            continue;
-        };
-
-        let key = line[..colon_idx].trim().to_string();
-        let value_str = line[colon_idx + 2..].trim();
-
-        // Skip system fields that we inject during materialization
-        // (they'll be reconstructed, not stored in frontmatter_json)
-        if matches!(
-            key.as_str(),
-            "entry_type" | "content_hash" | "created_at" | "updated_at"
-        ) {
-            continue;
-        }
-
-        let value = parse_yaml_value(value_str);
-        map.insert(key, value);
-    }
-
-    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
-}
-
-/// Parse a YAML value string into a serde_json::Value.
-fn parse_yaml_value(s: &str) -> serde_json::Value {
-    // Quoted values remain strings even when their contents look like another
-    // scalar type. Decode JSON-style double-quoted escapes losslessly.
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        return serde_json::from_str::<String>(s)
-            .map(serde_json::Value::String)
-            .unwrap_or_else(|_| serde_json::Value::String(s[1..s.len() - 1].to_string()));
-    }
-    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
-        return serde_json::Value::String(s[1..s.len() - 1].replace("''", "'"));
-    }
-
-    // Try as integer
-    if let Ok(n) = s.parse::<i64>() {
-        return serde_json::Value::Number(n.into());
-    }
-    // Try as float
-    if let Ok(n) = s.parse::<f64>() {
-        if let Some(n) = serde_json::Number::from_f64(n) {
-            return serde_json::Value::Number(n);
-        }
-    }
-
-    // Try as boolean / null
-    match s {
-        "true" => return serde_json::Value::Bool(true),
-        "false" => return serde_json::Value::Bool(false),
-        "null" => return serde_json::Value::Null,
-        _ => {}
-    }
-
-    // Materialized arrays/objects use JSON syntax, which is also valid YAML.
-    // Parse it first so quoted commas and nested values remain lossless.
-    if (s.starts_with('[') && s.ends_with(']')) || (s.starts_with('{') && s.ends_with('}')) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
-            return value;
-        }
-    }
-
-    // Also accept simple hand-authored YAML arrays such as [a, b, c].
-    if s.starts_with('[') && s.ends_with(']') {
-        let inner = s[1..s.len() - 1].trim();
-        if inner.is_empty() {
-            return serde_json::Value::Array(Vec::new());
-        }
-        let items: Vec<serde_json::Value> = inner
-            .split(',')
-            .map(|item| parse_yaml_value(item.trim()))
-            .collect();
-        return serde_json::Value::Array(items);
-    }
-
-    // Default: string
-    serde_json::Value::String(s.to_string())
 }
 
 /// Infer the vault entry type from its path.
@@ -2192,6 +2079,43 @@ mod tests {
     }
 
     #[test]
+    fn test_vault_materialize_all_skips_kind_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        let rel = "kinds/adr/01JD8ZK3M6W2Q4V7X9B5N1C3TR.md";
+        let path = repo.vault_dir().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "---\nuid: 01JD8ZK3M6W2Q4V7X9B5N1C3TR\nstatus: accepted\n---\nOriginal.\n",
+        )
+        .unwrap();
+        repo.vault_record_working_copy().unwrap();
+        assert!(repo.vault_retrieve(rel).unwrap().is_some());
+
+        // An edit not yet deflated survives a full materialization.
+        let edited = "---\nuid: 01JD8ZK3M6W2Q4V7X9B5N1C3TR\nstatus: proposed\n---\nEdited.\n";
+        std::fs::write(&path, edited).unwrap();
+        let others = repo.vault_list("", None).unwrap().len() - 1;
+        assert_eq!(repo.vault_materialize_all().unwrap(), others);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+
+        // Nor can a single kind file be materialized over the edit.
+        assert!(matches!(
+            repo.vault_materialize(rel),
+            Err(RepositoryError::InvalidOperation { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
+
+        // Deflate still sees kind files: the edit, then the deletion.
+        assert_eq!(repo.vault_record_working_copy().unwrap(), [rel]);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(repo.vault_record_working_copy().unwrap(), [rel]);
+        assert!(repo.vault_retrieve(rel).unwrap().is_none());
+    }
+
+    #[test]
     fn test_vault_materialize_creates_subdirs() {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
@@ -2300,7 +2224,7 @@ mod tests {
     fn test_parse_markdown_frontmatter() {
         let content =
             "---\nname: test\ntype: memory\nentry_type: memory\ncontent_hash: abc\n---\n# Hello\n\nWorld\n";
-        let (fm, body) = parse_markdown_frontmatter(content);
+        let (fm, body) = parse_vault_frontmatter_at(None, content);
 
         // entry_type and content_hash should be stripped from frontmatter JSON
         let fm_parsed: serde_json::Value = serde_json::from_str(&fm).unwrap();
@@ -2315,7 +2239,7 @@ mod tests {
     #[test]
     fn test_parse_markdown_no_frontmatter() {
         let content = "# Just content\n\nNo frontmatter here.";
-        let (fm, body) = parse_markdown_frontmatter(content);
+        let (fm, body) = parse_vault_frontmatter_at(None, content);
         assert_eq!(fm, "{}");
         assert_eq!(body, content);
     }
@@ -2519,7 +2443,7 @@ mod tests {
             "materializing an entry must not create a semantic frontmatter change"
         );
         let markdown = std::fs::read_to_string(repo.vault_dir().join(path)).unwrap();
-        let (parsed, _) = parse_markdown_frontmatter(&markdown);
+        let (parsed, _) = parse_vault_frontmatter_at(Some(path), &markdown);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&parsed).unwrap(),
             frontmatter
