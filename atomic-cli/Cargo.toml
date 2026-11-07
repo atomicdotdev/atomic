@@ -1,6 +1,7 @@
 [features]
 default = ["teams"]
 remote = []
+dsse-export = ["atomic-canonical/dsse-export"]
 teams = ["atomic-teams"]
 # Forwards the atomic-repository opt-in test instrumentation (R8): the CLI
 # test suite builds the binary with the deterministic adoption seams. The
@@ -98,6 +99,7 @@ toml = { workspace = true }
 redb = { workspace = true }
 bytes = { workspace = true }
 fs2 = "0.4"
+tempfile = { workspace = true }
 url = { workspace = true }
 
 # Parallelism
@@ -115,7 +117,6 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 serial_test = { workspace = true }
 # The remote-sandbox end-to-end test serves libatomic over a temp Unix socket.
 tokio-stream = { workspace = true, features = ["net"] }

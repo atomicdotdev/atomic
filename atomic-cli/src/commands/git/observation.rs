@@ -589,8 +589,10 @@ pub fn observe_head(repository: &GitRepository) -> Result<HeadObservation, Obser
         .find_reference("HEAD")
         .map_err(|error| ObservationError::new(format!("cannot read Git HEAD: {error}")))?;
 
-    if let Some(symref) = head.symbolic_target() {
-        let symref = symref.to_string();
+    let symref = head
+        .symbolic_target()
+        .map_err(|error| ObservationError::new(format!("cannot read Git HEAD: {error}")))?;
+    if let Some(symref) = symref.map(str::to_string) {
         match head.resolve() {
             Ok(resolved) => {
                 let oid = resolved.target().ok_or_else(|| {
@@ -1028,7 +1030,7 @@ fn compute_index_tree_oid(
                 }),
             ));
         };
-        if entry.oid == Oid::zero() || insert_index_tree_entry(&mut root, entry, mode).is_err() {
+        if entry.oid == Oid::ZERO_SHA1 || insert_index_tree_entry(&mut root, entry, mode).is_err() {
             return Ok((
                 None,
                 IndexTreeAvailability::Unavailable(IndexTreeUnavailable::UnsupportedEntry {
@@ -1357,7 +1359,10 @@ fn observe_refs(repository: &GitRepository) -> Result<Vec<RefObservation>, Obser
         })?;
         let target = if let Some(oid) = reference.target() {
             RefTargetObservation::Direct(oid)
-        } else if let Some(symbolic) = reference.symbolic_target() {
+        } else if let Some(symbolic) = reference
+            .symbolic_target()
+            .map_err(|error| ObservationError::new(format!("cannot read Git HEAD: {error}")))?
+        {
             RefTargetObservation::Symbolic(symbolic.as_bytes().to_vec())
         } else {
             RefTargetObservation::Unresolved

@@ -46,7 +46,10 @@ struct Report {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn verify_files(root: &Path, files: &[ExpectedFile]) -> Result<()> {

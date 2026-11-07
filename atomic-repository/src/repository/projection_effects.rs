@@ -95,7 +95,10 @@ pub(super) fn read_head_target(
 ) -> Result<Option<GitRefTarget>, RepositoryError> {
     match git.find_reference("HEAD") {
         Ok(head) => {
-            if let Some(symref) = head.symbolic_target() {
+            let symref = head
+                .symbolic_target()
+                .map_err(|error| git_map(format!("cannot read Git HEAD: {error}")))?;
+            if let Some(symref) = symref {
                 // An unborn branch (HEAD -> refs/heads/master with no
                 // commits) resolves to no target: that is a missing lease
                 // value, not an operational failure.
