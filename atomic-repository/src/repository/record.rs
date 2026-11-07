@@ -4694,11 +4694,13 @@ fn plan_file_moves(
         basis: MoveBasis,
     }
 
+    // One span context serves every deleted candidate in this planning pass.
+    let spans = super::content::SharedSpanRender::new(cached, store, visibility);
     let load_old_content =
         |inode: Inode, position: Position<NodeId>| -> Result<Vec<u8>, RecordError> {
-            if let Some(bytes) =
-                super::content::retrieve_span_if_present(cached, store, inode, visibility)
-                    .map_err(RecordError::Repository)?
+            if let Some(bytes) = spans
+                .render_if_present(inode)
+                .map_err(RecordError::Repository)?
             {
                 return Ok(bytes);
             }

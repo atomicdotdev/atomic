@@ -2045,6 +2045,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             }
             let mut restored: Vec<String> = Vec::new();
             let mut materialize = std::collections::HashSet::new();
+            let mut content_paths: Vec<String> = Vec::new();
             for (path, file_status) in dirty {
                 match file_status {
                     // Added: undo the add — untrack, keep on disk.
@@ -2058,15 +2059,32 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         restored.push(path);
                     }
                     // Modified/Deleted: pristine content back to disk.
-                    _ => {
-                        let content = repo
-                            .get_file_content(std::path::Path::new(&path))
-                            .map_err(repository_error)?;
-                        if content.is_some() {
-                            materialize.insert(path.clone());
-                            restored.push(path);
-                        }
-                        // No pristine content: skip (nothing safe to do).
+                    _ => content_paths.push(path),
+                }
+            }
+            // One projection decides which dirty paths the view still records;
+            // rendering every file here only to discard the bytes would decode
+            // the view's history once per file.
+            let presence = if content_paths.is_empty() {
+                Vec::new()
+            } else {
+                repo.recorded_presence_on_view(&content_paths, repo.current_view())
+                    .map_err(repository_error)?
+            };
+            for (path, presence) in content_paths.into_iter().zip(presence) {
+                match presence {
+                    atomic_repository::RecordedPresence::Present => {
+                        materialize.insert(path.clone());
+                        restored.push(path);
+                    }
+                    // No pristine content: skip (nothing safe to do).
+                    atomic_repository::RecordedPresence::Absent => {}
+                    atomic_repository::RecordedPresence::NameConflict => {
+                        return Err(repository_error(atomic_repository::RepositoryError::InvalidOperation {
+                            message: format!(
+                                "path '{path}' has an unresolved name conflict; refusing to choose content"
+                            ),
+                        }));
                     }
                 }
             }

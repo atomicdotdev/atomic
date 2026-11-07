@@ -138,6 +138,27 @@ impl Repository {
         // Files visible (tracked + recorded) on the current view.
         let visible = self.visible_file_paths(&desired_view)?;
 
+        // Clean files are compared against the graph; read them all through
+        // one transaction so the view's span history is decoded once.
+        let is_uncommitted_or_conflicted = |path: &String| {
+            matches!(
+                status_by_path.get(path),
+                Some(FileStatus::Modified)
+                    | Some(FileStatus::Added)
+                    | Some(FileStatus::Deleted)
+                    | Some(FileStatus::Conflicted)
+            )
+        };
+        let clean_paths: Vec<String> = visible
+            .iter()
+            .filter(|path| !is_uncommitted_or_conflicted(path))
+            .cloned()
+            .collect();
+        let graph_contents: std::collections::HashMap<&String, Option<Vec<u8>>> = clean_paths
+            .iter()
+            .zip(self.get_file_contents_on_view(&clean_paths, &desired_view)?)
+            .collect();
+
         for path in &visible {
             let st = status_by_path.get(path).copied();
 
@@ -156,7 +177,7 @@ impl Repository {
                 _ => {
                     let abs = self.root.join(path);
                     let disk = std::fs::read(&abs).ok();
-                    let graph = self.get_file_content_on_view(path, &desired_view)?;
+                    let graph = graph_contents.get(path).cloned().flatten();
                     if let (Some(disk), Some(graph)) = (disk.as_ref(), graph.as_ref()) {
                         report.clean_files_checked += 1;
                         if disk != graph {

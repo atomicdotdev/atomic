@@ -344,21 +344,23 @@ fn observe_atomic_on_handle(
         .map_err(|error| CheckpointError::Atomic(error.to_string()))?
         .map(|(object, markers)| (object.hash().ok(), markers));
 
+    // One read for every path: the view is projected and its span history
+    // decoded once instead of once per file.
+    let contents = repo
+        .get_file_contents_on_view(&paths, view)
+        .map_err(|error| CheckpointError::Atomic(error.to_string()))?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(ATOMIC_MANIFEST_DOMAIN);
-    for path in paths {
+    for (path, graph_content) in paths.into_iter().zip(contents) {
         let content = match &conflict_markers {
             Some((_, markers)) if markers.contains_key(&path) => {
                 markers.get(&path).cloned().expect("marker bytes")
             }
-            _ => repo
-                .get_file_content_on_view(&path, view)
-                .map_err(|error| CheckpointError::Atomic(error.to_string()))?
-                .ok_or_else(|| {
-                    CheckpointError::Atomic(format!(
-                        "visible path '{path}' has no graph-derived content on view '{view}'"
-                    ))
-                })?,
+            _ => graph_content.ok_or_else(|| {
+                CheckpointError::Atomic(format!(
+                    "visible path '{path}' has no graph-derived content on view '{view}'"
+                ))
+            })?,
         };
         hasher.update(&(path.len() as u64).to_le_bytes());
         hasher.update(path.as_bytes());

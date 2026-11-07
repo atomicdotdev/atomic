@@ -9,6 +9,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 mod attribute_tests;
+mod batch_content_tests;
 mod binding_fetch_tests;
 mod binding_store_tests;
 mod binding_verify_tests;

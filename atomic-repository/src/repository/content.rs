@@ -23,6 +23,17 @@ fn graph_visibility_at_change<T: ViewTxnT>(
     graph_visibility_from_membership(txn, &membership).map(Some)
 }
 
+/// Whether a view projects a file at a path, without rendering its content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordedPresence {
+    /// The view projects a non-directory entry at this path.
+    Present,
+    /// The path is absent on the view, or projects a directory.
+    Absent,
+    /// The path has an unresolved name conflict; no single content applies.
+    NameConflict,
+}
+
 impl Repository {
     /// Get the recorded content for a tracked file.
     ///
@@ -289,6 +300,49 @@ impl Repository {
         }
     }
 
+    /// Decide, for many paths at once, whether a view projects a file there.
+    ///
+    /// One transaction and one tree projection answer every path; nothing is
+    /// rendered. The rules match [`Self::get_materialized_entry_on_view`]:
+    /// a visible name conflict is reported instead of choosing content, and a
+    /// directory or an absent path is `Absent`.
+    pub fn recorded_presence_on_view(
+        &self,
+        paths: &[String],
+        view_name: &str,
+    ) -> Result<Vec<RecordedPresence>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
+        let wanted: std::collections::HashSet<String> = paths
+            .iter()
+            .map(|path| normalize_path(Path::new(path)))
+            .collect();
+        let projection =
+            self.project_tree_for_visibility_wanted(&txn, &visibility, Some(&wanted))?;
+        Ok(paths
+            .iter()
+            .map(|path| {
+                let normalized = normalize_path(Path::new(path));
+                if projection.name_conflicts.contains_key(&normalized) {
+                    return RecordedPresence::NameConflict;
+                }
+                match projection.present.get(&normalized) {
+                    Some(item) if !item.is_directory => RecordedPresence::Present,
+                    _ => RecordedPresence::Absent,
+                }
+            })
+            .collect())
+    }
+
     /// Resolve a file as an explicit present/absent materialization entry on a view.
     ///
     /// Presence comes from the operation-aware path lifecycle projection. Empty
@@ -335,20 +389,64 @@ impl Repository {
         if item.is_directory {
             return Ok(MaterializedEntry::absent(normalized, Some(item.inode)));
         }
-        let bytes =
-            match retrieve_span_if_present(&txn, &self.change_store, item.inode, &visibility)? {
-                Some(bytes) => bytes,
-                None => retrieve_content_with_filter_fast(
-                    &txn,
-                    &self.change_store,
-                    item.inode,
-                    item.position,
-                    atomic_core::output::alive::RetrieveOptions::new()
-                        .with_graph_visibility(visibility),
-                )
-                .map_err(|error| RepositoryError::Database(error.to_string()))?,
-            };
+        let spans = SharedSpanRender::new(&txn, &self.change_store, &visibility);
+        let bytes = render_projected_file(&txn, &self.change_store, &spans, item, &visibility)?;
         Ok(MaterializedEntry::present(normalized, item.inode, bytes))
+    }
+
+    /// Render many files on a view through one transaction, one tree
+    /// projection and one shared span context.
+    ///
+    /// Each entry is exactly what [`Self::get_file_content_on_view`] returns
+    /// for that path: `None` for an absent path or a directory. A requested
+    /// path with an unresolved name conflict fails the whole call, as the
+    /// single-path read refuses to choose content for it.
+    pub fn get_file_contents_on_view(
+        &self,
+        paths: &[String],
+        view_name: &str,
+    ) -> Result<Vec<Option<Vec<u8>>>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
+        let wanted: std::collections::HashSet<String> = paths
+            .iter()
+            .map(|path| normalize_path(Path::new(path)))
+            .collect();
+        let projection =
+            self.project_tree_for_visibility_wanted(&txn, &visibility, Some(&wanted))?;
+        let spans = SharedSpanRender::new(&txn, &self.change_store, &visibility);
+        paths
+            .iter()
+            .map(|path| {
+                let normalized = normalize_path(Path::new(path));
+                if let Some(conflict) = projection.name_conflicts.get(&normalized) {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: format!(
+                            "path '{}' has an unresolved name conflict ({} path(s), {} claimant(s)); refusing to choose content",
+                            normalized,
+                            conflict.paths.len(),
+                            conflict.sides.len()
+                        ),
+                    });
+                }
+                match projection.present.get(&normalized) {
+                    Some(item) if !item.is_directory => {
+                        render_projected_file(&txn, &self.change_store, &spans, item, &visibility)
+                            .map(Some)
+                    }
+                    _ => Ok(None),
+                }
+            })
+            .collect()
     }
 
     /// Read a path through an exact assembly visibility: `view`'s validated
@@ -907,6 +1005,37 @@ impl Repository {
     }
 }
 
+/// Recorded bytes of one projected file: its span rendering when the file is
+/// span-rooted on this view, otherwise the filtered graph rendering.
+fn render_projected_file<T, C>(
+    txn: &T,
+    store: &C,
+    spans: &SharedSpanRender<'_, T, C>,
+    item: &atomic_core::output::repo::OutputItem,
+    visibility: &GraphVisibilityClosure,
+) -> Result<Vec<u8>, RepositoryError>
+where
+    T: atomic_core::pristine::span_patch_storage::SpanPatchReadTxn
+        + atomic_core::pristine::GraphTxnT
+        + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
+        + atomic_core::pristine::TreeTxnT
+        + atomic_core::pristine::CapabilityTxnT,
+    C: atomic_core::change::ChangeStore,
+{
+    if let Some(bytes) = spans.render_if_present(item.inode)? {
+        return Ok(bytes);
+    }
+    retrieve_content_with_filter_fast(
+        txn,
+        store,
+        item.inode,
+        item.position,
+        atomic_core::output::alive::RetrieveOptions::new()
+            .with_graph_visibility(visibility.clone()),
+    )
+    .map_err(|error| RepositoryError::Database(error.to_string()))
+}
+
 pub(super) fn retrieve_span_if_present<T, C>(
     txn: &T,
     store: &C,
@@ -926,6 +1055,72 @@ where
         .and_then(|context| context.render(inode))
         .map(Some)
         .map_err(|error| RepositoryError::Database(error.to_string()))
+}
+
+/// A span renderer shared by every file read through one transaction and
+/// visibility closure.
+///
+/// Building a [`SpanRenderContext`] verifies and decodes the whole visible
+/// closure, so callers that render many files in one transaction must not
+/// rebuild it per file. The context is built lazily on the first span-rooted
+/// file and reused for the rest; graph-origin files never trigger a build.
+/// The per-file root, capability and visibility checks are unchanged.
+pub(super) struct SharedSpanRender<
+    'a,
+    T: atomic_core::pristine::span_patch_storage::SpanPatchReadTxn,
+    C,
+> {
+    txn: &'a T,
+    store: &'a C,
+    visibility: &'a GraphVisibilityClosure,
+    context:
+        std::cell::OnceCell<atomic_core::pristine::span_patch_storage::SpanRenderContext<'a, T>>,
+}
+
+impl<'a, T, C> SharedSpanRender<'a, T, C>
+where
+    T: atomic_core::pristine::span_patch_storage::SpanPatchReadTxn
+        + atomic_core::pristine::TreeTxnT
+        + atomic_core::pristine::CapabilityTxnT,
+    C: atomic_core::change::ChangeStore,
+{
+    pub(super) fn new(txn: &'a T, store: &'a C, visibility: &'a GraphVisibilityClosure) -> Self {
+        Self {
+            txn,
+            store,
+            visibility,
+            context: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// Render `inode` through the shared context when its span root is visible;
+    /// `None` means the file is graph-origin and must be read from the graph.
+    pub(super) fn render_if_present(
+        &self,
+        inode: Inode,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        if !has_visible_span_root(self.txn, self.store, inode, self.visibility)? {
+            return Ok(None);
+        }
+        let context = match self.context.get() {
+            Some(context) => context,
+            None => {
+                let built = atomic_core::pristine::span_patch_storage::SpanRenderContext::new(
+                    self.txn,
+                    self.store,
+                    self.visibility,
+                )
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+                // A concurrent `set` is impossible: `OnceCell` is single-threaded.
+                let _ = self.context.set(built);
+                self.context.get().expect("span context was just set")
+            }
+        };
+        context
+            .render(inode)
+            .map(Some)
+            .map_err(|error| RepositoryError::Database(error.to_string()))
+    }
 }
 
 pub(super) fn retrieve_span_bounded_if_present<T, C>(
