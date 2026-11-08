@@ -1454,16 +1454,12 @@ impl vault_service_server::VaultService for VaultImpl {
                     let id = id.clone();
                     let body = body_for_store;
                     move || {
-                        let repo = vault_repository(&handle)?;
-                        if repo
-                            .vault_retrieve(&vault_path)
-                            .map_err(repository_error)?
-                            .is_some()
-                        {
-                            return Err(Status::already_exists(format!(
-                                "memory '{id}' already exists"
-                            )));
-                        }
+                        // Validate the on-disk preconditions before the vault
+                        // is auto-initialised: initialising first would create
+                        // directories and files through a symlinked `.vault`
+                        // or `.vault/memory` even though the request is then
+                        // refused.
+                        let repo = handle.repository()?;
                         let vault_root = repo.root().join(".vault");
                         for directory in [&vault_root, &vault_root.join("memory")] {
                             match std::fs::symlink_metadata(directory) {
@@ -1499,6 +1495,16 @@ impl vault_service_server::VaultService for VaultImpl {
                                     disk_path.display()
                                 )))
                             }
+                        }
+                        repo.ensure_vault().map_err(repository_error)?;
+                        if repo
+                            .vault_retrieve(&vault_path)
+                            .map_err(repository_error)?
+                            .is_some()
+                        {
+                            return Err(Status::already_exists(format!(
+                                "memory '{id}' already exists"
+                            )));
                         }
                         let mut frontmatter = Map::new();
                         frontmatter.insert("uid".into(), Value::String(id));
