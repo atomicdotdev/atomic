@@ -344,19 +344,36 @@ fn observe_atomic_on_handle(
         .map_err(|error| CheckpointError::Atomic(error.to_string()))?
         .map(|(object, markers)| (object.hash().ok(), markers));
 
-    // One read for every path: the view is projected and its span history
-    // decoded once instead of once per file.
-    let contents = repo
-        .get_file_contents_on_view(&paths, view)
-        .map_err(|error| CheckpointError::Atomic(error.to_string()))?;
+    // Paths with marker bytes never consult the graph. Every other path is
+    // read in one call so the view is projected and its span history decoded
+    // once instead of once per file.
+    let has_marker = |path: &String| -> bool {
+        conflict_markers
+            .as_ref()
+            .is_some_and(|(_, markers)| markers.contains_key(path))
+    };
+    let graph_paths: Vec<String> = paths
+        .iter()
+        .filter(|path| !has_marker(path))
+        .cloned()
+        .collect();
+    let mut graph_contents: std::collections::HashMap<String, Option<Vec<u8>>> = graph_paths
+        .iter()
+        .cloned()
+        .zip(
+            repo.get_file_contents_on_view(&graph_paths, view)
+                .map_err(|error| CheckpointError::Atomic(error.to_string()))?,
+        )
+        .collect();
     let mut hasher = blake3::Hasher::new();
     hasher.update(ATOMIC_MANIFEST_DOMAIN);
-    for (path, graph_content) in paths.into_iter().zip(contents) {
-        let content = match &conflict_markers {
-            Some((_, markers)) if markers.contains_key(&path) => {
-                markers.get(&path).cloned().expect("marker bytes")
-            }
-            _ => graph_content.ok_or_else(|| {
+    for path in paths {
+        let marker_bytes = conflict_markers
+            .as_ref()
+            .and_then(|(_, markers)| markers.get(&path).cloned());
+        let content = match marker_bytes {
+            Some(marker_bytes) => marker_bytes,
+            None => graph_contents.remove(&path).flatten().ok_or_else(|| {
                 CheckpointError::Atomic(format!(
                     "visible path '{path}' has no graph-derived content on view '{view}'"
                 ))

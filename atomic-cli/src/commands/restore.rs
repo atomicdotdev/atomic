@@ -55,6 +55,7 @@
 //! Would restore: src/lib.rs
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use atomic_repository::tracking::TrackingOptions;
@@ -247,23 +248,27 @@ impl Restore {
         }
     }
 
-    /// Restore every path that the view projects as a file, in one
-    /// materialization. Returns `(restored, failed)` counts.
+    /// Classify and restore every Modified/Deleted path in one pass, returning
+    /// the outcome for each path so the caller can report them in status order.
     ///
-    /// Paths the view does not project (or projects as a directory) are
-    /// skipped silently, and a path with an unresolved name conflict is a
-    /// per-file failure, exactly as the single-file path reports them. If the
-    /// batched materialization itself fails, each path falls back to the
-    /// single-file restore so the per-file outcome stays accurate.
+    /// One projection decides which paths the view still records, and one
+    /// materialization writes all of them, instead of rendering and
+    /// materializing file by file. Outcomes match the single-file path: a path
+    /// the view does not project (or projects as a directory) is `Skipped`,
+    /// and a path with an unresolved name conflict fails with the same error.
+    /// A projection failure is reported for every path as the single-file read
+    /// would have reported it; if the batched materialization fails, every
+    /// path falls back to the single-file restore so outcomes stay per file.
     fn restore_contents(
         &self,
         repo: &Repository,
         working_copy: atomic_core::WorkingCopyId,
         view: &str,
         paths: &[PathBuf],
-    ) -> (usize, usize) {
+    ) -> HashMap<PathBuf, CliResult<RestoreOutcome>> {
+        let mut outcomes = HashMap::new();
         if paths.is_empty() {
-            return (0, 0);
+            return outcomes;
         }
         let names: Vec<String> = paths
             .iter()
@@ -272,46 +277,63 @@ impl Restore {
         let presence = match repo.recorded_presence_on_view(&names, view) {
             Ok(presence) => presence,
             Err(error) => {
-                print_warning(&format!("Failed to project the working copy: {}", error));
-                return self.restore_contents_one_by_one(repo, working_copy, view, paths);
+                // A view or projection error would fail every single-path read
+                // the same way; report it per file without re-projecting.
+                for path in paths {
+                    outcomes.insert(
+                        path.clone(),
+                        Err(CliError::Internal(anyhow::anyhow!(
+                            "Failed to get file content: {}",
+                            error
+                        ))),
+                    );
+                }
+                return outcomes;
             }
         };
-        let mut failed = 0;
-        let mut selected = Vec::new();
-        for (name, presence) in names.iter().zip(presence) {
+        let mut selected: Vec<(PathBuf, String)> = Vec::new();
+        for ((path, name), presence) in paths.iter().zip(&names).zip(presence) {
             match presence {
-                RecordedPresence::Present => selected.push(name.clone()),
-                RecordedPresence::Absent => {}
-                RecordedPresence::NameConflict => {
-                    print_warning(&format!(
-                        "Failed to restore '{}': path has an unresolved name conflict; refusing to choose content",
-                        name
-                    ));
-                    failed += 1;
+                RecordedPresence::Present => selected.push((path.clone(), name.clone())),
+                RecordedPresence::Absent => {
+                    outcomes.insert(path.clone(), Ok(RestoreOutcome::Skipped));
+                }
+                RecordedPresence::NameConflict { paths, claimants } => {
+                    let error = atomic_repository::name_conflict_error(
+                        &atomic_repository::normalize_path(path),
+                        paths,
+                        claimants,
+                    );
+                    outcomes.insert(
+                        path.clone(),
+                        Err(CliError::Internal(anyhow::anyhow!(
+                            "Failed to get file content: {}",
+                            error
+                        ))),
+                    );
                 }
             }
         }
         if selected.is_empty() {
-            return (0, failed);
+            return outcomes;
         }
-        match repo.materialize_paths(working_copy, selected.iter().cloned().collect()) {
+        let batch = selected.iter().map(|(_, name)| name.clone()).collect();
+        match repo.materialize_paths(working_copy, batch) {
             Ok(_) => {
-                for name in &selected {
-                    println!("  Restored: {}", name);
+                for (path, _) in selected {
+                    outcomes.insert(path, Ok(RestoreOutcome::Restored));
                 }
-                (selected.len(), failed)
             }
             Err(error) => {
                 print_warning(&format!(
-                    "Batched restore failed ({}); retrying file by file",
+                    "Batched restore failed ({}); restoring file by file",
                     error
                 ));
-                let retry: Vec<PathBuf> = selected.iter().map(PathBuf::from).collect();
-                let (restored, retry_failed) =
-                    self.restore_contents_one_by_one(repo, working_copy, view, &retry);
-                (restored, failed + retry_failed)
+                let retry: Vec<PathBuf> = selected.into_iter().map(|(path, _)| path).collect();
+                outcomes.extend(self.restore_contents_one_by_one(repo, working_copy, view, &retry));
             }
         }
+        outcomes
     }
 
     fn restore_contents_one_by_one(
@@ -320,31 +342,21 @@ impl Restore {
         working_copy: atomic_core::WorkingCopyId,
         view: &str,
         paths: &[PathBuf],
-    ) -> (usize, usize) {
-        let mut restored = 0;
-        let mut failed = 0;
-        for path in paths {
-            let path_display = path.display();
-            match self.restore_file(
-                repo,
-                working_copy,
-                view,
-                Path::new(""),
-                path,
-                FileStatus::Modified,
-            ) {
-                Ok(RestoreOutcome::Restored) => {
-                    println!("  Restored: {}", path_display);
-                    restored += 1;
-                }
-                Ok(RestoreOutcome::Untracked | RestoreOutcome::Skipped) => {}
-                Err(e) => {
-                    print_warning(&format!("Failed to restore '{}': {}", path_display, e));
-                    failed += 1;
-                }
-            }
-        }
-        (restored, failed)
+    ) -> HashMap<PathBuf, CliResult<RestoreOutcome>> {
+        paths
+            .iter()
+            .map(|path| {
+                let outcome = self.restore_file(
+                    repo,
+                    working_copy,
+                    view,
+                    Path::new(""),
+                    path,
+                    FileStatus::Modified,
+                );
+                (path.clone(), outcome)
+            })
+            .collect()
     }
 
     /// Restore a single file according to its status.
@@ -555,39 +567,56 @@ impl Command for Restore {
         let mut restored_count = 0;
         let mut error_count = 0;
 
-        // Added files are untracked one by one; every other dirty file is
-        // restored in a single materialization so the view is projected and
-        // its span history decoded once, not once per file.
-        let mut content_paths = Vec::new();
+        // Modified/Deleted files are classified and materialized together so
+        // the view is projected and its span history decoded once, not once
+        // per file. Added files are untracked one by one. Outcomes are
+        // reported in status order, as before.
+        let content_paths: Vec<PathBuf> = files_to_restore
+            .iter()
+            .filter(|(_, file_status)| *file_status != FileStatus::Added)
+            .map(|(path, _)| path.clone())
+            .collect();
+        let mut content_outcomes =
+            self.restore_contents(&repo, working_copy, &workspace_view, &content_paths);
+
         for (path, file_status) in &files_to_restore {
-            if *file_status != FileStatus::Added {
-                content_paths.push(path.clone());
-                continue;
-            }
             let path_display = path.display();
-            match self.restore_file(
-                &repo,
-                working_copy,
-                &workspace_view,
-                &repo_root,
-                path,
-                *file_status,
-            ) {
+
+            let outcome = if *file_status == FileStatus::Added {
+                self.restore_file(
+                    &repo,
+                    working_copy,
+                    &workspace_view,
+                    &repo_root,
+                    path,
+                    *file_status,
+                )
+            } else {
+                content_outcomes.remove(path).unwrap_or_else(|| {
+                    Err(CliError::Internal(anyhow::anyhow!(
+                        "no restore outcome recorded for '{}'",
+                        path_display
+                    )))
+                })
+            };
+            match outcome {
+                Ok(RestoreOutcome::Restored) => {
+                    println!("  Restored: {}", path_display);
+                    restored_count += 1;
+                }
                 Ok(RestoreOutcome::Untracked) => {
                     println!("  Untracked: {} (kept on disk)", path_display);
                     restored_count += 1;
                 }
-                Ok(RestoreOutcome::Restored | RestoreOutcome::Skipped) => {}
+                Ok(RestoreOutcome::Skipped) => {
+                    // No pristine content to restore; nothing to do.
+                }
                 Err(e) => {
                     print_warning(&format!("Failed to restore '{}': {}", path_display, e));
                     error_count += 1;
                 }
             }
         }
-        let (restored, failed) =
-            self.restore_contents(&repo, working_copy, &workspace_view, &content_paths);
-        restored_count += restored;
-        error_count += failed;
 
         // Summary
         println!();

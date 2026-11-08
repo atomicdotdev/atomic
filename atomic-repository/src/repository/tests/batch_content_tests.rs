@@ -54,6 +54,22 @@ fn batch_reads_and_presence_match_single_path_reads() {
         std::fs::write(temp.path().join("a.txt"), b"alpha on feature\n").unwrap();
         record_all(&repo, "feature edit");
 
+        if spans {
+            use atomic_core::pristine::span_patch_storage::SpanPatchReadTxn;
+            use atomic_core::pristine::TreeTxnT;
+            let txn = repo.pristine().read_txn().unwrap();
+            let inode = txn.get_inode("a.txt").unwrap().unwrap();
+            assert!(
+                txn.span_root(inode).unwrap().is_some(),
+                "fixture must record a.txt as a span-rooted file"
+            );
+            let legacy = txn.get_inode("legacy.txt").unwrap().unwrap();
+            assert!(
+                txn.span_root(legacy).unwrap().is_none(),
+                "fixture must keep legacy.txt graph-origin"
+            );
+        }
+
         let paths: Vec<String> = [
             "a.txt",
             "b.txt",

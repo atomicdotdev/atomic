@@ -31,7 +31,18 @@ pub enum RecordedPresence {
     /// The path is absent on the view, or projects a directory.
     Absent,
     /// The path has an unresolved name conflict; no single content applies.
-    NameConflict,
+    NameConflict { paths: usize, claimants: usize },
+}
+
+/// The error every content read returns for a path with an unresolved name
+/// conflict. Callers that classify paths first must report the same error.
+pub fn name_conflict_error(path: &str, paths: usize, claimants: usize) -> RepositoryError {
+    RepositoryError::InvalidOperation {
+        message: format!(
+            "path '{}' has an unresolved name conflict ({} path(s), {} claimant(s)); refusing to choose content",
+            path, paths, claimants
+        ),
+    }
 }
 
 impl Repository {
@@ -332,8 +343,11 @@ impl Repository {
             .iter()
             .map(|path| {
                 let normalized = normalize_path(Path::new(path));
-                if projection.name_conflicts.contains_key(&normalized) {
-                    return RecordedPresence::NameConflict;
+                if let Some(conflict) = projection.name_conflicts.get(&normalized) {
+                    return RecordedPresence::NameConflict {
+                        paths: conflict.paths.len(),
+                        claimants: conflict.sides.len(),
+                    };
                 }
                 match projection.present.get(&normalized) {
                     Some(item) if !item.is_directory => RecordedPresence::Present,
@@ -369,14 +383,11 @@ impl Repository {
         let projection =
             self.project_tree_for_visibility_scoped(&txn, &visibility, Some(normalized.as_str()))?;
         if let Some(conflict) = projection.name_conflicts.get(&normalized) {
-            return Err(RepositoryError::InvalidOperation {
-                message: format!(
-                    "path '{}' has an unresolved name conflict ({} path(s), {} claimant(s)); refusing to choose content",
-                    normalized,
-                    conflict.paths.len(),
-                    conflict.sides.len()
-                ),
-            });
+            return Err(name_conflict_error(
+                &normalized,
+                conflict.paths.len(),
+                conflict.sides.len(),
+            ));
         }
         let Some(item) = projection.present.get(&normalized) else {
             let inode = projection
@@ -429,14 +440,11 @@ impl Repository {
             .map(|path| {
                 let normalized = normalize_path(Path::new(path));
                 if let Some(conflict) = projection.name_conflicts.get(&normalized) {
-                    return Err(RepositoryError::InvalidOperation {
-                        message: format!(
-                            "path '{}' has an unresolved name conflict ({} path(s), {} claimant(s)); refusing to choose content",
-                            normalized,
-                            conflict.paths.len(),
-                            conflict.sides.len()
-                        ),
-                    });
+                    return Err(name_conflict_error(
+                        &normalized,
+                        conflict.paths.len(),
+                        conflict.sides.len(),
+                    ));
                 }
                 match projection.present.get(&normalized) {
                     Some(item) if !item.is_directory => {
