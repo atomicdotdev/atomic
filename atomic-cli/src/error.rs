@@ -764,17 +764,23 @@ mod tests {
         use atomic_remote::auth::AuthError;
 
         let error = CliError::from(AuthError::Internal(anyhow::anyhow!("key store failure")));
-        assert!(matches!(&error, CliError::Internal(source) if source.to_string() == "key store failure"));
+        assert!(
+            matches!(&error, CliError::Internal(source) if source.to_string() == "key store failure")
+        );
 
         let error = CliError::from(AuthError::AuthenticationFailed {
             remote: "https://example.com: missing signing key".into(),
         });
-        assert!(matches!(&error, CliError::AuthenticationFailed { remote } if remote == "https://example.com: missing signing key"));
+        assert!(
+            matches!(&error, CliError::AuthenticationFailed { remote } if remote == "https://example.com: missing signing key")
+        );
 
         let error = CliError::from(AuthError::DelegationError {
             message: "certificate expired; renew it".into(),
         });
-        assert!(matches!(&error, CliError::DelegationError { message } if message == "certificate expired; renew it"));
+        assert!(
+            matches!(&error, CliError::DelegationError { message } if message == "certificate expired; renew it")
+        );
     }
 
     // -------------------------------------------------------------------------

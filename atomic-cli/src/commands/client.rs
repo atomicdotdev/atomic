@@ -120,7 +120,8 @@ fn delegation_for(identity: &atomic_identity::Identity, server: &str) -> Option<
         return None;
     }
     let store = IdentityStore::open_default().ok()?;
-    let resolved = atomic_remote::auth::delegation::active_for(&store, identity, Some(server)).ok()?;
+    let resolved =
+        atomic_remote::auth::delegation::active_for(&store, identity, Some(server)).ok()?;
     Some(atomic_canonical::delegation::encode_for_transport(
         &resolved.document,
     ))

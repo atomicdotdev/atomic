@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
-use prost::Message;
 use atomic_remote::{auth, HttpRemoteConfig};
+use prost::Message;
 use tonic::{Request, Status};
 
 use crate::atomic::{
@@ -15,21 +15,21 @@ use crate::atomic::{
     knowledge_service_server::KnowledgeService,
     repository_mutation_service_server::RepositoryMutationService,
     repository_query_service_server::RepositoryQueryService, sync_service_server::SyncService,
-    vault_service_server::VaultService,
-    view_service_server::ViewService, AddFilesRequest, CreateViewRequest, DeleteViewRequest,
-    GetChangeRequest, GetVaultContextRequest, GetVaultEntryRequest, GetWorkflowSnapshotRequest,
-    ListVaultEntriesRequest, ListViewsRequest, LogRequest, PreviewRestoreRequest,
-    QueryGraphRequest, RecordRequest, ReplayVaultEvidenceRequest, ResolveRepositoryRequest,
-    StatusRequest, SwitchViewRequest, VerifyAttestationRequest, InsertChangesRequest,
-    PushChangesRequest, PullChangesRequest, ListRemotesRequest, ManageRemotesRequest,
+    vault_service_server::VaultService, view_service_server::ViewService, AddFilesRequest,
+    CreateViewRequest, DeleteViewRequest, GetChangeRequest, GetVaultContextRequest,
+    GetVaultEntryRequest, GetWorkflowSnapshotRequest, InsertChangesRequest, ListRemotesRequest,
+    ListVaultEntriesRequest, ListViewsRequest, LogRequest, ManageRemotesRequest,
+    PreviewRestoreRequest, PullChangesRequest, PushChangesRequest, QueryGraphRequest,
+    RecordRequest, ReplayVaultEvidenceRequest, ResolveRepositoryRequest, StatusRequest,
+    SwitchViewRequest, VerifyAttestationRequest,
 };
 use crate::daemon::{
     services::{DaemonImpl, MutationImpl, QueryImpl},
     services_agent::{AttestationImpl, KnowledgeImpl, VaultImpl},
     services_query::ViewImpl,
     services_sync::SyncImpl,
-    state::DaemonState,
     state::repository_error,
+    state::DaemonState,
 };
 
 /// Embedded service session for trusted local callers.
@@ -144,52 +144,75 @@ impl LocalService {
             "/atomic.RepositoryMutationService/InsertChanges" => {
                 let request = decode::<InsertChangesRequest>(request)?;
                 require_repository(&request.repository)?;
-                let response = MutationImpl { state: self.state.clone() }
-                    .insert_changes(Request::new(request)).await?;
+                let response = MutationImpl {
+                    state: self.state.clone(),
+                }
+                .insert_changes(Request::new(request))
+                .await?;
                 Ok(response.into_inner().encode_to_vec())
             }
             "/atomic.SyncService/ListRemotes" => {
                 let request = decode::<ListRemotesRequest>(request)?;
                 require_repository(&request.repository)?;
-                let response = SyncImpl { state: self.state.clone() }
-                    .list_remotes(Request::new(request)).await?;
+                let response = SyncImpl {
+                    state: self.state.clone(),
+                }
+                .list_remotes(Request::new(request))
+                .await?;
                 Ok(response.into_inner().encode_to_vec())
             }
             "/atomic.SyncService/ManageRemotes" => {
                 let request = decode::<ManageRemotesRequest>(request)?;
                 require_repository(&request.repository)?;
-                let response = SyncImpl { state: self.state.clone() }
-                    .manage_remotes(Request::new(request)).await?;
+                let response = SyncImpl {
+                    state: self.state.clone(),
+                }
+                .manage_remotes(Request::new(request))
+                .await?;
                 Ok(response.into_inner().encode_to_vec())
             }
             "/atomic.SyncService/PushChanges" => {
                 let mut request = decode::<PushChangesRequest>(request)?;
                 require_repository(&request.repository)?;
                 reject_transport_credentials(&request.auth_headers, &request.remote_url)?;
-                let (name, url, config) = self.sync_credentials(
-                    request.repository.as_ref().unwrap(), &request.remote,
-                    request.identity.clone(), true,
-                ).await?;
+                let (name, url, config) = self
+                    .sync_credentials(
+                        request.repository.as_ref().unwrap(),
+                        &request.remote,
+                        request.identity.clone(),
+                        true,
+                    )
+                    .await?;
                 request.remote = name;
                 request.remote_url = Some(url);
                 request.auth_headers = config.extra_headers.into_iter().collect();
-                let response = SyncImpl { state: self.state.clone() }
-                    .push_changes(Request::new(request)).await?;
+                let response = SyncImpl {
+                    state: self.state.clone(),
+                }
+                .push_changes(Request::new(request))
+                .await?;
                 Ok(response.into_inner().encode_to_vec())
             }
             "/atomic.SyncService/PullChanges" => {
                 let mut request = decode::<PullChangesRequest>(request)?;
                 require_repository(&request.repository)?;
                 reject_transport_credentials(&request.auth_headers, &request.remote_url)?;
-                let (name, url, config) = self.sync_credentials(
-                    request.repository.as_ref().unwrap(), &request.remote,
-                    request.identity.clone(), false,
-                ).await?;
+                let (name, url, config) = self
+                    .sync_credentials(
+                        request.repository.as_ref().unwrap(),
+                        &request.remote,
+                        request.identity.clone(),
+                        false,
+                    )
+                    .await?;
                 request.remote = name;
                 request.remote_url = Some(url);
                 request.auth_headers = config.extra_headers.into_iter().collect();
-                let response = SyncImpl { state: self.state.clone() }
-                    .pull_changes(Request::new(request)).await?;
+                let response = SyncImpl {
+                    state: self.state.clone(),
+                }
+                .pull_changes(Request::new(request))
+                .await?;
                 Ok(response.into_inner().encode_to_vec())
             }
             "/atomic.RepositoryQueryService/Log" => {
@@ -359,23 +382,31 @@ impl LocalService {
             let url = if name.contains("://") {
                 name.clone()
             } else {
-                repo.get_remote(&name).map_err(|error| match error {
-                    atomic_repository::RepositoryError::RemoteNotFound { .. } =>
-                        crate::daemon::state::domain_status(
-                            crate::atomic::ErrorCode::NotFound, format!("remote '{name}' not found"),
-                        ),
-                    other => repository_error(other),
-                })?.url
+                repo.get_remote(&name)
+                    .map_err(|error| match error {
+                        atomic_repository::RepositoryError::RemoteNotFound { .. } => {
+                            crate::daemon::state::domain_status(
+                                crate::atomic::ErrorCode::NotFound,
+                                format!("remote '{name}' not found"),
+                            )
+                        }
+                        other => repository_error(other),
+                    })?
+                    .url
             };
             if push {
                 auth::check_push_credentials(&url, identity.as_deref()).map_err(auth_status)?;
             }
             drop(repo);
             let config = runtime.block_on(auth::attach_identity(
-                HttpRemoteConfig::new(), &url, identity.as_deref(),
+                HttpRemoteConfig::new(),
+                &url,
+                identity.as_deref(),
             ));
             Ok::<_, Status>((name, url, config))
-        }).await.map_err(|e| Status::internal(format!("credentials task failed: {e}")))?
+        })
+        .await
+        .map_err(|e| Status::internal(format!("credentials task failed: {e}")))?
     }
 }
 
@@ -394,8 +425,9 @@ fn reject_transport_credentials(
 fn auth_status(error: auth::AuthError) -> Status {
     match error {
         auth::AuthError::Internal(error) => Status::internal(error.to_string()),
-        auth::AuthError::AuthenticationFailed { remote } =>
-            Status::unauthenticated(format!("authentication failed for {remote}")),
+        auth::AuthError::AuthenticationFailed { remote } => {
+            Status::unauthenticated(format!("authentication failed for {remote}"))
+        }
         auth::AuthError::DelegationError { message } => Status::permission_denied(message),
     }
 }

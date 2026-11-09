@@ -29,8 +29,8 @@
 //!    The default fallback does NOT apply when `--identity` explicitly names an
 //!    identity that doesn't exist (that's a clear error, not a substitution).
 
-use atomic_identity::{Identity, IdentityStore};
 use crate::HttpRemoteConfig;
+use atomic_identity::{Identity, IdentityStore};
 use url::Url;
 
 /// Shared authentication failures, preserving credential and delegation remedies.

@@ -196,9 +196,10 @@ fn from_environment(identity: &Identity) -> AuthResult<Option<ResolvedDelegation
         return Ok(None);
     }
 
-    let document = cert::decode_from_transport(encoded).map_err(|e| AuthError::DelegationError {
-        message: format!("{DELEGATION_ENV} is not a usable grant: {e}"),
-    })?;
+    let document =
+        cert::decode_from_transport(encoded).map_err(|e| AuthError::DelegationError {
+            message: format!("{DELEGATION_ENV} is not a usable grant: {e}"),
+        })?;
 
     let delegation =
         cert::verify_self_contained(&document).map_err(|e| AuthError::DelegationError {

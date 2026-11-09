@@ -31,10 +31,10 @@ use atomic_identity::delegation::{Delegation, DelegationScope};
 use atomic_identity::{Identity, IdentityStore};
 use atomic_remote::storage_types::PushDelegationRequest;
 
-use atomic_remote::auth::delegation::load_for_delegate;
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_success, print_warning};
+use atomic_remote::auth::delegation::load_for_delegate;
 
 use super::{
     humanize_remaining, parse_duration, parse_patterns, parse_permissions, DEFAULT_EXPIRY_DAYS,
