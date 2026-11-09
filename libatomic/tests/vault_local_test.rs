@@ -1,6 +1,6 @@
 use atomic_core::pristine::VaultEntryType;
 use atomic_identity::{Identity, KeyPair};
-use atomic_repository::{IntentCreateOptions, Repository};
+use atomic_repository::{IntentCreateOptions, IntentUpdateOptions, Repository};
 use libatomic::{proto, LocalService};
 use prost::Message;
 use serde_json::{json, Map, Value};
@@ -298,6 +298,121 @@ async fn verification_uses_only_a_public_key_and_preserves_the_signed_revision()
             .code(),
         tonic::Code::InvalidArgument
     );
+}
+
+#[tokio::test]
+async fn evidence_replay_returns_native_pins_and_refuses_stale_manifests() {
+    let (dir, id, _) = create();
+    let service = LocalService::new();
+    let reference = resolve(&service, dir.path()).await;
+
+    // `vault_intent_create` does not seed the CLI scaffold, so add the one
+    // acceptance criterion this replay manifest will name before pinning.
+    let repo = Repository::open_existing(dir.path()).unwrap();
+    repo.vault_intent_update(
+        &id,
+        IntentUpdateOptions {
+            content: Some(
+                ":::why\nPin the retained evidence.\n:::\n\n\
+                 :::acceptance-criterion{#test-ac-1 status=unmet}\n\
+                 The selected passage remains.\n:::\n"
+                    .into(),
+            ),
+            force: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let entry = repo.vault_intent_show(&id).unwrap();
+    let frontmatter: Map<String, Value> = serde_json::from_str(&entry.frontmatter_json).unwrap();
+    let body = String::from_utf8(entry.content_bytes).unwrap();
+    let node = atomic_canonical::lift::lift_intent(&frontmatter, &body).unwrap();
+    assert!(!node.has_acceptance_criterion.is_empty());
+    let criterion = node.has_acceptance_criterion[0].id.clone();
+    drop(repo);
+
+    let context_request = proto::ReplayVaultEvidenceRequest {
+        repository: Some(reference.clone()),
+        kind: proto::VaultEntityKind::Intent as i32,
+        id: id.clone(),
+        evidence_context: true,
+        ..Default::default()
+    };
+    let bytes = service
+        .call(
+            "/atomic.VaultService/ReplayVaultEvidence",
+            &context_request.encode_to_vec(),
+        )
+        .await
+        .unwrap();
+    let response = proto::ReplayVaultEvidenceResponse::decode(bytes.as_slice()).unwrap();
+    let context = response.evidence_context.unwrap();
+    assert!(context.intent_id.starts_with("urn:atomic:intent:"));
+    assert!(context.intent_substance_hash.starts_with("blake3:"));
+    assert!(!context.view_chain.is_empty());
+    assert!(response.evidence_replay.is_none());
+
+    let manifest = json!({
+        "schema_version": "atomic-evidence-replay-manifest/v1",
+        "context": {
+            "intent_id": context.intent_id,
+            "intent_substance_hash": context.intent_substance_hash,
+            "intent_source_hash": context.intent_source_hash,
+            "view_chain": context
+                .view_chain
+                .iter()
+                .map(|pin| json!({
+                    "name": pin.name,
+                    "merkle": pin.merkle,
+                    "scope": pin.scope,
+                }))
+                .collect::<Vec<_>>(),
+        },
+        "claims": [{
+            "criterion_id": criterion,
+            "claim_type": "source_text_coverage/v1",
+            "artifact_root": "missing-artifacts",
+            "case": {},
+            "policy": {},
+        }],
+    });
+    let replay_request = proto::ReplayVaultEvidenceRequest {
+        repository: Some(reference.clone()),
+        kind: proto::VaultEntityKind::Intent as i32,
+        id: id.clone(),
+        evidence_context: true,
+        manifest: serde_json::to_vec(&manifest).unwrap(),
+        manifest_base: dir.path().display().to_string(),
+        checker: dir.path().join("missing-checker").display().to_string(),
+        ..Default::default()
+    };
+    let bytes = service
+        .call(
+            "/atomic.VaultService/ReplayVaultEvidence",
+            &replay_request.encode_to_vec(),
+        )
+        .await
+        .unwrap();
+    let response = proto::ReplayVaultEvidenceResponse::decode(bytes.as_slice()).unwrap();
+    let report = response.evidence_replay.unwrap();
+    assert_eq!(report.decisions[0].reason, "artifact_root_unavailable");
+    assert!(!response.valid);
+
+    let mut stale = manifest;
+    stale["context"]["view_chain"][0]["merkle"] = json!("stale");
+    let stale_request = proto::ReplayVaultEvidenceRequest {
+        manifest: serde_json::to_vec(&stale).unwrap(),
+        ..replay_request
+    };
+    let error = service
+        .call(
+            "/atomic.VaultService/ReplayVaultEvidence",
+            &stale_request.encode_to_vec(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().contains("stale intent/view pins"));
 }
 
 #[tokio::test]

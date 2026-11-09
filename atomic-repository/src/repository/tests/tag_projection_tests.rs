@@ -143,7 +143,10 @@ fn annotated_tag_round_trip_carries_the_binding_and_restores_the_bound_state() {
         fixture.commit_oid,
         "the annotated tag points at the bound commit"
     );
-    let message = tag_object.message().unwrap();
+    let message = tag_object
+        .message()
+        .expect("tag message is readable")
+        .expect("annotated tag carries a message");
     assert!(
         message.contains("Release version 1.0.0"),
         "the Atomic tag message is preserved: {message}"

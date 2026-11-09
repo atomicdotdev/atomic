@@ -67,7 +67,8 @@ impl Command for Summaries {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         let prefix = match &self.goal {
             Some(name) => format!("goals/{}/", name),

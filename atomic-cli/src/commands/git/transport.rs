@@ -85,7 +85,7 @@ pub fn configure_fetch_refspecs(git: &GitRepository, remote: &str) -> CliResult<
             let mut out = Vec::new();
             while let Some(entry) = entries.next() {
                 let entry = entry?;
-                if let Some(value) = entry.value() {
+                if let Ok(value) = entry.value() {
                     out.push(value.to_string());
                 }
             }

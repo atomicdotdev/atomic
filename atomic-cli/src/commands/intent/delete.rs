@@ -42,7 +42,7 @@ impl Command for IntentDelete {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         if !self.force {
             // Check that the intent exists before prompting.
