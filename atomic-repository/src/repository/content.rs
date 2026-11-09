@@ -405,18 +405,23 @@ impl Repository {
         Ok(MaterializedEntry::present(normalized, item.inode, bytes))
     }
 
-    /// Render many files on a view through one transaction, one tree
-    /// projection and one shared span context.
+    /// Stream the recorded bytes of many files on a view through one
+    /// transaction, one tree projection and one shared span context.
     ///
-    /// Each entry is exactly what [`Self::get_file_content_on_view`] returns
-    /// for that path: `None` for an absent path or a directory. A requested
-    /// path with an unresolved name conflict fails the whole call, as the
-    /// single-path read refuses to choose content for it.
-    pub fn get_file_contents_on_view(
+    /// `visit` receives each path in the order given, with exactly what
+    /// [`Self::get_file_content_on_view`] returns for it: `None` for an absent
+    /// path or a directory. Bytes are handed over one file at a time and
+    /// dropped by the visitor, so peak memory stays at one file, not the whole
+    /// set. A requested path with an unresolved name conflict fails the call,
+    /// as the single-path read refuses to choose content for it; a visitor
+    /// error stops the walk and is returned unchanged. Nothing survives this
+    /// call's transaction; the visitor must not mutate repository state.
+    pub fn for_each_file_content_on_view(
         &self,
         paths: &[String],
         view_name: &str,
-    ) -> Result<Vec<Option<Vec<u8>>>, RepositoryError> {
+        mut visit: impl FnMut(&str, Option<Vec<u8>>) -> Result<(), RepositoryError>,
+    ) -> Result<(), RepositoryError> {
         let txn = self
             .pristine
             .read_txn()
@@ -435,26 +440,44 @@ impl Repository {
         let projection =
             self.project_tree_for_visibility_wanted(&txn, &visibility, Some(&wanted))?;
         let spans = SharedSpanRender::new(&txn, &self.change_store, &visibility);
-        paths
-            .iter()
-            .map(|path| {
-                let normalized = normalize_path(Path::new(path));
-                if let Some(conflict) = projection.name_conflicts.get(&normalized) {
-                    return Err(name_conflict_error(
-                        &normalized,
-                        conflict.paths.len(),
-                        conflict.sides.len(),
-                    ));
-                }
-                match projection.present.get(&normalized) {
-                    Some(item) if !item.is_directory => {
-                        render_projected_file(&txn, &self.change_store, &spans, item, &visibility)
-                            .map(Some)
-                    }
-                    _ => Ok(None),
-                }
-            })
-            .collect()
+        for path in paths {
+            let normalized = normalize_path(Path::new(path));
+            if let Some(conflict) = projection.name_conflicts.get(&normalized) {
+                return Err(name_conflict_error(
+                    &normalized,
+                    conflict.paths.len(),
+                    conflict.sides.len(),
+                ));
+            }
+            let bytes = match projection.present.get(&normalized) {
+                Some(item) if !item.is_directory => Some(render_projected_file(
+                    &txn,
+                    &self.change_store,
+                    &spans,
+                    item,
+                    &visibility,
+                )?),
+                _ => None,
+            };
+            visit(path, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Collected form of [`Self::for_each_file_content_on_view`]: one entry per
+    /// requested path, in order. This holds every rendered file at once, so
+    /// callers that only need to consume each file should stream instead.
+    pub fn get_file_contents_on_view(
+        &self,
+        paths: &[String],
+        view_name: &str,
+    ) -> Result<Vec<Option<Vec<u8>>>, RepositoryError> {
+        let mut contents = Vec::with_capacity(paths.len());
+        self.for_each_file_content_on_view(paths, view_name, |_, bytes| {
+            contents.push(bytes);
+            Ok(())
+        })?;
+        Ok(contents)
     }
 
     /// Read a path through an exact assembly visibility: `view`'s validated

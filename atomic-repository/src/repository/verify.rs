@@ -138,8 +138,10 @@ impl Repository {
         // Files visible (tracked + recorded) on the current view.
         let visible = self.visible_file_paths(&desired_view)?;
 
-        // Clean files are compared against the graph; read them all through
-        // one transaction so the view's span history is decoded once.
+        // Clean files are compared against the graph. Stream them through one
+        // transaction so the view's span history is decoded once, comparing
+        // each file as it arrives; only the mismatching lengths are kept and
+        // reported below in the visible-path order.
         let is_uncommitted_or_conflicted = |path: &String| {
             matches!(
                 status_by_path.get(path),
@@ -154,10 +156,19 @@ impl Repository {
             .filter(|path| !is_uncommitted_or_conflicted(path))
             .cloned()
             .collect();
-        let graph_contents: std::collections::HashMap<&String, Option<Vec<u8>>> = clean_paths
-            .iter()
-            .zip(self.get_file_contents_on_view(&clean_paths, &desired_view)?)
-            .collect();
+        let mut drift: HashMap<String, (usize, usize)> = HashMap::new();
+        let mut clean_files_checked = 0usize;
+        self.for_each_file_content_on_view(&clean_paths, &desired_view, |path, graph| {
+            let disk = std::fs::read(self.root.join(path)).ok();
+            if let (Some(disk), Some(graph)) = (disk, graph) {
+                clean_files_checked += 1;
+                if disk != graph {
+                    drift.insert(path.to_string(), (disk.len(), graph.len()));
+                }
+            }
+            Ok(())
+        })?;
+        report.clean_files_checked += clean_files_checked;
 
         for path in &visible {
             let st = status_by_path.get(path).copied();
@@ -175,18 +186,12 @@ impl Repository {
                 // Clean (absent from status) or other benign states: the disk
                 // must match the graph exactly.
                 _ => {
-                    let abs = self.root.join(path);
-                    let disk = std::fs::read(&abs).ok();
-                    let graph = graph_contents.get(path).cloned().flatten();
-                    if let (Some(disk), Some(graph)) = (disk.as_ref(), graph.as_ref()) {
-                        report.clean_files_checked += 1;
-                        if disk != graph {
-                            report.problems.push(VerifyProblem::MaterializationDrift {
-                                path: path.clone(),
-                                disk_len: disk.len(),
-                                graph_len: graph.len(),
-                            });
-                        }
+                    if let Some((disk_len, graph_len)) = drift.remove(path.as_str()) {
+                        report.problems.push(VerifyProblem::MaterializationDrift {
+                            path: path.clone(),
+                            disk_len,
+                            graph_len,
+                        });
                     }
                 }
             }

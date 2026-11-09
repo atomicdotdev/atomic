@@ -137,3 +137,53 @@ fn batch_reads_reject_unknown_views() {
     ));
     assert_eq!(repo.get_file_contents_on_view(&[], "dev").unwrap(), vec![]);
 }
+
+/// The streaming read visits every path in the requested order with the same
+/// bytes the collected read returns, and a visitor error stops the walk and
+/// comes back unchanged.
+#[test]
+fn streaming_reads_visit_in_order_and_propagate_visitor_errors() {
+    for spans in [false, true] {
+        let (temp, mut repo) = create_temp_repo();
+        if spans {
+            enable_spans(&repo);
+        }
+        write_and_add(&temp, &mut repo, "b.txt", b"beta\n");
+        write_and_add(&temp, &mut repo, "a.txt", b"alpha\n");
+        write_and_add(&temp, &mut repo, "dir/c.txt", b"gamma\n");
+        record_all(&repo, "files");
+        let paths: Vec<String> = ["dir/c.txt", "missing.txt", "a.txt", "dir", "b.txt"]
+            .map(str::to_string)
+            .into();
+        let collected = repo.get_file_contents_on_view(&paths, "dev").unwrap();
+        let mut visited = Vec::new();
+        repo.for_each_file_content_on_view(&paths, "dev", |path, bytes| {
+            visited.push((path.to_string(), bytes));
+            Ok(())
+        })
+        .unwrap();
+        let visited_paths: Vec<&str> = visited.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            visited_paths,
+            paths.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        let visited_bytes: Vec<Option<Vec<u8>>> =
+            visited.into_iter().map(|(_, bytes)| bytes).collect();
+        assert_eq!(visited_bytes, collected, "spans={spans}");
+
+        let mut seen = Vec::new();
+        let error = repo
+            .for_each_file_content_on_view(&paths, "dev", |path, _| {
+                seen.push(path.to_string());
+                if path == "a.txt" {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: "visitor refused".into(),
+                    });
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("visitor refused"), "{error}");
+        assert_eq!(seen, ["dir/c.txt", "missing.txt", "a.txt"], "spans={spans}");
+    }
+}

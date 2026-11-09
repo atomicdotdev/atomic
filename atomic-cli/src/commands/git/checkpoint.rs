@@ -345,44 +345,70 @@ fn observe_atomic_on_handle(
         .map(|(object, markers)| (object.hash().ok(), markers));
 
     // Paths with marker bytes never consult the graph. Every other path is
-    // read in one call so the view is projected and its span history decoded
-    // once instead of once per file.
-    let has_marker = |path: &String| -> bool {
+    // streamed from one read (one projection, one span context) in the same
+    // sorted order, and hashed as it arrives so only one file is held at a
+    // time; marker paths are hashed from their marker bytes in between.
+    let marker_bytes = |path: &str| -> Option<&[u8]> {
         conflict_markers
             .as_ref()
-            .is_some_and(|(_, markers)| markers.contains_key(path))
+            .and_then(|(_, markers)| markers.get(path))
+            .map(Vec::as_slice)
     };
     let graph_paths: Vec<String> = paths
         .iter()
-        .filter(|path| !has_marker(path))
+        .filter(|path| marker_bytes(path).is_none())
         .cloned()
-        .collect();
-    let mut graph_contents: std::collections::HashMap<String, Option<Vec<u8>>> = graph_paths
-        .iter()
-        .cloned()
-        .zip(
-            repo.get_file_contents_on_view(&graph_paths, view)
-                .map_err(|error| CheckpointError::Atomic(error.to_string()))?,
-        )
         .collect();
     let mut hasher = blake3::Hasher::new();
     hasher.update(ATOMIC_MANIFEST_DOMAIN);
-    for path in paths {
-        let marker_bytes = conflict_markers
-            .as_ref()
-            .and_then(|(_, markers)| markers.get(&path).cloned());
-        let content = match marker_bytes {
-            Some(marker_bytes) => marker_bytes,
-            None => graph_contents.remove(&path).flatten().ok_or_else(|| {
-                CheckpointError::Atomic(format!(
-                    "visible path '{path}' has no graph-derived content on view '{view}'"
-                ))
-            })?,
-        };
+    let hash_entry = |hasher: &mut blake3::Hasher, path: &str, content: &[u8]| {
         hasher.update(&(path.len() as u64).to_le_bytes());
         hasher.update(path.as_bytes());
         hasher.update(&(content.len() as u64).to_le_bytes());
-        hasher.update(&content);
+        hasher.update(content);
+    };
+    let mut next = 0usize;
+    let mut missing: Option<String> = None;
+    let streamed = repo.for_each_file_content_on_view(&graph_paths, view, |path, bytes| {
+        while paths.get(next).is_some_and(|pending| pending != path) {
+            let pending = &paths[next];
+            match marker_bytes(pending) {
+                Some(marker) => hash_entry(&mut hasher, pending, marker),
+                None => {
+                    missing = Some(pending.clone());
+                    return Err(atomic_repository::RepositoryError::InvalidOperation {
+                        message: format!("visible path '{pending}' has no content"),
+                    });
+                }
+            }
+            next += 1;
+        }
+        let Some(content) = bytes else {
+            missing = Some(path.to_string());
+            return Err(atomic_repository::RepositoryError::InvalidOperation {
+                message: format!("visible path '{path}' has no content"),
+            });
+        };
+        hash_entry(&mut hasher, path, &content);
+        next += 1;
+        Ok(())
+    });
+    if let Some(path) = missing {
+        return Err(CheckpointError::Atomic(format!(
+            "visible path '{path}' has no graph-derived content on view '{view}'"
+        )));
+    }
+    streamed.map_err(|error| CheckpointError::Atomic(error.to_string()))?;
+    while let Some(pending) = paths.get(next) {
+        match marker_bytes(pending) {
+            Some(marker) => hash_entry(&mut hasher, pending, marker),
+            None => {
+                return Err(CheckpointError::Atomic(format!(
+                    "visible path '{pending}' has no graph-derived content on view '{view}'"
+                )))
+            }
+        }
+        next += 1;
     }
 
     Ok(CheckpointAtomicState {
