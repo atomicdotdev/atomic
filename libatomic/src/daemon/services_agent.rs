@@ -1499,7 +1499,8 @@ impl vault_service_server::VaultService for VaultImpl {
                                     disk_path.display()
                                 )))
                             }
-                        }                        let mut frontmatter = Map::new();
+                        }
+                        let mut frontmatter = Map::new();
                         frontmatter.insert("uid".into(), Value::String(id));
                         frontmatter.insert("memoryKind".into(), Value::String(memory_kind));
                         frontmatter.insert("status".into(), Value::String(memory_status));
