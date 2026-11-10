@@ -5077,8 +5077,8 @@ fn prepare_name_resolution(
             &inode_graph_table,
             visibility,
             &external_hashes,
-
-            None,            path,
+            None,
+            path,
             side.inode,
             side.position,
         )

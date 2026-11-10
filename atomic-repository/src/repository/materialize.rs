@@ -456,13 +456,7 @@ pub(super) fn render_name_conflict_side<C: atomic_core::change::ChangeStore>(
     inode_graph_table: &redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
     visibility: &GraphVisibilityClosure,
     external_hashes: &std::collections::HashMap<NodeId, Hash>,
-    shared_spans: Option<
-        &super::content::SharedSpanContext<
-            '_,
-            atomic_core::pristine::ReadTxn,
-            C,
-        >,
-    >,
+    shared_spans: Option<&super::content::SharedSpanContext<'_, atomic_core::pristine::ReadTxn, C>>,
     path: &str,
     inode: Inode,
     position: Position<NodeId>,

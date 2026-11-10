@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
+use hyper_util::rt::TokioIo;
 use libatomic::atomic::{sandbox_service_client::SandboxServiceClient, MaterializeRequest};
 use libatomic::daemon::services_sandbox::SandboxImpl;
 use libatomic::daemon::state::DaemonState;
@@ -49,7 +50,6 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
-use hyper_util::rt::TokioIo;
 
 const CASES: &[&str] = &[
     "atomic_rpc_full",
@@ -97,15 +97,22 @@ impl Config {
                 "--keep-fixtures" => config.keep_fixtures = true,
                 "--output" => config.output = args.next().context("--output needs a path")?.into(),
                 "--files-east" => {
-                    config.files_east = args.next().context("--files-east needs a value")?.parse()?
+                    config.files_east =
+                        args.next().context("--files-east needs a value")?.parse()?
                 }
                 "--files-west" => {
-                    config.files_west = args.next().context("--files-west needs a value")?.parse()?
+                    config.files_west =
+                        args.next().context("--files-west needs a value")?.parse()?
                 }
-                "--lines" => config.lines = args.next().context("--lines needs a value")?.parse()?,
-                "--edits" => config.edits = args.next().context("--edits needs a value")?.parse()?,
+                "--lines" => {
+                    config.lines = args.next().context("--lines needs a value")?.parse()?
+                }
+                "--edits" => {
+                    config.edits = args.next().context("--edits needs a value")?.parse()?
+                }
                 "--iterations" => {
-                    config.iterations = args.next().context("--iterations needs a value")?.parse()?
+                    config.iterations =
+                        args.next().context("--iterations needs a value")?.parse()?
                 }
                 "--warmups" => {
                     config.warmups = args.next().context("--warmups needs a value")?.parse()?
@@ -119,10 +126,7 @@ impl Config {
 
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.files_east > 0
-                && self.files_west > 0
-                && self.lines >= 2
-                && self.iterations > 0,
+            self.files_east > 0 && self.files_west > 0 && self.lines >= 2 && self.iterations > 0,
             "file counts and iterations must be positive; lines must be at least two"
         );
         ensure!(
@@ -171,10 +175,7 @@ struct Golden {
 
 fn build_golden(config: &Config) -> Vec<Golden> {
     let mut golden = Vec::new();
-    for (tree, count) in [
-        ("east", config.files_east),
-        ("west", config.files_west),
-    ] {
+    for (tree, count) in [("east", config.files_east), ("west", config.files_west)] {
         for file in 0..count {
             golden.push(Golden {
                 path: format!("files/{tree}/file_{file:04}.txt"),
@@ -231,9 +232,7 @@ fn prepare_fixtures(
     parent: &Path,
     config: &Config,
 ) -> Result<(tempfile::TempDir, Vec<Golden>, PathBuf)> {
-    let directory = tempfile::Builder::new()
-        .prefix("agb")
-        .tempdir_in(parent)?;
+    let directory = tempfile::Builder::new().prefix("agb").tempdir_in(parent)?;
     let root = directory.path();
     let golden = build_golden(config);
 
@@ -305,7 +304,11 @@ fn prepare_fixtures(
     }
     git(&seed, &["init", "-q", "-b", "dev"], None)?;
     git(&seed, &["add", "-A"], None)?;
-    git(&seed, &["commit", "-q", "-m", "synthetic baseline"], Some(0))?;
+    git(
+        &seed,
+        &["commit", "-q", "-m", "synthetic baseline"],
+        Some(0),
+    )?;
     let seed_hot = seed.join("files/east/file_0000.txt");
     for edit in 0..config.edits {
         let line = (edit * 17) % config.lines;
@@ -316,7 +319,11 @@ fn prepare_fixtures(
         lines[line] = edited_line(line, edit + 1);
         fs::write(&seed_hot, lines.concat())?;
         git(&seed, &["add", "-A"], None)?;
-        git(&seed, &["commit", "-q", "-m", "synthetic hot-file edit"], Some(edit + 1))?;
+        git(
+            &seed,
+            &["commit", "-q", "-m", "synthetic hot-file edit"],
+            Some(edit + 1),
+        )?;
     }
     let bare = root.join("host-bare.git");
     git(
@@ -366,8 +373,8 @@ fn serve(
 ) -> Result<std::thread::JoinHandle<Result<()>>> {
     use libatomic::atomic::sandbox_service_server::SandboxServiceServer;
 
-    let std_listener = StdUnixListener::bind(&socket)
-        .with_context(|| format!("binding {}", socket.display()))?;
+    let std_listener =
+        StdUnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
     std_listener.set_nonblocking(true)?;
     // Fail fast if the repository cannot open; the server would otherwise
     // serve errors that look like client bugs. The registration also gives
@@ -423,63 +430,65 @@ fn atomic_sandbox(
     let mut phases = BTreeMap::new();
     let sandbox = sandbox.to_path_buf();
     let socket = socket.to_path_buf();
-    let (written, inner) = std::thread::spawn(move || -> Result<(usize, BTreeMap<String, u128>)> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(anyhow::Error::msg)?;
-        runtime.block_on(async move {
-            use tokio_stream::StreamExt;
-            let mut phases = BTreeMap::new();
-            let started = Instant::now();
-            let mut client = connect(&socket).await?;
-            phases.insert("connect".into(), started.elapsed().as_nanos());
-            let started = Instant::now();
-            let mut stream = client
-                .materialize(MaterializeRequest {
-                    repository: Some(repository),
-                    target: Some(target),
-                    path_prefix: prefix,
-                })
-                .await?
-                .into_inner();
-            phases.insert("request".into(), started.elapsed().as_nanos());
-            let started = Instant::now();
-            let mut written = 0usize;
-            loop {
-                let frame = stream
-                    .next()
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("materialize ended without its summary"))?
-                    .map_err(anyhow::Error::msg)?;
-                match frame.frame {
-                    Some(libatomic::atomic::materialize_frame::Frame::Entry(entry)) => {
-                        atomic_repository::write_sandbox_entry(
-                            &sandbox,
-                            &entry.path,
-                            sandbox_wire::tree_entry_kind(&entry).map_err(anyhow::Error::msg)?,
-                            entry.mode.unwrap_or(0o644),
-                            entry.inline.as_deref().unwrap_or_default(),
-                        )?;
-                        written += 1;
+    let (written, inner) =
+        std::thread::spawn(move || -> Result<(usize, BTreeMap<String, u128>)> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(anyhow::Error::msg)?;
+            runtime.block_on(async move {
+                use tokio_stream::StreamExt;
+                let mut phases = BTreeMap::new();
+                let started = Instant::now();
+                let mut client = connect(&socket).await?;
+                phases.insert("connect".into(), started.elapsed().as_nanos());
+                let started = Instant::now();
+                let mut stream = client
+                    .materialize(MaterializeRequest {
+                        repository: Some(repository),
+                        target: Some(target),
+                        path_prefix: prefix,
+                    })
+                    .await?
+                    .into_inner();
+                phases.insert("request".into(), started.elapsed().as_nanos());
+                let started = Instant::now();
+                let mut written = 0usize;
+                loop {
+                    let frame = stream
+                        .next()
+                        .await
+                        .ok_or_else(|| anyhow::anyhow!("materialize ended without its summary"))?
+                        .map_err(anyhow::Error::msg)?;
+                    match frame.frame {
+                        Some(libatomic::atomic::materialize_frame::Frame::Entry(entry)) => {
+                            atomic_repository::write_sandbox_entry(
+                                &sandbox,
+                                &entry.path,
+                                sandbox_wire::tree_entry_kind(&entry)
+                                    .map_err(anyhow::Error::msg)?,
+                                entry.mode.unwrap_or(0o644),
+                                entry.inline.as_deref().unwrap_or_default(),
+                            )?;
+                            written += 1;
+                        }
+                        Some(libatomic::atomic::materialize_frame::Frame::Done(done)) => {
+                            ensure!(
+                                done.entries as usize == written,
+                                "the server sent {written} entries but said {}",
+                                done.entries
+                            );
+                            break;
+                        }
+                        None => bail!("an empty materialize frame"),
                     }
-                    Some(libatomic::atomic::materialize_frame::Frame::Done(done)) => {
-                        ensure!(
-                            done.entries as usize == written,
-                            "the server sent {written} entries but said {}",
-                            done.entries
-                        );
-                        break;
-                    }
-                    None => bail!("an empty materialize frame"),
                 }
-            }
-            phases.insert("stream_and_write".into(), started.elapsed().as_nanos());
-            Ok((written, phases))
+                phases.insert("stream_and_write".into(), started.elapsed().as_nanos());
+                Ok((written, phases))
+            })
         })
-    })
-    .join()
-    .map_err(|_| anyhow::anyhow!("client thread panicked"))??;
+        .join()
+        .map_err(|_| anyhow::anyhow!("client thread panicked"))??;
     phases.extend(inner);
     Ok((phases, written))
 }

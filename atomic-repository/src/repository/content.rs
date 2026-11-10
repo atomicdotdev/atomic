@@ -1116,11 +1116,7 @@ where
         + atomic_core::pristine::CapabilityTxnT,
     C: atomic_core::change::ChangeStore,
 {
-    pub(super) fn new(
-        txn: &'a T,
-        store: &'a C,
-        visibility: &'a GraphVisibilityClosure,
-    ) -> Self {
+    pub(super) fn new(txn: &'a T, store: &'a C, visibility: &'a GraphVisibilityClosure) -> Self {
         Self {
             txn,
             store,
