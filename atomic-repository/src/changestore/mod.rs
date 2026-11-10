@@ -122,6 +122,12 @@ pub struct ChangeStore {
     /// concurrent read access while ensuring exclusive write access.
     pub(crate) cache: RwLock<LruCache<Hash, Change>>,
 
+    /// Parsed, hash-verified changes keyed by hash. Change files are
+    /// content-addressed and write-once, so a verified parse is immutable
+    /// for this handle's lifetime; re-parsing an 11 MB baseline per rendered
+    /// file is the dominant cost of span rendering.
+    pub(crate) verified_cache: RwLock<LruCache<Hash, VerifiedChange>>,
+
     /// Content spans held without their change files — a remote sandbox's
     /// cache has the bytes of the vertices it was sent, never whole changes.
     /// Consulted before the change files.
@@ -215,6 +221,7 @@ impl ChangeStore {
         Ok(Self {
             changes_dir,
             cache: RwLock::new(LruCache::new(cache_capacity)),
+            verified_cache: RwLock::new(LruCache::new(cache_capacity)),
             spans: RwLock::new(SpanOverlay::default()),
         })
     }
@@ -230,6 +237,7 @@ impl ChangeStore {
         Ok(Self {
             changes_dir,
             cache: RwLock::new(LruCache::new(cache_capacity)),
+            verified_cache: RwLock::new(LruCache::new(cache_capacity)),
             spans: RwLock::new(SpanOverlay::default()),
         })
     }
@@ -453,6 +461,13 @@ impl ChangeStore {
         hash: &Hash,
         cached: Option<&VerifiedChange>,
     ) -> ChangeStoreResult<VerifiedChange> {
+        if cached.is_none() {
+            if let Ok(cache) = self.verified_cache.read() {
+                if let Some(verified) = cache.peek(hash) {
+                    return Ok(verified.clone());
+                }
+            }
+        }
         let bytes = fs::read(self.change_path(hash)).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 ChangeStoreError::NotFound {
@@ -471,6 +486,11 @@ impl ChangeStore {
                 expected: hash.to_base32(),
                 computed: verified.hash().to_base32(),
             });
+        }
+        if cached.is_none() {
+            if let Ok(mut cache) = self.verified_cache.write() {
+                cache.insert(*hash, verified.clone());
+            }
         }
         Ok(verified)
     }

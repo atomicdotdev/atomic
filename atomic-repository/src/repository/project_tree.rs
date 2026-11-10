@@ -1229,6 +1229,7 @@ impl Repository {
             )));
         }
         let mut entries = Vec::new();
+        let spans = super::content::SharedSpanContext::new(&txn, &self.change_store, &closure);
         for item in projection
             .present
             .values()
@@ -1261,13 +1262,9 @@ impl Repository {
                 )));
             }
             let materialization = attrs.materialization;
-            let bytes = match super::content::retrieve_span_if_present(
-                &txn,
-                &self.change_store,
-                item.inode,
-                &closure,
-            )
-            .map_err(ProjectTreeError::from)?
+            let bytes = match spans
+                .render_if_present(item.inode)
+                .map_err(ProjectTreeError::from)?
             {
                 Some(content) => content,
                 None => super::content::retrieve_content_with_filter_fast(
@@ -1445,6 +1442,7 @@ impl Repository {
         }
         let mut entries = Vec::new();
         let mut projected_paths = std::collections::BTreeSet::new();
+        let spans = super::content::SharedSpanContext::new(txn, &self.change_store, &closure);
         for item in projection
             .present
             .values()
@@ -1468,13 +1466,9 @@ impl Repository {
             let materialization = attrs.materialization;
             let bytes = match marker_bytes.get(item.path.as_str()) {
                 Some(override_bytes) => override_bytes.clone(),
-                None => match super::content::retrieve_span_if_present(
-                    txn,
-                    &self.change_store,
-                    item.inode,
-                    &closure,
-                )
-                .map_err(ProjectTreeError::from)?
+                None => match spans
+                    .render_if_present(item.inode)
+                    .map_err(ProjectTreeError::from)?
                 {
                     Some(content) => content,
                     None => super::content::retrieve_content_with_filter_fast(
