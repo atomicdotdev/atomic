@@ -75,36 +75,6 @@ favors spans. Database sizes are post-sample, uncompacted sizes, not a storage
 efficiency measurement. Errors and incomplete/duplicate samples fail the run;
 they are not passes. Fixtures are disposable; `--keep-fixtures` retains them.
 
-## Git working-copy baseline
-
-`git_baseline.py` times Git doing the closest ordinary operation to a full
-materialization, on a disposable Git repository built with the **same
-synthetic content and edit count** as the atomic fixture (same file names,
-line values, hot-file edit sequence, and one commit per edit):
-
-```sh
-python3 -B tools/materialize-bench/git_baseline.py --profile many-files \
-  --output /approved/scratch/git-01
-```
-
-Cases: `checkout_full_noop` and `checkout_full_missing` (remove every
-generated file, then `git checkout -- .`). Bytes, modes and a clean
-`git status --porcelain` are verified after every sample outside timing.
-
-Boundary honesty for comparisons against a `materialize_bench` report from the
-same machine and profile:
-
-- Git checkout restores from the **index**; it never touches pack files or
-  history. The Git analog of reading history is clone/fetch, which this
-  harness deliberately does not time.
-- `total_ns` includes subprocess spawn overhead; atomic samples measure an
-  in-process API. Treat a few milliseconds as measurement overhead.
-- Files Git considers unchanged are skipped by stat, so noop cases measure
-  Git's fast path, just as atomic's lease observation is its fast path.
-- Reports are only comparable pairwise, same machine, same profile, close in
-  time; OS caches and system load remain uncontrolled. Ratios within one
-  report (partial against full) are more trustworthy than cross-tool ratios.
-
 ## Agent-sandbox sync benchmark
 
 `run_agent_sandbox.py` builds and drives
