@@ -344,26 +344,71 @@ fn observe_atomic_on_handle(
         .map_err(|error| CheckpointError::Atomic(error.to_string()))?
         .map(|(object, markers)| (object.hash().ok(), markers));
 
+    // Paths with marker bytes never consult the graph. Every other path is
+    // streamed from one read (one projection, one span context) in the same
+    // sorted order, and hashed as it arrives so only one file is held at a
+    // time; marker paths are hashed from their marker bytes in between.
+    let marker_bytes = |path: &str| -> Option<&[u8]> {
+        conflict_markers
+            .as_ref()
+            .and_then(|(_, markers)| markers.get(path))
+            .map(Vec::as_slice)
+    };
+    let graph_paths: Vec<String> = paths
+        .iter()
+        .filter(|path| marker_bytes(path).is_none())
+        .cloned()
+        .collect();
     let mut hasher = blake3::Hasher::new();
     hasher.update(ATOMIC_MANIFEST_DOMAIN);
-    for path in paths {
-        let content = match &conflict_markers {
-            Some((_, markers)) if markers.contains_key(&path) => {
-                markers.get(&path).cloned().expect("marker bytes")
-            }
-            _ => repo
-                .get_file_content_on_view(&path, view)
-                .map_err(|error| CheckpointError::Atomic(error.to_string()))?
-                .ok_or_else(|| {
-                    CheckpointError::Atomic(format!(
-                        "visible path '{path}' has no graph-derived content on view '{view}'"
-                    ))
-                })?,
-        };
+    let hash_entry = |hasher: &mut blake3::Hasher, path: &str, content: &[u8]| {
         hasher.update(&(path.len() as u64).to_le_bytes());
         hasher.update(path.as_bytes());
         hasher.update(&(content.len() as u64).to_le_bytes());
-        hasher.update(&content);
+        hasher.update(content);
+    };
+    let mut next = 0usize;
+    let mut missing: Option<String> = None;
+    let streamed = repo.for_each_file_content_on_view(&graph_paths, view, |path, bytes| {
+        while paths.get(next).is_some_and(|pending| pending != path) {
+            let pending = &paths[next];
+            match marker_bytes(pending) {
+                Some(marker) => hash_entry(&mut hasher, pending, marker),
+                None => {
+                    missing = Some(pending.clone());
+                    return Err(atomic_repository::RepositoryError::InvalidOperation {
+                        message: format!("visible path '{pending}' has no content"),
+                    });
+                }
+            }
+            next += 1;
+        }
+        let Some(content) = bytes else {
+            missing = Some(path.to_string());
+            return Err(atomic_repository::RepositoryError::InvalidOperation {
+                message: format!("visible path '{path}' has no content"),
+            });
+        };
+        hash_entry(&mut hasher, path, &content);
+        next += 1;
+        Ok(())
+    });
+    if let Some(path) = missing {
+        return Err(CheckpointError::Atomic(format!(
+            "visible path '{path}' has no graph-derived content on view '{view}'"
+        )));
+    }
+    streamed.map_err(|error| CheckpointError::Atomic(error.to_string()))?;
+    while let Some(pending) = paths.get(next) {
+        match marker_bytes(pending) {
+            Some(marker) => hash_entry(&mut hasher, pending, marker),
+            None => {
+                return Err(CheckpointError::Atomic(format!(
+                    "visible path '{pending}' has no graph-derived content on view '{view}'"
+                )))
+            }
+        }
+        next += 1;
     }
 
     Ok(CheckpointAtomicState {

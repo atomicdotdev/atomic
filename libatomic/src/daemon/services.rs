@@ -2043,6 +2043,34 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                          name paths explicitly or pass force",
                 ));
             }
+            // One projection decides which Modified/Deleted paths the view
+            // still records; rendering every file here only to discard the
+            // bytes would decode the view's history once per file. A
+            // projection error therefore fails the request before any path is
+            // untracked, and a render error now surfaces from materialization
+            // (which plans before it writes). The walk below keeps status
+            // order, so untracking and a name-conflict failure happen at the
+            // same position as before.
+            let content_paths: Vec<String> = dirty
+                .iter()
+                .filter(|(_, file_status)| {
+                    *file_status != atomic_repository::status::FileStatus::Added
+                })
+                .map(|(path, _)| path.clone())
+                .collect();
+            let presence: std::collections::HashMap<String, atomic_repository::RecordedPresence> =
+                if content_paths.is_empty() {
+                    Default::default()
+                } else {
+                    content_paths
+                        .iter()
+                        .cloned()
+                        .zip(
+                            repo.recorded_presence_on_view(&content_paths, repo.current_view())
+                                .map_err(repository_error)?,
+                        )
+                        .collect()
+                };
             let mut restored: Vec<String> = Vec::new();
             let mut materialize = std::collections::HashSet::new();
             for (path, file_status) in dirty {
@@ -2058,16 +2086,26 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         restored.push(path);
                     }
                     // Modified/Deleted: pristine content back to disk.
-                    _ => {
-                        let content = repo
-                            .get_file_content(std::path::Path::new(&path))
-                            .map_err(repository_error)?;
-                        if content.is_some() {
+                    _ => match presence.get(&path) {
+                        Some(atomic_repository::RecordedPresence::Present) => {
                             materialize.insert(path.clone());
                             restored.push(path);
                         }
                         // No pristine content: skip (nothing safe to do).
-                    }
+                        Some(atomic_repository::RecordedPresence::Absent) | None => {}
+                        Some(atomic_repository::RecordedPresence::NameConflict {
+                            paths,
+                            claimants,
+                        }) => {
+                            return Err(repository_error(atomic_repository::name_conflict_error(
+                                &atomic_repository::tracking::normalize_path(std::path::Path::new(
+                                    &path,
+                                )),
+                                *paths,
+                                *claimants,
+                            )));
+                        }
+                    },
                 }
             }
             if !materialize.is_empty() {
