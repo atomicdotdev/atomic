@@ -709,6 +709,7 @@ mod tests {
             warmups: 0,
             allow_debug: true,
             keep_fixtures: false,
+            span: true,
         })
         .unwrap();
         let report: serde_json::Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();

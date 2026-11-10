@@ -435,6 +435,7 @@ pub(super) fn render_name_conflict<C: atomic_core::change::ChangeStore>(
             inode_graph_table,
             visibility,
             external_hashes,
+            None,
             path,
             *inode,
             *position,
@@ -455,13 +456,25 @@ pub(super) fn render_name_conflict_side<C: atomic_core::change::ChangeStore>(
     inode_graph_table: &redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
     visibility: &GraphVisibilityClosure,
     external_hashes: &std::collections::HashMap<NodeId, Hash>,
+    shared_spans: Option<
+        &super::content::SharedSpanContext<
+            '_,
+            atomic_core::pristine::ReadTxn,
+            C,
+        >,
+    >,
     path: &str,
     inode: Inode,
     position: Position<NodeId>,
 ) -> Result<Vec<u8>, String> {
-    if let Some(bytes) = super::content::retrieve_span_if_present(txn, store, inode, visibility)
-        .map_err(|error| format!("{path}: span: {error}"))?
-    {
+    let span_bytes = match shared_spans {
+        Some(shared) => shared
+            .render_if_present(inode)
+            .map_err(|error| format!("{path}: span: {error}"))?,
+        None => super::content::retrieve_span_if_present(txn, store, inode, visibility)
+            .map_err(|error| format!("{path}: span: {error}"))?,
+    };
+    if let Some(bytes) = span_bytes {
         return Ok(bytes);
     }
     use atomic_core::output::repo::{
@@ -597,6 +610,7 @@ fn prepare_name_conflict_output<C: atomic_core::change::ChangeStore>(
                 inode_graph_table,
                 visibility,
                 external_hashes,
+                None,
                 &path,
                 side.inode,
                 side.position,
@@ -755,6 +769,7 @@ impl Repository {
                     &inode_graph_table,
                     &visibility,
                     &external_hashes,
+                    None,
                     path,
                     item.inode,
                     item.position,
@@ -2589,6 +2604,11 @@ impl Repository {
         // Preserve the streaming client's mkdir-before-file contract.
         paths.sort_by(|a, b| is_directory(b).cmp(&is_directory(a)).then_with(|| a.cmp(b)));
         let filter = crate::content_filter::GitAttributesFilter::for_repository(&self.root);
+        // One span context per walk: per-file contexts each decode and
+        // verify the whole visible closure, which on a large span-backed
+        // view costs more than the render itself.
+        let shared_spans =
+            super::content::SharedSpanContext::new(&txn, &self.change_store, &visibility);
         for chunk in paths.chunks(256) {
             let rendered: Vec<Result<ViewEntry, RepositoryError>> = chunk
                 .par_iter()
@@ -2625,6 +2645,7 @@ impl Repository {
                             &table,
                             &visibility,
                             &hashes,
+                            Some(&shared_spans),
                             path,
                             item.inode,
                             item.position,

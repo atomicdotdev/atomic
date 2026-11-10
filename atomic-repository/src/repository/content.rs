@@ -928,6 +928,82 @@ where
         .map_err(|error| RepositoryError::Database(error.to_string()))
 }
 
+/// One span render context shared by every file read through a single
+/// transaction and visibility closure. `retrieve_span_if_present` builds a
+/// fresh context per call — which decodes and verifies the whole visible
+/// closure — so a per-file caller on a large view pays the closure decode
+/// thousands of times; holders of this struct pay it once. Safe to share
+/// across rayon workers: first use builds, the rest reuse.
+pub(super) struct SharedSpanContext<'a, T, C>
+where
+    T: atomic_core::pristine::span_patch_storage::SpanPatchReadTxn
+        + atomic_core::pristine::TreeTxnT
+        + atomic_core::pristine::CapabilityTxnT,
+    C: atomic_core::change::ChangeStore,
+{
+    txn: &'a T,
+    store: &'a C,
+    visibility: &'a GraphVisibilityClosure,
+    context: std::sync::OnceLock<
+        Option<atomic_core::pristine::span_patch_storage::SpanRenderContext<'a, T>>,
+    >,
+}
+
+impl<'a, T, C> SharedSpanContext<'a, T, C>
+where
+    T: atomic_core::pristine::span_patch_storage::SpanPatchReadTxn
+        + atomic_core::pristine::TreeTxnT
+        + atomic_core::pristine::CapabilityTxnT
+        + Sync,
+    C: atomic_core::change::ChangeStore + Sync,
+{
+    pub(super) fn new(
+        txn: &'a T,
+        store: &'a C,
+        visibility: &'a GraphVisibilityClosure,
+    ) -> Self {
+        Self {
+            txn,
+            store,
+            visibility,
+            context: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Render `inode` through the shared context when its span root is
+    /// visible; `None` means the file is graph-origin and must be read from
+    /// the graph.
+    pub(super) fn render_if_present(
+        &self,
+        inode: Inode,
+    ) -> Result<Option<Vec<u8>>, RepositoryError> {
+        if !has_visible_span_root(self.txn, self.store, inode, self.visibility)? {
+            return Ok(None);
+        }
+        let context = self
+            .context
+            .get_or_init(|| {
+                atomic_core::pristine::span_patch_storage::SpanRenderContext::new(
+                    self.txn,
+                    self.store,
+                    self.visibility,
+                )
+                .ok()
+            })
+            .as_ref();
+        match context {
+            Some(context) => context
+                .render(inode)
+                .map(Some)
+                .map_err(|error| RepositoryError::Database(error.to_string())),
+            // The closure could not be decoded this once; without a span
+            // context this file must be read from the graph like any other
+            // graph-origin path.
+            None => Ok(None),
+        }
+    }
+}
+
 pub(super) fn retrieve_span_bounded_if_present<T, C>(
     txn: &T,
     store: &C,

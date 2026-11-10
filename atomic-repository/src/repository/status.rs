@@ -507,7 +507,8 @@ impl Repository {
                     &inode_graph_table,
                     &visibility,
                     &external_hashes,
-                    &item.path,
+
+                    None,                    &item.path,
                     item.inode,
                     item.position,
                 )
