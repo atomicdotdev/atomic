@@ -68,6 +68,15 @@ The old per-repository `atomic agent database-owner` command, its
 have been removed from the current CLI. Processes started by an older binary
 can still be running after an upgrade. Stop them using the steps below.
 
+The official installer keeps complete native releases in separate versioned
+directories and exposes `atomic` through a command symlink. Its installation
+record keeps that command's absolute path in `install_path` and the complete
+native release directory in `runtime_dir`. `atomic update` verifies that the
+recorded command still resolves to the running executable, then preserves the
+original command directory in its upgrade instructions instead of targeting the
+immutable release directory. Restart editors to adopt a newly registered runtime;
+do not remove an older release while a process still uses its library.
+
 ### Upgrading from legacy database owners (0.19.1 and earlier)
 
 Replacing the executable does not stop existing processes. Before upgrading,

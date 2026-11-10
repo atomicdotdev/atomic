@@ -181,7 +181,8 @@ fn manifest_path(env: &dyn EnvLookup) -> PathBuf {
 /// Determine the install source for a binary at `current_exe`.
 ///
 /// Manifest is consulted first under the trust gate (canonicalized path
-/// must match current_exe). Path heuristics provide the fallback.
+/// must match current_exe). Preserve its command path for upgrade guidance,
+/// rather than installing into a versioned symlink target.
 pub fn detect_source(current_exe: &Path, env: &dyn EnvLookup) -> InstallSource {
     let canonical_exe =
         std::fs::canonicalize(current_exe).unwrap_or_else(|_| current_exe.to_path_buf());
@@ -193,11 +194,11 @@ pub fn detect_source(current_exe: &Path, env: &dyn EnvLookup) -> InstallSource {
     if let Ok(raw) = std::fs::read_to_string(&manifest_p) {
         if let Ok(m) = serde_json::from_str::<Manifest>(&raw) {
             if m.schema_version == 1 && m.source == "official-installer" {
-                let recorded = std::fs::canonicalize(&m.install_path).unwrap_or(m.install_path);
-                if recorded == canonical_exe {
+                let recorded = std::fs::canonicalize(&m.install_path);
+                if recorded.as_deref().unwrap_or(&m.install_path) == canonical_exe {
                     return InstallSource::OfficialInstaller {
                         manifest_path: manifest_p,
-                        recorded_install_path: recorded,
+                        recorded_install_path: m.install_path,
                         recorded_version: m.version,
                     };
                 }
@@ -671,6 +672,45 @@ mod tests {
             }
             other => panic!("expected OfficialInstaller, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_source_preserves_command_symlink_for_versioned_install() {
+        let state = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
+        let command_dir = root.path().join("commands with spaces");
+        let release_dir = command_dir.join(".atomic-runtime/v0.21.0-test");
+        fs::create_dir_all(&release_dir).unwrap();
+        let executable = release_dir.join("atomic");
+        let command = command_dir.join("atomic");
+        fs::write(&executable, b"executable").unwrap();
+        std::os::unix::fs::symlink(&executable, &command).unwrap();
+        write_manifest(state.path(), &command, "0.21.0", 1);
+        let env = MockEnv::new().set("XDG_STATE_HOME", state.path().to_str().unwrap());
+
+        let source = detect_source(&executable, &env);
+        let InstallSource::OfficialInstaller {
+            recorded_install_path,
+            ..
+        } = &source
+        else {
+            panic!("expected official installer for a matching command symlink");
+        };
+        assert_eq!(recorded_install_path, &command);
+        let message = format_upgrade_message(&source, "0.21.0", "0.22.0", None, &env);
+        let upgrade = message
+            .lines()
+            .find(|line| line.trim_start().starts_with("curl "))
+            .unwrap();
+        assert!(upgrade.contains(&format!("ATOMIC_INSTALL='{}' sh", command_dir.display())));
+        assert!(!upgrade.contains(".atomic-runtime"));
+
+        let unrelated = root.path().join("unrelated-atomic");
+        fs::write(&unrelated, b"other executable").unwrap();
+        fs::remove_file(&command).unwrap();
+        std::os::unix::fs::symlink(&unrelated, &command).unwrap();
+        assert_eq!(detect_source(&executable, &env), InstallSource::Manual);
     }
 
     #[test]
