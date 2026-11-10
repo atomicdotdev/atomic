@@ -46,7 +46,8 @@ struct Report {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    use data_encoding::HEXLOWER;
+    HEXLOWER.encode(&Sha256::digest(bytes))
 }
 
 fn verify_files(root: &Path, files: &[ExpectedFile]) -> Result<()> {
