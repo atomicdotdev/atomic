@@ -28,6 +28,7 @@ const CASES: &[&str] = &[
     "switch_one_back",
     "switch_many_forward",
     "switch_many_back",
+    "switch_from_empty",
 ];
 
 /// Zero-based fixture index of a generated `files/file_NNNN.txt` path.
@@ -229,6 +230,16 @@ impl Fixture {
         golden.insert("dev".into(), capture(&contents)?);
         repo.create_view_from("bench-near", "dev")?;
         repo.create_view_from("bench-far", "dev")?;
+        // A view where every tracked file is absent: the far end of the
+        // switch spectrum (the existing near/far views differ by lines).
+        repo.create_view_from("bench-empty", "dev")?;
+        repo.switch_view(wc, "bench-empty")?;
+        for file in &golden["dev"] {
+            fs::remove_file(root.join(&file.path))?;
+        }
+        record(&repo, "synthetic empty view", &mut tick)?;
+        repo.switch_view(wc, "dev")?;
+        repo.materialize(wc)?;
         repo.switch_view(wc, "bench-near")?;
         let mut near = contents.clone();
         near[0][0] = "near view: one changed line\n".into();
@@ -419,6 +430,13 @@ fn sample(fixture: &mut Fixture, case: &str, iteration: usize) -> Result<Sample>
     }
     if case == "render_reopened" {
         drop(fixture.repo.take());
+    }
+    if case == "switch_from_empty" {
+        // Untimed setup: rest on the empty view so the timed switch carries
+        // the full materialization — every tracked file rendered and written,
+        // nothing deleted. Pure materialize work, no revert machinery.
+        let repo = fixture.repo.as_mut().unwrap();
+        repo.switch_view(repo.require_working_copy_id()?, "bench-empty")?;
     }
     // Partial path sets are cloned outside the timed region.
     let partial_paths = fixture.partial_paths.clone();
