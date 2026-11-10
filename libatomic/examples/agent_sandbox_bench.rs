@@ -67,6 +67,7 @@ struct Config {
     warmups: usize,
     allow_debug: bool,
     keep_fixtures: bool,
+    span: bool,
 }
 
 impl Config {
@@ -81,11 +82,13 @@ impl Config {
             warmups: 1,
             allow_debug: false,
             keep_fixtures: false,
+            span: false,
         };
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--allow-debug" => config.allow_debug = true,
+                "--span" => config.span = true,
                 "--keep-fixtures" => config.keep_fixtures = true,
                 "--output" => config.output = args.next().context("--output needs a path")?.into(),
                 "--files-east" => {
@@ -232,6 +235,12 @@ fn prepare_fixtures(
     // Atomic host repository. Writes happen through the ordinary record path
     // so the served graph is a real repository, not a canned fixture.
     let repo = atomic_repository::Repository::init(root.join("host"))?;
+    if config.span {
+        use atomic_core::pristine::{CapabilityMutTxnT, MutTxnT, SPAN_RANGE_CAPABILITY};
+        let mut txn = repo.pristine().write_txn()?;
+        txn.put_required_capability(SPAN_RANGE_CAPABILITY)?;
+        txn.commit()?;
+    }
     fs::create_dir_all(root.join("host/files/east"))?;
     fs::create_dir_all(root.join("host/files/west"))?;
     for file in &golden {
