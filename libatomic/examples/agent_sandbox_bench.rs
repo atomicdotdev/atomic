@@ -13,6 +13,10 @@
 //!   directories may be streamed.
 //! - `git_clone_full` — `git clone` of a bare repository over the `file://`
 //!   wire transport.
+//! - `atomic_sandbox_cow` — `Repository::provision_sandbox`, the local
+//!   copy-on-write clone an agent gets on a machine that already holds the
+//!   repository (reflink where the filesystem supports it). No wire, no
+//!   RPC: the instant-workspace path.
 //!
 //! The atomic side exercises the real transport end to end: a fresh channel
 //! per sample (a sandbox never reuses a connection), the generated client,
@@ -50,6 +54,7 @@ use hyper_util::rt::TokioIo;
 const CASES: &[&str] = &[
     "atomic_rpc_full",
     "atomic_rpc_partial",
+    "atomic_sandbox_cow",
     "git_clone_full",
 ];
 
@@ -590,7 +595,7 @@ fn run(config: Config) -> Result<()> {
     let handle = state.register(host_root.clone());
     let repository = handle.repository_ref().repository_id;
     handle.repository()?; // fail fast; the server would serve errors otherwise
-    let server = serve(state, host_root, socket.clone())?;
+    let server = serve(state, host_root.clone(), socket.clone())?;
     let east = east_paths(&config);
     let east_bytes: usize = golden
         .iter()
@@ -604,29 +609,44 @@ fn run(config: Config) -> Result<()> {
             for case in CASES {
                 let partial = case.contains("partial");
                 let sandbox = fixtures.path().join(format!("sandbox-{case}-{iteration}"));
+                // Store open is setup, not measured: the COW clone is the
+                // operation under test.
+                let cow_repo = (*case == "atomic_sandbox_cow").then(|| {
+                    atomic_repository::Repository::open_existing_wait(
+                        &host_root,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .expect("open host repository")
+                });
                 let started = Instant::now();
-                let (phases, entries) = if case.starts_with("atomic") {
-                    let target = libatomic::atomic::ViewRef {
-                        view_id: Vec::new(),
-                        name: Some("dev".into()),
-                    };
-                    let reference = libatomic::atomic::RepositoryRef {
-                        authority: "local".into(),
-                        repository_id: repository.clone(),
-                        workspace_id: None,
-                    };
-                    let (phases, entries) = atomic_sandbox(
-                        &socket,
-                        reference,
-                        target,
-                        partial.then(|| PARTIAL_PREFIX.to_string()),
-                        &sandbox,
-                    )?;
-                    (phases, Some(entries))
-                } else if *case == "git_clone_full" {
-                    (git_clone_full(&bare, &sandbox)?, None)
-                } else {
-                    bail!("unknown case: {case}")
+                let (phases, entries) = match *case {
+                    "atomic_rpc_full" | "atomic_rpc_partial" => {
+                        let target = libatomic::atomic::ViewRef {
+                            view_id: Vec::new(),
+                            name: Some("dev".into()),
+                        };
+                        let reference = libatomic::atomic::RepositoryRef {
+                            authority: "local".into(),
+                            repository_id: repository.clone(),
+                            workspace_id: None,
+                        };
+                        let (phases, entries) = atomic_sandbox(
+                            &socket,
+                            reference,
+                            target,
+                            partial.then(|| PARTIAL_PREFIX.to_string()),
+                            &sandbox,
+                        )?;
+                        (phases, Some(entries))
+                    }
+                    "atomic_sandbox_cow" => {
+                        let repo = cow_repo.as_ref().unwrap();
+                        let wc = repo.require_working_copy_id()?;
+                        let written = repo.provision_sandbox(wc, &sandbox, "dev")?;
+                        (BTreeMap::new(), Some(written))
+                    }
+                    "git_clone_full" => (git_clone_full(&bare, &sandbox)?, None),
+                    _ => bail!("unknown case: {case}"),
                 };
                 let total_ns = started.elapsed().as_nanos();
                 // Byte verification is never timed.

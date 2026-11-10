@@ -29,7 +29,7 @@ PROFILES = {
     'many-files': dict(files_east=8, files_west=16, lines=128, edits=24),
     'hot-file': dict(files_east=1, files_west=16, lines=4096, edits=48),
 }
-CASES = ('atomic_rpc_full', 'atomic_rpc_partial', 'git_clone_full')
+CASES = ('atomic_rpc_full', 'atomic_rpc_partial', 'atomic_sandbox_cow', 'git_clone_full')
 
 
 def validate_report(report, iterations):
