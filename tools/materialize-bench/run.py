@@ -20,6 +20,7 @@ PROFILES = {
     'hot-file': dict(files=1, lines=4096, edits=48),
 }
 CASES = ('render_session', 'render_reopened', 'materialize_noop', 'materialize_missing',
+         'materialize_paths_noop', 'materialize_paths_missing', 'materialize_prefix_missing',
          'switch_one_forward', 'switch_one_back', 'switch_many_forward', 'switch_many_back')
 
 

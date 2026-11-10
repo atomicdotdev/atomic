@@ -20,7 +20,7 @@ class RunnerTests(unittest.TestCase):
         report = self.report()
         runner.validate_report(report, 3)
         summary = runner.summarize(report)
-        self.assertEqual(len(summary), 8)
+        self.assertEqual(len(summary), len(runner.CASES))
         for row in summary:
             self.assertEqual(row['graph_over_span_median'], 2)
             self.assertEqual(row['graph']['n'], 3)

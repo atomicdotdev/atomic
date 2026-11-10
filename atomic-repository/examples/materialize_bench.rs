@@ -21,11 +21,19 @@ const CASES: &[&str] = &[
     "render_reopened",
     "materialize_noop",
     "materialize_missing",
+    "materialize_paths_noop",
+    "materialize_paths_missing",
+    "materialize_prefix_missing",
     "switch_one_forward",
     "switch_one_back",
     "switch_many_forward",
     "switch_many_back",
 ];
+
+/// Zero-based fixture index of a generated `files/file_NNNN.txt` path.
+fn fixture_file_index(path: &str) -> Option<usize> {
+    path.strip_prefix("files/file_")?.get(..4)?.parse().ok()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Config {
@@ -151,6 +159,13 @@ struct Fixture {
     repo: Option<Repository>,
     backend: &'static str,
     golden: BTreeMap<String, Vec<Golden>>,
+    /// Every third generated file (including the edited hot file); the
+    /// `materialize_paths_*` partial subset.
+    partial_paths: std::collections::HashSet<String>,
+    /// Filename prefix selecting the first ten generated files; the
+    /// `materialize_prefix_missing` subset.
+    prefix: String,
+    prefix_paths: std::collections::BTreeSet<String>,
     setup_ns: u128,
 }
 
@@ -240,11 +255,39 @@ impl Fixture {
             "fixture indexes unhealthy: {:?}",
             healthy.problems
         );
+        let partial_paths: std::collections::HashSet<String> = golden["dev"]
+            .iter()
+            .filter_map(|file| {
+                fixture_file_index(&file.path)
+                    .filter(|index| index % 3 == 0)
+                    .map(|_| file.path.clone())
+            })
+            .collect();
+        ensure!(
+            !partial_paths.is_empty() && partial_paths.len() < golden["dev"].len(),
+            "degenerate partial path subset"
+        );
+        let prefix = "files/file_000".to_string();
+        let prefix_paths: std::collections::BTreeSet<String> = golden["dev"]
+            .iter()
+            .filter_map(|file| {
+                fixture_file_index(&file.path)
+                    .filter(|index| *index < 10)
+                    .map(|_| file.path.clone())
+            })
+            .collect();
+        ensure!(
+            !prefix_paths.is_empty() && prefix_paths.len() < golden["dev"].len(),
+            "degenerate prefix subset"
+        );
         let fixture = Self {
             directory,
             repo: Some(repo),
             backend: if span { "span" } else { "graph" },
             golden,
+            partial_paths,
+            prefix,
+            prefix_paths,
             setup_ns: started.elapsed().as_nanos(),
         };
         fixture.verify("dev")?;
@@ -362,9 +405,24 @@ fn sample(fixture: &mut Fixture, case: &str, iteration: usize) -> Result<Sample>
             fs::remove_file(fixture.directory.path().join(&file.path))?;
         }
     }
+    if case == "materialize_paths_missing" || case == "materialize_prefix_missing" {
+        // Partial analog of materialize_missing: remove only the subset the
+        // partial call is expected to restore.
+        let subset: Vec<&String> = if case == "materialize_paths_missing" {
+            fixture.partial_paths.iter().collect()
+        } else {
+            fixture.prefix_paths.iter().collect()
+        };
+        for path in subset {
+            fs::remove_file(fixture.directory.path().join(path))?;
+        }
+    }
     if case == "render_reopened" {
         drop(fixture.repo.take());
     }
+    // Partial path sets are cloned outside the timed region.
+    let partial_paths = fixture.partial_paths.clone();
+    let prefix = fixture.prefix.clone();
     let started = Instant::now();
     if case == "render_reopened" {
         let opened = Instant::now();
@@ -386,9 +444,28 @@ fn sample(fixture: &mut Fixture, case: &str, iteration: usize) -> Result<Sample>
     } else {
         let result = if case.starts_with("switch_") {
             repo.switch_view(wc, target)?
+        } else if case == "materialize_paths_noop" || case == "materialize_paths_missing" {
+            repo.materialize_paths(wc, partial_paths)?
+        } else if case == "materialize_prefix_missing" {
+            repo.materialize_prefix(wc, &prefix)?
         } else {
             repo.materialize(wc)?
         };
+        // A partial call must actually rewrite its subset, never report the
+        // whole view as written and never skip deleted files.
+        if case == "materialize_paths_missing" || case == "materialize_prefix_missing" {
+            let expected = if case == "materialize_paths_missing" {
+                fixture.partial_paths.len()
+            } else {
+                fixture.prefix_paths.len()
+            };
+            ensure!(
+                result.files_written >= expected,
+                "partial materialize wrote {} files, expected at least {}",
+                result.files_written,
+                expected
+            );
+        }
         written = Some(result.files_written);
         skipped = Some(result.files_skipped);
         bytes_written = Some(result.bytes_written);

@@ -38,6 +38,14 @@ Every fixture also includes an empty file. Override with `--files`, `--lines`,
 - `render_reopened`: drop/reopen the repository, then render; includes open cost.
 - `materialize_noop`: ordinary journaled materialization of already-correct files.
 - `materialize_missing`: same API after removing only generated tracked files.
+- `materialize_paths_noop`: journaled `materialize_paths` over a fixed subset
+  (every third generated file, including the edited hot file) with nothing
+  deleted; measures the partial fast path when every file is already correct.
+- `materialize_paths_missing`: the same subset after removing only those files;
+  the partial analog of `materialize_missing`.
+- `materialize_prefix_missing`: remove the first ten generated files, then
+  journaled `materialize_prefix("files/file_000")`; partial selection by
+  filename prefix instead of an explicit path set.
 - `switch_one_forward/back`: switch to/from a view with one changed line.
 - `switch_many_forward/back`: switch to/from a view changing one line per file.
 
@@ -66,6 +74,52 @@ commands, outcome, medians/p95 and logs. A graph/span median ratio above one
 favors spans. Database sizes are post-sample, uncompacted sizes, not a storage
 efficiency measurement. Errors and incomplete/duplicate samples fail the run;
 they are not passes. Fixtures are disposable; `--keep-fixtures` retains them.
+
+## Git working-copy baseline
+
+`git_baseline.py` times Git doing the closest ordinary operation to a full
+materialization, on a disposable Git repository built with the **same
+synthetic content and edit count** as the atomic fixture (same file names,
+line values, hot-file edit sequence, and one commit per edit):
+
+```sh
+python3 -B tools/materialize-bench/git_baseline.py --profile many-files \
+  --output /approved/scratch/git-01
+```
+
+Cases: `checkout_full_noop` and `checkout_full_missing` (remove every
+generated file, then `git checkout -- .`). Bytes, modes and a clean
+`git status --porcelain` are verified after every sample outside timing.
+
+Boundary honesty for comparisons against a `materialize_bench` report from the
+same machine and profile:
+
+- Git checkout restores from the **index**; it never touches pack files or
+  history. The Git analog of reading history is clone/fetch, which this
+  harness deliberately does not time.
+- `total_ns` includes subprocess spawn overhead; atomic samples measure an
+  in-process API. Treat a few milliseconds as measurement overhead.
+- Files Git considers unchanged are skipped by stat, so noop cases measure
+  Git's fast path, just as atomic's lease observation is its fast path.
+- Reports are only comparable pairwise, same machine, same profile, close in
+  time; OS caches and system load remain uncontrolled. Ratios within one
+  report (partial against full) are more trustworthy than cross-tool ratios.
+
+## Agent-sandbox sync benchmark
+
+`run_agent_sandbox.py` builds and drives
+`libatomic/examples/agent_sandbox_bench.rs`: a cold, empty sandbox syncing
+over the production daemon `Materialize` RPC (tonic, Unix socket,
+`SandboxImpl` handlers, `path_prefix` partial) versus Git's wire clone
+(`file://`) on matched synthetic histories — the cold-sandbox scenario the
+local cases above cannot answer. The benchmark checks expected bytes after
+every sample; partial sandboxes must hold exactly the requested subtree and
+nothing beyond it.
+
+```sh
+python3 -B tools/materialize-bench/run_agent_sandbox.py --build \
+  --profile many-files --output /approved/scratch/asb-01
+```
 
 The benchmark checks expected bytes and modes after every sample and verifies a
 single completed working-copy operation head. It does not certify imported
