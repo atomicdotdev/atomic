@@ -81,7 +81,8 @@ impl Command for IntentVerify {
 impl IntentVerify {
     async fn execute(&self) -> CliResult<()> {
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         let inputs = bridge::read_intent(&repo, &self.id)?;
         let node = match bridge::load_attestation(&repo, &self.id, &inputs)? {

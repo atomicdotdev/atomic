@@ -371,7 +371,7 @@ impl Clone {
             })?;
             git.head()
                 .ok()
-                .and_then(|head| head.shorthand().map(str::to_owned))
+                .and_then(|head| head.shorthand().ok().map(str::to_owned))
                 .unwrap_or_else(|| self.view.clone())
         };
         let outcome = crate::commands::git::bootstrap::clone_git_url(

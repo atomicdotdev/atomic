@@ -111,7 +111,7 @@ impl Command for MemoryNew {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo = crate::commands::open_repository_with_vault(&root)?;
 
         let id = self.id.clone().unwrap_or_else(generate_ulid_lowercased);
         let vault_path = bridge::normalize_memory_path(&id);

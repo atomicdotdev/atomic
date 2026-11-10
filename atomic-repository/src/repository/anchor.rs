@@ -835,7 +835,13 @@ impl Repository {
             // checkpoint records a `None` symref for detached states so the
             // entry protocol keeps them aligned (RFC §7.5).
             let symref = if head.is_branch() {
-                head.name().map(str::to_string)
+                Some(
+                    head.name()
+                        .map_err(|error| RepositoryError::InvalidRepository {
+                            reason: format!("cannot read Git HEAD ref name: {error}"),
+                        })?
+                        .to_string(),
+                )
             } else {
                 None
             };
@@ -1687,16 +1693,16 @@ fn branch_is_newly_created(git: &GitRepository, branch: &str) -> bool {
     if reflog.len() != 1 {
         return false;
     }
-    reflog
-        .iter()
-        .next()
-        .and_then(|entry| entry.message().map(str::to_string))
-        .is_some_and(|message| {
-            let message = message.trim();
-            message.starts_with("branch: Created from")
-                || message.starts_with("branch: Created")
-                || message.starts_with("Created from")
-        })
+    let Some(entry) = reflog.iter().next() else {
+        return false;
+    };
+    let Ok(Some(message)) = entry.message() else {
+        return false;
+    };
+    let message = message.trim();
+    message.starts_with("branch: Created from")
+        || message.starts_with("branch: Created")
+        || message.starts_with("Created from")
 }
 
 fn pristine_map(error: atomic_core::pristine::PristineError) -> RepositoryError {

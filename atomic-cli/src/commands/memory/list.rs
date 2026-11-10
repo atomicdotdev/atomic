@@ -422,7 +422,8 @@ impl Command for MemoryList {
         }
 
         let root = find_repository_root()?;
-        let repo = Repository::open(&root).map_err(CliError::Repository)?;
+        let repo =
+            crate::commands::open_readonly_repository(&root).map_err(CliError::Repository)?;
 
         let verifier = resolve_verifier(&self.identity)?;
 

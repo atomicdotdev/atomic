@@ -1027,8 +1027,10 @@ fn observe_metadata_head(
     let head = repository
         .find_reference("HEAD")
         .map_err(|error| ObservationError::GitIndex(format!("cannot read Git HEAD: {error}")))?;
-    if let Some(symref) = head.symbolic_target() {
-        let symref = symref.to_string();
+    let symref = head.symbolic_target().map_err(|error| {
+        ObservationError::GitIndex(format!("cannot read Git HEAD symref: {error}"))
+    })?;
+    if let Some(symref) = symref.map(str::to_string) {
         match head.resolve() {
             Ok(resolved) => resolved
                 .target()
@@ -1336,7 +1338,7 @@ pub fn observe_colocated_git_readiness(root: &Path) -> ColocatedGitReadiness {
         .map(|names| {
             names
                 .iter()
-                .flatten()
+                .filter_map(|name| name.ok().flatten())
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         })

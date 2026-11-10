@@ -83,6 +83,7 @@ mod session_integration_test;
 mod shim_census_cb13a_test;
 mod status_git_cb11a_test;
 mod unrecord_integration_test;
+mod vault_auto_init_test;
 mod vault_context_integration_test;
 mod view_confirmation_integration_test;
 mod working_copy_preservation_test;

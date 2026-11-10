@@ -1810,10 +1810,8 @@ pub(crate) fn detect_git_boundaries(git: &GitRepository) -> CliResult<Vec<GitClo
         boundaries.push(GitClosureBoundary::Promisor);
     } else if let Ok(mut entries) = config.entries(Some("remote.*.promisor")) {
         while let Some(entry) = entries.next() {
-            let is_promisor = entry
-                .ok()
-                .and_then(|entry| entry.value().map(|value| value == "true"))
-                .unwrap_or(false);
+            let is_promisor =
+                entry.is_ok_and(|entry| entry.value().is_ok_and(|value| value == "true"));
             if is_promisor {
                 boundaries.push(GitClosureBoundary::Promisor);
                 break;
@@ -4472,7 +4470,7 @@ impl ParallelImporter {
         if git
             .head()
             .ok()
-            .and_then(|head| head.shorthand().map(str::to_owned))
+            .and_then(|head| head.shorthand().ok().map(str::to_owned))
             .as_deref()
             != Some(branch_name)
         {
@@ -7525,7 +7523,7 @@ impl ParallelImporter {
         merge_tree
             .walk(git2::TreeWalkMode::PreOrder, |prefix, entry| {
                 if entry.kind() == Some(git2::ObjectType::Tree) {
-                    if let Some(name) = entry.name() {
+                    if let Ok(name) = entry.name() {
                         directories.insert(format!("{prefix}{name}"));
                     }
                 }
@@ -8895,7 +8893,7 @@ fn parse_push_trailer(message: &str) -> Option<PushTrailer> {
 fn extract_commit_metadata(commit: &git2::Commit) -> CliResult<CommitMetadata> {
     let author = commit.author();
     let author_name = author.name().unwrap_or("Unknown").to_string();
-    let author_email = author.email().map(|s| s.to_string());
+    let author_email = author.email().ok().map(ToString::to_string);
     let author_name_raw = author.name_bytes().to_vec();
     let author_email_raw = {
         let bytes = author.email_bytes();
@@ -8907,7 +8905,7 @@ fn extract_commit_metadata(commit: &git2::Commit) -> CliResult<CommitMetadata> {
     };
     let committer = commit.committer();
     let committer_name = committer.name().unwrap_or("Unknown").to_string();
-    let committer_email = committer.email().map(|s| s.to_string());
+    let committer_email = committer.email().ok().map(ToString::to_string);
     let committer_name_raw = committer.name_bytes().to_vec();
     let committer_email_raw = {
         let bytes = committer.email_bytes();
@@ -10228,7 +10226,7 @@ mod tests {
                 "feat: test\n\nAtomic-View: {}\nAtomic-State: {}",
                 view, state_b32
             )),
-            tree_oid: Oid::zero(),
+            tree_oid: Oid::ZERO_SHA1,
             parent_tree_oid: None,
             raw_object: Vec::new(),
         }
