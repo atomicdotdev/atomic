@@ -102,10 +102,12 @@ impl BuildGate {
     }
 }
 
-/// The repository's change store, counting the verified loads that only a
-/// span context build performs and optionally holding the first one up.
+/// The repository's change store, counting plain loads and the verified
+/// loads that only a span context build performs, and optionally holding the
+/// first build up.
 struct ObservedStore<'a> {
     inner: &'a ChangeStore,
+    plain_loads: AtomicUsize,
     verified_loads: AtomicUsize,
     hold_first_build: Option<&'a BuildGate>,
 }
@@ -114,6 +116,7 @@ impl<'a> ObservedStore<'a> {
     fn new(inner: &'a ChangeStore) -> Self {
         Self {
             inner,
+            plain_loads: AtomicUsize::new(0),
             verified_loads: AtomicUsize::new(0),
             hold_first_build: None,
         }
@@ -131,6 +134,7 @@ impl atomic_core::change::ChangeStore for ObservedStore<'_> {
     type Error = ChangeStoreError;
 
     fn get_change(&self, hash: &Hash) -> Result<Change, Self::Error> {
+        self.plain_loads.fetch_add(1, Ordering::SeqCst);
         self.inner.load_change(hash)
     }
 
@@ -185,10 +189,16 @@ fn render_does_not_wait_for_a_span_context_build_in_progress() {
     let gate = BuildGate::default();
     let store = ObservedStore::holding_first_build(repo.change_store(), &gate);
     let spans = SharedSpanContext::new(&txn, &store, &visibility);
+    // The held build keeps one worker inside the store, so the second render
+    // needs a worker of its own whatever size the global pool is.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
     let (first, second) = std::thread::scope(|scope| {
-        let first = scope.spawn(|| spans.render_if_present(a));
+        let first = scope.spawn(|| pool.install(|| spans.render_if_present(a)));
         gate.wait_for_build();
-        let second = spans.render_if_present(b);
+        let second = pool.install(|| spans.render_if_present(b));
         gate.second_render_finished();
         (first.join().unwrap(), second)
     });
@@ -205,8 +215,9 @@ fn render_does_not_wait_for_a_span_context_build_in_progress() {
 }
 
 /// A parallel walk primes the context before it fans out. Priming builds it
-/// once when the walk covers a span-rooted file, and not at all for a walk
-/// over graph-origin files only.
+/// once when the walk covers a span-rooted file. For graph-origin files it
+/// builds nothing and loads nothing: the walk checks each of those itself, on
+/// its workers, and priming must not repeat that on one thread.
 #[test]
 fn prime_builds_the_span_context_once_and_only_for_span_rooted_files() {
     let (temp, repo) = create_temp_repo();
@@ -225,6 +236,11 @@ fn prime_builds_the_span_context_once_and_only_for_span_rooted_files() {
         store.verified_loads.load(Ordering::SeqCst),
         0,
         "graph-origin files need no span context"
+    );
+    assert_eq!(
+        store.plain_loads.load(Ordering::SeqCst),
+        0,
+        "priming must not load the origin change of a graph-origin file"
     );
     assert_eq!(spans.render_if_present(legacy).unwrap(), None);
 

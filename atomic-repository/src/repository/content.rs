@@ -1152,10 +1152,14 @@ where
     /// failure is left for the walk to report at the path that hits it.
     pub(super) fn prime(&self, inodes: impl IntoIterator<Item = Inode>) {
         let any_span_root = inodes.into_iter().any(|inode| {
-            matches!(
-                has_visible_span_root(self.txn, self.store, inode, self.visibility),
-                Ok(true)
-            )
+            // Only an indexed root can need the context. Asking about a file
+            // without one would load its origin change, which the walk does
+            // for each file on its own workers.
+            matches!(self.txn.span_root(inode), Ok(Some(_)))
+                && matches!(
+                    has_visible_span_root(self.txn, self.store, inode, self.visibility),
+                    Ok(true)
+                )
         });
         if any_span_root {
             // The outcome, an error included, is stored for the renders.
