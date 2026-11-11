@@ -666,16 +666,17 @@ impl std::fmt::Display for StoredConflictKind {
 
 /// A conflict persisted in the `CONFLICTS` table for one file on one view.
 ///
-/// Captured from the materialization result so the repository can report
-/// conflicted files (`atomic status`) and refuse to `record` over markers
-/// without re-running a full materialize.
+/// Name conflicts can be derived before materialization. A known marker line
+/// is captured only from a materialization result, so status can distinguish
+/// an unmaterialized conflict from marker removal pending a recorded resolution.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoredConflict {
     /// The kind of conflict.
     pub kind: StoredConflictKind,
     /// The file's path at detection time (for display).
     pub path: String,
-    /// 1-based line where the conflict region begins, if known.
+    /// 1-based observed marker line, if known. For Name conflicts, `None`
+    /// means the namespace conflict is known but no marker rendering is known.
     pub line: Option<u32>,
     /// Base32 hashes of the changes involved.
     pub sides: Vec<String>,

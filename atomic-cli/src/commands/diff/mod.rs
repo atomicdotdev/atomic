@@ -243,7 +243,9 @@ pub(crate) mod types;
 const RECENT_CHANGE_SUGGESTIONS: usize = 3;
 
 pub use command::*;
-pub(crate) use helpers::{change_file_diffs, change_file_diffs_with, legacy_content_file_diffs};
+pub(crate) use helpers::{
+    change_file_diffs, legacy_content_file_diffs, projected_change_file_diffs_with,
+};
 pub(crate) use output::{
     build_hunks_from_diff, format_stat_graph, print_semantic_word_diff_line, print_word_diff_line,
 };

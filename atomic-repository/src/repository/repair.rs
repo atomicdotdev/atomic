@@ -1469,8 +1469,16 @@ fn collect_expected_conflicts<T>(
     conflicts: &mut BTreeMap<(u64, Inode), Vec<StoredConflict>>,
 ) -> Result<(), RepositoryError>
 where
-    T: GraphTxnT + TreeTxnT + InodeGraphOps<InodeError = PristineError>,
+    T: GraphTxnT + TreeTxnT + ViewTxnT + InodeGraphOps<InodeError = PristineError>,
 {
+    let cached: Vec<_> = match txn.iter_conflicts(view_id) {
+        Ok(rows) => rows.into_iter().flat_map(|(_, records)| records).collect(),
+        // An unreadable observation is not authority. Derive the required
+        // conflict rows anyway; the independent actual-table comparison below
+        // still reports malformed CONFLICTS bytes (and other damaged indexes).
+        Err(PristineError::Serialization { .. }) => Vec::new(),
+        Err(error) => return Err(RepositoryError::Database(error.to_string())),
+    };
     for (path, conflict) in &reduced.conflicts {
         let mut side_hashes = Vec::new();
         for change_id in conflict
@@ -1491,6 +1499,17 @@ where
         }
         side_hashes.sort();
         side_hashes.dedup();
+        // A derived Name row can be complete before its view is materialized.
+        // `line` is an observation, not graph authority: retain a valid marker
+        // location only for the same conflict. Missing/invalid observations do
+        // not justify fabricating one during repair. Paths, sides and required
+        // rows are still independently re-derived from authoritative claims.
+        let markers_observed = cached.iter().any(|record| {
+            record.kind == StoredConflictKind::Name
+                && record.path == *path
+                && record.sides == side_hashes
+                && record.line == Some(1)
+        });
         for side in conflict.sides_at_path(path) {
             conflicts
                 .entry((view_id, side.inode))
@@ -1498,7 +1517,7 @@ where
                 .push(StoredConflict {
                     kind: StoredConflictKind::Name,
                     path: path.clone(),
-                    line: (!side.is_directory()).then_some(1),
+                    line: (!side.is_directory() && markers_observed).then_some(1),
                     sides: side_hashes.clone(),
                 });
         }

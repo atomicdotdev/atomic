@@ -38,6 +38,617 @@ use atomic_core::pristine::InodeGraphOps;
 use atomic_core::types::{ChangePosition, EdgeFlags, GraphNode, SerializedGraphEdge};
 use std::collections::{HashMap, HashSet};
 
+impl Repository {
+    // Inspect the complete closure before acquiring a reentrant operation lock.
+    fn span_in_closure(&self, roots: &[Hash]) -> Result<bool, RepositoryError> {
+        let mut pending = roots.to_vec();
+        let mut seen = HashSet::new();
+        let mut has_spans = false;
+        while let Some(hash) = pending.pop() {
+            if !seen.insert(hash) {
+                continue;
+            }
+            let change = self.load_change(&hash)?;
+            has_spans |= change.hashed.span.is_some();
+            pending.extend_from_slice(change.dependencies());
+        }
+        Ok(has_spans)
+    }
+
+    // Simulate the entire closure in an aborted transaction before preparing
+    // any operation. This validates incoming indexes and the prospective
+    // render without publishing a partial multi-change insertion.
+    fn preflight_span_references(
+        &self,
+        view_name: &str,
+        roots: &[Hash],
+        require_existing_dependencies: bool,
+    ) -> Result<(), RepositoryError> {
+        use atomic_core::change::span_patch::{ExternalFile, SpanOp};
+        use atomic_core::pristine::span_patch_storage::{SpanPatchReadTxn, SpanRenderContext};
+        use atomic_core::pristine::{CapabilityTxnT, PathClaimMutTxnT, SPAN_RANGE_CAPABILITY};
+        let mut txn = self
+            .pristine
+            .write_txn()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.enable_abort_only_allocations()
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        txn.get_view(view_name)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.to_string(),
+            })?;
+        if require_existing_dependencies {
+            for hash in roots {
+                let change = self.load_change(hash)?;
+                for dep in change.dependencies() {
+                    let id = txn
+                        .get_internal(dep)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                    if !matches!(id, Some(id) if txn.was_change_applied(id).map_err(|e| RepositoryError::Database(e.to_string()))?)
+                    {
+                        return Err(RepositoryError::Apply(format!(
+                            "missing applied dependency {}",
+                            dep.to_base32()
+                        )));
+                    }
+                }
+            }
+        }
+        let mut stack: Vec<_> = roots.iter().rev().map(|hash| (*hash, false)).collect();
+        let mut active = HashSet::new();
+        let mut done = HashSet::new();
+        let mut ordered = Vec::new();
+        while let Some((hash, expanded)) = stack.pop() {
+            if expanded {
+                active.remove(&hash);
+                if done.insert(hash) {
+                    ordered.push(hash);
+                }
+                continue;
+            }
+            if done.contains(&hash) {
+                continue;
+            }
+            if !active.insert(hash) {
+                return Err(RepositoryError::Apply("cyclic change dependency".into()));
+            }
+            let change = self.load_change(&hash)?;
+            if change
+                .hash()
+                .map_err(|e| RepositoryError::Apply(e.to_string()))?
+                != hash
+            {
+                return Err(RepositoryError::Apply("change hash mismatch".into()));
+            }
+            stack.push((hash, true));
+            for dep in change.dependencies().iter().rev() {
+                stack.push((*dep, false));
+            }
+        }
+        let mut inodes = HashSet::new();
+        let preserve = view_name != self.current_view;
+        let options = InsertOptions::default().view(view_name);
+        for hash in ordered {
+            let change = self.load_change(&hash)?;
+            let existing = txn
+                .get_internal(&hash)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let applied = match existing {
+                Some(id) => txn
+                    .was_change_applied(id)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?,
+                None => false,
+            };
+            if let Some(patch) = &change.hashed.span {
+                let capability = txn
+                    .required_capability_version(SPAN_RANGE_CAPABILITY.id())
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                let indexed = match existing {
+                    Some(id) => txn
+                        .span_change_indexed(id)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?,
+                    None => false,
+                };
+                if applied != indexed {
+                    return Err(RepositoryError::Apply(
+                        "Invalid change: span changes require a span-aware repository writer"
+                            .into(),
+                    ));
+                }
+                if capability != Some(SPAN_RANGE_CAPABILITY.minimum_version())
+                    && !(capability == Some(2) && patch.version == 1 && applied && indexed)
+                {
+                    return Err(RepositoryError::Apply(
+                        "span index has no matching repository capability".into(),
+                    ));
+                }
+            }
+            let id = txn
+                .register_change(&hash)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            txn.put_change_deps(id, change.dependencies())
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            if applied && is_graph_only_git_span(&change) {
+                index_replayed_git_span(&mut txn, id, hash, &change, false)?;
+            }
+            let view = txn
+                .get_view(view_name)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .unwrap();
+            let membership = txn
+                .view_membership_set(&view)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            if !membership.contains(id) {
+                self.ensure_change_allowed_in_view(&txn, view_name, &change)?;
+                let projected_change = if applied {
+                    Change::empty(ChangeHeader::new("insert replay (no tree ops)"))
+                } else {
+                    change.clone()
+                };
+                let projection = self.plan_tree_projection(
+                    &mut txn,
+                    id,
+                    hash,
+                    &projected_change,
+                    &[],
+                    preserve,
+                )?;
+                projection.apply_prerequisites(&mut txn)?;
+                if change.hashed.span.is_some() && !applied {
+                    write_recorded_graph_and_spans(
+                        self, &mut txn, view_name, id, &hash, &change, &options,
+                    )?;
+                } else if change.hashed.span.is_some() {
+                    crate::apply::write_span_hunks_with_index(
+                        &mut txn, view_name, id, &hash, &change, &options, true,
+                    )
+                    .map_err(|e| RepositoryError::Apply(e.to_string()))?;
+                } else {
+                    write_change_to_graph(
+                        &mut txn, view_name, id, &hash, &change, &options, applied,
+                    )
+                    .map_err(|e| RepositoryError::Apply(e.to_string()))?;
+                }
+                // apply_tree_projection persists a filesystem journal; preview
+                // only records the equivalent immutable claim events in redb.
+                for entry in super::name_resolution::path_claim_events_for_change(
+                    &txn,
+                    id,
+                    &projected_change,
+                )? {
+                    txn.put_path_claim(&entry.path, &entry.event)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                }
+            } else if !applied {
+                return Err(RepositoryError::Apply(
+                    "visible change is not in the ambient graph".into(),
+                ));
+            }
+            if let Some(patch) = &change.hashed.span {
+                for op in &patch.ops {
+                    let file = match op {
+                        SpanOp::Root { ordinal, .. } => ExternalFile {
+                            owner: hash,
+                            ordinal: *ordinal,
+                        },
+                        SpanOp::Edit { file, .. } => file.clone(),
+                    };
+                    let inode = txn
+                        .span_file_inode(&file)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?
+                        .ok_or_else(|| {
+                            RepositoryError::Apply("span file mapping missing".into())
+                        })?;
+                    inodes.insert(inode);
+                }
+            }
+        }
+        if !inodes.is_empty() {
+            let view = txn
+                .get_view(view_name)
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .unwrap();
+            let visibility = graph_visibility_closure(&txn, &view)?;
+            let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+            for (path, conflict) in &projection.name_conflicts {
+                for side in &conflict.sides {
+                    if txn
+                        .span_root(side.inode)
+                        .map_err(|e| RepositoryError::Database(e.to_string()))?
+                        .is_some_and(|root| visibility.contains(NodeId::new(root[0])))
+                    {
+                        return Err(RepositoryError::Apply(format!(
+                            "cannot materialize span-backed name conflict at '{path}'"
+                        )));
+                    }
+                }
+            }
+            let context = SpanRenderContext::new(&txn, &self.change_store, &visibility)
+                .map_err(|e| RepositoryError::Apply(e.to_string()))?;
+            for inode in inodes {
+                context
+                    .render(inode)
+                    .map_err(|e| RepositoryError::Apply(e.to_string()))?;
+            }
+        }
+        txn.abort()
+            .map_err(|e| RepositoryError::Database(e.to_string()))
+    }
+}
+
+fn write_recorded_graph_and_spans(
+    repository: &Repository,
+    txn: &mut atomic_core::pristine::WriteTxn<'_>,
+    view_name: &str,
+    change_id: NodeId,
+    hash: &Hash,
+    change: &Change,
+    options: &InsertOptions,
+) -> Result<InsertOutcome, RepositoryError> {
+    let Some(patch) = &change.hashed.span else {
+        return write_change_to_graph(txn, view_name, change_id, hash, change, options, false)
+            .map_err(|error| RepositoryError::Apply(error.to_string()));
+    };
+    if change.file_ops().iter().any(|ops| {
+        matches!(
+            ops.trunk_op(),
+            Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+        )
+    }) {
+        use atomic_core::pristine::{CapabilityMutTxnT, SPAN_PROJECTED_SEMANTICS_CAPABILITY};
+        txn.put_required_capability(SPAN_PROJECTED_SEMANTICS_CAPABILITY)?;
+    }
+    use atomic_core::change::span_patch::SpanOp;
+    use atomic_core::pristine::{span_patch_storage::SpanPatchReadTxn, CrdtTxnT};
+    let semantic = atomic_core::change::span_patch::localize_file_ops(txn, change)
+        .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+    let graph_only_git = is_graph_only_git_span(change);
+    let projected: Vec<_> = semantic
+        .iter()
+        .filter_map(|ops| match ops.trunk_op() {
+            Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { file, .. }) => Some((ops, file)),
+            _ => None,
+        })
+        .collect();
+    if !projected.is_empty() {
+        let mut ids = Vec::new();
+        for hash in change.dependencies() {
+            ids.push(txn.get_internal(hash)?.ok_or_else(|| {
+                RepositoryError::Apply("projected semantic dependency missing".into())
+            })?);
+        }
+        let membership = atomic_core::pristine::ViewMembershipSet::from_ordered(ids);
+        let visibility = super::filter::graph_visibility_from_membership(txn, &membership)?;
+        for (ops, file) in &projected {
+            let inode = txn
+                .span_file_inode(file)
+                .map_err(|error| RepositoryError::Apply(error.to_string()))?
+                .ok_or_else(|| {
+                    RepositoryError::Apply("projected semantic file mapping missing".into())
+                })?;
+            if txn.get_crdt_inode_trunk(inode.get())?.is_some() {
+                return Err(RepositoryError::Apply(
+                    "projected semantic edit cannot replace an existing CRDT trunk".into(),
+                ));
+            }
+            let binding = repository
+                .projected_path_binding_for_visibility(txn, &visibility, ops.path())?
+                .ok_or_else(|| {
+                    RepositoryError::Apply("projected semantic path is absent or conflicted".into())
+                })?;
+            if binding.directory || binding.inode != inode {
+                return Err(RepositoryError::Apply(
+                    "projected semantic path names a different file".into(),
+                ));
+            }
+        }
+    }
+    // The portable mapping is author-supplied. A hash in the dependency
+    // closure is not by itself proof that its semantic branch belongs to the
+    // file named by a span edit.
+    for op in &patch.ops {
+        let SpanOp::Edit { file, .. } = op else {
+            continue;
+        };
+        let inode = txn
+            .span_file_inode(file)
+            .map_err(|e| RepositoryError::Apply(e.to_string()))?
+            .ok_or_else(|| RepositoryError::Apply("span file mapping missing".into()))?;
+        if graph_only_git {
+            continue;
+        }
+        if semantic.iter().any(|ops| matches!(ops.trunk_op(), Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { file: projected, .. }) if projected == file)) {
+            continue;
+        }
+        let trunk_key = txn
+            .get_crdt_inode_trunk(inode.get())
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+            .ok_or_else(|| RepositoryError::Apply("span file has no semantic trunk".into()))?;
+        let trunk = atomic_core::crdt::TrunkId::from_bytes(&trunk_key);
+        let matches: Vec<_> = semantic
+            .iter()
+            .filter(|ops| ops.trunk_id() == trunk)
+            .collect();
+        if matches.is_empty() {
+            return Err(RepositoryError::Apply(
+                "span edit has no matching semantic trunk".into(),
+            ));
+        }
+        let check_branch = |id: atomic_core::crdt::BranchId| -> Result<(), RepositoryError> {
+            if id.change_id().is_root() {
+                return Ok(());
+            }
+            let branch = txn
+                .get_crdt_branch(&id.to_bytes())
+                .map_err(|e| RepositoryError::Database(e.to_string()))?
+                .ok_or_else(|| RepositoryError::Apply("span semantic branch missing".into()))?;
+            if branch.trunk_id != trunk {
+                return Err(RepositoryError::Apply(
+                    "span semantic branch belongs to another file".into(),
+                ));
+            }
+            Ok(())
+        };
+        for line in matches.iter().flat_map(|ops| ops.line_ops()) {
+            check_branch(line.branch_id())?;
+            use atomic_core::crdt::BranchOp;
+            match line.operation() {
+                BranchOp::Insert {
+                    after: Some(id), ..
+                } => check_branch(*id)?,
+                BranchOp::Delete { branch, .. }
+                | BranchOp::Modify { branch, .. }
+                | BranchOp::Restore { branch } => {
+                    check_branch(*branch)?;
+                    if *branch != line.branch_id() {
+                        return Err(RepositoryError::Apply(
+                            "span semantic branch identity mismatch".into(),
+                        ));
+                    }
+                }
+                BranchOp::Reparent { branch, new_after } => {
+                    check_branch(*branch)?;
+                    if *branch != line.branch_id() {
+                        return Err(RepositoryError::Apply(
+                            "span semantic branch identity mismatch".into(),
+                        ));
+                    }
+                    if let Some(id) = new_after {
+                        check_branch(*id)?;
+                    }
+                }
+                BranchOp::Insert { after: None, .. } => {}
+            }
+            let leaf_ops: Vec<&atomic_core::crdt::LeafOp> = match line.operation() {
+                BranchOp::Insert { content, .. } | BranchOp::Delete { content, .. } => {
+                    content.iter().collect()
+                }
+                BranchOp::Modify {
+                    old_content,
+                    new_content,
+                    ..
+                } => old_content.iter().chain(new_content).collect(),
+                BranchOp::Restore { .. } | BranchOp::Reparent { .. } => Vec::new(),
+            };
+            for op in leaf_ops {
+                use atomic_core::crdt::LeafOp;
+                let id = match op {
+                    LeafOp::Insert { after, .. } => *after,
+                    LeafOp::Delete { leaf }
+                    | LeafOp::Replace { leaf, .. }
+                    | LeafOp::Restore { leaf } => Some(*leaf),
+                };
+                let Some(id) = id.filter(|id| !id.change_id().is_root()) else {
+                    continue;
+                };
+                let leaf = txn
+                    .get_crdt_leaf(&id.to_bytes())
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .ok_or_else(|| RepositoryError::Apply("span semantic token missing".into()))?;
+                if leaf.branch_id != line.branch_id() {
+                    return Err(RepositoryError::Apply(
+                        "span semantic token belongs to another line".into(),
+                    ));
+                }
+            }
+        }
+    }
+    let inserted = crate::apply::write_span_hunks_with_index(
+        txn, view_name, change_id, hash, change, options, false,
+    )
+    .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+    let mut roots = std::collections::BTreeMap::new();
+    for op in &patch.ops {
+        if let SpanOp::Root { path, ordinal, .. } = op {
+            let positions: Vec<_> = change
+                .hunks()
+                .iter()
+                .filter_map(|hunk| {
+                    if let GraphOp::FileAdd {
+                        path: added,
+                        add_inode,
+                        contents: None,
+                        ..
+                    } = hunk
+                    {
+                        (added == path).then_some(add_inode.start)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if positions.len() != 1 {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!("span root '{path}' has no unique namespace creation"),
+                });
+            }
+            let creators: Vec<_> = semantic
+                .iter()
+                .filter(|ops| ops.path() == path && ops.is_create())
+                .collect();
+            if !graph_only_git
+                && (creators.len() != 1
+                    || !creators[0].trunk_id().change_id().is_root()
+                    || !matches!(creators[0].trunk_op(), Some(atomic_core::crdt::TrunkOp::Create { path: created, .. }) if created == path))
+            {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!("span root '{path}' has no unique semantic creation"),
+                });
+            }
+            let position = Position::new(change_id, positions[0]);
+            let inode = txn
+                .position_inode(position)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: format!("span root '{path}' has no inode binding"),
+                })?;
+            if roots.insert(*ordinal, inode).is_some() {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "duplicate span root ordinal".into(),
+                });
+            }
+        }
+    }
+    let additions = change
+        .hunks()
+        .iter()
+        .filter(|op| matches!(op, GraphOp::FileAdd { .. }))
+        .count();
+    if additions != roots.len() {
+        return Err(RepositoryError::InvalidOperation {
+            message: "span change must bind every file addition to one span root".into(),
+        });
+    }
+    atomic_core::pristine::span_patch_storage::index_change(
+        txn,
+        &repository.change_store,
+        view_name,
+        *hash,
+        change,
+        &roots,
+    )
+    .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+    if graph_only_git {
+        index_replayed_git_span(txn, change_id, *hash, change, true)?;
+    }
+    Ok(inserted)
+}
+
+fn is_graph_only_git_span(change: &Change) -> bool {
+    change.hashed.span.is_some()
+        && matches!(
+            change.origin(),
+            atomic_core::change::ChangeOrigin::GitSynthesized { .. }
+        )
+        && change.file_ops().is_empty()
+}
+
+fn index_replayed_git_span(
+    txn: &mut atomic_core::pristine::WriteTxn<'_>,
+    change_id: NodeId,
+    hash: Hash,
+    change: &Change,
+    allow_create: bool,
+) -> Result<(), RepositoryError> {
+    use atomic_core::pristine::{
+        EffectiveProjectionClosure, GitCommitClosureMutTxnT, GitCommitClosureTxnT,
+        GitShaIndexMutTxnT, GitShaIndexTxnT, ViewMembershipSet,
+    };
+    let atomic_core::change::ChangeOrigin::GitSynthesized {
+        commit, parents, ..
+    } = change.origin()
+    else {
+        return Err(RepositoryError::Apply(
+            "replayed Git span has no Git origin".into(),
+        ));
+    };
+    let sha = super::synthesis::git_oid_hex(commit);
+    match txn.get_by_git_sha(&sha)? {
+        Some(existing) if existing != change_id => {
+            return Err(RepositoryError::Apply(format!(
+                "Git commit {sha} already has a different repository identity"
+            )))
+        }
+        None if !allow_create => {
+            return Err(RepositoryError::Apply(format!(
+                "Git commit {sha} identity is missing"
+            )))
+        }
+        _ => {}
+    }
+    let mut closure = if let Some(parent) = parents.first() {
+        let parent_sha = super::synthesis::git_oid_hex(parent);
+        let parent_id = txn.get_by_git_sha(&parent_sha)?.ok_or_else(|| {
+            RepositoryError::Apply(format!("Git parent {parent_sha} is not indexed"))
+        })?;
+        let dependency_ids = change
+            .dependencies()
+            .iter()
+            .map(|dependency| {
+                txn.get_internal(dependency)?
+                    .ok_or_else(|| RepositoryError::Apply("Git replay dependency missing".into()))
+            })
+            .collect::<Result<Vec<_>, RepositoryError>>()?;
+        let visible = EffectiveProjectionClosure::try_from_membership(
+            txn,
+            &ViewMembershipSet::from_ordered(dependency_ids),
+        )?;
+        if !visible.contains(parent_id) {
+            return Err(RepositoryError::Apply(
+                "Git first parent is outside the change dependency closure".into(),
+            ));
+        }
+        let parent_hash = txn
+            .get_external(parent_id)?
+            .ok_or_else(|| RepositoryError::Apply("Git parent hash missing".into()))?;
+        let closure = txn.get_git_commit_closure(&parent_sha)?.ok_or_else(|| {
+            RepositoryError::Apply(format!(
+                "Git parent {parent_sha} interpretation closure is missing"
+            ))
+        })?;
+        if !closure.contains(&parent_hash) || closure.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(RepositoryError::Apply(
+                "Git parent interpretation closure is not canonical".into(),
+            ));
+        }
+        for member in &closure {
+            let id = txn.get_internal(member)?.ok_or_else(|| {
+                RepositoryError::Apply("Git interpretation closure member missing".into())
+            })?;
+            if !visible.contains(id) {
+                return Err(RepositoryError::Apply(
+                    "Git interpretation closure exceeds the change dependency closure".into(),
+                ));
+            }
+        }
+        closure
+    } else {
+        Vec::new()
+    };
+    closure.push(hash);
+    closure.sort();
+    closure.dedup();
+    match txn.get_git_commit_closure(&sha)? {
+        Some(existing) if existing != closure => {
+            return Err(RepositoryError::Apply(format!(
+                "Git commit {sha} has a different interpretation closure"
+            )))
+        }
+        None if !allow_create => {
+            return Err(RepositoryError::Apply(format!(
+                "Git commit {sha} interpretation closure is missing"
+            )))
+        }
+        _ => {}
+    }
+    if allow_create {
+        txn.put_git_sha(&sha, change_id)?;
+        txn.put_git_commit_closure(&sha, &closure)?;
+    }
+    Ok(())
+}
+
 fn write_recorded_in_txn(
     repository: &Repository,
     txn: &mut atomic_core::pristine::WriteTxn<'_>,
@@ -64,8 +675,10 @@ fn write_recorded_in_txn(
     tree_projection.apply_prerequisites(txn)?;
     let mut options = InsertOptions::default().view(view_name);
     options.track_conflicts = false;
-    let inserted = write_change_to_graph(txn, view_name, change_id, hash, change, &options, false)
-        .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+    let inserted = write_recorded_graph_and_spans(
+        repository, txn, view_name, change_id, hash, change, &options,
+    )?;
+    validate_recorded_span_projection(repository, txn, view_name, *hash, change)?;
     repository.apply_tree_projection(
         txn,
         &tree_projection,
@@ -73,6 +686,50 @@ fn write_recorded_in_txn(
         preserve_existing_tree_paths,
     )?;
     Ok(inserted)
+}
+
+fn validate_recorded_span_projection(
+    repository: &Repository,
+    txn: &atomic_core::pristine::WriteTxn<'_>,
+    view_name: &str,
+    hash: Hash,
+    change: &Change,
+) -> Result<(), RepositoryError> {
+    use atomic_core::change::span_patch::{ExternalFile, SpanOp};
+    use atomic_core::pristine::span_patch_storage::{SpanPatchReadTxn, SpanRenderContext};
+    let Some(patch) = &change.hashed.span else {
+        return Ok(());
+    };
+    let view = txn
+        .get_view(view_name)?
+        .ok_or_else(|| RepositoryError::ViewNotFound {
+            name: view_name.to_string(),
+        })?;
+    let visibility = graph_visibility_closure(txn, &view)?;
+    let context = SpanRenderContext::new(txn, &repository.change_store, &visibility)
+        .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+    let mut inodes = HashSet::new();
+    for op in &patch.ops {
+        let file = match op {
+            SpanOp::Root { ordinal, .. } => ExternalFile {
+                owner: hash,
+                ordinal: *ordinal,
+            },
+            SpanOp::Edit { file, .. } => file.clone(),
+        };
+        let inode = txn
+            .span_file_inode(&file)
+            .map_err(|error| RepositoryError::Apply(error.to_string()))?
+            .ok_or_else(|| {
+                RepositoryError::Apply("span file mapping missing after record".into())
+            })?;
+        if inodes.insert(inode) {
+            context
+                .render(inode)
+                .map_err(|error| RepositoryError::Apply(error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Timing details for the git-import fresh-write path.
@@ -1758,18 +2415,25 @@ impl Repository {
         hash: &Hash,
         options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
-        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
-        let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
-        let t0 = std::time::Instant::now();
-
-        // Load the change from the store
         let change = self.load_change(hash)?;
         let view_name = options
             .view
             .as_deref()
             .unwrap_or(&self.current_view)
             .to_string();
+        let _span_lock = if self.span_in_closure(std::slice::from_ref(hash))? {
+            let working_copy = self.require_working_copy_id()?;
+            let lock = self.try_lock_workspace_operation(working_copy)?;
+            self.preflight_span_references(&view_name, std::slice::from_ref(hash), true)?;
+            Some(lock)
+        } else {
+            None
+        };
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
+        let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
+        let t0 = std::time::Instant::now();
 
+        // The change was checked before any repository mutation.
         // CB-12B: trusted provenance publication gate. Before any metadata
         // operation or mutation on a Shared target, the complete reachable
         // closure of this change must carry trusted managed-session evidence.
@@ -1996,16 +2660,29 @@ impl Repository {
         tree_projection.apply_prerequisites(&mut txn)?;
         // Apply to the graph (skips hunk application if already_in_graph)
         let t_graph = std::time::Instant::now();
-        let mut outcome = write_change_to_graph(
-            &mut txn,
-            &view_name,
-            change_id,
-            hash,
-            &change,
-            &options,
-            already_in_graph,
-        )
-        .map_err(|e| RepositoryError::Apply(e.to_string()))?;
+        let mut outcome = if change.hashed.span.is_some() {
+            if already_in_graph {
+                crate::apply::write_span_hunks_with_index(
+                    &mut txn, &view_name, change_id, hash, &change, &options, true,
+                )
+                .map_err(|e| RepositoryError::Apply(e.to_string()))?
+            } else {
+                write_recorded_graph_and_spans(
+                    self, &mut txn, &view_name, change_id, hash, &change, &options,
+                )?
+            }
+        } else {
+            write_change_to_graph(
+                &mut txn,
+                &view_name,
+                change_id,
+                hash,
+                &change,
+                &options,
+                already_in_graph,
+            )
+            .map_err(|e| RepositoryError::Apply(e.to_string()))?
+        };
 
         if trace_insert {
             eprintln!(
@@ -2068,6 +2745,35 @@ impl Repository {
                     .iter()
                     .filter_map(|op| op.path().map(str::to_owned)),
             );
+            if let Some(patch) = &inserted.hashed.span {
+                use atomic_core::change::span_patch::{ExternalFile, SpanOp};
+                use atomic_core::pristine::span_patch_storage::SpanPatchReadTxn;
+                for op in &patch.ops {
+                    let file = match op {
+                        SpanOp::Root { ordinal, .. } => ExternalFile {
+                            owner: hash,
+                            ordinal: *ordinal,
+                        },
+                        SpanOp::Edit { file, .. } => file.clone(),
+                    };
+                    let inode = txn
+                        .span_file_inode(&file)
+                        .map_err(|e| RepositoryError::Apply(e.to_string()))?
+                        .ok_or_else(|| {
+                            RepositoryError::Apply("span file mapping missing".into())
+                        })?;
+                    for (path, claim) in &after_projection.present_metadata {
+                        if claim.inode == inode {
+                            outcome.stats.affected_paths.insert(path.clone());
+                        }
+                    }
+                    for (path, conflict) in &after_projection.name_conflicts {
+                        if conflict.sides.iter().any(|side| side.inode == inode) {
+                            outcome.stats.affected_paths.insert(path.clone());
+                        }
+                    }
+                }
+            }
         }
 
         // Commit the transaction
@@ -2145,6 +2851,17 @@ impl Repository {
         hash: &Hash,
         mut options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
+        let _span_lock = if self.span_in_closure(std::slice::from_ref(hash))? {
+            let lock = self.try_lock_workspace_operation(self.require_working_copy_id()?)?;
+            self.preflight_span_references(
+                options.view.as_deref().unwrap_or(&self.current_view),
+                std::slice::from_ref(hash),
+                false,
+            )?;
+            Some(lock)
+        } else {
+            None
+        };
         let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
         let t0 = std::time::Instant::now();
 
@@ -2376,17 +3093,8 @@ impl Repository {
         // Apply to the graph
         // For write_recorded, the change is always new (just recorded), so
         // already_in_graph is always false.
-        let mut apply_outcome = write_change_to_graph(
-            &mut txn, view_name, change_id, hash, change, &options,
-            false, // always_in_graph: freshly recorded changes are never in the graph yet
-        )
-        .map_err(|e| RepositoryError::Apply(e.to_string()))?;
-
-        self.apply_tree_projection(
-            &mut txn,
-            &tree_projection,
-            view_name,
-            preserve_existing_tree_paths,
+        let mut apply_outcome = write_recorded_graph_and_spans(
+            self, &mut txn, view_name, change_id, hash, change, &options,
         )?;
 
         if let Some((removal_view_name, removed_hash)) = removal {
@@ -2415,9 +3123,6 @@ impl Repository {
             // pending deletions (or rename paths) from the next durable
             // record. Preserve the same selected-view boundary as the write
             // above, including separately staged working-copy paths.
-            if removal_view_name == self.current_view {
-                self.realign_tree_projection_in_txn(&mut txn, removal_view_name)?;
-            }
             if removal_view_name == view_name {
                 let final_view = txn
                     .get_view(view_name)
@@ -2427,6 +3132,21 @@ impl Repository {
                     })?;
                 apply_outcome.new_state = final_view.state;
                 apply_outcome.sequence = final_view.change_count;
+            }
+        }
+        // Snapshot replacement deliberately has both the old and new private
+        // references in the transaction until the old one is removed. Verify
+        // the final view, not that transient overlap, before committing.
+        validate_recorded_span_projection(self, &txn, view_name, *hash, change)?;
+        self.apply_tree_projection(
+            &mut txn,
+            &tree_projection,
+            view_name,
+            preserve_existing_tree_paths,
+        )?;
+        if let Some((removal_view_name, _)) = removal {
+            if removal_view_name == self.current_view {
+                self.realign_tree_projection_in_txn(&mut txn, removal_view_name)?;
             }
         }
 
@@ -2696,6 +3416,17 @@ impl Repository {
                 .into_iter()
                 .map(|(_, hash)| hash)
                 .collect()
+        };
+        let _span_lock = if self.span_in_closure(&source_changes)? {
+            let lock = self.try_lock_workspace_operation(self.require_working_copy_id()?)?;
+            self.preflight_span_references(
+                &options.to_view,
+                &source_changes,
+                !options.apply_dependencies,
+            )?;
+            Some(lock)
+        } else {
+            None
         };
 
         if trace_insert {

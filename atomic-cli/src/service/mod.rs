@@ -257,6 +257,40 @@ impl Service {
 /// bugs.
 pub fn status_message(error: tonic::Status) -> CliError {
     use tonic::Code;
+    if error.code() == Code::FailedPrecondition
+        && error
+            .metadata()
+            .get("atomic-record-error")
+            .and_then(|value| value.to_str().ok())
+            == Some("file-too-large")
+    {
+        let parsed = (|| {
+            let path = error
+                .metadata()
+                .get_bin("atomic-file-path-bin")?
+                .to_bytes()
+                .ok()?;
+            let path = String::from_utf8(path.to_vec()).ok()?;
+            let size = error
+                .metadata()
+                .get("atomic-file-size")?
+                .to_str()
+                .ok()?
+                .parse()
+                .ok()?;
+            let limit = error
+                .metadata()
+                .get("atomic-file-limit")?
+                .to_str()
+                .ok()?
+                .parse()
+                .ok()?;
+            Some(CliError::FileTooLarge { path, size, limit })
+        })();
+        if let Some(error) = parsed {
+            return error;
+        }
+    }
     let message = error.message().to_string();
     match error.code() {
         Code::FailedPrecondition
@@ -524,6 +558,8 @@ impl Service {
     }
 
     pub fn record(&self, request: pb::RecordRequest) -> CliResult<pb::RecordResponse> {
+        let requires_file_options =
+            request.skip_binary.is_some() || request.max_file_size.is_some();
         self.call(move |backend| async move {
             match backend {
                 Backend::Local(state) => {
@@ -533,9 +569,32 @@ impl Service {
                         .map(|response| response.into_inner())
                 }
                 Backend::Reactor(channel) => {
+                    if requires_file_options {
+                        let capabilities = pb::daemon_service_client::DaemonServiceClient::new(channel.clone())
+                            .get_capabilities(pb::GetCapabilitiesRequest {})
+                            .await?
+                            .into_inner();
+                        require_record_file_options(&capabilities)?;
+                    }
                     let mut mutation =
                         pb::repository_mutation_service_client::RepositoryMutationServiceClient::new(channel);
                     mutation.record(request).await.map(|response| response.into_inner())
+                }
+            }
+        })
+    }
+
+    /// Check before `record --all` stages any files on an older Reactor.
+    pub fn ensure_record_file_options(&self) -> CliResult<()> {
+        self.call(move |backend| async move {
+            match backend {
+                Backend::Local(_) => Ok(()),
+                Backend::Reactor(channel) => {
+                    let capabilities = pb::daemon_service_client::DaemonServiceClient::new(channel)
+                        .get_capabilities(pb::GetCapabilitiesRequest {})
+                        .await?
+                        .into_inner();
+                    require_record_file_options(&capabilities)
                 }
             }
         })
@@ -743,6 +802,8 @@ impl Service {
         &self,
         request: pb::CreateVaultEntityRequest,
     ) -> CliResult<pb::CreateVaultEntityResponse> {
+        let requires_memory_options =
+            request.memory_id.is_some() || request.memory_status.is_some();
         self.call(move |backend| async move {
             match backend {
                 Backend::Local(state) => services_agent::VaultImpl { state }
@@ -750,6 +811,14 @@ impl Service {
                     .await
                     .map(|response| response.into_inner()),
                 Backend::Reactor(channel) => {
+                    if requires_memory_options {
+                        let capabilities =
+                            pb::daemon_service_client::DaemonServiceClient::new(channel.clone())
+                                .get_capabilities(pb::GetCapabilitiesRequest {})
+                                .await?
+                                .into_inner();
+                        require_memory_create_options(&capabilities)?;
+                    }
                     let mut vault = pb::vault_service_client::VaultServiceClient::new(channel);
                     vault
                         .create_vault_entity(request)
@@ -983,6 +1052,90 @@ impl Service {
                 }
             }
         })
+    }
+}
+
+fn require_memory_create_options(capabilities: &pb::GetCapabilitiesResponse) -> Result<(), Status> {
+    if capabilities.protocol_version != 2
+        || !capabilities
+            .features
+            .iter()
+            .any(|feature| feature == services::VAULT_MEMORY_CREATE_OPTIONS_FEATURE)
+    {
+        return Err(Status::failed_precondition(
+            "the running Reactor does not support explicit memory ID or status; update/restart it before retrying",
+        ));
+    }
+    Ok(())
+}
+
+fn require_record_file_options(capabilities: &pb::GetCapabilitiesResponse) -> Result<(), Status> {
+    if capabilities.protocol_version != 2
+        || !capabilities
+            .features
+            .iter()
+            .any(|feature| feature == services::RECORD_FILE_OPTIONS_FEATURE)
+    {
+        return Err(Status::failed_precondition(
+            "the running Reactor does not support record size or binary options; update/restart it before retrying",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod memory_create_option_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_memory_options_require_advertised_capability() {
+        let mut capabilities = pb::GetCapabilitiesResponse {
+            protocol_version: 2,
+            ..Default::default()
+        };
+        assert!(require_memory_create_options(&capabilities).is_err());
+        capabilities
+            .features
+            .push(services::VAULT_MEMORY_CREATE_OPTIONS_FEATURE.into());
+        assert!(require_memory_create_options(&capabilities).is_ok());
+        capabilities.protocol_version = 1;
+        assert!(require_memory_create_options(&capabilities).is_err());
+    }
+
+    #[test]
+    fn record_file_options_require_advertised_capability() {
+        let mut capabilities = pb::GetCapabilitiesResponse {
+            protocol_version: 2,
+            ..Default::default()
+        };
+        assert!(require_record_file_options(&capabilities).is_err());
+        capabilities
+            .features
+            .push(services::RECORD_FILE_OPTIONS_FEATURE.into());
+        assert!(require_record_file_options(&capabilities).is_ok());
+        capabilities.protocol_version = 1;
+        assert!(require_record_file_options(&capabilities).is_err());
+    }
+
+    #[test]
+    fn structured_oversize_status_preserves_utf8_path_and_sizes() {
+        let mut status = Status::failed_precondition("atomic:CHANGE_REJECTED: file too large");
+        status
+            .metadata_mut()
+            .insert("atomic-record-error", "file-too-large".parse().unwrap());
+        status.metadata_mut().insert_bin(
+            "atomic-file-path-bin",
+            tonic::metadata::MetadataValue::from_bytes("data/é.bin".as_bytes()),
+        );
+        status
+            .metadata_mut()
+            .insert("atomic-file-size", "123".parse().unwrap());
+        status
+            .metadata_mut()
+            .insert("atomic-file-limit", "42".parse().unwrap());
+        assert!(
+            matches!(status_message(status), CliError::FileTooLarge { path, size: 123, limit: 42 } if path == "data/é.bin")
+        );
     }
 }
 

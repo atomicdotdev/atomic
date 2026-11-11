@@ -42,29 +42,29 @@ init_repo
 
 # Create file on dev
 create_file "config.txt" "version=1.0"
-assert_success "add config.txt" atomic add config.txt
-record_change "Add config.txt" >/dev/null 2>&1 || true
+require_success "add config.txt" atomic add config.txt
+require_success "record config.txt" record_change "Add config.txt"
 
 # Create draft from dev
-new_view "feature" --draft --parent dev >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature" new_view "feature" --draft --parent dev
+require_success "switch to feature" switch_view "feature"
 
 # Modify on feature
 overwrite_file "config.txt" "version=2.0"
-record_change "Update config to 2.0 on feature" >/dev/null 2>&1 || true
+require_success "record feature config" record_change "Update config to 2.0 on feature"
 
 # Switch to dev — should show dev's version, no conflict markers
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_file_content "dev has original version" "config.txt" "version=1.0"
 assert_no_conflict_markers "no conflict markers after switch to dev (case 1)" "config.txt"
 
 # Switch back to feature — should show feature's version
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 assert_file_content "feature has v2.0" "config.txt" "version=2.0"
 assert_no_conflict_markers "no conflict markers after switch to feature" "config.txt"
 
 # Round-trip
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_file_content "dev still has v1.0 (round 2)" "config.txt" "version=1.0"
 assert_no_conflict_markers "no conflict markers (round 2)" "config.txt"
 
@@ -91,30 +91,30 @@ def main():
 if __name__ == "__main__":
     main()
 EOF
-assert_success "add app.py" atomic add app.py
-record_change "Add app.py" >/dev/null 2>&1 || true
+require_success "add app.py" atomic add app.py
+require_success "record app.py" record_change "Add app.py"
 
 ORIGINAL_CONTENT="$(cat app.py)"
 
 # Create draft from dev
-new_view "agent" --draft --parent dev >/dev/null 2>&1 || true
-switch_view "agent" >/dev/null 2>&1 || true
+require_success "create agent" new_view "agent" --draft --parent dev
+require_success "switch to agent" switch_view "agent"
 
 # Modify line 5 on agent (change name)
 sed -i.bak 's/name = "World"/name = "Agent"/' app.py && rm -f app.py.bak
-record_change "Change name to Agent" >/dev/null 2>&1 || true
+require_success "record agent edit" record_change "Change name to Agent"
 
 AGENT_CONTENT="$(cat app.py)"
 
 # Switch to dev — should show ORIGINAL, not agent's version, no conflict
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_file_content "dev has original app.py" "app.py" "$ORIGINAL_CONTENT"
 assert_no_conflict_markers "no conflict markers on dev after agent edits (case 2)" "app.py"
 assert_file_contains "dev has World" "app.py" '"World"'
 assert_file_not_contains "dev does NOT have Agent" "app.py" '"Agent"'
 
 # Switch back to agent
-switch_view "agent" >/dev/null 2>&1 || true
+require_success "switch back to agent" switch_view "agent"
 assert_file_content "agent has its version" "app.py" "$AGENT_CONTENT"
 assert_no_conflict_markers "no conflict markers on agent" "app.py"
 
@@ -144,31 +144,31 @@ url = postgres://localhost/mydb
 pool_size = 10
 timeout = 30
 EOF
-assert_success "add server.conf" atomic add server.conf
-record_change "Add server.conf" >/dev/null 2>&1 || true
+require_success "add server.conf" atomic add server.conf
+require_success "record server.conf" record_change "Add server.conf"
 
 # Create draft
-new_view "feature" --draft --parent dev >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature" new_view "feature" --draft --parent dev
+require_success "switch to feature" switch_view "feature"
 
 # Feature edits: change port and pool_size
 sed -i.bak 's/port = 8080/port = 9090/' server.conf && rm -f server.conf.bak
 sed -i.bak 's/pool_size = 10/pool_size = 20/' server.conf && rm -f server.conf.bak
-record_change "Feature: change port and pool_size" >/dev/null 2>&1 || true
+require_success "record feature configuration" record_change "Feature: change port and pool_size"
 
 # Switch to dev, edit workers and timeout
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_no_conflict_markers "no markers on dev before dev edits" "server.conf"
 
 sed -i.bak 's/workers = 4/workers = 8/' server.conf && rm -f server.conf.bak
 sed -i.bak 's/timeout = 30/timeout = 60/' server.conf && rm -f server.conf.bak
-record_change "Dev: change workers and timeout" >/dev/null 2>&1 || true
+require_success "record dev configuration" record_change "Dev: change workers and timeout"
 
 DEV_CONF="$(cat server.conf)"
 
 # Switch to feature — draft inherits dev's changes (live perspective)
 # so it sees the merged state of both views' edits
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch to feature with inherited changes" switch_view "feature"
 assert_no_conflict_markers "no conflict markers on feature (merged, different lines)" "server.conf"
 # Feature should see BOTH its own edits AND dev's edits (inherited)
 assert_file_contains "feature has port 9090 (own edit)" "server.conf" "port = 9090"
@@ -177,7 +177,7 @@ assert_file_contains "feature has workers 8 (inherited from dev)" "server.conf" 
 assert_file_contains "feature has timeout 60 (inherited from dev)" "server.conf" "timeout = 60"
 
 # THE KEY TEST: Switch to dev — must show ONLY dev's state, no merge
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_no_conflict_markers "no conflict markers on dev after round-trip" "server.conf"
 assert_file_content "dev has its own clean version" "server.conf" "$DEV_CONF"
 assert_file_contains "dev has workers 8" "server.conf" "workers = 8"
@@ -203,23 +203,23 @@ version = 1.0.0
 author = original
 description = A sample app
 EOF
-assert_success "add version.txt" atomic add version.txt
-record_change "Add version.txt" >/dev/null 2>&1 || true
+require_success "add version.txt" atomic add version.txt
+require_success "record version.txt" record_change "Add version.txt"
 
 # Create draft
-new_view "hotfix" --draft --parent dev >/dev/null 2>&1 || true
-switch_view "hotfix" >/dev/null 2>&1 || true
+require_success "create hotfix" new_view "hotfix" --draft --parent dev
+require_success "switch to hotfix" switch_view "hotfix"
 
 # Hotfix changes version to 1.0.1
 sed -i.bak 's/version = 1.0.0/version = 1.0.1/' version.txt && rm -f version.txt.bak
-record_change "Hotfix: bump to 1.0.1" >/dev/null 2>&1 || true
+require_success "record hotfix version" record_change "Hotfix: bump to 1.0.1"
 
 # Switch to dev, change version to 2.0.0
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_no_conflict_markers "no markers before dev edit" "version.txt"
 
 sed -i.bak 's/version = 1.0.0/version = 2.0.0/' version.txt && rm -f version.txt.bak
-record_change "Dev: bump to 2.0.0" >/dev/null 2>&1 || true
+require_success "record dev version" record_change "Dev: bump to 2.0.0"
 
 # THE KEY TEST: dev must show ONLY its own version, no merge
 assert_no_conflict_markers "no conflict markers on dev (case 4)" "version.txt"
@@ -227,12 +227,32 @@ assert_file_contains "dev has 2.0.0" "version.txt" "version = 2.0.0"
 
 # Switch to hotfix — draft inherits dev's change, CRDT merges
 # (the exact result depends on token-level merge — may be 2.0.1 or markers)
-switch_view "hotfix" >/dev/null 2>&1 || true
+snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-switch-snapshot-XXXXXX")"
+_HARNESS_TMPDIRS+=("$snapshot_dir")
+cp version.txt "$snapshot_dir/version.txt"
+require_capture "read dev history before conflicting switch" atomic log --format json --view dev --all
+history_before="$COMMAND_OUTPUT"
+if switch_out="$(switch_view "hotfix" 2>&1)"; then
+    _pass "switch to conflicting hotfix"
+else
+    _fail "switch to conflicting hotfix" "$switch_out"
+    assert_current_view "refused switch preserves dev view" "dev"
+    assert_success "refused switch preserves dev file byte-for-byte" cmp -s "$snapshot_dir/version.txt" version.txt
+    require_capture "read dev history after refused switch" atomic log --format json --view dev --all
+    if [[ "$COMMAND_OUTPUT" == "$history_before" ]]; then
+        _pass "refused switch preserves dev history"
+    else
+        _fail "refused switch preserves dev history" "target history changed"
+    fi
+    _skip "remaining case 4 and cases 5–14" "conflicting switch refused"
+    print_summary || true
+    exit 1
+fi
 # Don't assert exact content — just verify no crash and file exists
 assert_file_exists "version.txt exists on hotfix" "version.txt"
 
 # Switch back to dev — MUST be clean, the visit to hotfix must not pollute
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 assert_no_conflict_markers "no conflict markers on dev after visiting hotfix" "version.txt"
 assert_file_contains "dev still has 2.0.0" "version.txt" "version = 2.0.0"
 # Verify dev does NOT have hotfix's version mixed in

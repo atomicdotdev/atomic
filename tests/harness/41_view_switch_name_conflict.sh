@@ -30,26 +30,42 @@ make_temp_repo "view-switch-name-conflict"
 init_repo
 
 create_file "seed.txt" "seed content"
-assert_success "add seed.txt" atomic add seed.txt
-record_change "seed base" >/dev/null 2>&1 || true
+require_success "add seed.txt" atomic add seed.txt
+require_success "record seed base" record_change "seed base"
 
 # ───────────────────────────────────────────────────────────────────────────
 begin_section "Repro: two views claim f.txt independently (name conflict)"
 # ───────────────────────────────────────────────────────────────────────────
-new_view "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "switch to feature" switch_view "feature"
 
-create_file "f.txt" "from-feature first line\nbody line"
-assert_success "add f.txt on feature" atomic add f.txt
-record_change "feature creates f.txt" >/dev/null 2>&1 || true
+create_file "f.txt" $'from-feature first line\nbody line'
+require_success "add f.txt on feature" atomic add f.txt
+require_success "record feature file" record_change "feature creates f.txt"
 
-switch_view "dev" >/dev/null 2>&1 || true
-create_file "f.txt" "from-dev first line\nbody line"
-assert_success "add f.txt on dev" atomic add f.txt
-record_change "dev creates f.txt" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
+create_file "f.txt" $'from-dev first line\nbody line'
+require_success "add f.txt on dev" atomic add f.txt
+require_success "record dev file" record_change "dev creates f.txt"
 
 # Insert feature → dev: two inodes claim f.txt ⇒ name conflict.
-insert_from_view "feature" "dev" >/dev/null 2>&1 || true
+snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-name-conflict-XXXXXX")"
+_HARNESS_TMPDIRS+=("$snapshot_dir")
+cp f.txt "$snapshot_dir/f.txt"
+require_capture "read dev history before insertion" atomic log --view dev -f json
+history_before="$COMMAND_OUTPUT"
+if insert_out="$(insert_from_view "feature" "dev" 2>&1)"; then
+    _pass "insert feature name conflict"
+else
+    _fail "insert feature name conflict" "$insert_out"
+    assert_success "refusal preserves dev file bytes" cmp -s "$snapshot_dir/f.txt" f.txt
+    assert_current_view "refusal preserves dev view" dev
+    require_capture "read dev history after refusal" atomic log --view dev -f json
+    if [[ "$COMMAND_OUTPUT" == "$history_before" ]]; then _pass "refusal preserves dev history"; else _fail "refusal preserves dev history" "history changed"; fi
+    _skip "conflict-marker and child-switch checks" "name-conflict insertion refused"
+    print_summary || true
+    exit 1
+fi
 
 # The conflict must actually be materialized: markers on disk.
 if grep -q ">>>>>>>" f.txt 2>/dev/null; then
@@ -63,8 +79,8 @@ fi
 begin_section "Bug: switching to an inheriting child deletes the file"
 # ───────────────────────────────────────────────────────────────────────────
 # Fork from the current view (dev): the child inherits dev's lineage.
-new_view "child" >/dev/null 2>&1 || true
-switch_view "child" >/dev/null 2>&1 || true
+require_success "create child view" new_view "child"
+require_success "switch to child" switch_view "child"
 assert_current_view "now on child" "child"
 
 # THE REGRESSION: the file is in the child's inherited state — it must NOT

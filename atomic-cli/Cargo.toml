@@ -7,6 +7,8 @@ teams = ["atomic-teams"]
 # test suite builds the binary with the deterministic adoption seams. The
 # default/shipping configuration compiles no injection code at all.
 adoption-test-injection = ["atomic-repository/adoption-test-injection"]
+# Non-default Git span-import experiment; no native semantic history is invented.
+experimental-span-import = []
 
 [package]
 name = "atomic-cli"

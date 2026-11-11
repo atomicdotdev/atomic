@@ -115,6 +115,9 @@ pub struct AssemblyContext {
     /// Accumulated hunks (graph operations).
     hunks: Vec<GraphOp<Option<Hash>>>,
 
+    /// Immutable range edits, with offsets in the assembled content blob.
+    span_ops: Vec<crate::change::span_patch::SpanOp>,
+
     /// Accumulated file operations (semantic layer).
     file_ops: Vec<FileOps>,
 
@@ -153,6 +156,7 @@ impl AssemblyContext {
         Self {
             header,
             hunks: Vec::new(),
+            span_ops: Vec::new(),
             file_ops: Vec::new(),
             dependencies: HashSet::new(),
             extra_known: HashSet::new(),
@@ -172,6 +176,7 @@ impl AssemblyContext {
         Self {
             header,
             hunks: Vec::with_capacity(hunk_capacity),
+            span_ops: Vec::new(),
             file_ops: Vec::new(),
             dependencies: HashSet::new(),
             extra_known: HashSet::new(),
@@ -336,6 +341,12 @@ impl AssemblyContext {
             dependencies,
         );
         change.hashed.extra_known = extra_known;
+        if !self.span_ops.is_empty() {
+            change.hashed.span = Some(crate::change::span_patch::SpanPatch::new(
+                Vec::new(),
+                self.span_ops,
+            ));
+        }
 
         // Set opaque metadata bytes (e.g., SessionEnvelope from atomic-agent)
         if !metadata_bytes.is_empty() {
@@ -656,6 +667,9 @@ where
             file.kind(),
         );
         let glob_start = Instant::now();
+        // Causal observations apply to both pre-globalized span edits and
+        // ordinary lifecycle hunks such as deletion of a span-backed file.
+        ctx.add_dependencies(file.span_dependencies().iter().copied());
 
         // Fast path: if the file has pre-globalized ops (vertex map was
         // available during content retrieval), skip globalization entirely.
@@ -671,11 +685,64 @@ where
                 shift_graph_op_content(&mut op, shift);
                 ctx.add_hunk(op);
             }
+            for op in file.span_ops() {
+                let mut op = op.clone();
+                match &mut op {
+                    crate::change::span_patch::SpanOp::Edit {
+                        file: span_file,
+                        target,
+                        insert_start,
+                        insert_end,
+                        ..
+                    } => {
+                        ctx.add_dependency(span_file.owner);
+                        ctx.add_dependency(target.owner);
+                        *insert_start = insert_start.checked_add(shift).ok_or_else(|| {
+                            AssemblyError::Globalize {
+                                path: file.path().to_string(),
+                                source: super::globalize::GlobalizeError::MissingField {
+                                    field: "span content offset overflow",
+                                    path: file.path().to_string(),
+                                },
+                            }
+                        })?;
+                        *insert_end = insert_end.checked_add(shift).ok_or_else(|| {
+                            AssemblyError::Globalize {
+                                path: file.path().to_string(),
+                                source: super::globalize::GlobalizeError::MissingField {
+                                    field: "span content offset overflow",
+                                    path: file.path().to_string(),
+                                },
+                            }
+                        })?;
+                    }
+                    crate::change::span_patch::SpanOp::Root { .. } => {
+                        return Err(AssemblyError::Globalize {
+                            path: file.path().to_string(),
+                            source: super::globalize::GlobalizeError::MissingField {
+                                field: "span root must use a file addition",
+                                path: file.path().to_string(),
+                            },
+                        })
+                    }
+                }
+                ctx.span_ops.push(op);
+            }
             // Opaque files retain their trunk lifecycle but deliberately omit
             // line/token semantics. Attribute operations still need that stable
             // trunk identity.
             if let Some(crdt_ops) = file.crdt_ops() {
                 let mut crdt_ops = crdt_ops.clone();
+                if !file.span_ops().is_empty() {
+                    for line in crdt_ops.line_ops_mut() {
+                        if let Some((start, end)) = line.content_range() {
+                            line.set_content_range(
+                                ChangePosition::new(start.get() + shift),
+                                ChangePosition::new(end.get() + shift),
+                            );
+                        }
+                    }
+                }
                 if file.opaque_generated() {
                     crdt_ops.line_ops_mut().clear();
                 }
@@ -788,7 +855,7 @@ where
     );
 
     // Check if we have any hunks
-    if ctx.hunk_count() == 0 && !options.get_include_empty_files() {
+    if ctx.hunk_count() == 0 && ctx.span_ops.is_empty() && !options.get_include_empty_files() {
         return Err(types::AssemblyError::AllEmpty);
     }
 

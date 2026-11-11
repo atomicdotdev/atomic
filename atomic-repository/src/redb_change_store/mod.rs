@@ -92,6 +92,10 @@ pub enum RedbStoreError {
     #[error("Corrupt change data: {0}")]
     Corrupt(String),
 
+    /// Selective reads must not silently discard span operations.
+    #[error("selective section reads cannot interpret span changes")]
+    UnsupportedSpanSelectiveRead,
+
     #[error("Unsupported provenance store schema version {0}")]
     UnsupportedProvenanceSchema(u64),
 
@@ -226,7 +230,10 @@ pub struct StoredChangeMeta {
 #[derive(serde::Serialize, serde::Deserialize)]
 enum StoredChangeMetaExtension {
     V1 { header_v2: Vec<u8> },
+    V2 { header_v2: Vec<u8>, span: Vec<u8> },
 }
+
+type StoredMetaWithSections = (StoredChangeMeta, Option<Vec<u8>>, Option<Vec<u8>>);
 
 // ═══════════════════════════════════════════════════════════════════════
 // RedbChangeStore — the main store
@@ -376,11 +383,16 @@ impl RedbChangeStore {
         let mut reader = ChangeReader::open(&mut cursor)?;
 
         let file_header = *reader.file_header();
+        if file_header.version == format_v3::SPAN_FORMAT_VERSION {
+            Change::deserialize(&mut Cursor::new(data))
+                .map_err(|error| RedbStoreError::Corrupt(error.to_string()))?;
+        }
         let hash_table = reader.hash_table().clone();
 
         // Read all sections
         let mut meta_header: Option<ChangeHeader> = None;
         let mut header_v2: Option<Vec<u8>> = None;
+        let mut span_payload: Option<Vec<u8>> = None;
         let mut meta_deps: Vec<u16> = Vec::new();
         let mut provenance_payload: Option<Vec<u8>> = None;
         let mut graph_sections: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -399,7 +411,7 @@ impl RedbChangeStore {
                         postcard::from_bytes(&section.payload)
                             .map_err(|e| RedbStoreError::Serialization(e.to_string()))?,
                     );
-                    if file_header.version == format_v3::FORMAT_VERSION {
+                    if file_header.version != format_v3::LEGACY_FORMAT_VERSION {
                         header_v2 = Some(section.payload.clone());
                     }
                 }
@@ -413,6 +425,14 @@ impl RedbChangeStore {
                 SectionType::Graph => {
                     graph_sections.push((graph_idx, section.payload.clone()));
                     graph_idx += 1;
+                }
+                SectionType::Span => {
+                    if file_header.version != format_v3::SPAN_FORMAT_VERSION
+                        || span_payload.is_some()
+                    {
+                        return Err(RedbStoreError::Corrupt("unexpected span section".into()));
+                    }
+                    span_payload = Some(section.payload.clone());
                 }
                 SectionType::Semantic => {
                     semantic_sections.push((semantic_idx, section.payload.clone()));
@@ -459,7 +479,10 @@ impl RedbChangeStore {
         let mut meta_bytes = postcard::to_allocvec(&meta)
             .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
         if let Some(header_v2) = header_v2 {
-            let extension = StoredChangeMetaExtension::V1 { header_v2 };
+            let extension = match span_payload {
+                Some(span) => StoredChangeMetaExtension::V2 { header_v2, span },
+                None => StoredChangeMetaExtension::V1 { header_v2 },
+            };
             meta_bytes.extend(
                 postcard::to_allocvec(&extension)
                     .map_err(|e| RedbStoreError::Serialization(e.to_string()))?,
@@ -575,14 +598,14 @@ impl RedbChangeStore {
         hash: &[u8; 32],
     ) -> RedbStoreResult<StoredChangeMeta> {
         self.load_meta_with_header_in_txn(txn, hash)
-            .map(|(meta, _)| meta)
+            .map(|(meta, _, _)| meta)
     }
 
     fn load_meta_with_header_in_txn(
         &self,
         txn: &redb::ReadTransaction,
         hash: &[u8; 32],
-    ) -> RedbStoreResult<(StoredChangeMeta, Option<Vec<u8>>)> {
+    ) -> RedbStoreResult<StoredMetaWithSections> {
         let table = txn.open_table(tables::CHANGE_META)?;
 
         let value = table.get(hash)?.ok_or_else(|| RedbStoreError::NotFound {
@@ -597,8 +620,8 @@ impl RedbChangeStore {
             .map_err(|e| RedbStoreError::Corrupt(format!("meta decompression failed: {}", e)))?;
         let (meta, suffix) = postcard::take_from_bytes::<StoredChangeMeta>(&decompressed)
             .map_err(|e| RedbStoreError::Corrupt(format!("meta deserialization failed: {}", e)))?;
-        let header_v2 = if suffix.is_empty() {
-            None
+        let (header_v2, span) = if suffix.is_empty() {
+            (None, None)
         } else {
             let (extension, remainder) =
                 postcard::take_from_bytes::<StoredChangeMetaExtension>(suffix).map_err(|e| {
@@ -609,10 +632,12 @@ impl RedbChangeStore {
                     "unexpected bytes after meta extension".to_string(),
                 ));
             }
-            let StoredChangeMetaExtension::V1 { header_v2 } = extension;
-            Some(header_v2)
+            match extension {
+                StoredChangeMetaExtension::V1 { header_v2 } => (Some(header_v2), None),
+                StoredChangeMetaExtension::V2 { header_v2, span } => (Some(header_v2), Some(span)),
+            }
         };
-        Ok((meta, header_v2))
+        Ok((meta, header_v2, span))
     }
 
     // NOTE: load_change(), export_v3_file(), export_v3_bytes(), and

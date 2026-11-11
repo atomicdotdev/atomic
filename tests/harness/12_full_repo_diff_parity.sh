@@ -10,9 +10,8 @@
 #   PARITY_REPO_URL   — git clone URL to test (default: hyperfine)
 #   PARITY_SAMPLE_N   — check every Nth commit (default: 10)
 #   PARITY_MAX_COMMITS— stop after this many sampled commits (default: 50)
-#   PARITY_SKIP_PATHS — colon-separated glob patterns to skip
-#                       (default: "*.lock:*.sum" — generated lockfiles
-#                        whose diffs vary by algorithm)
+#   PARITY_SKIP_PATHS — optional colon-separated glob patterns to skip;
+#                       any exclusions make the suite partial
 #
 # Examples:
 #
@@ -48,16 +47,24 @@ source "$HARNESS_DIR/helpers.sh"
 REPO_URL="${PARITY_REPO_URL:-https://github.com/sharkdp/hyperfine.git}"
 SAMPLE_N="${PARITY_SAMPLE_N:-10}"
 MAX_COMMITS="${PARITY_MAX_COMMITS:-50}"
-SKIP_PATHS="${PARITY_SKIP_PATHS:-*.lock:*.sum:package-lock.json:yarn.lock}"
+SKIP_PATHS="${PARITY_SKIP_PATHS-}"
+if [[ ! "$SAMPLE_N" =~ ^[1-9][0-9]*$ || ! "$MAX_COMMITS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PARITY_SAMPLE_N and PARITY_MAX_COMMITS must be positive integers" >&2
+    exit 1
+fi
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 extract_git_change_lines() {
-    grep -E '^\+[^+]|^-[^-]' || true
+    awk '/^diff --git / { hunk = 0; next } /^@@ / { hunk = 1; next } hunk && /^[+-]/ { print }'
 }
 
 extract_atomic_change_lines() {
-    grep -E '^\+[^+]|^-[^-]' || true
+    awk '/^diff --atomic / { hunk = 0; next } /^@@ / { hunk = 1; next } hunk && /^[+-]/ { print }'
+}
+
+atomic_in_clone() {
+    (cd "$CLONE_DIR" && atomic "$@")
 }
 
 # Check if a file path matches any of the skip patterns.
@@ -87,10 +94,10 @@ atomic_diff_for_path() {
     local path_filter="$2"
     printf '%s\n' "$raw" | awk -v pat="$path_filter" '
         /^diff --atomic/ {
-            # Match only when the path appears after " b/" (the new-file side).
-            in_sec = (index($0, " b/" pat) > 0 && \
-                      (index($0, " b/" pat " ") > 0 || \
-                       substr($0, length($0) - length(pat)) == pat)) ? 1 : 0
+            # Additions use the new path; deletions use the old path.
+            in_sec = (index($0, " b/" pat " ") > 0 || \
+                      substr($0, length($0) - length(pat) - 2) == " b/" pat || \
+                      index($0, " a/" pat " /dev/null") > 0) ? 1 : 0
             next
         }
         in_sec { print }
@@ -116,7 +123,6 @@ get_rename_old_path() {
     # --diff-filter=R limits output to renamed files.
     # --name-status lines look like: R100<TAB>old/path<TAB>new/path
     git -C "$repo" diff --diff-filter=R --name-status "${sha}^" "$sha" \
-        2>/dev/null \
         | awk -v np="$new_path" -F'\t' '$3 == np { print $2 }'
 }
 
@@ -139,15 +145,18 @@ git_change_lines_for_file() {
     local path="$4"
     local is_rename="$5"   # "1" if this file was renamed, "0" otherwise
 
+    local raw
     if [[ "$is_rename" == "1" ]]; then
         # -M10% enables rename detection with a low similarity threshold so
         # git recognises renames even when content changed significantly.
         # We then extract only the section of the diff that belongs to our
         # file (matched on the "b/<path>" side of the diff --git header),
         # and filter to +/- lines.
-        git -C "$repo" --no-pager diff -M10% "$parent" "$sha" \
-            2>/dev/null \
-            | awk -v pat="$path" '
+        if ! raw="$(git -C "$repo" --no-pager diff -M10% "$parent" "$sha" 2>&1)"; then
+            printf 'Git rename diff failed: %s\n' "$raw" >&2
+            return 1
+        fi
+        printf '%s\n' "$raw" | awk -v pat="$path" '
                 /^diff --git/ {
                     n = length($0)
                     plen = length(pat)
@@ -157,10 +166,13 @@ git_change_lines_for_file() {
                     next
                 }
                 in_sec { print }
-            ' | extract_git_change_lines || true
+            ' | extract_git_change_lines
     else
-        git -C "$repo" --no-pager diff "$parent" "$sha" -- "$path" \
-            2>/dev/null | extract_git_change_lines || true
+        if ! raw="$(git -C "$repo" --no-pager diff "$parent" "$sha" -- "$path" 2>&1)"; then
+            printf 'Git diff failed: %s\n' "$raw" >&2
+            return 1
+        fi
+        printf '%s\n' "$raw" | extract_git_change_lines
     fi
 }
 
@@ -184,6 +196,18 @@ change_lines_match() {
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+begin_section "Full-Repo Parity: Diff extraction"
+_fixture=$'diff --atomic /dev/null b/src/file.rs (+2)\n--- /dev/null\n+++ b/src/file.rs\n@@ -0,0 +1,2 @@\n+--- a/content\n+\ndiff --atomic a/src/removed.rs /dev/null (-1)\n--- a/src/removed.rs\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-old\ndiff --atomic /dev/null b/src/file.rs.extra (+1)\n--- /dev/null\n+++ b/src/file.rs.extra\n@@ -0,0 +1,1 @@\n+wrong'
+_added="$(atomic_diff_for_path "$_fixture" 'src/file.rs')"
+_removed="$(atomic_diff_for_path "$_fixture" 'src/removed.rs')"
+if [[ "$_added" == $'+--- a/content\n+' && "$_removed" == '-old' ]]; then
+    _pass "path extraction keeps hunk content and handles additions and deletions"
+else
+    _fail "path extraction" "addition: $_added; deletion: $_removed"
+    print_summary || true
+    exit 1
+fi
+
 begin_section "Full-Repo Import: ${REPO_URL}"
 
 make_temp_repo "full-parity"
@@ -198,8 +222,7 @@ fi
 _pass "cloned $REPO_URL"
 
 # Import
-(cd "$CLONE_DIR" && atomic git import 2>/dev/null) || true
-_pass "atomic git import completed"
+require_success "atomic git import completed" atomic_in_clone git import
 
 # ── Collect commits to sample ────────────────────────────────────────────────
 #
@@ -210,11 +233,11 @@ begin_section "Sampling commits (every ${SAMPLE_N}, max ${MAX_COMMITS}) and buil
 
 # Get all commit SHAs oldest-first, skipping the root (no parent).
 ALL_COMMITS=()
-while IFS= read -r sha; do
-    parent=$(git -C "$CLONE_DIR" rev-parse "${sha}^" 2>/dev/null) || true
-    [[ -z "$parent" ]] && continue
+require_capture "read Git history for sampling" git -C "$CLONE_DIR" rev-list --reverse --parents HEAD
+while IFS=' ' read -r sha parent rest; do
+    [[ -z "${parent:-}" ]] && continue
     ALL_COMMITS+=("$sha")
-done < <(git -C "$CLONE_DIR" rev-list --reverse HEAD 2>/dev/null)
+done <<< "$COMMAND_OUTPUT"
 
 TOTAL_COMMITS=${#ALL_COMMITS[@]}
 
@@ -229,7 +252,13 @@ for sha in "${ALL_COMMITS[@]}"; do
     _idx=$((_idx + 1))
 done
 
-_pass "sampling ${#SAMPLED_COMMITS[@]} of $TOTAL_COMMITS commits"
+if [[ ${#SAMPLED_COMMITS[@]} -gt 0 ]]; then
+    _pass "sampling ${#SAMPLED_COMMITS[@]} of $TOTAL_COMMITS commits"
+else
+    _fail "sample commits" "no commits with parents were selected"
+    print_summary || true
+    exit 1
+fi
 
 # ── Build git-SHA → atomic-hash map (lazy, for sampled commits only) ─────────
 #
@@ -245,7 +274,8 @@ _pass "sampling ${#SAMPLED_COMMITS[@]} of $TOTAL_COMMITS commits"
 # Our SAMPLED_COMMITS are drawn from git rev-list --reverse (oldest first),
 # so they cluster near the beginning of the reversed atomic log.
 # This makes the early-exit trigger much sooner for typical samples.
-_all_atomic_log=$( (cd "$CLONE_DIR" && atomic log --format short --no-color --full-hash --reverse 2>/dev/null) || true )
+require_capture "read imported Atomic history" atomic_in_clone log --format short --no-color --full-hash --reverse
+_all_atomic_log="$COMMAND_OUTPUT"
 
 MAP_GIT_SHAS=()
 MAP_ATOMIC_HASHES=()
@@ -254,12 +284,17 @@ MAP_ATOMIC_HASHES=()
 # We call `atomic change` for each entry, extract "Commit:", and store.
 # Progress is shown every 100 entries.
 _map_count=0
-_total_log=$(printf '%s\n' "$_all_atomic_log" | grep -c '.' 2>/dev/null || echo 0)
+_found_all=0
+_total_log=$(printf '%s\n' "$_all_atomic_log" | awk 'length($0) { n++ } END { print n + 0 }')
 while IFS= read -r logline; do
     _ah=$(echo "$logline" | awk '{print $1}')
     [[ -z "$_ah" ]] && continue
-    _detail=$( (cd "$CLONE_DIR" && atomic change "$_ah" 2>/dev/null) || true )
-    _gsha=$(echo "$_detail" | grep "Commit:" | awk '{print $2}')
+    if ! _detail="$(atomic_in_clone change "$_ah" --full-hash 2>&1)"; then
+        _fail "read imported change $_ah" "$_detail"
+        print_summary || true
+        exit 1
+    fi
+    _gsha=$(printf '%s\n' "$_detail" | sed -n 's/^.*Git source revision: //p')
     if [[ -n "$_gsha" ]]; then
         MAP_GIT_SHAS+=("$_gsha")
         MAP_ATOMIC_HASHES+=("$_ah")
@@ -283,7 +318,11 @@ while IFS= read -r logline; do
     [[ $_found_all -eq 1 ]] && break
 done <<< "$_all_atomic_log"
 
-_pass "map built: ${#MAP_GIT_SHAS[@]} entries (scanned $_map_count of $_total_log)"
+if [[ "$_found_all" -eq 1 ]]; then
+    _pass "map built: ${#MAP_GIT_SHAS[@]} entries (scanned $_map_count of $_total_log)"
+else
+    _fail "map sampled Git commits" "not all sampled commits were imported (scanned $_map_count of $_total_log)"
+fi
 
 # Helper: look up atomic hash for a git SHA (full or short prefix match).
 _lookup_atomic_hash() {
@@ -310,16 +349,14 @@ COMMITS_SKIP=0
 FILES_PASS=0
 FILES_FAIL=0
 FILES_SKIP=0
+FILES_EXCLUDED=0
+FILES_EMPTY=0
+FILES_RENAMES=0
 
 for curr_sha in "${SAMPLED_COMMITS[@]}"; do
     short="${curr_sha:0:8}"
-    parent=$(git -C "$CLONE_DIR" rev-parse "${curr_sha}^" 2>/dev/null) || true
-
-    if [[ -z "$parent" ]]; then
-        COMMITS_SKIP=$((COMMITS_SKIP + 1))
-        FILES_SKIP=$((FILES_SKIP + 1))
-        continue
-    fi
+    require_capture "commit $short: resolve parent" git -C "$CLONE_DIR" rev-parse "${curr_sha}^"
+    parent="$COMMAND_OUTPUT"
 
     # Get the atomic hash for this commit.
     atomic_hash=$(_lookup_atomic_hash "$curr_sha") || true
@@ -331,14 +368,17 @@ for curr_sha in "${SAMPLED_COMMITS[@]}"; do
 
     # Get files changed in this commit (excluding merges, submodules).
     changed_files=()
+    require_capture "commit $short: list changed paths" git -C "$CLONE_DIR" diff --name-only "$parent" "$curr_sha"
+    changed_output="$COMMAND_OUTPUT"
     while IFS= read -r fpath; do
         [[ -z "$fpath" ]] && continue
         should_skip "$fpath" && {
             FILES_SKIP=$((FILES_SKIP + 1))
+            FILES_EXCLUDED=$((FILES_EXCLUDED + 1))
             continue
         }
         changed_files+=("$fpath")
-    done < <(git -C "$CLONE_DIR" diff --name-only "$parent" "$curr_sha" 2>/dev/null)
+    done <<< "$changed_output"
 
     if [[ ${#changed_files[@]} -eq 0 ]]; then
         # Empty or all-skipped commit
@@ -347,28 +387,95 @@ for curr_sha in "${SAMPLED_COMMITS[@]}"; do
     fi
 
     # Get the full atomic diff output once per commit (amortised cost).
-    atomic_raw=$( (cd "$CLONE_DIR" && atomic diff -c "$atomic_hash" --no-color 2>/dev/null) || true )
+    require_capture "commit $short: read Atomic diff" atomic_in_clone diff -c "$atomic_hash" --no-color
+    atomic_raw="$COMMAND_OUTPUT"
 
     commit_ok=1
+    checked_files=0
     for fpath in "${changed_files[@]}"; do
         # Detect whether this file is the new path of a rename.
         _is_rename=0
-        if [[ -n "$(get_rename_old_path "$CLONE_DIR" "$curr_sha" "$fpath")" ]]; then
+        if ! rename_path="$(get_rename_old_path "$CLONE_DIR" "$curr_sha" "$fpath" 2>&1)"; then
+            _fail "commit $short: detect rename for $fpath" "$rename_path"
+            FILES_FAIL=$((FILES_FAIL + 1))
+            commit_ok=0
+            continue
+        fi
+        if [[ -n "$rename_path" ]]; then
             _is_rename=1
         fi
 
         # Git change lines for this file (rename-aware).
-        git_lines=$(git_change_lines_for_file \
-            "$CLONE_DIR" "$parent" "$curr_sha" "$fpath" "$_is_rename") || true
+        if ! git_lines=$(git_change_lines_for_file \
+            "$CLONE_DIR" "$parent" "$curr_sha" "$fpath" "$_is_rename" 2>&1); then
+            _fail "commit $short: read Git diff for $fpath" "$git_lines"
+            FILES_FAIL=$((FILES_FAIL + 1))
+            commit_ok=0
+            continue
+        fi
 
         # Atomic change lines for this file
-        atomic_lines=$(atomic_diff_for_path "$atomic_raw" "$fpath") || true
+        if ! atomic_lines=$(atomic_diff_for_path "$atomic_raw" "$fpath" 2>&1); then
+            _fail "commit $short: extract Atomic diff for $fpath" "$atomic_lines"
+            FILES_FAIL=$((FILES_FAIL + 1))
+            commit_ok=0
+            continue
+        fi
+
+        # Empty text diffs do not prove parity. A pure Git rename can instead
+        # be verified by exact blob/mode equality and the imported change's
+        # explicit Git evidence and graph representation.
+        if [[ -z "$git_lines" && -z "$atomic_lines" ]]; then
+            if [[ "$_is_rename" == 1 ]]; then
+                require_capture "commit $short: read rename diff JSON" atomic_in_clone diff -c "$atomic_hash" --json --no-color
+                rename_diff_json="$COMMAND_OUTPUT"
+                require_capture "commit $short: read rename change JSON" atomic_in_clone change "$atomic_hash" --format json
+                rename_change_json="$COMMAND_OUTPUT"
+                if python3 -c '
+import json, subprocess, sys
+repo,parent,sha,old,new,diff_text,change_text = sys.argv[1:]
+def tree(revision, path):
+    raw = subprocess.check_output(["git", "-C", repo, "ls-tree", "-z", revision, "--", path])
+    rows = [row for row in raw.split(b"\0") if row]
+    assert len(rows) == 1
+    meta, name = rows[0].split(b"\t", 1)
+    assert name.decode() == path
+    mode, kind, oid = meta.decode().split()
+    assert kind == "blob"
+    return mode, oid
+assert tree(parent, old) == tree(sha, new), "Git rename changed blob or mode"
+doc = json.loads(diff_text)
+matches = [item for item in doc["files"] if item["old_path"] == old and item["new_path"] == new]
+assert len(matches) == 1 and not matches[0]["hunks"] and matches[0].get("git_rename_identity_unproven") is True
+change = json.loads(change_text)
+hunks = change["hunks"]
+assert any(h["hunk_type"] == "FileDel" and h["path"] == old for h in hunks)
+assert any(h["hunk_type"] == "FileAdd" and h["path"] == new for h in hunks)
+loss = change["unhashed"]["git"]["stream"]["rename_identity_loss"]
+assert any(x["from"] == old and x["to"] == new for x in loss)
+' "$CLONE_DIR" "$parent" "$curr_sha" "$rename_path" "$fpath" "$rename_diff_json" "$rename_change_json"; then
+                    FILES_PASS=$((FILES_PASS + 1))
+                    FILES_RENAMES=$((FILES_RENAMES + 1))
+                    checked_files=$((checked_files + 1))
+                    continue
+                else
+                    _fail "commit $short: verify pure rename $fpath" "Git blobs/modes, diff evidence, or recorded graph operations differ"
+                    FILES_FAIL=$((FILES_FAIL + 1))
+                    commit_ok=0
+                    continue
+                fi
+            fi
+            FILES_SKIP=$((FILES_SKIP + 1))
+            FILES_EMPTY=$((FILES_EMPTY + 1))
+            continue
+        fi
+        checked_files=$((checked_files + 1))
 
         if change_lines_match "$git_lines" "$atomic_lines"; then
             FILES_PASS=$((FILES_PASS + 1))
         else
-            git_count=$(printf '%s\n' "$git_lines" | grep -c '.' 2>/dev/null || echo 0)
-            atomic_count=$(printf '%s\n' "$atomic_lines" | grep -c '.' 2>/dev/null || echo 0)
+            git_count=$(printf '%s\n' "$git_lines" | awk 'length($0) { n++ } END { print n + 0 }')
+            atomic_count=$(printf '%s\n' "$atomic_lines" | awk 'length($0) { n++ } END { print n + 0 }')
             # Show first diverging line for diagnosis
             first_diff=$(diff \
                 <(printf '%s\n' "$git_lines" | sort) \
@@ -382,7 +489,9 @@ for curr_sha in "${SAMPLED_COMMITS[@]}"; do
             commit_ok=0
         fi
     done
-    if [[ $commit_ok -eq 1 ]]; then
+    if [[ $commit_ok -eq 1 && $checked_files -eq 0 ]]; then
+        COMMITS_SKIP=$((COMMITS_SKIP + 1))
+    elif [[ $commit_ok -eq 1 ]]; then
         COMMITS_PASS=$((COMMITS_PASS + 1))
     else
         COMMITS_FAIL=$((COMMITS_FAIL + 1))
@@ -394,13 +503,25 @@ done
 echo ""
 echo "  Commits: ${COMMITS_PASS} passed, ${COMMITS_FAIL} failed, ${COMMITS_SKIP} skipped"
 echo "  Files:   ${FILES_PASS} passed, ${FILES_FAIL} failed, ${FILES_SKIP} skipped"
+echo "           ${FILES_RENAMES} verified pure renames (non-text evidence)"
 echo ""
 
+if [[ "$FILES_EXCLUDED" -gt 0 ]]; then
+    _skip "excluded $FILES_EXCLUDED generated file paths" "configured PARITY_SKIP_PATHS"
+fi
+if [[ "$FILES_EMPTY" -gt 0 ]]; then
+    _skip "$FILES_EMPTY paths had no textual change lines" "no text diff to compare"
+fi
+if [[ "$COMMITS_SKIP" -gt 0 ]]; then
+    _skip "$COMMITS_SKIP commits had no checked paths" "paths excluded or no textual change lines"
+fi
 if [[ $COMMITS_FAIL -gt 0 || $FILES_FAIL -gt 0 ]]; then
     _fail "full-repo parity" \
         "${COMMITS_FAIL} commits and ${FILES_FAIL} files failed diff parity"
+elif [[ $FILES_PASS -gt 0 && $COMMITS_PASS -gt 0 ]]; then
+    _pass "full-repo parity: ${FILES_PASS} text diffs or verified pure renames matched Git"
 else
-    _pass "full-repo parity: all ${FILES_PASS} file-diffs matched git exactly"
+    _fail "full-repo parity" "no file-diffs were checked"
 fi
 
 print_summary

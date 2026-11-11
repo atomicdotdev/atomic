@@ -100,16 +100,25 @@ impl QueryView<'_> {
     ) -> Result<ContentSearchResult, RepositoryError> {
         plan.run(|path| {
             let (inode, position) = self.files[path];
-            let rendered = super::content::retrieve_content_bounded(
+            let rendered = match super::content::retrieve_span_bounded_if_present(
                 &self.txn,
                 &self.repo.change_store,
                 inode,
-                position,
-                atomic_core::output::alive::RetrieveOptions::new()
-                    .with_graph_visibility(self.visibility.clone()),
+                &self.visibility,
                 RECORDED_CONTENT_LIMIT,
-            )
-            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            )? {
+                Some(content) => content,
+                None => super::content::retrieve_content_bounded(
+                    &self.txn,
+                    &self.repo.change_store,
+                    inode,
+                    position,
+                    atomic_core::output::alive::RetrieveOptions::new()
+                        .with_graph_visibility(self.visibility.clone()),
+                    RECORDED_CONTENT_LIMIT,
+                )
+                .map_err(|error| RepositoryError::Database(error.to_string()))?,
+            };
             let (bytes, retained_bytes) = match rendered {
                 super::content::BoundedContent::Complete(bytes) => {
                     let retained = bytes.len();
@@ -257,15 +266,23 @@ impl Repository {
         let scope = self.query_view(view_name)?;
         let mut sources = Vec::new();
         for (path, (inode, position)) in &scope.files {
-            let bytes = super::content::retrieve_content_with_filter_fast(
+            let bytes = match super::content::retrieve_span_if_present(
                 &scope.txn,
                 &self.change_store,
                 *inode,
-                *position,
-                atomic_core::output::alive::RetrieveOptions::new()
-                    .with_graph_visibility(scope.visibility.clone()),
-            )
-            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+                &scope.visibility,
+            )? {
+                Some(content) => content,
+                None => super::content::retrieve_content_with_filter_fast(
+                    &scope.txn,
+                    &self.change_store,
+                    *inode,
+                    *position,
+                    atomic_core::output::alive::RetrieveOptions::new()
+                        .with_graph_visibility(scope.visibility.clone()),
+                )
+                .map_err(|error| RepositoryError::Database(error.to_string()))?,
+            };
             if let Ok(source) = String::from_utf8(bytes) {
                 sources.push((path.clone(), source));
             }

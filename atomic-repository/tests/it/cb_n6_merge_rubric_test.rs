@@ -122,6 +122,70 @@ fn assert_rename_conflict(repo: &Repository, root: &Path) -> BTreeMap<String, Ve
 }
 
 #[test]
+fn region_delete_reattaches_concurrent_insertion_without_rewriting_survivors() {
+    for (prior_insertion, region_lines) in [(false, 3), (true, 3), (true, 38)] {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let path = root.join("f.txt");
+        let mut repo = Repository::init(root).unwrap();
+        let middle: String = (0..region_lines - 2)
+            .map(|index| format!("middle{index}\n"))
+            .collect();
+        let baseline = format!("line1\nline2\n{middle}line4\nline5\n");
+        let initial: &[u8] = if prior_insertion {
+            b"line1\nline4\nline5\n"
+        } else {
+            baseline.as_bytes()
+        };
+        fs::write(&path, initial).unwrap();
+        repo.add(working_copy(&repo), "f.txt", Default::default())
+            .unwrap();
+        record_all(&repo, "initial");
+        if prior_insertion {
+            fs::write(&path, &baseline).unwrap();
+            record_all(&repo, "insert region");
+        }
+        for view in ["delete", "insert", "merge-di", "merge-id"] {
+            repo.create_view_from(view, "dev").unwrap();
+        }
+        repo.switch_view(working_copy(&repo), "delete").unwrap();
+        fs::write(&path, b"line1\nline5\n").unwrap();
+        let deletion = record_all(&repo, "delete region");
+        assert_eq!(
+            repo.get_file_content("f.txt").unwrap().unwrap(),
+            b"line1\nline5\n"
+        );
+        assert!(conflicted_paths(&repo).is_empty());
+        repo.switch_view(working_copy(&repo), "insert").unwrap();
+        fs::write(&path, baseline.replace("line2\n", "line2\nINSIDE\n")).unwrap();
+        let insertion = record_all(&repo, "insert inside region");
+        for (view, first, second) in [
+            ("merge-di", deletion.hash(), insertion.hash()),
+            ("merge-id", insertion.hash(), deletion.hash()),
+        ] {
+            repo.switch_view(working_copy(&repo), view).unwrap();
+            repo.insert_change(first, InsertOptions::default()).unwrap();
+            repo.insert_change(second, InsertOptions::default())
+                .unwrap();
+            repo.materialize(working_copy(&repo)).unwrap();
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                b"line1\nINSIDE\nline5\n",
+                "{view}, prior insertion: {prior_insertion}"
+            );
+            assert!(conflicted_paths(&repo).is_empty());
+            assert!(listed_conflict_paths(&repo).is_empty());
+        }
+        drop(repo);
+        let repo = Repository::open(root).unwrap();
+        assert_eq!(
+            repo.get_file_content("f.txt").unwrap().unwrap(),
+            b"line1\nINSIDE\nline5\n"
+        );
+    }
+}
+
+#[test]
 fn a12_resolution_is_explicit_order_independent_and_reopen_stable() {
     let temp = TempDir::new().expect("temp repo");
     let root = temp.path();

@@ -192,6 +192,7 @@ impl Change {
                 dependencies,
                 extra_known: Vec::new(),
                 metadata: Vec::new(),
+                span: None,
                 provenance: Vec::new(),
                 hunks,
                 file_ops,
@@ -217,6 +218,7 @@ impl Change {
                 dependencies: Vec::new(),
                 extra_known: Vec::new(),
                 metadata: Vec::new(),
+                span: None,
                 provenance: Vec::new(),
                 hunks: Vec::new(),
                 file_ops: Vec::new(),
@@ -327,6 +329,10 @@ impl Change {
                 claimed: self.hashed.contents_hash.to_string(),
                 computed: computed.to_string(),
             });
+        }
+        if let Some(span) = &self.hashed.span {
+            span.validate_content_ranges(self.contents.len() as u64)
+                .map_err(|error| ChangeError::Invalid(error.to_string()))?;
         }
         Ok(())
     }
@@ -447,7 +453,10 @@ impl Change {
             file_header_builder = file_header_builder.with_signature();
         }
 
-        let file_header = file_header_builder.build();
+        let mut file_header = file_header_builder.build();
+        if self.hashed.span.is_some() {
+            file_header.version = SPAN_FORMAT_VERSION;
+        }
 
         // 4. Create writer and write preamble
         let mut change_writer = ChangeWriter::new(writer, WriterOptions::default());
@@ -500,6 +509,13 @@ impl Change {
 
             let payload_bytes = graph_payload.to_postcard_bytes()?;
             change_writer.write_graph_section(&payload_bytes)?;
+        }
+
+        if let Some(span) = &self.hashed.span {
+            let bytes = span
+                .encode()
+                .map_err(|error| ChangeError::Invalid(error.to_string()))?;
+            change_writer.write_span_section(&bytes)?;
         }
 
         // 7. Write SEMANTIC section(s)
@@ -588,7 +604,7 @@ impl Change {
         let file_header = *change_reader.file_header();
         let format_version = file_header.version;
         let hash_table = change_reader.hash_table().clone();
-        let strict_v2 = format_version == FORMAT_VERSION;
+        let strict_v2 = format_version == FORMAT_VERSION || format_version == SPAN_FORMAT_VERSION;
 
         // 2. Read all sections. V2 enforces the canonical section manifest;
         // V1 keeps its historical framing and gains only semantic defaults.
@@ -597,6 +613,7 @@ impl Change {
         let mut dependencies: Vec<Hash> = Vec::new();
         let mut provenance: Vec<Provenance> = Vec::new();
         let mut hunks: Vec<GraphOp<Option<Hash>>> = Vec::new();
+        let mut span = None;
         let mut file_ops: Vec<FileOps> = Vec::new();
         let mut contents: Vec<u8> = Vec::new();
         let mut unhashed: Option<serde_json::Value> = None;
@@ -688,6 +705,23 @@ impl Change {
                         });
                     }
                 }
+                SectionType::Span => {
+                    if format_version != SPAN_FORMAT_VERSION || span.is_some() {
+                        return Err(ChangeError::Invalid(
+                            "unexpected or duplicate SPAN section".into(),
+                        ));
+                    }
+                    let patch = super::span_patch::SpanPatch::decode(&section.payload)
+                        .map_err(|error| ChangeError::Invalid(error.to_string()))?;
+                    if patch
+                        .encode()
+                        .map_err(|error| ChangeError::Invalid(error.to_string()))?
+                        != section.payload
+                    {
+                        return Err(ChangeError::Invalid("noncanonical SPAN section".into()));
+                    }
+                    span = Some(patch);
+                }
                 SectionType::Semantic => {
                     semantic_count += 1;
                     let ops: Vec<FileOps> = postcard::from_bytes(&section.payload)
@@ -739,6 +773,7 @@ impl Change {
                 || semantic_count != file_header.semantic_section_count
                 || content_count != file_header.contents_chunks
                 || unhashed_count != expected_unhashed
+                || (format_version == SPAN_FORMAT_VERSION) != span.is_some()
             {
                 return Err(ChangeError::Invalid(
                     "V2 section manifest does not match the file header".to_string(),
@@ -790,6 +825,7 @@ impl Change {
                 dependencies,
                 extra_known,
                 metadata,
+                span,
                 provenance,
                 hunks,
                 file_ops,
@@ -1066,6 +1102,10 @@ pub struct HashedChange {
     /// Application-specific metadata that affects the change hash.
     pub metadata: Vec<u8>,
 
+    /// Immutable range operations in a separately hashed schema-3 section.
+    /// Opaque metadata is never interpreted as a span discriminator.
+    pub span: Option<super::span_patch::SpanPatch>,
+
     /// AI provenance information (optional)
     ///
     /// Tracks AI involvement in creating this change, including:
@@ -1169,7 +1209,9 @@ impl HashedChange {
 
     /// Check if this change has any hunks.
     pub fn is_empty(&self) -> bool {
-        self.hunks.is_empty() && self.file_ops.is_empty()
+        self.hunks.is_empty()
+            && self.file_ops.is_empty()
+            && self.span.as_ref().is_none_or(|span| span.ops.is_empty())
     }
 
     /// Get the number of hunks.
@@ -1261,6 +1303,7 @@ mod tests {
             dependencies: Vec::new(),
             extra_known: Vec::new(),
             metadata: Vec::new(),
+            span: None,
             provenance: Vec::new(),
             hunks: Vec::new(),
             file_ops: Vec::new(),
@@ -1290,6 +1333,7 @@ mod tests {
             dependencies: vec![dep1, dep2],
             extra_known: vec![known1],
             metadata: Vec::new(),
+            span: None,
             provenance: Vec::new(),
             hunks: Vec::new(),
             file_ops: Vec::new(),

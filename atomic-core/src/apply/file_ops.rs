@@ -679,6 +679,12 @@ fn apply_trunk_op<T: MutTxnT>(
 
         // GraphOp::SetAttr owns persistence; FileOps carries the semantic fact.
         TrunkOp::SetMode { .. } | TrunkOp::SetKind { .. } => {}
+        TrunkOp::ProjectedSpanEdit { .. } => {
+            return Err(PristineError::Inconsistent {
+                message: "projected span edit requires span-aware validation and application"
+                    .into(),
+            })
+        }
     }
 
     Ok(())

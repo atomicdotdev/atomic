@@ -195,6 +195,7 @@ impl Repository {
 
         txn.update_view(&new_view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        super::name_resolution::refresh_name_conflict_caches(&mut txn, new_view.id)?;
 
         if txn.kg_writes_enabled()? {
             self.project_view_kg(&mut txn)?;
@@ -276,6 +277,8 @@ impl Repository {
         txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
+        super::name_resolution::refresh_name_conflict_caches(&mut txn, view.id)?;
+
         if txn.kg_writes_enabled()? {
             self.project_view_kg(&mut txn)?;
         }
@@ -338,6 +341,8 @@ impl Repository {
 
         txn.update_view(&view)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        super::name_resolution::refresh_name_conflict_caches(&mut txn, view.id)?;
 
         if txn.kg_writes_enabled()? {
             self.project_view_kg(&mut txn)?;
@@ -812,8 +817,10 @@ impl Repository {
             None => None,
         };
 
-        txn.create_view(name, scope, parent_id)
+        let view = txn
+            .create_view(name, scope, parent_id)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        super::name_resolution::refresh_name_conflict_caches(&mut txn, view.id)?;
 
         if txn.kg_writes_enabled()? {
             self.project_view_kg(&mut txn)?;

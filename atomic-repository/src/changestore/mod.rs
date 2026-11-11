@@ -74,7 +74,7 @@ use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use atomic_core::change::Change;
+use atomic_core::change::{Change, VerifiedChange};
 use atomic_core::types::{Base32, Hash};
 
 // Re-export iterator types used by the public API
@@ -121,6 +121,12 @@ pub struct ChangeStore {
     /// We use `RwLock` for thread-safe interior mutability, allowing
     /// concurrent read access while ensuring exclusive write access.
     pub(crate) cache: RwLock<LruCache<Hash, Change>>,
+
+    /// Parsed, hash-verified changes keyed by hash. Change files are
+    /// content-addressed and write-once, so a verified parse is immutable
+    /// for this handle's lifetime; re-parsing an 11 MB baseline per rendered
+    /// file is the dominant cost of span rendering.
+    pub(crate) verified_cache: RwLock<LruCache<Hash, VerifiedChange>>,
 
     /// Content spans held without their change files — a remote sandbox's
     /// cache has the bytes of the vertices it was sent, never whole changes.
@@ -215,6 +221,7 @@ impl ChangeStore {
         Ok(Self {
             changes_dir,
             cache: RwLock::new(LruCache::new(cache_capacity)),
+            verified_cache: RwLock::new(LruCache::new(cache_capacity)),
             spans: RwLock::new(SpanOverlay::default()),
         })
     }
@@ -230,6 +237,7 @@ impl ChangeStore {
         Ok(Self {
             changes_dir,
             cache: RwLock::new(LruCache::new(cache_capacity)),
+            verified_cache: RwLock::new(LruCache::new(cache_capacity)),
             spans: RwLock::new(SpanOverlay::default()),
         })
     }
@@ -443,6 +451,48 @@ impl ChangeStore {
         }
 
         Ok(change)
+    }
+
+    /// Read the current source even on an operation-local cache hit. Identical
+    /// bytes reuse the immutable checked decode; changed notes, corruption,
+    /// replacement and deletion cannot hide behind the ordinary decoded LRU.
+    pub(crate) fn load_verified_change(
+        &self,
+        hash: &Hash,
+        cached: Option<&VerifiedChange>,
+    ) -> ChangeStoreResult<VerifiedChange> {
+        if cached.is_none() {
+            if let Ok(cache) = self.verified_cache.read() {
+                if let Some(verified) = cache.peek(hash) {
+                    return Ok(verified.clone());
+                }
+            }
+        }
+        let bytes = fs::read(self.change_path(hash)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ChangeStoreError::NotFound {
+                    hash: hash.to_base32(),
+                }
+            } else {
+                ChangeStoreError::Io(error)
+            }
+        })?;
+        let verified = match cached.filter(|cached| cached.matches_source_bytes(&bytes)) {
+            Some(cached) => cached.clone(),
+            None => VerifiedChange::from_bytes(&bytes)?,
+        };
+        if verified.hash() != *hash {
+            return Err(ChangeStoreError::HashMismatch {
+                expected: hash.to_base32(),
+                computed: verified.hash().to_base32(),
+            });
+        }
+        if cached.is_none() {
+            if let Ok(mut cache) = self.verified_cache.write() {
+                cache.insert(*hash, verified.clone());
+            }
+        }
+        Ok(verified)
     }
 
     /// Hold `bytes` as `hash`'s content at `start..start + bytes.len()`.

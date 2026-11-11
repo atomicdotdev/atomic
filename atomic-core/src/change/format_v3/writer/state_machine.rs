@@ -4,7 +4,7 @@
 //! and all public methods for writing sections of a V3 change file.
 //! Private helper methods live in the sibling `helpers` module.
 
-use super::super::error::{FormatError, FormatResult, FORMAT_VERSION};
+use super::super::error::{FormatError, FormatResult, FORMAT_VERSION, SPAN_FORMAT_VERSION};
 use super::super::hash_table::HashDedupTable;
 use super::super::types::{
     envelope::encode_native_change_header_v2, FileHeader, SectionHeader, SectionType, Trailer,
@@ -160,6 +160,9 @@ pub struct ChangeWriter<'w, W: Write> {
     /// Tracks whether the SIGNATURE section has been written.
     pub(super) wrote_signature_section: bool,
 
+    pub(super) schema_version: u32,
+    pub(super) wrote_span_section: bool,
+
     /// The highest section ordering value written so far.
     /// Used to enforce monotonic section ordering.
     pub(super) last_section_ordering: Option<u8>,
@@ -194,6 +197,8 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
             wrote_header_section: false,
             wrote_deps_section: false,
             wrote_signature_section: false,
+            schema_version: 0,
+            wrote_span_section: false,
             last_section_ordering: None,
         }
     }
@@ -224,7 +229,7 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     pub fn write_file_header(&mut self, header: &FileHeader) -> FormatResult<()> {
         self.expect_state(WriterState::Created, "write_file_header")?;
         header.validate()?;
-        if header.version != FORMAT_VERSION {
+        if header.version != FORMAT_VERSION && header.version != SPAN_FORMAT_VERSION {
             return Err(FormatError::InvalidHeader {
                 reason: format!(
                     "schema version {} is read-only; writers emit version {}",
@@ -234,6 +239,7 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
         }
 
         header.write_to(self.writer)?;
+        self.schema_version = header.version;
         self.stats.total_bytes_written += FileHeader::SIZE as u64;
         self.state = WriterState::FileHeaderWritten;
         Ok(())
@@ -508,6 +514,11 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     /// - I/O errors from writing the trailer.
     pub fn finalize(mut self) -> FormatResult<WriteOutcome> {
         self.ensure_metadata_complete()?;
+        if (self.schema_version == SPAN_FORMAT_VERSION) != self.wrote_span_section {
+            return Err(FormatError::InvalidHeader {
+                reason: "schema 3 requires exactly one SPAN section; schema 2 forbids it".into(),
+            });
+        }
 
         // Compute the final hash
         let hash = self.hasher.finalize();
@@ -554,6 +565,11 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
         uncompressed_len: u64,
     ) -> FormatResult<()> {
         self.ensure_metadata_complete()?;
+        if section_type == SectionType::Span {
+            return Err(FormatError::InvalidHeader {
+                reason: "SPAN sections must use write_span_section".into(),
+            });
+        }
         self.check_section_ordering(section_type)?;
 
         let section_header = SectionHeader::new(section_type, compressed_data.len() as u32);

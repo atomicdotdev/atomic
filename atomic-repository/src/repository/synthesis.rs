@@ -23,6 +23,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use atomic_core::change::{
     CausalFrontier, Change, ChangeHeader, ChangeKind, ChangeOrigin, ChangeStore, GitDerivation,
+    GraphOp,
 };
 use atomic_core::operation::{
     ActorRef, GitHashAlgorithm, GitObjectId, MetadataTarget, MetadataTransition, MetadataValue,
@@ -2956,6 +2957,18 @@ impl Repository {
         use crate::apply::write_change_to_graph;
         use atomic_core::apply::compute_new_state;
 
+        let span_change = final_change.hashed.span.is_some();
+        if span_change {
+            use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
+            if txn.required_capability_version(SPAN_RANGE_CAPABILITY.id())?
+                != Some(SPAN_RANGE_CAPABILITY.minimum_version())
+            {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "span capability is not enabled".into(),
+                });
+            }
+        }
+
         // Deterministic test fault: fails the mutation stage after the
         // SynthesizeGit intent was journaled, exercising the recovery path.
         #[cfg(test)]
@@ -3046,6 +3059,17 @@ impl Repository {
                 false,
                 crate::InsertStats::new(),
             )
+        } else if span_change {
+            crate::apply::write_span_hunks_with_index(
+                txn,
+                view_name,
+                change_id,
+                hash,
+                final_change,
+                options,
+                false,
+            )
+            .map_err(|error| RepositoryError::Apply(error.to_string()))?
         } else {
             write_change_to_graph(
                 txn,
@@ -3058,6 +3082,87 @@ impl Repository {
             )
             .map_err(|e| RepositoryError::Apply(e.to_string()))?
         };
+        if span_change && !already_applied {
+            use atomic_core::change::span_patch::SpanOp;
+            use atomic_core::pristine::{span_patch_storage, TreeTxnT};
+            let patch = final_change
+                .hashed
+                .span
+                .as_ref()
+                .expect("span change checked above");
+            let mut roots = std::collections::BTreeMap::new();
+            for op in &patch.ops {
+                if let SpanOp::Root { path, ordinal, .. } = op {
+                    let matches: Vec<_> = final_change
+                        .hunks()
+                        .iter()
+                        .filter_map(|hunk| {
+                            if let GraphOp::FileAdd {
+                                path: added,
+                                add_inode,
+                                contents: None,
+                                ..
+                            } = hunk
+                            {
+                                (crate::canonical_path_identity(added)
+                                    == crate::canonical_path_identity(path))
+                                .then_some(add_inode.start)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if matches.len() != 1 {
+                        return Err(RepositoryError::InvalidOperation {
+                            message: format!("span root '{path}' has no unique namespace creation"),
+                        });
+                    }
+                    let position = atomic_core::types::Position::new(change_id, matches[0]);
+                    let inode = txn.position_inode(position)?.ok_or_else(|| {
+                        RepositoryError::InvalidOperation {
+                            message: format!("span root '{path}' has no inode binding"),
+                        }
+                    })?;
+                    if roots.insert(*ordinal, inode).is_some() {
+                        return Err(RepositoryError::InvalidOperation {
+                            message: "duplicate span root ordinal".into(),
+                        });
+                    }
+                }
+            }
+            if final_change
+                .hunks()
+                .iter()
+                .filter(|op| matches!(op, GraphOp::FileAdd { .. }))
+                .count()
+                != roots.len()
+            {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "span change must bind every file addition to one span root".into(),
+                });
+            }
+            span_patch_storage::index_change(
+                txn,
+                &self.change_store,
+                view_name,
+                *hash,
+                final_change,
+                &roots,
+            )
+            .map_err(|error| RepositoryError::InvalidOperation {
+                message: format!("span indexing failed: {error}"),
+            })?;
+        } else if span_change {
+            use atomic_core::pristine::span_patch_storage::SpanPatchReadTxn;
+            if !txn
+                .span_change_indexed(change_id)
+                .map_err(|error| RepositoryError::Database(error.to_string()))?
+            {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "applied span change is missing its index".into(),
+                });
+            }
+        }
         timings.apply_ms = apply_start.elapsed().as_millis();
 
         let commit_start = std::time::Instant::now();
@@ -3411,17 +3516,27 @@ impl Repository {
                         .ok_or_else(|| RepositoryError::InvalidOperation {
                             message: format!("staged path '{path}' inode has no graph position"),
                         })?;
-                    let rendered = retrieve_content_with_filter_fast(
+                    let rendered = match super::content::retrieve_span_if_present(
                         txn,
                         &self.change_store,
                         inode,
-                        position,
-                        atomic_core::output::alive::RetrieveOptions::new()
-                            .with_graph_visibility(visibility.clone()),
-                    )
-                    .map_err(|error| RepositoryError::InvalidOperation {
-                        message: format!("staged retrieval failed for '{path}': {error}"),
-                    })?;
+                        &visibility,
+                    )? {
+                        Some(bytes) => bytes,
+                        None => retrieve_content_with_filter_fast(
+                            txn,
+                            &self.change_store,
+                            inode,
+                            position,
+                            atomic_core::output::alive::RetrieveOptions::new()
+                                .with_graph_visibility(visibility.clone()),
+                        )
+                        .map_err(|error| {
+                            RepositoryError::InvalidOperation {
+                                message: format!("staged retrieval failed for '{path}': {error}"),
+                            }
+                        })?,
+                    };
                     if rendered.as_slice() != bytes.as_slice() {
                         return Err(RepositoryError::InvalidOperation {
                             message: format!(
@@ -3493,6 +3608,23 @@ impl Repository {
     ) -> Result<(), RepositoryError> {
         let verify_start = std::time::Instant::now();
         let projection = self.project_tree_for_visibility(txn, visibility)?;
+        use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
+        let span_context = match txn.required_capability_version(SPAN_RANGE_CAPABILITY.id())? {
+            Some(2 | 3) => Some(
+                atomic_core::pristine::span_patch_storage::SpanRenderContext::new(
+                    txn,
+                    &self.change_store,
+                    visibility,
+                )
+                .map_err(|error| RepositoryError::Database(error.to_string()))?,
+            ),
+            None => None,
+            Some(version) => {
+                return Err(RepositoryError::InvalidOperation {
+                    message: format!("unsupported span capability version {version}"),
+                })
+            }
+        };
         let _projection_ms = verify_start.elapsed().as_millis();
         // The projection keys paths by the graph's own spelling (raw for
         // native tracking and current imports, escaped for earlier imports);
@@ -3534,17 +3666,32 @@ impl Repository {
                     ),
                 });
             }
-            let rendered = retrieve_content_with_filter_fast(
+            let rendered = if super::content::has_visible_span_root(
                 txn,
                 &self.change_store,
                 item.inode,
-                item.position,
-                atomic_core::output::alive::RetrieveOptions::new()
-                    .with_graph_visibility(visibility.clone()),
-            )
-            .map_err(|error| RepositoryError::InvalidOperation {
-                message: format!("staged retrieval failed for '{path}': {error}"),
-            })?;
+                visibility,
+            )? {
+                span_context
+                    .as_ref()
+                    .ok_or_else(|| {
+                        RepositoryError::Database("span context missing for indexed file".into())
+                    })?
+                    .render(item.inode)
+                    .map_err(|error| RepositoryError::Database(error.to_string()))?
+            } else {
+                retrieve_content_with_filter_fast(
+                    txn,
+                    &self.change_store,
+                    item.inode,
+                    item.position,
+                    atomic_core::output::alive::RetrieveOptions::new()
+                        .with_graph_visibility(visibility.clone()),
+                )
+                .map_err(|error| RepositoryError::InvalidOperation {
+                    message: format!("staged retrieval failed for '{path}': {error}"),
+                })?
+            };
             if rendered.as_slice() != expected.bytes.as_slice() {
                 if std::env::var_os("ATOMIC_DEBUG_DELETION").is_some() {
                     let first_diff = rendered

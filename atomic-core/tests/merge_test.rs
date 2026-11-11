@@ -5,7 +5,9 @@ use std::path::Path;
 use atomic_core::crdt::tables as crdt;
 use atomic_core::pristine::build_metadata::{BUILD_VERSION, CREATED_WITH_KEY, MIGRATED_WITH_KEY};
 use atomic_core::pristine::merge::{merged_legacy_dir, LegacyDatabases};
-use atomic_core::pristine::schema::{LEGACY_DIR_KEY, SCHEMA_VERSION, SCHEMA_VERSION_KEY};
+use atomic_core::pristine::schema::{
+    BASE_SCHEMA_VERSION, LEGACY_DIR_KEY, PROJECTED_SEMANTICS_SCHEMA_VERSION, SCHEMA_VERSION_KEY,
+};
 use atomic_core::pristine::tables::{
     ATOMIC_META, CHANGE_META, EXTERNAL, GRAPH, PROVENANCE_STORE_META, PROVENANCE_TURNS,
 };
@@ -135,7 +137,7 @@ fn merge_copies_both_databases_and_records_the_legacy_dir() {
         let meta = txn.open_table(ATOMIC_META).unwrap();
         assert_eq!(
             meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap().value(),
-            SCHEMA_VERSION.to_le_bytes().as_slice()
+            BASE_SCHEMA_VERSION.to_le_bytes().as_slice()
         );
         assert_eq!(
             meta.get(LEGACY_DIR_KEY).unwrap().unwrap().value(),
@@ -166,6 +168,159 @@ fn merge_copies_both_databases_and_records_the_legacy_dir() {
         .expect("view survives the merge");
     assert_eq!(view.change_count, 1);
     assert!(txn.get_internal(&hash).unwrap().is_some());
+}
+
+#[test]
+fn merge_preserves_projected_semantic_schema_fence() {
+    use atomic_core::pristine::{CapabilityTxnT, SPAN_PROJECTED_SEMANTICS_CAPABILITY};
+    let dir = tempfile::tempdir().unwrap();
+    let pristine_path = dir.path().join("pristine.redb");
+    let changes_path = dir.path().join("changes.redb");
+    let merged_path = dir.path().join("atomic.redb");
+    legacy_pristine(&pristine_path);
+    legacy_changes(&changes_path);
+    let pristine = Pristine::open(&pristine_path).unwrap();
+    pristine
+        .require_repository_capability(SPAN_PROJECTED_SEMANTICS_CAPABILITY)
+        .unwrap();
+    drop(pristine);
+    let legacy = open_sources(&[&pristine_path, &changes_path]);
+    legacy.merge_into(&merged_path, "fixture").unwrap();
+    drop(legacy);
+    let merged = Pristine::open_readonly_without_recovery(&merged_path).unwrap();
+    let txn = merged.read_txn().unwrap();
+    assert_eq!(
+        txn.required_capability_version(SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())
+            .unwrap(),
+        Some(SPAN_PROJECTED_SEMANTICS_CAPABILITY.minimum_version())
+    );
+    drop(txn);
+    drop(merged);
+    let db = Database::open(&merged_path).unwrap();
+    let txn = db.begin_read().unwrap();
+    let meta = txn.open_table(ATOMIC_META).unwrap();
+    assert_eq!(
+        meta.get(SCHEMA_VERSION_KEY).unwrap().unwrap().value(),
+        PROJECTED_SEMANTICS_SCHEMA_VERSION.to_le_bytes().as_slice()
+    );
+}
+
+#[test]
+fn merge_keeps_span_indexes_on_baseline_schema() {
+    use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
+    const APPLIED: TableDefinition<u64, u8> = TableDefinition::new("span_patch_applied_v1");
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("pristine.redb");
+    let merged = dir.path().join("atomic.redb");
+    legacy_pristine(&source);
+    let pristine = Pristine::open(&source).unwrap();
+    pristine
+        .require_repository_capability(SPAN_RANGE_CAPABILITY)
+        .unwrap();
+    drop(pristine);
+    let db = Database::open(&source).unwrap();
+    let txn = db.begin_write().unwrap();
+    txn.open_table(APPLIED).unwrap().insert(42, 1).unwrap();
+    txn.commit().unwrap();
+    drop(db);
+    let legacy = open_sources(&[&source]);
+    legacy.merge_into(&merged, "fixture").unwrap();
+    legacy.verify_unchanged(&merged).unwrap();
+    drop(legacy);
+    let pristine = Pristine::open_readonly_without_recovery(&merged).unwrap();
+    let txn = pristine.read_txn().unwrap();
+    assert_eq!(
+        txn.required_capability_version(SPAN_RANGE_CAPABILITY.id())
+            .unwrap(),
+        Some(SPAN_RANGE_CAPABILITY.minimum_version())
+    );
+    drop(txn);
+    drop(pristine);
+    let db = Database::open(&merged).unwrap();
+    let txn = db.begin_read().unwrap();
+    assert_eq!(
+        txn.open_table(APPLIED)
+            .unwrap()
+            .get(42)
+            .unwrap()
+            .unwrap()
+            .value(),
+        1
+    );
+    assert_eq!(
+        txn.open_table(ATOMIC_META)
+            .unwrap()
+            .get(SCHEMA_VERSION_KEY)
+            .unwrap()
+            .unwrap()
+            .value(),
+        BASE_SCHEMA_VERSION.to_le_bytes().as_slice()
+    );
+}
+
+#[test]
+fn merge_copies_span_indexes_and_detects_later_span_mutation() {
+    use atomic_core::pristine::{SPAN_PROJECTED_SEMANTICS_CAPABILITY, SPAN_RANGE_CAPABILITY};
+    const FILES: TableDefinition<&[u8; 36], u64> = TableDefinition::new("span_patch_files_v1");
+    const ROOTS: TableDefinition<u64, &[u8; 24]> = TableDefinition::new("span_patch_roots_v1");
+    const SPANS: TableDefinition<&[u8; 32], u8> = TableDefinition::new("span_patch_nodes_v1");
+    const EDITS: MultimapTableDefinition<&[u8; 32], &[u8; 40]> =
+        MultimapTableDefinition::new("span_patch_edits_v1");
+    const APPLIED: TableDefinition<u64, u8> = TableDefinition::new("span_patch_applied_v1");
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("pristine.redb");
+    let merged = dir.path().join("atomic.redb");
+    legacy_pristine(&source);
+    let pristine = Pristine::open(&source).unwrap();
+    pristine
+        .require_repository_capabilities(&[
+            SPAN_RANGE_CAPABILITY,
+            SPAN_PROJECTED_SEMANTICS_CAPABILITY,
+        ])
+        .unwrap();
+    drop(pristine);
+    let db = Database::open(&source).unwrap();
+    let txn = db.begin_write().unwrap();
+    txn.open_table(FILES).unwrap().insert(&[1; 36], 7).unwrap();
+    txn.open_table(ROOTS).unwrap().insert(7, &[2; 24]).unwrap();
+    txn.open_table(SPANS).unwrap().insert(&[3; 32], 4).unwrap();
+    txn.open_multimap_table(EDITS)
+        .unwrap()
+        .insert(&[3; 32], &[5; 40])
+        .unwrap();
+    txn.open_multimap_table(EDITS)
+        .unwrap()
+        .insert(&[3; 32], &[6; 40])
+        .unwrap();
+    txn.open_table(APPLIED).unwrap().insert(9, 1).unwrap();
+    txn.commit().unwrap();
+    drop(db);
+    let legacy = open_sources(&[&source]);
+    let report = legacy.merge_into(&merged, "fixture").unwrap();
+    for name in [
+        "span_patch_files_v1",
+        "span_patch_roots_v1",
+        "span_patch_nodes_v1",
+        "span_patch_edits_v1",
+        "span_patch_applied_v1",
+    ] {
+        assert!(report.tables.contains_key(name), "missing {name}");
+    }
+    assert_eq!(report.tables["span_patch_edits_v1"].rows, 2);
+    legacy.verify_unchanged(&merged).unwrap();
+    drop(legacy);
+    let db = Database::open(&source).unwrap();
+    let txn = db.begin_write().unwrap();
+    txn.open_table(SPANS).unwrap().insert(&[3; 32], 5).unwrap();
+    txn.commit().unwrap();
+    drop(db);
+    let error = open_sources(&[&source])
+        .verify_unchanged(&merged)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("changed after migration"),
+        "{error}"
+    );
 }
 
 #[test]

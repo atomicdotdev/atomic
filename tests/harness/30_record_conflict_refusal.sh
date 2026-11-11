@@ -32,24 +32,62 @@ echo "${BOLD}record refuses conflict markers (and reports it as a user error)${R
 # markers on the base view. (Rubric A4 x B1; same shape as merge_helpers'
 # build_case, spelled out here so this suite stands alone.)
 setup_conflict() {
-    init_repo
-    printf 'alpha\nbeta\ngamma\n' > f.txt
-    add_files f.txt >/dev/null
-    record_change "base" >/dev/null
-    BASE_VIEW="$(current_view)"
-
-    new_view feature >/dev/null
-    switch_view feature >/dev/null
-    printf 'alpha\nONE\nbeta\ngamma\n' > f.txt
-    record_change "edit A" >/dev/null
-    FEATURE_HASH="$(tip_hash feature)"
-
-    switch_view "$BASE_VIEW" >/dev/null
-    printf 'alpha\nTWO\nbeta\ngamma\n' > f.txt
-    record_change "edit B" >/dev/null
-
-    atomic insert "$FEATURE_HASH" >/dev/null 2>&1
+    build_case $'alpha\nbeta\ngamma\n' $'alpha\nONE\nbeta\ngamma\n' $'alpha\nTWO\nbeta\ngamma\n'
+    local snapshot_dir history_before output
+    snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-refusal-snapshot-XXXXXX")"
+    _HARNESS_TMPDIRS+=("$snapshot_dir")
+    cp f.txt "$snapshot_dir/f.txt"
+    require_capture "read history before conflict insert" atomic log --format json --view "$BASE_VIEW" --all
+    history_before="$COMMAND_OUTPUT"
+    if output="$(atomic insert "$FEATURE_HASH" 2>&1)"; then
+        _pass "create conflict for record refusal"
+    else
+        _fail "create conflict for record refusal" "$output"
+        assert_success "refused conflict insert preserves bytes" cmp -s "$snapshot_dir/f.txt" f.txt
+        assert_current_view "refused conflict insert preserves view" "$BASE_VIEW"
+        require_capture "read history after refused conflict insert" atomic log --format json --view "$BASE_VIEW" --all
+        if [[ "$COMMAND_OUTPUT" == "$history_before" ]]; then
+            _pass "refused conflict insert preserves history"
+        else
+            _fail "refused conflict insert preserves history" "history changed"
+        fi
+        _skip "merge-generated marker refusal and resolution cases" "conflict insert refused"
+        print_summary || true
+        exit 1
+    fi
 }
+
+begin_section "record refuses user-written marker text"
+make_temp_repo record-user-markers
+init_repo
+create_file f.txt $'alpha\nbeta\n'
+require_success "add marker fixture" atomic add f.txt
+require_success "record marker fixture" record_change "base"
+printf 'alpha\n>>>>>>> side A\nONE\n=======\nTWO\n<<<<<<< side B\n' > f.txt
+snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-marker-snapshot-XXXXXX")"
+_HARNESS_TMPDIRS+=("$snapshot_dir")
+cp f.txt "$snapshot_dir/f.txt"
+require_capture "read history before marker refusal" atomic log --format json
+history_before="$COMMAND_OUTPUT"
+assert_failed_output_contains "marker refusal names file and line" "f.txt still contains conflict markers at line 2" atomic record -m "should be refused"
+assert_failed_output_not_contains "marker refusal is not internal" "Internal error" atomic record -m "should be refused"
+assert_failed_output_not_contains "marker refusal has no bug-report hint" "Please report it" atomic record -m "should be refused"
+record_status=0
+record_output="$(atomic record -m "should be refused" 2>&1)" || record_status=$?
+if [[ "$record_status" -ne 0 && "$record_status" -ne 128 ]]; then
+    _pass "marker refusal uses a user-error exit code"
+else
+    _fail "marker refusal uses a user-error exit code" "exit=$record_status: $record_output"
+fi
+assert_success "marker refusal preserves bytes" cmp -s "$snapshot_dir/f.txt" f.txt
+require_capture "read history after marker refusal" atomic log --format json
+if [[ "$COMMAND_OUTPUT" == "$history_before" ]]; then
+    _pass "marker refusal preserves history"
+else
+    _fail "marker refusal preserves history" "history changed"
+fi
+require_success "explicit marker override succeeds" atomic record -m "record explicit marker text" --allow-conflict-markers
+assert_clean "marker override records the working file"
 
 # ── 1 · the refusal ─────────────────────────────────────────────────────────
 
@@ -60,7 +98,7 @@ setup_conflict
 
 assert_markers      "conflict markers are present"      f.txt
 assert_failure      "record fails while markers remain" atomic record -m "should be refused"
-assert_output_contains "names the file and the line" \
+assert_failed_output_contains "names the file and the line" \
     "f.txt still contains conflict markers at line 2" \
     atomic record -m "should be refused"
 
@@ -73,9 +111,9 @@ assert_markers      "markers survive the refused record" f.txt
 
 begin_section "the refusal is classified as a user error"
 
-assert_output_not_contains "not reported as an internal error" \
+assert_failed_output_not_contains "not reported as an internal error" \
     "Internal error" atomic record -m "should be refused"
-assert_output_not_contains "does not tell the user to file a bug" \
+assert_failed_output_not_contains "does not tell the user to file a bug" \
     "Please report it" atomic record -m "should be refused"
 
 # Exit code: must be a user/data error, never 128 (which error.rs reserves for
@@ -94,7 +132,7 @@ fi
 # The hint should point at the fix, not at the issue tracker.
 # NB: the leading '--' is dropped from the needle on purpose — assert_output_contains
 # passes it straight to `grep -F`, which would parse '--allow…' as an option.
-assert_output_contains "hint points at the resolution" \
+assert_failed_output_contains "hint points at the resolution" \
     "allow-conflict-markers" atomic record -m "should be refused"
 
 # ── 3 · the documented override still works ─────────────────────────────────

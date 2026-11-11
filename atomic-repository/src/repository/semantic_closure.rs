@@ -130,6 +130,12 @@ impl SemanticClosureMemo {
             return;
         }
         for ops in change.file_ops() {
+            if matches!(
+                ops.trunk_op(),
+                Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+            ) {
+                continue;
+            }
             let trunk = resolve_trunk(change_id, ops.trunk_id());
             let state = closure.trunks.entry(trunk).or_default();
             for line in ops.line_ops() {

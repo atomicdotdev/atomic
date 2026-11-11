@@ -44,6 +44,7 @@ use std::sync::Arc;
 use atomic_core::change::{Change, ChangeHeader, GraphOp};
 pub use atomic_core::output::repo::MaterializedEntry;
 use atomic_core::output::repo::{MaterializeResult, OutputItem};
+pub use content::{name_conflict_error, RecordedPresence};
 
 use atomic_core::pristine::{
     GraphTxnT, GraphVisibilityClosure, MutTxnT, Pristine, TreeTxnT, ViewMembershipSet, ViewScope,
@@ -181,7 +182,7 @@ pub use ignore_mirror::{
     check_ignore_policy, mirror_ignores, IgnoreMirrorError, IgnorePolicyReport,
     MANAGED_BLOCK_BEGIN, MANAGED_BLOCK_END,
 };
-pub use locks::RepositoryCommonLockGuard;
+pub use locks::{GitImportPreflightGuard, RepositoryCommonLockGuard, RepositoryMaintenanceGuard};
 pub use operation::{
     OperationDetails, OperationHeadState, OperationLog, OperationLogEntry,
     OperationVerificationState, PreparedRemoteOperation, PreparedShimGitWrite,

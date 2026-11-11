@@ -843,6 +843,47 @@ struct CheckpointWire {
 }
 
 impl Repository {
+    /// Read-only early refusal for an ordinary workspace command, before its
+    /// writable database open can perform redb maintenance. This is a preflight,
+    /// not a lease: the real transaction must re-observe under operation locks.
+    /// Verified bound-HEAD adoption and pending journal recovery remain eligible
+    /// for that transaction; an unbound Git checkout is never adopted here.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use atomic_repository::Repository;
+    /// use std::path::Path;
+    /// if let Some(remediation) = Repository::preflight_workspace_boundary(Path::new("."))? {
+    ///     eprintln!("{}", remediation.describe());
+    /// }
+    /// # Ok::<(), atomic_repository::RepositoryError>(())
+    /// ```
+    pub fn preflight_workspace_boundary(
+        root: &Path,
+    ) -> Result<Option<WorkspaceRemediation>, RepositoryError> {
+        let mut repo = Self::open_readonly_for_operation_inspection(root)?;
+        if !repo.shim_workspace_active()? {
+            return Ok(None);
+        }
+        let working_copy = repo.require_working_copy_id()?;
+        if repo.pending_unsafe_recovery_work(working_copy)?.is_some() {
+            return Ok(None);
+        }
+        match repo.begin_workspace_txn(WorkspaceTxnMode::Observe)? {
+            WorkspaceTxnStart::Ready(_) => Ok(None),
+            WorkspaceTxnStart::Remediation(remediation) => {
+                if remediation.is_head_candidate() {
+                    let observed = observe_git_metadata(root).map_err(observation_error)?;
+                    if super::anchor::head_binding_for_observation(&repo, &observed).is_some() {
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(remediation))
+            }
+        }
+    }
+
     /// Enter the shared workspace boundary while retaining its ordered locks.
     pub fn begin_workspace_txn(
         &mut self,

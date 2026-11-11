@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 38_shadow_drift_v3.sh — Validator Rule V3 (git ↔ Atomic state lineage).
+# HISTORICAL: coverage migrated to ../40_git_shim_safety.sh and ../42_git_shim_guard.sh.
 #
 # SPEC-single-materializer-validator.md §6.3 / Phase 5: a shadow push must refuse
 # when the git branch's last published Atomic-State is NOT in the current view's
@@ -27,10 +27,9 @@ require_git
 
 # Extract the current view's tip Atomic-State (base32) from the log.
 view_tip_state() {
-    atomic log --view "$MAIN" -f json 2>/dev/null \
-        | grep -o '"state"[[:space:]]*:[[:space:]]*"[^"]*"' \
-        | head -1 \
-        | sed -E 's/.*"([^"]+)"$/\1/'
+    local output
+    output="$(atomic log --view "$MAIN" -f json 2>&1)" || return 1
+    printf '%s\n' "$output" | python3 -c 'import json,sys; rows=json.load(sys.stdin); assert rows and len(rows[0]["state"])==52; print(rows[0]["state"])'
 }
 
 begin_section "Fast-forward push commits (no false positive)"
@@ -38,26 +37,31 @@ begin_section "Fast-forward push commits (no false positive)"
 make_temp_repo "drift-v3"
 init_git_repo
 git_commit "Initial" "README.md" "# Project"
-assert_success "git import" atomic git import --no-vault
-MAIN="$(git symbolic-ref --short HEAD)"
+require_success "git import" atomic git import --no-vault
+require_capture "read current Git branch" git symbolic-ref --short HEAD
+MAIN="$COMMAND_OUTPUT"
 
 create_file "src/a.ts" "const a = 1;"
-add_files "src/a.ts"
-record_change "feat: a" >/dev/null
-assert_success "baseline push (fast-forward)" atomic git push --no-push -m "A"
-BASE_COUNT="$(git_commit_count)"
+require_success "add src/a.ts" atomic add "src/a.ts"
+require_success "record src/a.ts" record_change "feat: a"
+require_success "baseline local shadow commit" atomic git push --no-push -m "A"
+require_capture "read baseline commit count" git rev-list --count HEAD
+BASE_COUNT="$COMMAND_OUTPUT"
 
 begin_section "Drift (state not in lineage) is rejected by V3"
 
 # Record another change (not yet pushed).
 create_file "src/b.ts" "const b = 2;"
-add_files "src/b.ts"
-record_change "feat: b" >/dev/null
+require_success "add src/b.ts" atomic add "src/b.ts"
+require_success "record src/b.ts" record_change "feat: b"
+require_capture "read coherent Git HEAD" git rev-parse HEAD
+COHERENT_HEAD="$COMMAND_OUTPUT"
 
 # Fabricate drift: a git commit on the branch advertising an Atomic-State that
 # is NOT in the view's history (mutate the tip state's last char). find_last_
 # pushed_state will pick this up as the branch's last published state.
-TIP_STATE="$(view_tip_state)"
+require_capture "read current view state" view_tip_state
+TIP_STATE="$COMMAND_OUTPUT"
 # Mutate a MIDDLE character (full data bits) rather than the last (which carries
 # base32 padding bits) so the result is still a valid merkle, just a different
 # one that is not in the view's history.
@@ -65,18 +69,32 @@ IDX=10
 ORIG_CHAR="${TIP_STATE:$IDX:1}"
 REPL="Q"; [ "$ORIG_CHAR" = "Q" ] && REPL="Z"
 FAKE_STATE="${TIP_STATE:0:$IDX}$REPL${TIP_STATE:$((IDX + 1))}"
-git commit --allow-empty -q -m "Simulated drift
+require_success "create empty drift fixture commit" git commit --allow-empty -q -m "Simulated drift
 
 Atomic-View: $MAIN
 Atomic-State: $FAKE_STATE"
 
-DRIFT_TIP_COUNT="$(git_commit_count)"
+require_capture "read drift commit count" git rev-list --count HEAD
+DRIFT_TIP_COUNT="$COMMAND_OUTPUT"
+require_capture "read drift Git HEAD" git rev-parse HEAD
+DRIFT_HEAD="$COMMAND_OUTPUT"
+require_capture "read Atomic history before refusal" atomic log --view "$MAIN" -f json
+HISTORY_BEFORE="$COMMAND_OUTPUT"
+snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-shadow-drift-XXXXXX")"
+_HARNESS_TMPDIRS+=("$snapshot_dir")
+cp src/b.ts "$snapshot_dir/b.ts"
 
 set +e
 PUSH_OUT="$(atomic git push --no-push -m "onto drift" 2>&1)"
 PUSH_RC=$?
 set -e
-AFTER_COUNT="$(git_commit_count)"
+require_capture "read Git count after refusal" git rev-list --count HEAD
+AFTER_COUNT="$COMMAND_OUTPUT"
+assert_success "drift refusal preserves source bytes" cmp -s "$snapshot_dir/b.ts" src/b.ts
+require_capture "read Git HEAD after refusal" git rev-parse HEAD
+if [[ "$COMMAND_OUTPUT" == "$DRIFT_HEAD" ]]; then _pass "drift refusal preserves Git HEAD"; else _fail "drift refusal preserves Git HEAD" "HEAD changed"; fi
+require_capture "read Atomic history after refusal" atomic log --view "$MAIN" -f json
+if [[ "$COMMAND_OUTPUT" == "$HISTORY_BEFORE" ]]; then _pass "drift refusal preserves Atomic history"; else _fail "drift refusal preserves Atomic history" "history changed"; fi
 
 if [ "$PUSH_RC" -ne 0 ]; then
     _pass "shadow push aborts (V3) on drift"
@@ -105,11 +123,13 @@ fi
 
 begin_section "Reconcile-then-push succeeds"
 
-# Reconcile by dropping the drift commit so the branch tip is a coherent shadow
-# state again.
-git reset --hard HEAD~1 >/dev/null 2>&1
-assert_success "push succeeds after reconcile" atomic git push --no-push -m "recorded b"
-FINAL_COUNT="$(git_commit_count)"
+# The drift commit was empty, so compare-and-set the disposable fixture ref
+# back to its prior commit without resetting the index or working bytes.
+require_success "restore fixture branch with expected-old lease" git update-ref "refs/heads/$MAIN" "$COHERENT_HEAD" "$DRIFT_HEAD"
+assert_success "fixture ref restoration preserves source bytes" cmp -s "$snapshot_dir/b.ts" src/b.ts
+require_success "local shadow commit succeeds after reconcile" atomic git push --no-push -m "recorded b"
+require_capture "read reconciled Git commit count" git rev-list --count HEAD
+FINAL_COUNT="$COMMAND_OUTPUT"
 if [ "$FINAL_COUNT" -gt "$BASE_COUNT" ]; then
     _pass "reconciled push created a commit ($FINAL_COUNT)"
 else

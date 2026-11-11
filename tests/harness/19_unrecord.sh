@@ -25,77 +25,35 @@ make_temp_repo "unrecord-basic"
 init_repo
 
 create_file "greeting.txt" "Hello, World!"
-assert_success "add greeting.txt" atomic add greeting.txt
-record_change "Add greeting.txt" >/dev/null 2>&1 || true
+require_success "add greeting.txt" atomic add greeting.txt
+require_success "record greeting.txt" record_change "Add greeting.txt"
 
 # Verify clean after first record
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*greeting\.txt"; then
-    _fail "greeting.txt is clean after initial record" "still dirty: $(echo "$out" | head -5)"
-else
-    _pass "greeting.txt is clean after initial record"
-fi
+assert_status_no_entry "greeting.txt is clean after initial record" "greeting.txt"
 
 # Modify and record the modification
 overwrite_file "greeting.txt" "Hello, Modified World!"
 assert_status_flag "greeting.txt shows M after modify" "M" "greeting.txt"
 
-record_change "Modify greeting.txt" >/dev/null 2>&1 || true
+require_success "record greeting modification" record_change "Modify greeting.txt"
 
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*greeting\.txt"; then
-    _fail "greeting.txt is clean after modification record" "still dirty: $(echo "$out" | head -5)"
-else
-    _pass "greeting.txt is clean after modification record"
-fi
+assert_status_no_entry "greeting.txt is clean after modification record" "greeting.txt"
 
 # Unrecord the modification
-unrec_out="$(unrecord_last)"
-if echo "$unrec_out" | grep -qiE "unrecord|removed|hash"; then
-    _pass "unrecord last succeeds"
-else
-    _pass "unrecord last completes without crash"
-fi
+require_success "unrecord last succeeds" unrecord_last
 
 # After unrecord, file should show as modified (disk has new content, graph
 # has the old content from the first record)
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MA].*greeting\.txt"; then
-    _pass "greeting.txt shows modified or added after unrecord"
-else
-    _fail "greeting.txt shows modified after unrecord" \
-        "expected M or A flag. Status: $(echo "$out" | head -5)"
-fi
+assert_status_flag "greeting.txt shows modified after unrecord" "M" "greeting.txt"
 
 # File should NOT show as untracked — it was recorded in the first change
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^\?.*greeting\.txt"; then
-    _fail "greeting.txt is not untracked after unrecord" \
-        "file should be modified, not untracked"
-else
-    _pass "greeting.txt is not untracked after unrecord"
-fi
+assert_file_content "greeting bytes preserved after unrecord" "greeting.txt" "Hello, Modified World!"
 
 # Re-record should succeed
-rec_out="$(record_change "Re-record greeting.txt" 2>&1)" || true
-if echo "$rec_out" | grep -qiE "hash|recorded|created|change"; then
-    _pass "re-record after unrecord succeeds"
-else
-    if atomic status >/dev/null 2>&1; then
-        _pass "re-record after unrecord completes (status still works)"
-    else
-        _fail "re-record after unrecord succeeds" \
-            "output: $(echo "$rec_out" | head -5)"
-    fi
-fi
+require_success "re-record after unrecord succeeds" record_change "Re-record greeting.txt"
 
 # Should be clean again
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*greeting\.txt"; then
-    _fail "greeting.txt is clean after re-record" "still dirty: $(echo "$out" | head -5)"
-else
-    _pass "greeting.txt is clean after re-record"
-fi
+assert_status_no_entry "greeting.txt is clean after re-record" "greeting.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Unrecord: File-add change"
@@ -110,33 +68,17 @@ make_temp_repo "unrecord-file-add"
 init_repo
 
 create_file "newfile.txt" "I am brand new"
-assert_success "add newfile.txt" atomic add newfile.txt
+require_success "add newfile.txt" atomic add newfile.txt
 assert_status_flag "newfile.txt shows A after add" "A" "newfile.txt"
 
-rec_out="$(record_change "Add newfile.txt" 2>&1)" || true
-if echo "$rec_out" | grep -qiE "hash|recorded|created|change"; then
-    _pass "record newfile.txt succeeds"
-else
-    _pass "record newfile.txt completes"
-fi
+require_success "record newfile.txt succeeds" record_change "Add newfile.txt"
 
 # Unrecord the file-add change
-unrec_out="$(unrecord_last)"
-if echo "$unrec_out" | grep -qiE "unrecord|removed|hash"; then
-    _pass "unrecord file-add change succeeds"
-else
-    _pass "unrecord file-add change completes without crash"
-fi
+require_success "unrecord file-add change succeeds" unrecord_last
 
 # File should appear as added (A) or untracked (?) — either is acceptable
 # as long as the system is internally consistent
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[A?].*newfile\.txt"; then
-    _pass "newfile.txt shows as added or untracked after unrecord"
-else
-    _fail "newfile.txt shows as added or untracked after unrecord" \
-        "expected A or ? flag. Status: $(echo "$out" | head -5)"
-fi
+assert_status_flag "newfile.txt is untracked after unrecord" "?" "newfile.txt"
 
 # The file should still exist on disk
 assert_file_exists "newfile.txt still exists on disk after unrecord" "newfile.txt"
@@ -145,9 +87,8 @@ assert_file_content "newfile.txt content preserved after unrecord" \
 
 # If status says untracked (?), add should accept it
 # If status says added (A), add should either succeed or say already tracked
-add_out="$(atomic add newfile.txt 2>&1)" || true
-# Should not error fatally
-_pass "add after unrecord does not crash"
+require_success "add after unrecord succeeds" atomic add newfile.txt
+assert_status_flag "newfile.txt is staged after re-add" "A" "newfile.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Unrecord: Full modify cycle"
@@ -160,66 +101,32 @@ make_temp_repo "unrecord-full-cycle"
 init_repo
 
 create_file "cycle.txt" "version one"
-assert_success "add cycle.txt" atomic add cycle.txt
-record_change "Add cycle.txt v1" >/dev/null 2>&1 || true
+require_success "add cycle.txt" atomic add cycle.txt
+require_success "record cycle.txt v1" record_change "Add cycle.txt v1"
 
 # Modify file
 overwrite_file "cycle.txt" "version two"
 assert_status_flag "cycle.txt is modified after overwrite" "M" "cycle.txt"
 
 # Record the modification
-record_change "Modify cycle.txt to v2" >/dev/null 2>&1 || true
+require_success "record cycle.txt v2" record_change "Modify cycle.txt to v2"
 
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*cycle\.txt"; then
-    _fail "cycle.txt is clean after recording v2" "still dirty: $(echo "$out" | head -5)"
-else
-    _pass "cycle.txt is clean after recording v2"
-fi
+assert_status_no_entry "cycle.txt is clean after recording v2" "cycle.txt"
 
 # Unrecord the modification
-unrec_out="$(unrecord_last)"
-if echo "$unrec_out" | grep -qiE "unrecord|removed|hash"; then
-    _pass "unrecord v2 modification succeeds"
-else
-    _pass "unrecord v2 modification completes"
-fi
+require_success "unrecord v2 modification succeeds" unrecord_last
 
 # Status should show modified — disk has "version two", graph has "version one"
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^M.*cycle\.txt"; then
-    _pass "cycle.txt shows modified after unrecording v2"
-elif echo "$out" | grep -qE "^[A].*cycle\.txt"; then
-    # Some implementations might show added if the modify was complex
-    _pass "cycle.txt shows added after unrecording v2 (acceptable)"
-else
-    _fail "cycle.txt shows modified after unrecording v2" \
-        "expected M flag. Status: $(echo "$out" | head -5)"
-fi
+assert_status_flag "cycle.txt shows modified after unrecording v2" "M" "cycle.txt"
 
 # Disk content should still have the new version
 assert_file_content "disk has version two after unrecord" "cycle.txt" "version two"
 
 # Re-record should work
-rec_out="$(record_change "Re-record cycle.txt v2" 2>&1)" || true
-if echo "$rec_out" | grep -qiE "hash|recorded|created|change"; then
-    _pass "re-record cycle.txt succeeds"
-else
-    if atomic status >/dev/null 2>&1; then
-        _pass "re-record cycle.txt completes (status still works)"
-    else
-        _fail "re-record cycle.txt succeeds" \
-            "output: $(echo "$rec_out" | head -5)"
-    fi
-fi
+require_success "re-record cycle.txt succeeds" record_change "Re-record cycle.txt v2"
 
 # Clean after re-record
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*cycle\.txt"; then
-    _fail "cycle.txt is clean after re-record" "still dirty: $(echo "$out" | head -5)"
-else
-    _pass "cycle.txt is clean after re-record"
-fi
+assert_status_no_entry "cycle.txt is clean after re-record" "cycle.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Unrecord: Multiple files"
@@ -235,19 +142,14 @@ create_file "alpha.txt" "alpha content"
 create_file "beta.txt" "beta content"
 create_file "gamma.txt" "gamma content"
 
-assert_success "add all three files" atomic add alpha.txt beta.txt gamma.txt
+require_success "add all three files" atomic add alpha.txt beta.txt gamma.txt
 
 # Record all three in a single change
-record_change "Add alpha, beta, gamma" >/dev/null 2>&1 || true
+require_success "record three files" record_change "Add alpha, beta, gamma"
 
 # Verify all clean
-out="$(get_status_short)"
 for f in alpha.txt beta.txt gamma.txt; do
-    if echo "$out" | grep -qE "^[MADU?].*${f}"; then
-        _fail "$f is clean after record" "still dirty"
-    else
-        _pass "$f is clean after record"
-    fi
+    assert_status_no_entry "$f is clean after record" "$f"
 done
 
 # Modify all three and record
@@ -255,35 +157,19 @@ overwrite_file "alpha.txt" "alpha modified"
 overwrite_file "beta.txt" "beta modified"
 overwrite_file "gamma.txt" "gamma modified"
 
-record_change "Modify all three files" >/dev/null 2>&1 || true
+require_success "record all three modifications" record_change "Modify all three files"
 
 # Verify clean again
-out="$(get_status_short)"
 for f in alpha.txt beta.txt gamma.txt; do
-    if echo "$out" | grep -qE "^[MADU?].*${f}"; then
-        _fail "$f is clean after modification record" "still dirty"
-    else
-        _pass "$f is clean after modification record"
-    fi
+    assert_status_no_entry "$f is clean after modification record" "$f"
 done
 
 # Unrecord the modification change
-unrec_out="$(unrecord_last)"
-if echo "$unrec_out" | grep -qiE "unrecord|removed|hash"; then
-    _pass "unrecord multi-file change succeeds"
-else
-    _pass "unrecord multi-file change completes"
-fi
+require_success "unrecord multi-file change succeeds" unrecord_last
 
 # All three should show as modified (or added) after unrecord
-out="$(get_status_short)"
 for f in alpha.txt beta.txt gamma.txt; do
-    if echo "$out" | grep -qE "^[MA].*${f}"; then
-        _pass "$f shows modified or added after unrecord"
-    else
-        _fail "$f shows modified or added after unrecord" \
-            "Status: $(echo "$out" | grep "$f" || echo '(not found)')"
-    fi
+    assert_status_flag "$f shows modified after unrecord" "M" "$f"
 done
 
 # All files should still exist on disk with modified content
@@ -303,9 +189,19 @@ make_temp_repo "unrecord-preserve-change"
 init_repo
 
 create_file "preserve.txt" "will be preserved"
-assert_success "add preserve.txt" atomic add preserve.txt
+require_success "add preserve.txt" atomic add preserve.txt
 
-rec_out="$(record_change "Add preserve.txt" 2>&1)" || true
+require_success "record preserve.txt" record_change "Add preserve.txt"
+require_capture "read recorded change hash" atomic log --format json --count 1
+if ! recorded_hash="$(printf '%s\n' "$COMMAND_OUTPUT" | python3 -c 'import json,sys; entries=json.load(sys.stdin); assert len(entries)==1; print(entries[0]["hash"])')"; then
+    _fail "extract recorded change hash" "log: $COMMAND_OUTPUT"
+    print_summary || true
+    exit 1
+fi
+change_file=".atomic/changes/${recorded_hash:0:2}/${recorded_hash}.change"
+assert_file_exists "recorded change object exists" "$change_file"
+require_capture "hash recorded change object before unrecord" shasum -a 256 "$change_file"
+object_digest_before="$COMMAND_OUTPUT"
 
 # Count change files before unrecord
 change_count_before="$(find .atomic/changes/ -type f 2>/dev/null | wc -l | tr -d '[:space:]')"
@@ -320,11 +216,11 @@ fi
 change_files_before="$(find .atomic/changes/ -type f 2>/dev/null | sort)"
 
 # Unrecord
-unrecord_last >/dev/null 2>&1
+require_success "unrecord preserve.txt" unrecord_last
 
 # Count change files after unrecord — should still be the same
 change_count_after="$(find .atomic/changes/ -type f 2>/dev/null | wc -l | tr -d '[:space:]')"
-if [[ "$change_count_after" -ge "$change_count_before" ]]; then
+if [[ "$change_count_after" -eq "$change_count_before" ]]; then
     _pass "change files preserved after unrecord (count: $change_count_after)"
 else
     _fail "change files preserved after unrecord" \
@@ -336,7 +232,13 @@ change_files_after="$(find .atomic/changes/ -type f 2>/dev/null | sort)"
 if [[ "$change_files_before" == "$change_files_after" ]]; then
     _pass "same change files present before and after unrecord"
 else
-    _pass "change files still present after unrecord (set may differ)"
+    _fail "same change files present before and after unrecord" "before: $change_files_before; after: $change_files_after"
+fi
+require_capture "hash recorded change object after unrecord" shasum -a 256 "$change_file"
+if [[ "$COMMAND_OUTPUT" == "$object_digest_before" ]]; then
+    _pass "unrecord preserves recorded object bytes"
+else
+    _fail "unrecord preserves recorded object bytes" "before: $object_digest_before; after: $COMMAND_OUTPUT"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -355,69 +257,41 @@ init_repo
 
 # -- Test 1: Unrecord a file-add, then check status/add consistency --
 create_file "cons_new.txt" "new file for consistency"
-assert_success "add cons_new.txt" atomic add cons_new.txt
-record_change "Add cons_new.txt" >/dev/null 2>&1 || true
+require_success "add cons_new.txt" atomic add cons_new.txt
+require_success "record cons_new.txt" record_change "Add cons_new.txt"
 
 # Unrecord
-unrecord_last >/dev/null 2>&1
+require_success "unrecord cons_new.txt" unrecord_last
 
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^\?.*cons_new\.txt"; then
-    # Status says untracked → add should accept it
-    add_out="$(atomic add cons_new.txt 2>&1)" || true
-    if echo "$add_out" | grep -qiE "error|fatal|cannot"; then
-        _fail "untracked file accepted by add" \
-            "status says untracked but add refused: $add_out"
-    else
-        _pass "untracked file accepted by add (status/add consistent)"
-    fi
-elif echo "$out" | grep -qE "^[AM].*cons_new\.txt"; then
-    # Status says added or modified → file is tracked, add should say so
-    add_out="$(atomic add cons_new.txt 2>&1)" || true
-    # Either succeeds silently (idempotent) or says already tracked — both OK
-    _pass "tracked file handled by add (status/add consistent)"
-else
-    # No flag at all — file might be clean (shouldn't happen after unrecord
-    # of the only change, but handle gracefully)
-    _pass "status shows no flag for cons_new.txt (may be implementation-specific)"
-fi
+assert_status_flag "unrecorded addition is untracked" "?" "cons_new.txt"
+require_success "re-add untracked file" atomic add cons_new.txt
+assert_status_flag "re-added file is staged" "A" "cons_new.txt"
+assert_file_content "re-add preserves file content" "cons_new.txt" "new file for consistency"
 
 # -- Test 2: Unrecord a modification, then check status/add consistency --
 make_temp_repo "unrecord-consistency-modify"
 init_repo
 
 create_file "cons_mod.txt" "original content"
-assert_success "add cons_mod.txt" atomic add cons_mod.txt
-record_change "Add cons_mod.txt" >/dev/null 2>&1 || true
+require_success "add cons_mod.txt" atomic add cons_mod.txt
+require_success "record cons_mod.txt" record_change "Add cons_mod.txt"
 
 overwrite_file "cons_mod.txt" "modified content"
-record_change "Modify cons_mod.txt" >/dev/null 2>&1 || true
+require_success "record cons_mod modification" record_change "Modify cons_mod.txt"
 
 # Unrecord the modification
-unrecord_last >/dev/null 2>&1
+require_success "unrecord cons_mod modification" unrecord_last
 
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^M.*cons_mod\.txt"; then
-    # Status says modified → add should say already tracked
-    add_out="$(atomic add cons_mod.txt 2>&1)" || true
-    if echo "$add_out" | grep -qiE "error|fatal|cannot"; then
-        _fail "modified file handled by add" \
-            "status says modified but add errored: $add_out"
-    else
-        _pass "modified file handled by add (status/add consistent)"
-    fi
-elif echo "$out" | grep -qE "^[A?].*cons_mod\.txt"; then
-    # Added or untracked — add should accept
-    add_out="$(atomic add cons_mod.txt 2>&1)" || true
-    _pass "file handled by add after unrecord (status/add consistent)"
-else
-    # Clean or no entry — acceptable after unrecord if impl re-applies
-    _pass "cons_mod.txt status after unrecord is consistent"
-fi
+assert_status_flag "unrecorded modification remains tracked and modified" "M" "cons_mod.txt"
+require_success "add handles tracked modified file" atomic add cons_mod.txt
+assert_status_flag "modified status remains after add" "M" "cons_mod.txt"
+assert_file_content "tracked add preserves modified bytes" "cons_mod.txt" "modified content"
 
 # -- Test 3: Verify that status is stable (calling it twice yields same result) --
-out1="$(get_status_short)"
-out2="$(get_status_short)"
+require_capture "read first status" get_status_short
+out1="$COMMAND_OUTPUT"
+require_capture "read second status" get_status_short
+out2="$COMMAND_OUTPUT"
 if [[ "$out1" == "$out2" ]]; then
     _pass "status is idempotent after unrecord"
 else

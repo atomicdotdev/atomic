@@ -76,6 +76,10 @@ async fn compact_inner(
             .ok_or_else(|| Status::failed_precondition("canonical .atomic has no parent"))?
             .to_path_buf(),
     );
+    let repository_root = dot_dir
+        .parent()
+        .expect("validated canonical parent")
+        .to_path_buf();
     let guard = tokio::time::timeout(
         wait.saturating_sub(started.elapsed()),
         handle.exclusive_owned(),
@@ -88,7 +92,7 @@ async fn compact_inner(
     let report = tokio::task::spawn_blocking(move || {
         // The blocking task, not the RPC future, owns this until redb closes.
         let _guard = guard;
-        compact_waiting(&path, started, wait)
+        compact_waiting(&repository_root, &path, started, wait)
     })
     .await
     .map_err(|error| Status::internal(format!("compaction task failed: {error}")))??;
@@ -108,18 +112,24 @@ async fn compact_inner(
 }
 
 fn compact_waiting(
+    repository_root: &Path,
     path: &Path,
     started: Instant,
     wait: Duration,
 ) -> Result<CompactDatabaseResponse, Status> {
     loop {
-        match compact_file(path) {
+        match compact_repository(repository_root, path) {
             Ok(report) => return Ok(report),
             Err(error)
                 if matches!(
                     error.downcast_ref::<redb::DatabaseError>(),
                     Some(redb::DatabaseError::DatabaseAlreadyOpen)
-                ) =>
+                ) || error
+                    .downcast_ref::<atomic_repository::RepositoryError>()
+                    .is_some_and(|error| {
+                        matches!(error, atomic_repository::RepositoryError::DatabaseBusy)
+                            || error.is_lock_contended()
+                    }) =>
             {
                 let remaining = wait.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
@@ -140,9 +150,28 @@ fn compact_waiting(
     }
 }
 
+fn compact_repository(root: &Path, path: &Path) -> anyhow::Result<CompactDatabaseResponse> {
+    // Inspect before creating a lock file or opening redb writable. Then hold
+    // the common operation lock and repeat the complete operation/capability
+    // gate so no cooperating writer can change it during compaction.
+    drop(Repository::open_readonly_without_migration(root)?);
+    let _guard = Repository::try_lock_database_maintenance(root)?;
+    drop(Repository::open_readonly_without_migration(root)?);
+    compact_file(path)
+}
+
 fn compact_file(path: &Path) -> anyhow::Result<CompactDatabaseResponse> {
+    let readonly = redb::Builder::new().open_read_only(path)?;
+    let txn = readonly.begin_read()?;
+    atomic_core::pristine::schema::check_schema_version(&txn)?;
+    atomic_core::pristine::schema::check_required_capabilities(&txn)?;
+    drop(txn);
+    drop(readonly);
     let mut database = redb::Builder::new().open(path)?;
-    atomic_core::pristine::schema::check_schema_version(&database.begin_read()?)?;
+    let txn = database.begin_read()?;
+    atomic_core::pristine::schema::check_schema_version(&txn)?;
+    atomic_core::pristine::schema::check_required_capabilities(&txn)?;
+    drop(txn);
     let before_bytes = std::fs::metadata(path)?.len();
     database.compact()?;
     // Closing persists allocator metadata; include that in the final size.

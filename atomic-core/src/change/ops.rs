@@ -214,6 +214,22 @@ impl FileOps {
         }
     }
 
+    /// Create a semantic edit against a span projection without fabricating a
+    /// historical trunk. The repository must validate the baseline against the
+    /// dependency closure and apply the corresponding span operations.
+    pub fn projected_span_edit(
+        path: String,
+        file: crate::change::span_patch::ExternalFile,
+        baseline: crate::change::span_patch::SpanProjectionId,
+    ) -> Self {
+        Self {
+            trunk_id: TrunkId::ROOT,
+            path,
+            trunk_op: Some(TrunkOp::ProjectedSpanEdit { file, baseline }),
+            line_ops: Vec::new(),
+        }
+    }
+
     /// Returns the trunk ID.
     #[inline]
     pub fn trunk_id(&self) -> TrunkId {
@@ -268,7 +284,7 @@ impl FileOps {
             | Some(TrunkOp::SetKind { trunk, .. }) => {
                 ids.insert(trunk.change_id());
             }
-            Some(TrunkOp::Create { .. }) | None => {}
+            Some(TrunkOp::Create { .. } | TrunkOp::ProjectedSpanEdit { .. }) | None => {}
         }
         for line in &self.line_ops {
             ids.insert(line.branch_id().change_id());
@@ -303,6 +319,104 @@ impl FileOps {
         }
         ids.remove(&crate::types::NodeId::ROOT);
         ids
+    }
+
+    /// Translate existing semantic identities while preserving ROOT placeholders.
+    pub fn remap_referenced_node_ids<E>(
+        &mut self,
+        mut remap: impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
+    ) -> Result<(), E> {
+        fn trunk<E>(
+            id: &mut TrunkId,
+            f: &mut impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
+        ) -> Result<(), E> {
+            if !id.change_id().is_root() {
+                *id = TrunkId::new(f(id.change_id())?, id.file_idx());
+            }
+            Ok(())
+        }
+        fn branch<E>(
+            id: &mut BranchId,
+            f: &mut impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
+        ) -> Result<(), E> {
+            if !id.change_id().is_root() {
+                *id = BranchId::new(f(id.change_id())?, id.branch_idx());
+            }
+            Ok(())
+        }
+        fn leaf<E>(
+            id: &mut LeafId,
+            f: &mut impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
+        ) -> Result<(), E> {
+            if !id.change_id().is_root() {
+                *id = LeafId::new(f(id.change_id())?, id.leaf_idx());
+            }
+            Ok(())
+        }
+        fn leaves<E>(
+            ops: &mut [LeafOp],
+            f: &mut impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
+        ) -> Result<(), E> {
+            for op in ops {
+                match op {
+                    LeafOp::Insert {
+                        after: Some(id), ..
+                    } => leaf(id, f)?,
+                    LeafOp::Delete { leaf: id }
+                    | LeafOp::Replace { leaf: id, .. }
+                    | LeafOp::Restore { leaf: id } => leaf(id, f)?,
+                    LeafOp::Insert { after: None, .. } => {}
+                }
+            }
+            Ok(())
+        }
+        trunk(&mut self.trunk_id, &mut remap)?;
+        match &mut self.trunk_op {
+            Some(TrunkOp::Delete { trunk: id })
+            | Some(TrunkOp::Move { trunk: id, .. })
+            | Some(TrunkOp::Undelete { trunk: id })
+            | Some(TrunkOp::SetMode { trunk: id, .. })
+            | Some(TrunkOp::SetKind { trunk: id, .. }) => trunk(id, &mut remap)?,
+            Some(TrunkOp::Create { .. } | TrunkOp::ProjectedSpanEdit { .. }) | None => {}
+        }
+        for line in &mut self.line_ops {
+            branch(&mut line.branch_id, &mut remap)?;
+            match &mut line.operation {
+                BranchOp::Insert { after, content } => {
+                    if let Some(id) = after {
+                        branch(id, &mut remap)?;
+                    }
+                    leaves(content, &mut remap)?;
+                }
+                BranchOp::Delete {
+                    branch: id,
+                    content,
+                } => {
+                    branch(id, &mut remap)?;
+                    leaves(content, &mut remap)?;
+                }
+                BranchOp::Modify {
+                    branch: id,
+                    old_content,
+                    new_content,
+                } => {
+                    branch(id, &mut remap)?;
+                    leaves(old_content, &mut remap)?;
+                    leaves(new_content, &mut remap)?;
+                }
+                BranchOp::Restore { branch: id } => branch(id, &mut remap)?,
+                BranchOp::Reparent {
+                    branch: id,
+                    new_after,
+                } => {
+                    branch(id, &mut remap)?;
+                    if let Some(id) = new_after {
+                        branch(id, &mut remap)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Adds a line operation.
@@ -377,7 +491,9 @@ impl FileOps {
         branch_base: u32,
         leaf_base: u32,
     ) {
-        if self.trunk_id.change_id().is_root() {
+        if self.trunk_id.change_id().is_root()
+            && !matches!(self.trunk_op, Some(TrunkOp::ProjectedSpanEdit { .. }))
+        {
             self.trunk_id = TrunkId::new(self.trunk_id.change_id(), trunk_file_idx);
         }
         if let Some(trunk_op) = &mut self.trunk_op {
@@ -386,7 +502,7 @@ impl FileOps {
                 TrunkOp::Move { trunk, .. } => Some(trunk),
                 TrunkOp::SetMode { trunk, .. } => Some(trunk),
                 TrunkOp::SetKind { trunk, .. } => Some(trunk),
-                TrunkOp::Create { .. } => None,
+                TrunkOp::Create { .. } | TrunkOp::ProjectedSpanEdit { .. } => None,
             };
             if let Some(trunk) = trunk {
                 if trunk.change_id().is_root() {
@@ -423,6 +539,7 @@ impl fmt::Display for FileOps {
             Some(TrunkOp::Undelete { .. }) => "undelete",
             Some(TrunkOp::SetMode { .. }) => "set-mode",
             Some(TrunkOp::SetKind { .. }) => "set-kind",
+            Some(TrunkOp::ProjectedSpanEdit { .. }) => "projected-span-edit",
             None => "edit",
         };
         write!(
@@ -920,6 +1037,7 @@ impl FileOpsStats {
                 Some(TrunkOp::SetMode { .. }) | Some(TrunkOp::SetKind { .. }) => {
                     stats.files_edited += 1
                 }
+                Some(TrunkOp::ProjectedSpanEdit { .. }) => stats.files_edited += 1,
                 None if !file.line_ops().is_empty() => stats.files_edited += 1,
                 None => {}
             }

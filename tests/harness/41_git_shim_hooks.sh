@@ -12,7 +12,9 @@ begin_section "Prerequisites"
 require_git
 
 atomic_current_view() {
-    atomic view list 2>/dev/null | awk '/^\*/ { print $2 }'
+    local output
+    output="$(atomic view list --all --json 2>&1)" || return 1
+    printf '%s\n' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_view"])'
 }
 
 wait_for_receipt() {
@@ -52,15 +54,16 @@ git commit --quiet -m "feature"
 FEATURE_HEAD="$(git_head_sha_full)"
 git switch --quiet "$MAIN"
 
-assert_success "initialize Atomic for shim hooks" atomic init --view "$MAIN"
-assert_success "enable advisory shim" atomic git shim enable
-HOOK_PATH="$(git rev-parse --git-path hooks/post-checkout)"
-if [[ -x "$HOOK_PATH" ]] && grep -q '^# atomic:git-shim-dispatcher:v1$' "$HOOK_PATH"; then
+require_success "initialize Atomic for shim hooks" atomic init --view "$MAIN"
+require_success "enable advisory shim" atomic git shim enable
+require_capture "locate post-checkout hook" git rev-parse --git-path hooks/post-checkout
+HOOK_PATH="$COMMAND_OUTPUT"
+if [[ -x "$HOOK_PATH" ]] && grep -q '^# atomic:git-bridge-dispatcher:v1$' "$HOOK_PATH"; then
     _pass "shim enable installs an owned executable dispatcher"
 else
     _fail "shim enable installs an owned executable dispatcher" "$HOOK_PATH missing or unowned"
 fi
-if grep -q "${ATOMIC_BIN}" "$HOOK_PATH"; then
+if grep -qF -- "${HARNESS_REAL_ATOMIC:-$ATOMIC_BIN}" "$HOOK_PATH"; then
     _pass "dispatcher embeds the absolute Atomic binary"
 else
     _fail "dispatcher embeds the absolute Atomic binary" "$(cat "$HOOK_PATH")"
@@ -104,10 +107,12 @@ begin_section "Correctness remains independent of hook execution"
 rm -f "$HOOK_PATH" "$JOURNAL"
 git switch --quiet "$MAIN"
 git switch --quiet feature
-if [[ -e "$JOURNAL" ]]; then
-    _fail "disabled hook produces no evidence" "journal unexpectedly recreated"
+# Reference-transaction dispatchers remain installed and may legitimately
+# recreate the journal; only post-checkout evidence must be absent.
+if [[ -f "$JOURNAL" ]] && grep -q '"record_type":"post-checkout"' "$JOURNAL"; then
+    _fail "disabled checkout hook produces no checkout evidence" "$(cat "$JOURNAL")"
 else
-    _pass "disabled hook produces no evidence"
+    _pass "disabled checkout hook produces no checkout evidence"
 fi
 set +e
 FORENSIC_OUT="$(atomic status --no-reconcile 2>&1)"
@@ -140,4 +145,32 @@ else
     _fail "custom hook owner receives integration instructions" "$CUSTOM_OUT"
 fi
 
+begin_section "Owned dispatchers install and uninstall without touching user hooks"
+make_temp_repo git-shim-hook-ownership
+init_git_repo
+git_commit initial tracked.txt baseline
+require_success "import hook-ownership fixture" atomic git import --no-vault
+printf '#!/bin/sh\necho user-owned\n' > .git/hooks/post-checkout
+chmod +x .git/hooks/post-checkout
+CUSTOM_BYTES="$(shasum -a 256 .git/hooks/post-checkout)"
+require_success "install preserves unmanaged post-checkout" atomic git hooks install
+assert_output_not_contains "unmanaged hook has no Atomic dispatcher" atomic:git-bridge-dispatcher:v1 cat .git/hooks/post-checkout
+for hook in pre-commit pre-push post-rewrite reference-transaction; do
+    assert_success "$hook is an executable owned dispatcher" test -x ".git/hooks/$hook"
+    assert_output_contains "$hook carries ownership marker" atomic:git-bridge-dispatcher:v1 cat ".git/hooks/$hook"
+done
+assert_file_not_exists "legacy post-commit importer absent" .git/hooks/post-commit
+assert_file_not_exists "legacy post-merge importer absent" .git/hooks/post-merge
+require_success "second install succeeds" atomic git hooks install
+require_success "uninstall owned dispatchers" atomic git hooks uninstall
+for hook in pre-commit pre-push post-rewrite reference-transaction; do
+    assert_file_not_exists "$hook removed by uninstall" ".git/hooks/$hook"
+done
+require_capture "hash unmanaged hook after install/uninstall" shasum -a 256 .git/hooks/post-checkout
+if [[ "$COMMAND_OUTPUT" == "$CUSTOM_BYTES" ]]; then
+    _pass "unmanaged hook bytes retained exactly"
+else
+    _fail "unmanaged hook bytes retained exactly" "$COMMAND_OUTPUT"
+fi
+assert_success "unmanaged executable mode retained" test -x .git/hooks/post-checkout
 print_summary

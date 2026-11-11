@@ -970,6 +970,12 @@ impl Repository {
                 .get(&metadata_target)
                 .cloned()
                 .unwrap_or(MetadataValue::Absent);
+            if is_projected_semantic_capability(&metadata_target)
+                && matches!(observed, MetadataValue::Sequence(_))
+                && matches!(expected_new, MetadataValue::Absent)
+            {
+                continue;
+            }
             if matches!(
                 (&observed, &expected_new),
                 (MetadataValue::Sequence(_), MetadataValue::Sequence(_))
@@ -1018,6 +1024,9 @@ impl Repository {
                 .delta
                 .metadata
                 .iter()
+                // Once a projected change is stored or indexed, older clients
+                // must remain fenced even after its view reference is undone.
+                .filter(|transition| !is_projected_semantic_capability(&transition.target))
                 .map(|transition| MetadataTransition {
                     target: transition.target.clone(),
                     expected_old: transition.expected_new.clone(),
@@ -3510,11 +3519,15 @@ impl Repository {
                 &transition.expected_new,
             ) {
                 LeaseClassification::Apply => {}
-                LeaseClassification::AlreadyApplied => metadata.push(MetadataTransition {
-                    target: transition.target.clone(),
-                    expected_old: transition.expected_new.clone(),
-                    expected_new: transition.expected_old.clone(),
-                }),
+                LeaseClassification::AlreadyApplied => {
+                    if !is_projected_semantic_capability(&transition.target) {
+                        metadata.push(MetadataTransition {
+                            target: transition.target.clone(),
+                            expected_old: transition.expected_new.clone(),
+                            expected_new: transition.expected_old.clone(),
+                        });
+                    }
+                }
                 LeaseClassification::Diverged => {
                     return Err(metadata_divergence_error(transition, &observed));
                 }
@@ -4041,9 +4054,20 @@ fn validate_capability_lease(
                     ),
                 });
             }
+            if is_projected_semantic_capability(target) && requested < supported.minimum_version() {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "projected span semantic capability cannot be lowered".into(),
+                });
+            }
             Ok(())
         }
         MetadataValue::Absent => {
+            if is_projected_semantic_capability(target) {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "projected span semantic capability is permanent once installed"
+                        .into(),
+                });
+            }
             if !SUPPORTED_REPOSITORY_CAPABILITIES
                 .iter()
                 .any(|capability| capability.id() == id.as_str())
@@ -4059,6 +4083,10 @@ fn validate_capability_lease(
         }
         _ => Err(unsupported_metadata_error(target)),
     }
+}
+
+fn is_projected_semantic_capability(target: &MetadataTarget) -> bool {
+    matches!(target, MetadataTarget::Capability { id } if id == atomic_core::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())
 }
 
 fn apply_metadata_value_in_write(
@@ -5367,4 +5395,21 @@ fn sync_directory(path: &Path) -> Result<(), RepositoryError> {
         let _ = path;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod projected_capability_lease_tests {
+    use super::*;
+
+    #[test]
+    fn projected_capability_zero_is_rejected_before_preparation() {
+        let target = MetadataTarget::Capability {
+            id: atomic_core::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY
+                .id()
+                .to_string(),
+        };
+        assert!(validate_capability_lease(&target, &MetadataValue::Sequence(0)).is_err());
+        assert!(validate_capability_lease(&target, &MetadataValue::Sequence(1)).is_ok());
+        assert!(validate_capability_lease(&target, &MetadataValue::Absent).is_err());
+    }
 }

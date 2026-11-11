@@ -57,6 +57,11 @@ url = { workspace = true }
 # Loopback protocol acceptance harness only; no production listener is added.
 axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
 tempfile = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+# agent_sandbox_bench: the real tonic client stack over a Unix socket.
+hyper-util = { workspace = true }
+tower = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }

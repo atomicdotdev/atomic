@@ -9,6 +9,7 @@ use std::path::Path;
 use tempfile::TempDir;
 
 mod attribute_tests;
+mod batch_content_tests;
 mod binding_fetch_tests;
 mod binding_store_tests;
 mod binding_verify_tests;
@@ -50,6 +51,7 @@ mod snapshot_tests;
 mod stale_conflict_reconcile_tests;
 mod status_tests;
 mod switch_file_loss_tests;
+mod switch_lease_render_tests;
 mod synthesis_tests;
 mod tag_projection_tests;
 mod tracking_tests;

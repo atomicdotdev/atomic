@@ -78,8 +78,8 @@ message FileStatusEntry {
 
 message LogRequest {
   RepositoryRef repository = 1;
-  bool all_views = 2;                  // `--all`
-  optional string view = 3; // required unless all_views; no daemon current-view default
+  bool all_views = 2; // Legacy field name: include inherited history (`--all`) of the selected view.
+  optional string view = 3; // Explicit target is honored even with all_views; otherwise use the request's working-copy view.
   optional PageCursor cursor = 4;
   optional PageBudget budget = 5;
   repeated string path_filter = 6;      // `--path`: entries whose changes touch it

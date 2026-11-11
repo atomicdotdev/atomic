@@ -43,6 +43,58 @@ source "$HARNESS_DIR/helpers.sh"
 # assert_max_lines, assert_file_contains, assert_file_not_contains).
 source "$HARNESS_DIR/merge_helpers.sh"
 
+# A refused insert is a failure of this suite's merge expectation, not a
+# successful merge. Verify that it preserved the target history and bytes,
+# then explicitly mark the post-insert assertions as unexercised.
+attempt_merge() {
+    local desc="$1" from="$2" to="$3"; shift 3
+    local before after output file index=0 snapshot_dir
+    if ! before="$(atomic log --format json --view "$to" --all 2>&1)"; then
+        _fail "$desc: read target history" "$before"
+        _skip "$desc: merge postconditions" "target history unavailable"
+        return 1
+    fi
+    if ! snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-merge-snapshot-XXXXXX")"; then
+        _fail "$desc: create snapshot directory" "mktemp failed"
+        _skip "$desc: merge postconditions" "snapshot unavailable"
+        return 1
+    fi
+    _HARNESS_TMPDIRS+=("$snapshot_dir")
+    for file in "$@"; do
+        if ! cp "$file" "$snapshot_dir/$index"; then
+            _fail "$desc: snapshot $file" "cannot save pre-insert bytes"
+            _skip "$desc: merge postconditions" "snapshot unavailable"
+            return 1
+        fi
+        index=$((index + 1))
+    done
+    if output="$(insert_from_view "$from" "$to" 2>&1)"; then
+        _pass "$desc: insert succeeds"
+        return 0
+    fi
+    _fail "$desc: insert succeeds" "$output"
+    if after="$(atomic log --format json --view "$to" --all 2>&1)"; then
+        if [[ "$before" == "$after" ]]; then
+            _pass "$desc: refused insert preserves target history"
+        else
+            _fail "$desc: refused insert preserves target history" "target history changed"
+        fi
+    else
+        _fail "$desc: read target history after refusal" "$after"
+    fi
+    index=0
+    for file in "$@"; do
+        if cmp -s "$snapshot_dir/$index" "$file"; then
+            _pass "$desc: refused insert preserves $file"
+        else
+            _fail "$desc: refused insert preserves $file" "working bytes changed"
+        fi
+        index=$((index + 1))
+    done
+    _skip "$desc: merge postconditions" "insert failed"
+    return 1
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Case 1: Non-overlapping edits merge without duplication"
@@ -72,14 +124,13 @@ pool_size = 5
 level = "info"
 format = "json"'
 
-assert_success "add config.toml on dev" atomic add config.toml
-record_change "Initial config" >/dev/null 2>&1
+require_success "add config.toml on dev" atomic add config.toml
+require_success "record initial config" record_change "Initial config"
 
 # Create draft view from dev
-new_view "feature-config" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "feature-config" >/dev/null 2>&1
-insert_from_view "dev" "feature-config" >/dev/null 2>&1 || true
-switch_view "feature-config" >/dev/null 2>&1
+require_success "create feature-config" new_view "feature-config" --draft --parent dev
+require_success "insert dev into feature-config" insert_from_view "dev" "feature-config"
+require_success "switch to feature-config" switch_view "feature-config"
 assert_current_view "on feature-config" "feature-config"
 
 # Modify section 1 on draft (change host)
@@ -95,10 +146,10 @@ pool_size = 5
 level = "info"
 format = "json"'
 
-record_change "Change server host to 0.0.0.0" >/dev/null 2>&1
+require_success "record server host edit" record_change "Change server host to 0.0.0.0"
 
 # Switch to dev and modify section 3 (change log level)
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 assert_current_view "back on dev" "dev"
 
 overwrite_file "config.toml" '[server]
@@ -113,10 +164,10 @@ pool_size = 5
 level = "debug"
 format = "json"'
 
-record_change "Change log level to debug" >/dev/null 2>&1
+require_success "record log level edit" record_change "Change log level to debug"
 
 # Insert from draft → dev
-insert_out="$(insert_from_view "feature-config" "dev" 2>&1)" || true
+if attempt_merge "non-overlapping edits" "feature-config" "dev" config.toml; then
 
 # Verify: file exists and has no duplication
 assert_file_exists "config.toml exists after insert" "config.toml"
@@ -136,11 +187,23 @@ assert_max_lines "config.toml has reasonable line count" "config.toml" 20
 # Both changes should be present
 assert_file_contains "draft edit present (host = 0.0.0.0)" "config.toml" '0.0.0.0'
 assert_file_contains "dev edit present (level = debug)" "config.toml" 'debug'
+assert_file_content "non-overlapping merge preserves exact content" "config.toml" '[server]
+host = "0.0.0.0"
+port = 8080
+
+[database]
+url = "postgres://localhost/mydb"
+pool_size = 5
+
+[logging]
+level = "debug"
+format = "json"'
 
 echo ""
 echo "  config.toml after merge:"
 cat config.toml | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -163,14 +226,13 @@ create_file "version.txt" 'version = "1.0.0"
 name = "my-app"
 description = "A sample application"'
 
-assert_success "add version.txt on dev" atomic add version.txt
-record_change "Initial version file" >/dev/null 2>&1
+require_success "add version.txt on dev" atomic add version.txt
+require_success "record initial version file" record_change "Initial version file"
 
 # Create draft view
-new_view "bump-major" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "bump-major" >/dev/null 2>&1
-insert_from_view "dev" "bump-major" >/dev/null 2>&1 || true
-switch_view "bump-major" >/dev/null 2>&1
+require_success "create bump-major" new_view "bump-major" --draft --parent dev
+require_success "insert dev into bump-major" insert_from_view "dev" "bump-major"
+require_success "switch to bump-major" switch_view "bump-major"
 assert_current_view "on bump-major" "bump-major"
 
 # Draft: bump to 2.0.0
@@ -178,19 +240,19 @@ overwrite_file "version.txt" 'version = "2.0.0"
 name = "my-app"
 description = "A sample application"'
 
-record_change "Bump to 2.0.0" >/dev/null 2>&1
+require_success "record version 2.0.0" record_change "Bump to 2.0.0"
 
 # Switch to dev: bump to 1.1.0
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 
 overwrite_file "version.txt" 'version = "1.1.0"
 name = "my-app"
 description = "A sample application"'
 
-record_change "Bump to 1.1.0" >/dev/null 2>&1
+require_success "record version 1.1.0" record_change "Bump to 1.1.0"
 
 # Insert from draft → dev (this is the collision)
-insert_out="$(insert_from_view "bump-major" "dev" 2>&1)" || true
+if attempt_merge "overlapping edits" "bump-major" "dev" version.txt; then
 
 assert_file_exists "version.txt exists after overlapping insert" "version.txt"
 
@@ -200,14 +262,14 @@ assert_file_exists "version.txt exists after overlapping insert" "version.txt"
 #   - two "version = …" lines WRAPPED in conflict markers
 #     (`>>>>>>>` / `=======` / `<<<<<<<`), so a human can see both sides.
 # What we must reject is duplication WITHOUT markers.
-version_lines="$(grep -c 'version = ' version.txt)"
+version_lines="$(grep -c 'version = ' version.txt || true)"
 version_lines="$(echo "$version_lines" | tr -d '[:space:]')"
 has_conflict_markers=0
-if grep -qE '^(>>>>>>>|<<<<<<<|=======)' version.txt; then
+if grep -qE '^>>>>>>>' version.txt && grep -qE '^=======' version.txt && grep -qE '^<<<<<<<' version.txt; then
     has_conflict_markers=1
 fi
 
-if [[ "$version_lines" -le 1 || "$has_conflict_markers" -eq 1 ]]; then
+if [[ "$version_lines" -eq 1 || ( "$version_lines" -ge 2 && "$has_conflict_markers" -eq 1 ) ]]; then
     _pass "no silent duplication of version line ($version_lines occurrence(s), markers=$has_conflict_markers)"
 else
     _fail "no silent duplication of version line" "found $version_lines 'version = ' lines with no conflict markers"
@@ -226,6 +288,7 @@ echo ""
 echo "  version.txt after overlapping merge:"
 cat version.txt | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -257,15 +320,14 @@ create_file "app.py" 'def main():
 if __name__ == "__main__":
     main()'
 
-assert_success "add readme.md" atomic add readme.md
-assert_success "add app.py" atomic add app.py
-record_change "Initial files" >/dev/null 2>&1
+require_success "add readme.md" atomic add readme.md
+require_success "add app.py" atomic add app.py
+require_success "record initial files" record_change "Initial files"
 
 # Create draft view
-new_view "feature-docs" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "feature-docs" >/dev/null 2>&1
-insert_from_view "dev" "feature-docs" >/dev/null 2>&1 || true
-switch_view "feature-docs" >/dev/null 2>&1
+require_success "create feature-docs" new_view "feature-docs" --draft --parent dev
+require_success "insert dev into feature-docs" insert_from_view "dev" "feature-docs"
+require_success "switch to feature-docs" switch_view "feature-docs"
 assert_current_view "on feature-docs" "feature-docs"
 
 # Draft: change readme heading + add helper to app.py
@@ -286,10 +348,10 @@ def main():
 if __name__ == "__main__":
     main()'
 
-record_change "Update docs heading and add greet function" >/dev/null 2>&1
+require_success "record draft documentation and function" record_change "Update docs heading and add greet function"
 
 # Switch to dev: change readme heading differently
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 
 overwrite_file "readme.md" '# My Cool Project
 
@@ -299,10 +361,10 @@ This is the project description.
 
 Run the app with `python app.py`.'
 
-record_change "Update docs heading on dev" >/dev/null 2>&1
+require_success "record dev documentation" record_change "Update docs heading on dev"
 
 # Insert from draft → dev
-insert_out="$(insert_from_view "feature-docs" "dev" 2>&1)" || true
+if attempt_merge "two-file overlap" "feature-docs" "dev" readme.md app.py; then
 
 # Check readme.md — the heading collides
 assert_file_exists "readme.md exists after insert" "readme.md"
@@ -319,7 +381,7 @@ assert_max_lines "readme.md reasonable size" "readme.md" 20
 assert_file_exists "app.py exists after insert" "app.py"
 
 # main() should appear exactly once as a definition
-def_main_count="$(grep -c 'def main' app.py || echo 0)"
+def_main_count="$(grep -c 'def main' app.py || true)"
 if [[ "$def_main_count" -eq 1 ]]; then
     _pass "def main() appears once in app.py"
 else
@@ -339,6 +401,7 @@ echo ""
 echo "  app.py after merge:"
 cat app.py | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -371,14 +434,13 @@ create_file "changelog.md" '# Changelog
 ## v1.2.0
 - Performance improvements'
 
-assert_success "add changelog.md" atomic add changelog.md
-record_change "Initial changelog" >/dev/null 2>&1
+require_success "add changelog.md" atomic add changelog.md
+require_success "record initial changelog" record_change "Initial changelog"
 
 # Create draft view
-new_view "release-notes" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "release-notes" >/dev/null 2>&1
-insert_from_view "dev" "release-notes" >/dev/null 2>&1 || true
-switch_view "release-notes" >/dev/null 2>&1
+require_success "create release-notes" new_view "release-notes" --draft --parent dev
+require_success "insert dev into release-notes" insert_from_view "dev" "release-notes"
+require_success "switch to release-notes" switch_view "release-notes"
 assert_current_view "on release-notes" "release-notes"
 
 # Draft: append v1.3.0
@@ -396,10 +458,10 @@ overwrite_file "changelog.md" '# Changelog
 ## v1.3.0
 - New feature: user profiles'
 
-record_change "Add v1.3.0 release notes" >/dev/null 2>&1
+require_success "record v1.3.0 notes" record_change "Add v1.3.0 release notes"
 
 # Switch to dev: append v1.4.0
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 
 overwrite_file "changelog.md" '# Changelog
 
@@ -415,10 +477,10 @@ overwrite_file "changelog.md" '# Changelog
 ## v1.4.0
 - Security patches'
 
-record_change "Add v1.4.0 release notes" >/dev/null 2>&1
+require_success "record v1.4.0 notes" record_change "Add v1.4.0 release notes"
 
 # Insert from draft → dev
-insert_out="$(insert_from_view "release-notes" "dev" 2>&1)" || true
+if attempt_merge "same-gap appends" "release-notes" "dev" changelog.md; then
 
 assert_file_exists "changelog.md exists after insert" "changelog.md"
 
@@ -443,6 +505,7 @@ echo ""
 echo "  changelog.md after merge:"
 cat changelog.md | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -470,14 +533,13 @@ def deprecated_multiply(a, b):
 def subtract(a, b):
     return a - b'
 
-assert_success "add utils.py" atomic add utils.py
-record_change "Initial utils" >/dev/null 2>&1
+require_success "add utils.py" atomic add utils.py
+require_success "record initial utils" record_change "Initial utils"
 
 # Create draft view
-new_view "cleanup" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "cleanup" >/dev/null 2>&1
-insert_from_view "dev" "cleanup" >/dev/null 2>&1 || true
-switch_view "cleanup" >/dev/null 2>&1
+require_success "create cleanup" new_view "cleanup" --draft --parent dev
+require_success "insert dev into cleanup" insert_from_view "dev" "cleanup"
+require_success "switch to cleanup" switch_view "cleanup"
 assert_current_view "on cleanup" "cleanup"
 
 # Draft: delete the deprecated function
@@ -487,10 +549,10 @@ overwrite_file "utils.py" 'def add(a, b):
 def subtract(a, b):
     return a - b'
 
-record_change "Remove deprecated_multiply" >/dev/null 2>&1
+require_success "record removal" record_change "Remove deprecated_multiply"
 
 # Switch to dev: modify the deprecated function
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 
 overwrite_file "utils.py" 'def add(a, b):
     return a + b
@@ -502,10 +564,10 @@ def deprecated_multiply(a, b):
 def subtract(a, b):
     return a - b'
 
-record_change "Add deprecation warning" >/dev/null 2>&1
+require_success "record deprecation warning" record_change "Add deprecation warning"
 
 # Insert from draft → dev
-insert_out="$(insert_from_view "cleanup" "dev" 2>&1)" || true
+if attempt_merge "delete versus edit" "cleanup" "dev" utils.py; then
 
 assert_file_exists "utils.py exists after insert" "utils.py"
 
@@ -537,6 +599,7 @@ echo ""
 echo "  utils.py after merge:"
 cat utils.py | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -568,14 +631,13 @@ export function start(): void {
 
 // End of service'
 
-assert_success "add service.ts" atomic add service.ts
-record_change "Initial service" >/dev/null 2>&1
+require_success "add service.ts" atomic add service.ts
+require_success "record initial service" record_change "Initial service"
 
 # Create draft view
-new_view "feature-service" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "feature-service" >/dev/null 2>&1
-insert_from_view "dev" "feature-service" >/dev/null 2>&1 || true
-switch_view "feature-service" >/dev/null 2>&1
+require_success "create feature-service" new_view "feature-service" --draft --parent dev
+require_success "insert dev into feature-service" insert_from_view "dev" "feature-service"
+require_success "switch to feature-service" switch_view "feature-service"
 assert_current_view "on feature-service" "feature-service"
 
 # Draft change 1: modify header comment
@@ -588,7 +650,7 @@ export function start(): void {
 
 // End of service'
 
-record_change "Update service header to v2" >/dev/null 2>&1
+require_success "record service header" record_change "Update service header to v2"
 
 # Draft change 2: add a stop function
 overwrite_file "service.ts" '// Service v2 — improved
@@ -604,7 +666,7 @@ export function stop(): void {
 
 // End of service'
 
-record_change "Add stop function" >/dev/null 2>&1
+require_success "record stop function" record_change "Add stop function"
 
 # Draft change 3: modify stop function
 overwrite_file "service.ts" '// Service v2 — improved
@@ -624,10 +686,10 @@ export function stop(graceful: boolean = true): void {
 
 // End of service'
 
-record_change "Add graceful stop parameter" >/dev/null 2>&1
+require_success "record graceful stop" record_change "Add graceful stop parameter"
 
 # Switch to dev and make a non-overlapping change (modify footer)
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 
 overwrite_file "service.ts" '// Service v1
 const SERVICE_NAME = "my-service";
@@ -638,10 +700,10 @@ export function start(): void {
 
 // Copyright 2024 — All rights reserved'
 
-record_change "Update footer with copyright" >/dev/null 2>&1
+require_success "record copyright footer" record_change "Update footer with copyright"
 
 # Insert all draft changes → dev
-insert_out="$(insert_from_view "feature-service" "dev" 2>&1)" || true
+if attempt_merge "sequential draft changes" "feature-service" "dev" service.ts; then
 
 assert_file_exists "service.ts exists after insert" "service.ts"
 
@@ -653,12 +715,13 @@ assert_occurrence_count "export start() once" "service.ts" "export function star
 
 # stop() should appear exactly once (from draft's final state, NOT
 # duplicated from intermediate states)
-stop_count="$(grep -c 'export function stop' service.ts || echo 0)"
-if [[ "$stop_count" -le 1 ]]; then
-    _pass "export stop() not duplicated ($stop_count occurrence(s))"
+stop_count="$(grep -c 'export function stop' service.ts || true)"
+if [[ "$stop_count" -eq 1 ]]; then
+    _pass "export stop() appears once ($stop_count occurrence(s))"
 else
-    _fail "export stop() not duplicated" "found $stop_count times (expected 0 or 1)"
+    _fail "export stop() appears once" "found $stop_count times (expected 1)"
 fi
+assert_file_contains "final stop signature is present" "service.ts" 'stop(graceful: boolean = true)'
 
 # The header should be the draft's version (v2)
 assert_file_contains "draft header present (v2)" "service.ts" "v2"
@@ -683,6 +746,7 @@ echo ""
 echo "  service.ts after merge:"
 cat service.ts | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -716,14 +780,13 @@ database:
   host: localhost
   port: 5432'
 
-assert_success "add config.yaml" atomic add config.yaml
-record_change "Initial config.yaml" >/dev/null 2>&1
+require_success "add config.yaml" atomic add config.yaml
+require_success "record initial config.yaml" record_change "Initial config.yaml"
 
 # Create draft
-new_view "feature-yaml" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "feature-yaml" >/dev/null 2>&1
-insert_from_view "dev" "feature-yaml" >/dev/null 2>&1 || true
-switch_view "feature-yaml" >/dev/null 2>&1
+require_success "create feature-yaml" new_view "feature-yaml" --draft --parent dev
+require_success "insert dev into feature-yaml" insert_from_view "dev" "feature-yaml"
+require_success "switch to feature-yaml" switch_view "feature-yaml"
 assert_current_view "on feature-yaml" "feature-yaml"
 
 # Draft: change app name
@@ -739,10 +802,10 @@ database:
   host: localhost
   port: 5432'
 
-record_change "Rename app to super-app" >/dev/null 2>&1
+require_success "record app name" record_change "Rename app to super-app"
 
 # Switch to dev: change database port
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 
 overwrite_file "config.yaml" 'app:
   name: myapp
@@ -756,15 +819,15 @@ database:
   host: localhost
   port: 5433'
 
-record_change "Change db port to 5433" >/dev/null 2>&1
+require_success "record database port" record_change "Change db port to 5433"
 
 # Switch to draft and insert FROM dev (reverse direction)
-switch_view "feature-yaml" >/dev/null 2>&1
+require_success "switch to feature-yaml" switch_view "feature-yaml"
 
-insert_out="$(insert_from_view "dev" "feature-yaml" 2>&1)" || true
+if attempt_merge "reverse non-overlapping edits" "dev" "feature-yaml" config.yaml; then
 
 # Materialise the working copy after inserting into current view
-atomic_out="$(atomic status 2>&1)" || true
+require_success "read status after reverse insert" atomic status
 
 assert_file_exists "config.yaml exists after reverse insert" "config.yaml"
 
@@ -778,6 +841,17 @@ assert_file_contains "draft edit present (super-app)" "config.yaml" "super-app"
 
 # Dev's change should be present
 assert_file_contains "dev edit present (5433)" "config.yaml" "5433"
+assert_file_content "reverse merge preserves exact content" "config.yaml" 'app:
+  name: super-app
+  version: 1.0.0
+
+server:
+  host: localhost
+  port: 3000
+
+database:
+  host: localhost
+  port: 5433'
 
 assert_max_lines "config.yaml reasonable size" "config.yaml" 18
 
@@ -785,6 +859,7 @@ echo ""
 echo "  config.yaml after reverse insert:"
 cat config.yaml | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -807,14 +882,13 @@ create_file "index.html" '<!DOCTYPE html>
 </body>
 </html>'
 
-assert_success "add index.html" atomic add index.html
-record_change "Initial HTML" >/dev/null 2>&1
+require_success "add index.html" atomic add index.html
+require_success "record initial HTML" record_change "Initial HTML"
 
 # Create draft, modify, record
-new_view "feature-html" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "feature-html" >/dev/null 2>&1
-insert_from_view "dev" "feature-html" >/dev/null 2>&1 || true
-switch_view "feature-html" >/dev/null 2>&1
+require_success "create feature-html" new_view "feature-html" --draft --parent dev
+require_success "insert dev into feature-html" insert_from_view "dev" "feature-html"
+require_success "switch to feature-html" switch_view "feature-html"
 
 overwrite_file "index.html" '<!DOCTYPE html>
 <html>
@@ -825,10 +899,10 @@ overwrite_file "index.html" '<!DOCTYPE html>
 </body>
 </html>'
 
-record_change "Update title and paragraph on draft" >/dev/null 2>&1
+require_success "record draft HTML" record_change "Update title and paragraph on draft"
 
 # Dev: different edit
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 
 overwrite_file "index.html" '<!DOCTYPE html>
 <html>
@@ -839,10 +913,10 @@ overwrite_file "index.html" '<!DOCTYPE html>
 </body>
 </html>'
 
-record_change "Update heading on dev" >/dev/null 2>&1
+require_success "record dev heading" record_change "Update heading on dev"
 
 # Insert draft → dev
-insert_from_view "feature-html" "dev" >/dev/null 2>&1 || true
+if attempt_merge "post-merge record" "feature-html" "dev" index.html; then
 
 # Now make another edit on dev AFTER the merge
 overwrite_file "index.html" '<!DOCTYPE html>
@@ -855,7 +929,8 @@ overwrite_file "index.html" '<!DOCTYPE html>
 </html>'
 
 # This record should work cleanly — no duplication from the merge
-record_out="$(record_change "Post-merge edit" 2>&1)" || true
+require_success "record post-merge edit" record_change "Post-merge edit"
+assert_clean "clean after post-merge record"
 
 # Verify the file has the post-merge content
 assert_file_content "index.html has final content" "index.html" '<!DOCTYPE html>
@@ -877,6 +952,7 @@ echo ""
 echo "  index.html after post-merge record:"
 cat index.html | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -903,31 +979,30 @@ create_file "config.ts" 'export const APP_NAME = "atomic";
 export const TIMEOUT_MS = 5000;
 export const MAX_RETRIES = 3;'
 
-assert_success "add config.ts" atomic add config.ts
-record_change "Initial timeout config" >/dev/null 2>&1
+require_success "add config.ts" atomic add config.ts
+require_success "record initial timeout config" record_change "Initial timeout config"
 
-new_view "rename-timeout" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "rename-timeout" >/dev/null 2>&1
-insert_from_view "dev" "rename-timeout" >/dev/null 2>&1 || true
-switch_view "rename-timeout" >/dev/null 2>&1
+require_success "create rename-timeout" new_view "rename-timeout" --draft --parent dev
+require_success "insert dev into rename-timeout" insert_from_view "dev" "rename-timeout"
+require_success "switch to rename-timeout" switch_view "rename-timeout"
 
 # Agent A renames the identifier
 overwrite_file "config.ts" 'export const APP_NAME = "atomic";
 export const TIMEOUT_SEC = 5000;
 export const MAX_RETRIES = 3;'
 
-record_change "Rename TIMEOUT_MS → TIMEOUT_SEC" >/dev/null 2>&1
+require_success "record timeout rename" record_change "Rename TIMEOUT_MS → TIMEOUT_SEC"
 
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 
 # Agent B changes the value (different token, same line)
 overwrite_file "config.ts" 'export const APP_NAME = "atomic";
 export const TIMEOUT_MS = 10000;
 export const MAX_RETRIES = 3;'
 
-record_change "Tune timeout to 10000" >/dev/null 2>&1
+require_success "record timeout value" record_change "Tune timeout to 10000"
 
-insert_out="$(insert_from_view "rename-timeout" "dev" 2>&1)" || true
+if attempt_merge "disjoint token edits" "rename-timeout" "dev" config.ts; then
 
 assert_file_exists "config.ts exists after token-merge insert" "config.ts"
 
@@ -946,6 +1021,7 @@ echo ""
 echo "  config.ts after token-disjoint merge:"
 cat config.ts | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -969,22 +1045,21 @@ init_repo
 
 create_file "config.ts" 'export const TIMEOUT_MS = 5000;'
 
-assert_success "add config.ts" atomic add config.ts
-record_change "Initial timeout" >/dev/null 2>&1
+require_success "add config.ts" atomic add config.ts
+require_success "record initial timeout" record_change "Initial timeout"
 
-new_view "bump-A" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "bump-A" >/dev/null 2>&1
-insert_from_view "dev" "bump-A" >/dev/null 2>&1 || true
-switch_view "bump-A" >/dev/null 2>&1
+require_success "create bump-A" new_view "bump-A" --draft --parent dev
+require_success "insert dev into bump-A" insert_from_view "dev" "bump-A"
+require_success "switch to bump-A" switch_view "bump-A"
 
 overwrite_file "config.ts" 'export const TIMEOUT_MS = 10000;'
-record_change "Bump to 10000" >/dev/null 2>&1
+require_success "record timeout 10000" record_change "Bump to 10000"
 
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 overwrite_file "config.ts" 'export const TIMEOUT_MS = 30000;'
-record_change "Bump to 30000" >/dev/null 2>&1
+require_success "record timeout 30000" record_change "Bump to 30000"
 
-insert_out="$(insert_from_view "bump-A" "dev" 2>&1)" || true
+if attempt_merge "overlapping token edits" "bump-A" "dev" config.ts; then
 
 assert_file_exists "config.ts exists after overlap insert" "config.ts"
 
@@ -997,6 +1072,7 @@ echo ""
 echo "  config.ts after same-token conflict:"
 cat config.ts | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1026,31 +1102,30 @@ create_file "process.ts" 'export function process(data) {
     return transform(data);
 }'
 
-assert_success "add process.ts" atomic add process.ts
-record_change "Initial process function" >/dev/null 2>&1
+require_success "add process.ts" atomic add process.ts
+require_success "record initial process function" record_change "Initial process function"
 
-new_view "add-param" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "add-param" >/dev/null 2>&1
-insert_from_view "dev" "add-param" >/dev/null 2>&1 || true
-switch_view "add-param" >/dev/null 2>&1
+require_success "create add-param" new_view "add-param" --draft --parent dev
+require_success "insert dev into add-param" insert_from_view "dev" "add-param"
+require_success "switch to add-param" switch_view "add-param"
 
 # Agent A: add an options parameter
 overwrite_file "process.ts" 'export function process(data, options) {
     return transform(data);
 }'
 
-record_change "Add options parameter" >/dev/null 2>&1
+require_success "record options parameter" record_change "Add options parameter"
 
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 
 # Agent B: add a return type
 overwrite_file "process.ts" 'export function process(data): Result {
     return transform(data);
 }'
 
-record_change "Add Result return type" >/dev/null 2>&1
+require_success "record return type" record_change "Add Result return type"
 
-insert_out="$(insert_from_view "add-param" "dev" 2>&1)" || true
+if attempt_merge "structural token edits" "add-param" "dev" process.ts; then
 
 assert_file_exists "process.ts exists after structural merge" "process.ts"
 
@@ -1080,6 +1155,7 @@ echo ""
 echo "  process.ts after structural merge:"
 cat process.ts | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1117,14 +1193,13 @@ create_file "src/lib.ts" 'export function oldFn(x) {
 
 export const VERSION = "1.0";'
 
-assert_success "add src/api.ts" atomic add src/api.ts
-assert_success "add src/lib.ts" atomic add src/lib.ts
-record_change "Initial library" >/dev/null 2>&1
+require_success "add src/api.ts" atomic add src/api.ts
+require_success "add src/lib.ts" atomic add src/lib.ts
+require_success "record initial library" record_change "Initial library"
 
-new_view "rename-fn" --draft --parent dev >/dev/null 2>&1 || \
-    new_view "rename-fn" >/dev/null 2>&1
-insert_from_view "dev" "rename-fn" >/dev/null 2>&1 || true
-switch_view "rename-fn" >/dev/null 2>&1
+require_success "create rename-fn" new_view "rename-fn" --draft --parent dev
+require_success "insert dev into rename-fn" insert_from_view "dev" "rename-fn"
+require_success "switch to rename-fn" switch_view "rename-fn"
 
 # Agent A: rename oldFn → newFn across both files.
 overwrite_file "src/api.ts" 'import { newFn } from "./lib";
@@ -1139,9 +1214,9 @@ overwrite_file "src/lib.ts" 'export function newFn(x) {
 
 export const VERSION = "1.0";'
 
-record_change "Rename oldFn → newFn" >/dev/null 2>&1
+require_success "record function rename" record_change "Rename oldFn → newFn"
 
-switch_view "dev" >/dev/null 2>&1
+require_success "switch to dev" switch_view "dev"
 
 # Agent B: change the function body (a DIFFERENT line than agent A
 # touched in lib.ts).  api.ts is left alone by agent B.
@@ -1151,9 +1226,9 @@ overwrite_file "src/lib.ts" 'export function oldFn(x) {
 
 export const VERSION = "1.0";'
 
-record_change "Tighten oldFn body" >/dev/null 2>&1
+require_success "record function body" record_change "Tighten oldFn body"
 
-insert_out="$(insert_from_view "rename-fn" "dev" 2>&1)" || true
+if attempt_merge "multi-file refactor" "rename-fn" "dev" src/api.ts src/lib.ts; then
 
 assert_file_exists "src/api.ts exists after refactor" "src/api.ts"
 assert_file_exists "src/lib.ts exists after refactor" "src/lib.ts"
@@ -1170,7 +1245,7 @@ assert_occurrence_count "api.ts has one handle()" "src/api.ts" "function handle"
 # Both edits must be present in their respective lines.
 assert_file_contains "lib.ts signature renamed"  "src/lib.ts" 'export function newFn'
 assert_file_contains "lib.ts body change present" "src/lib.ts" 'x * 3 + 1'
-assert_file_not_contains "lib.ts old body gone"   "src/lib.ts" 'return x \* 2;'
+assert_file_not_contains "lib.ts old body gone"   "src/lib.ts" 'return x * 2;'
 assert_occurrence_count "lib.ts has one function def" "src/lib.ts" "export function" 1
 assert_file_contains "lib.ts VERSION untouched"   "src/lib.ts" 'VERSION = "1.0"'
 
@@ -1181,6 +1256,7 @@ echo ""
 echo "  src/lib.ts after multi-file refactor:"
 cat src/lib.ts | sed 's/^/    /'
 echo ""
+fi
 
 
 # ═══════════════════════════════════════════════════════════════════════════

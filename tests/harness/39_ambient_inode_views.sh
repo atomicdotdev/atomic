@@ -38,26 +38,26 @@ begin_section "Descendant draft inherits parent file identity"
 make_temp_repo ambient-inode-descendant
 init_repo
 
-new_view ab12 --draft --parent dev --switch >/dev/null
+require_success "create parent draft" new_view ab12 --draft --parent dev --switch
 printf 'from-ab12\n' > f.txt
-add_files f.txt >/dev/null
-record_change "ab12 adds f.txt" >/dev/null
+require_success "add parent file" atomic add f.txt
+require_success "record parent file" record_change "ab12 adds f.txt"
 
-new_view cd23 --draft --parent ab12 --switch >/dev/null
+require_success "create child draft" new_view cd23 --draft --parent ab12 --switch
 assert_file_content "cd23 materializes ab12's inherited file" f.txt "from-ab12"
 assert_clean "cd23 starts clean with inherited file"
 
-ADD_OUTPUT="$(atomic add f.txt 2>&1)"
+require_success "add inherited file" atomic add f.txt
 assert_clean "adding inherited file is idempotent"
 assert_file_content "idempotent add preserves inherited content" f.txt "from-ab12"
 
 printf 'from-cd23\n' > f.txt
-record_change "cd23 edits inherited f.txt" >/dev/null
+require_success "record child edit" record_change "cd23 edits inherited f.txt"
 assert_file_content "cd23 records against inherited file" f.txt "from-cd23"
 
-switch_view ab12 >/dev/null
+require_success "switch to parent" switch_view ab12
 assert_file_content "parent remains at its own visible generation" f.txt "from-ab12"
-switch_view cd23 >/dev/null
+require_success "switch to child" switch_view cd23
 assert_file_content "child restores its edit on the same inherited file" f.txt "from-cd23"
 
 # ── Case 2: selecting ambient graph data does not rewrite TREE history ──────
@@ -65,23 +65,29 @@ begin_section "Cross-view insertion is closure-only and idempotent"
 make_temp_repo ambient-inode-insert
 init_repo
 
-new_view feature --draft --parent dev --switch >/dev/null
+require_success "create feature draft" new_view feature --draft --parent dev --switch
 printf 'ambient content\n' > ambient.txt
-add_files ambient.txt >/dev/null
-record_change "feature adds ambient.txt" >/dev/null
+require_success "add ambient file" atomic add ambient.txt
+require_success "record ambient file" record_change "feature adds ambient.txt"
 
 JOURNAL_BEFORE="$(journal_fingerprint)"
-switch_view dev >/dev/null
-insert_from_view feature dev >/dev/null
+require_success "switch to dev" switch_view dev
+require_success "insert ambient file" insert_from_view feature dev
 JOURNAL_AFTER_FIRST="$(journal_fingerprint)"
-assert_equal_value "first insert does not append snapshot-derived TREE ops" \
-    "$JOURNAL_BEFORE" "$JOURNAL_AFTER_FIRST"
+if [[ "$JOURNAL_BEFORE" == missing ]]; then
+    _skip "first insert does not append snapshot-derived TREE ops" "legacy deferred TREE journal absent"
+else
+    assert_equal_value "first insert does not append snapshot-derived TREE ops" "$JOURNAL_BEFORE" "$JOURNAL_AFTER_FIRST"
+fi
 assert_file_content "dev materializes selected ambient file" ambient.txt "ambient content"
 
-insert_from_view feature dev >/dev/null
+require_success "repeat ambient insertion" insert_from_view feature dev
 JOURNAL_AFTER_SECOND="$(journal_fingerprint)"
-assert_equal_value "repeated insert leaves TREE lifecycle metadata unchanged" \
-    "$JOURNAL_AFTER_FIRST" "$JOURNAL_AFTER_SECOND"
+if [[ "$JOURNAL_AFTER_FIRST" == missing ]]; then
+    _skip "repeated insert leaves TREE lifecycle metadata unchanged" "legacy deferred TREE journal absent"
+else
+    assert_equal_value "repeated insert leaves TREE lifecycle metadata unchanged" "$JOURNAL_AFTER_FIRST" "$JOURNAL_AFTER_SECOND"
+fi
 assert_file_content "repeated insert preserves content" ambient.txt "ambient content"
 assert_clean "repeated ambient insert leaves dev clean"
 
@@ -90,19 +96,35 @@ begin_section "Sibling same-path creates surface an identity conflict"
 make_temp_repo ambient-inode-siblings
 init_repo
 
-new_view bill --draft --parent dev --switch >/dev/null
+require_success "create Bill draft" new_view bill --draft --parent dev --switch
 printf 'from-bill\n' > f.txt
-add_files f.txt >/dev/null
-record_change "bill creates f.txt" >/dev/null
+require_success "add Bill file" atomic add f.txt
+require_success "record Bill file" record_change "bill creates f.txt"
 
-switch_view dev >/dev/null
-new_view sally --draft --parent dev --switch >/dev/null
+require_success "switch to dev" switch_view dev
+require_success "create Sally draft" new_view sally --draft --parent dev --switch
 printf 'from-sally\n' > f.txt
-add_files f.txt >/dev/null
-record_change "sally creates f.txt" >/dev/null
+require_success "add Sally file" atomic add f.txt
+require_success "record Sally file" record_change "sally creates f.txt"
 
 JOURNAL_BEFORE_CONFLICT="$(journal_fingerprint)"
-insert_from_view bill sally >/dev/null 2>&1 || true
+snapshot_dir="$(mktemp -d "${TMPDIR:-/tmp}/atomic-ambient-snapshot-XXXXXX")"
+_HARNESS_TMPDIRS+=("$snapshot_dir")
+cp f.txt "$snapshot_dir/f.txt"
+require_capture "read Sally history before insert" atomic log --view sally -f json
+history_before="$COMMAND_OUTPUT"
+if insert_out="$(insert_from_view bill sally 2>&1)"; then
+    _pass "insert Bill's same-path identity"
+else
+    _fail "insert Bill's same-path identity" "$insert_out"
+    assert_success "refused insertion preserves Sally bytes" cmp -s "$snapshot_dir/f.txt" f.txt
+    assert_current_view "refused insertion preserves Sally view" sally
+    require_capture "read Sally history after refusal" atomic log --view sally -f json
+    if [[ "$COMMAND_OUTPUT" == "$history_before" ]]; then _pass "refusal preserves Sally history"; else _fail "refusal preserves Sally history" "history changed"; fi
+    _skip "same-path conflict and remaining cases" "name-conflict insertion refused"
+    print_summary || true
+    exit 1
+fi
 JOURNAL_AFTER_CONFLICT="$(journal_fingerprint)"
 assert_equal_value "combining siblings does not invent TREE lifecycle ops" \
     "$JOURNAL_BEFORE_CONFLICT" "$JOURNAL_AFTER_CONFLICT"

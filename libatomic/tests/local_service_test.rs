@@ -178,6 +178,11 @@ async fn local_add_record_log_and_change_use_existing_handlers() {
         },
     )
     .await;
+    let statistics = recorded.statistics.as_ref().expect("record statistics");
+    assert_eq!(statistics.files_recorded, 1);
+    assert_eq!(statistics.lines_added, 1);
+    assert!(statistics.tokens_added > 0);
+    assert_eq!(recorded.recorded_paths, vec!["hello.txt"]);
     let hash = recorded.change.unwrap().hash.unwrap();
     assert_eq!(hash.value.len(), 32);
 
@@ -233,6 +238,130 @@ async fn local_add_record_log_and_change_use_existing_handlers() {
     .await;
     assert!(without.metadata.is_none());
     assert!(without.change_bundle.is_none());
+}
+
+#[tokio::test]
+async fn local_log_all_preserves_explicit_view_and_includes_ancestors() {
+    use atomic_core::change::ChangeHeader;
+    use atomic_repository::RecordOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let mut repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let record = |repo: &Repository, message: &str| {
+        repo.record(
+            wc,
+            ChangeHeader::new(message),
+            RecordOptions::new()
+                .with_all(true)
+                .save_to_store(true)
+                .apply_after_record(true),
+        )
+        .unwrap();
+    };
+    std::fs::write(dir.path().join("base.txt"), b"base\n").unwrap();
+    repo.add(wc, "base.txt", Default::default()).unwrap();
+    record(&repo, "shared baseline");
+    // Seed baseline membership so --all retains inherited entries that the
+    // ordinary Draft-only log hides, while still honoring an explicit view.
+    repo.create_view_from("agent", "dev").unwrap();
+    repo.switch_view(wc, "agent").unwrap();
+    std::fs::write(dir.path().join("draft.txt"), b"draft\n").unwrap();
+    repo.add(wc, "draft.txt", Default::default()).unwrap();
+    record(&repo, "draft only");
+    drop(repo);
+    let service = LocalService::new();
+    let repository = resolve(&service, dir.path()).await;
+    for (view, all, expected) in [
+        (Some("dev"), true, vec!["shared baseline"]),
+        (Some("agent"), true, vec!["draft only", "shared baseline"]),
+        (Some("agent"), false, vec!["draft only"]),
+        (None, true, vec!["draft only", "shared baseline"]),
+    ] {
+        let response: proto::LogResponse = invoke(
+            &service,
+            "/atomic.RepositoryQueryService/Log",
+            &proto::LogRequest {
+                repository: Some(repository.clone()),
+                view: view.map(str::to_string),
+                all_views: all,
+                ..Default::default()
+            },
+        )
+        .await;
+        let messages: Vec<_> = response
+            .entries
+            .iter()
+            .map(|entry| entry.message.as_deref().unwrap())
+            .collect();
+        assert_eq!(messages, expected, "view={view:?}, all={all}");
+    }
+}
+
+#[tokio::test]
+async fn local_record_reports_native_span_semantic_statistics() {
+    assert_local_record_reports_semantic_statistics(true).await;
+}
+
+#[tokio::test]
+async fn local_record_reports_native_graph_semantic_statistics() {
+    assert_local_record_reports_semantic_statistics(false).await;
+}
+
+async fn assert_local_record_reports_semantic_statistics(span: bool) {
+    use atomic_core::pristine::{CapabilityMutTxnT, MutTxnT, SPAN_RANGE_CAPABILITY};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    if span {
+        let mut txn = repo.pristine().write_txn().unwrap();
+        txn.put_required_capability(SPAN_RANGE_CAPABILITY).unwrap();
+        txn.commit().unwrap();
+    }
+    drop(repo);
+    let path = dir.path().join("hello.txt");
+    std::fs::write(&path, "first\nsecond\n").unwrap();
+    let service = LocalService::new();
+    let repository = resolve(&service, dir.path()).await;
+    let _: proto::AddFilesResponse = invoke(
+        &service,
+        "/atomic.RepositoryMutationService/AddFiles",
+        &proto::AddFilesRequest {
+            repository: Some(repository.clone()),
+            paths: vec!["hello.txt".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let root: proto::RecordResponse = invoke(
+        &service,
+        "/atomic.RepositoryMutationService/Record",
+        &proto::RecordRequest {
+            repository: Some(repository.clone()),
+            message: "root".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let stats = root.statistics.unwrap();
+    assert_eq!(stats.files_recorded, 1);
+    assert_eq!(stats.lines_added, 2);
+    assert!(stats.tokens_added > 0);
+    assert_eq!(root.recorded_paths, vec!["hello.txt"]);
+    std::fs::write(&path, "FIRST\nsecond\n").unwrap();
+    let edit: proto::RecordResponse = invoke(
+        &service,
+        "/atomic.RepositoryMutationService/Record",
+        &proto::RecordRequest {
+            repository: Some(repository),
+            message: "edit".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let stats = edit.statistics.unwrap();
+    assert_eq!(stats.files_recorded, 1);
+    assert!(stats.lines_added + stats.lines_deleted + stats.lines_modified > 0);
+    assert!(stats.tokens_added + stats.tokens_deleted + stats.tokens_replaced > 0);
+    assert_eq!(edit.recorded_paths, vec!["hello.txt"]);
 }
 
 #[tokio::test]

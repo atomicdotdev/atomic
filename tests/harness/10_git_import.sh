@@ -13,25 +13,35 @@ HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
 
 count_imported_git_changes() {
-    local count=0
-    local hash
+    local count=0 hash log_output details
+    if ! log_output="$(atomic log --format short --no-color --full-hash 2>&1)"; then
+        echo "atomic log failed: $log_output" >&2
+        return 1
+    fi
     while IFS= read -r hash; do
         [[ -z "$hash" ]] && continue
-        if atomic change "$hash" 2>/dev/null | grep -q 'Commit:'; then
+        if ! details="$(atomic change "$hash" --full-hash 2>&1)"; then
+            echo "atomic change $hash failed: $details" >&2
+            return 1
+        fi
+        if printf '%s\n' "$details" | grep -qF 'Git source revision:'; then
             count=$((count + 1))
         fi
-    done < <(atomic log --format short --no-color --full-hash 2>/dev/null | awk '/^[A-Z2-7]{20,}/ { print $1 }')
+    done <<< "$(printf '%s\n' "$log_output" | awk '$1 ~ /^[A-Z2-7]+$/ && length($1) == 52 { print $1 }')"
     echo "$count"
 }
 
 git_first_parent_commit_count() {
-    git rev-list --first-parent --count HEAD 2>/dev/null || echo "0"
+    git rev-list --first-parent --count HEAD
 }
 assert_imported_git_change_count() {
     local desc="$1"
     local expected="$2"
     local actual
-    actual="$(count_imported_git_changes)"
+    if ! actual="$(count_imported_git_changes 2>&1)"; then
+        _fail "$desc" "failed to count imported changes: $actual"
+        return
+    fi
     if [[ "$actual" -eq "$expected" ]]; then
         _pass "$desc"
     else
@@ -41,14 +51,23 @@ assert_imported_git_change_count() {
 
 find_imported_change_hash_containing() {
     local needle="$1"
-    local hash
+    local hash log_output details
+    if ! log_output="$(atomic log --format short --no-color --full-hash 2>&1)"; then
+        echo "atomic log failed: $log_output" >&2
+        return 1
+    fi
     while IFS= read -r hash; do
         [[ -z "$hash" ]] && continue
-        if atomic change "$hash" 2>/dev/null | grep -qiF "$needle"; then
+        if ! details="$(atomic change "$hash" --full-hash 2>&1)"; then
+            echo "atomic change $hash failed: $details" >&2
+            return 1
+        fi
+        if printf '%s\n' "$details" | grep -qiF "$needle"; then
             echo "$hash"
             return 0
         fi
-    done < <(atomic log --format short --no-color --full-hash 2>/dev/null | awk '/^[A-Z2-7]{20,}/ { print $1 }')
+    done <<< "$(printf '%s\n' "$log_output" | awk '$1 ~ /^[A-Z2-7]+$/ && length($1) == 52 { print $1 }')"
+    echo "no imported change contains '$needle'" >&2
     return 1
 }
 
@@ -86,7 +105,7 @@ default_branch="$(git_default_branch)"
 echo "  Found $expected_commits first-parent commits on branch '$default_branch'"
 
 # Initialize atomic and import
-assert_success "atomic git import succeeds" atomic git import
+require_success "atomic git import succeeds" atomic git import
 
 git_status_after_import="$(git status --short)"
 if [[ -z "$git_status_after_import" ]]; then
@@ -101,7 +120,8 @@ assert_view_exists "view '$default_branch' created" "$default_branch"
 # Verify imported change count is effectively complete.
 # Some tiny repos contain a non-material merge/empty commit that import
 # intentionally skips, so allow a one-commit gap here.
-actual_imported_commits="$(count_imported_git_changes)"
+require_capture "count imported tiny-repository changes" count_imported_git_changes
+actual_imported_commits="$COMMAND_OUTPUT"
 if [[ "$actual_imported_commits" -eq "$expected_commits" ]] || \
    [[ "$actual_imported_commits" -eq $((expected_commits - 1)) ]]; then
     _pass "change count matches git first-parent commits ($expected_commits)"
@@ -120,11 +140,11 @@ make_temp_repo "git-import-dry-run"
 clone_git_repo "https://github.com/hashicorp/go-uuid.git"
 cd "$GIT_REPO_DIR"
 
-# Remove any existing .atomic from clone (shouldn't exist, but be safe)
-rm -rf .atomic 2>/dev/null || true
+assert_dir_not_exists "fresh clone has no Atomic repository" ".atomic"
 
 # Run dry-run
-out="$(atomic git import --dry-run 2>&1)" || true
+require_capture "git import dry-run succeeds" atomic git import --dry-run
+out="$COMMAND_OUTPUT"
 
 # Verify no .atomic created
 assert_dir_not_exists ".atomic not created in dry-run" ".atomic"
@@ -133,7 +153,7 @@ assert_dir_not_exists ".atomic not created in dry-run" ".atomic"
 if echo "$out" | grep -qiE "would import|preview|commits|dry.run"; then
     _pass "dry-run output shows preview"
 else
-    _pass "dry-run completes without creating repo"
+    _fail "dry-run output shows preview" "got: $out"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -159,15 +179,15 @@ git checkout -b feature --quiet
 git_commit "Feature commit" "feature.txt" "feature content"
 
 # Switch back to the original (main) branch
-git checkout "$main_branch" --quiet 2>/dev/null || true
+require_success "return to main Git branch" git checkout "$main_branch" --quiet
 
 # Import main branch
-atomic init >/dev/null 2>&1
-assert_success "import main branch" atomic git import --branch "$main_branch"
+require_success "initialize Atomic repository" atomic init
+require_success "import main branch" atomic git import --branch "$main_branch"
 assert_imported_git_change_count "main has 2 commits" 2
 
 # Import feature branch
-assert_success "import feature branch" atomic git import --branch feature
+require_success "import feature branch" atomic git import --branch feature
 assert_view_exists "feature view created" "feature"
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -185,16 +205,17 @@ cd "$GIT_REPO_DIR"
 expected_commits="$(git_first_parent_commit_count)"
 echo "  Found $expected_commits first-parent commits"
 
-assert_success "atomic git import succeeds" atomic git import
+require_success "atomic git import succeeds" atomic git import
 
-# Check that imported git changes preserve author/message metadata.
-medium_change_hash="$(find_imported_change_hash_containing "spark" || true)"
-if [[ -n "$medium_change_hash" ]]; then
+# Locate an actual first-parent commit by its Git source revision, rather than
+# matching the repository name in every imported change's metadata.
+medium_git_sha="$(git log --first-parent --author=holman --regexp-ignore-case --grep=spark --format=%H -n 1)"
+if [[ -n "$medium_git_sha" ]] && medium_change_hash="$(find_imported_change_hash_containing "$medium_git_sha" 2>&1)"; then
     assert_change_author "change has author preserved" "$medium_change_hash" "holman"
     assert_change_message "commit message preserved" "$medium_change_hash" "spark"
 else
-    _fail "change has author preserved" "could not find imported git change mentioning 'spark'"
-    _fail "commit message preserved" "could not find imported git change mentioning 'spark'"
+    _fail "change has author preserved" "no matching Git commit or imported change: ${medium_change_hash:-$medium_git_sha}"
+    _fail "commit message preserved" "no matching Git commit or imported change: ${medium_change_hash:-$medium_git_sha}"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -213,8 +234,8 @@ git_commit "Add file B" "fileB.txt" "content B"
 rm fileA.txt && git add fileA.txt && git commit --quiet -m "Delete file A"
 git mv fileB.txt fileC.txt && git commit --quiet -m "Rename B to C"
 
-atomic init >/dev/null 2>&1
-atomic git import >/dev/null 2>&1
+require_success "initialize Atomic repository" atomic init
+require_success "import file operations" atomic git import
 
 assert_imported_git_change_count "5 changes imported" 5
 
@@ -235,8 +256,8 @@ init_git_repo
 git_commit "Commit 1" "file1.txt" "v1"
 git_commit "Commit 2" "file2.txt" "v2"
 
-atomic init >/dev/null 2>&1
-atomic git import >/dev/null 2>&1
+require_success "initialize Atomic repository" atomic init
+require_success "import initial Git history" atomic git import
 assert_imported_git_change_count "initial import: 2 changes" 2
 
 # Add more git commits
@@ -244,7 +265,7 @@ git_commit "Commit 3" "file3.txt" "v3"
 git_commit "Commit 4" "file4.txt" "v4"
 
 # Incremental import (should only add new commits)
-atomic git import --incremental >/dev/null 2>&1
+require_success "import incremental Git history" atomic git import --incremental
 assert_imported_git_change_count "after incremental: 4 changes" 4
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -263,11 +284,10 @@ expected_commits="$(git_first_parent_commit_count)"
 echo "  Found $expected_commits first-parent commits"
 
 start_time=$(date +%s)
-atomic git import >/dev/null 2>&1
+require_success "import hyperfine Git history" atomic git import
 end_time=$(date +%s)
 duration=$((end_time - start_time))
 
-assert_success "import completed" true
 echo "  Import took ${duration}s"
 
 # Should complete in reasonable time (< 5 minutes)
@@ -280,7 +300,8 @@ fi
 # Verify imported Git mainline commit count exactly. Do not use raw `atomic log`
 # length here: git import records follow-up Atomic-only changes such as
 # repository/vault initialization, and those are not Git commits.
-actual="$(count_imported_git_changes)"
+require_capture "count imported hyperfine changes" count_imported_git_changes
+actual="$COMMAND_OUTPUT"
 if [[ "$actual" -eq "$expected_commits" ]]; then
     _pass "imported git change count matches ($actual vs $expected_commits)"
 else
@@ -296,7 +317,7 @@ begin_section "Git Import: Error Handling"
 make_temp_repo "git-import-errors"
 
 # Initialize atomic only (not a git repo)
-atomic init >/dev/null 2>&1
+require_success "initialize non-Git Atomic repository" atomic init
 
 # Should fail with clear error about not being a git repo
 status=0
@@ -335,15 +356,18 @@ git_commit "Test commit" "test.txt" "test content"
 sha="$(git_head_sha)"
 sha_full="$(git_head_sha_full)"
 
-atomic init >/dev/null 2>&1
-atomic git import >/dev/null 2>&1
+require_success "initialize Atomic repository" atomic init
+require_success "import Git metadata" atomic git import
 
 # Check change details for git metadata (SHA should be preserved)
-out="$(atomic change @ 2>/dev/null || true)"
-if echo "$out" | grep -qiE "git|sha|commit|$sha"; then
+require_capture "read imported Git metadata" find_imported_change_hash_containing "$sha_full"
+metadata_hash="$COMMAND_OUTPUT"
+require_capture "show imported change metadata" atomic change "$metadata_hash" --full-hash
+out="$COMMAND_OUTPUT"
+if echo "$out" | grep -qiF "$sha_full"; then
     _pass "git metadata present in change"
 else
-    _pass "change imported (metadata format may vary)"
+    _fail "git metadata present in change" "expected commit $sha_full: $out"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -376,8 +400,8 @@ git_commit "Feature B" "b.txt" "b"
 # Return to initial branch
 git checkout "$initial_branch" --quiet
 
-atomic init >/dev/null 2>&1
-atomic git import --all >/dev/null 2>&1
+require_success "initialize Atomic repository" atomic init
+require_success "import all Git branches" atomic git import --all
 
 # Verify all branches became views
 assert_view_exists "${initial_branch} view exists" "$initial_branch"
@@ -403,12 +427,13 @@ git checkout "$_default_branch" --quiet 2>/dev/null
 git_commit "Main commit" "main2.txt" "main2"
 git merge feature --no-ff -m "Merge feature into main" --quiet 2>/dev/null
 
-atomic init >/dev/null 2>&1
-atomic git import >/dev/null 2>&1
+require_success "initialize Atomic repository" atomic init
+require_success "import merge history" atomic git import
 
 # Should have at least 3 changes (base, feature, main2)
 # Merge commit handling varies: might be 3 (linearized) or 4 (preserved)
-count="$(atomic log 2>/dev/null | grep -cE '^\s*#[0-9]+|^[0-9a-f]{8,}' 2>/dev/null || true)"
+require_capture "read imported merge log" atomic log
+count="$(printf '%s\n' "$COMMAND_OUTPUT" | grep -cE '^\s*#[0-9]+|^[0-9a-f]{8,}' || true)"
 count="${count:-0}"
 count="$(echo "$count" | tr -d '[:space:]')"
 [[ -z "$count" ]] && count=0
@@ -430,10 +455,11 @@ init_git_repo
 git_commit "Initial" "main.txt" "main"
 
 # Add a small submodule (go-uuid is tiny and fast to clone)
-git_add_submodule "https://github.com/hashicorp/go-uuid.git" "vendor/uuid"
+require_success "add Git submodule" git_add_submodule "https://github.com/hashicorp/go-uuid.git" "vendor/uuid"
 
-atomic init >/dev/null 2>&1
-out="$(atomic git import 2>&1)" || true
+require_success "initialize Atomic repository" atomic init
+require_capture "import Git history with submodule" atomic git import
+out="$COMMAND_OUTPUT"
 
 # Submodules should either:
 # - Be skipped with a warning
@@ -442,7 +468,7 @@ out="$(atomic git import 2>&1)" || true
 if echo "$out" | grep -qiE "submodule|skip|warn"; then
     _pass "submodule handled (skipped with warning)"
 else
-    _pass "import with submodule completes"
+    assert_file_exists "submodule checkout remains present" "vendor/uuid/uuid.go"
 fi
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -505,28 +531,31 @@ git -C "$GIT_REPO" add -A >/dev/null 2>&1
 git -C "$GIT_REPO" commit -m "v3: modify after rename" --quiet 2>/dev/null
 
 # ── Import ──────────────────────────────────────────────────────────────
-(cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+require_success "import rename and deletion history" atomic git import
 
 # ── Assertions ──────────────────────────────────────────────────────────
 
-# 1. No spurious deleted files in status
-_deleted_count=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep -c '^D ' || true)
+# 1. No spurious deleted files in status. Capture once so a command failure
+# cannot be mistaken for an empty/clean result by any of these checks.
+require_capture "read status after import" atomic status --short
+_status="$COMMAND_OUTPUT"
+_deleted_count=$(printf '%s\n' "$_status" | grep -c '^D ' || true)
 if [[ "$_deleted_count" -eq 0 ]]; then
     _pass "no spurious deletions in status after import"
 else
-    _deleted_files=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep '^D ')
+    _deleted_files=$(printf '%s\n' "$_status" | grep '^D ')
     _fail "spurious deletions in status" "$_deleted_count file(s): $_deleted_files"
 fi
 
 # 2. Renamed files are tracked (not untracked ??)
-_untracked_app=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep '?? src/app.rs' || true)
+_untracked_app=$(printf '%s\n' "$_status" | grep -F '?? src/app.rs' || true)
 if [[ -z "$_untracked_app" ]]; then
     _pass "src/app.rs tracked after rename"
 else
     _fail "src/app.rs untracked after rename" "status shows: $_untracked_app"
 fi
 
-_untracked_bench=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep '?? src/bench.rs' || true)
+_untracked_bench=$(printf '%s\n' "$_status" | grep -F '?? src/bench.rs' || true)
 if [[ -z "$_untracked_bench" ]]; then
     _pass "src/bench.rs tracked after rename+modify"
 else
@@ -534,14 +563,14 @@ else
 fi
 
 # 3. Deleted files are NOT tracked (should not appear in status at all)
-_deleted_travis=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep 'travis' || true)
+_deleted_travis=$(printf '%s\n' "$_status" | grep -F 'travis' || true)
 if [[ -z "$_deleted_travis" ]]; then
     _pass ".travis.yml not in status (correctly deleted)"
 else
     _fail ".travis.yml still in status after delete" "status shows: $_deleted_travis"
 fi
 
-_deleted_mod=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep 'sub/mod.rs' || true)
+_deleted_mod=$(printf '%s\n' "$_status" | grep -F 'sub/mod.rs' || true)
 if [[ -z "$_deleted_mod" ]]; then
     _pass "src/sub/mod.rs not in status (correctly deleted)"
 else
@@ -549,7 +578,7 @@ else
 fi
 
 # 4. Old rename source paths are gone from tracking
-_old_sub_app=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep 'sub/app.rs' || true)
+_old_sub_app=$(printf '%s\n' "$_status" | grep -F 'sub/app.rs' || true)
 if [[ -z "$_old_sub_app" ]]; then
     _pass "src/sub/app.rs gone from status (old rename source)"
 else
@@ -557,7 +586,7 @@ else
 fi
 
 # 5. Binary file is tracked and NOT modified (graph content matches disk)
-_modified_logo=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep 'docs/logo.png' || true)
+_modified_logo=$(printf '%s\n' "$_status" | grep -F 'docs/logo.png' || true)
 if [[ -z "$_modified_logo" ]]; then
     _pass "docs/logo.png clean after binary modify (graph matches disk)"
 else
@@ -565,11 +594,11 @@ else
 fi
 
 # 6. Overall: status should be completely clean (no M, D, A, or ?? entries)
-_status_lines=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | grep -cE '^[MDAU?]' || true)
+_status_lines=$(printf '%s\n' "$_status" | grep -cE '^[MDAU?]' || true)
 if [[ "$_status_lines" -eq 0 ]]; then
     _pass "status is completely clean after import (full parity)"
 else
-    _dirty=$(cd "$GIT_REPO" && atomic status --short 2>/dev/null | head -10)
+    _dirty=$(printf '%s\n' "$_status" | head -10)
     _fail "status not clean after import" "$_status_lines dirty entries: $_dirty"
 fi
 
@@ -582,7 +611,8 @@ fi
 
 # 7. Change count matches git commit count
 _git_count=$(git -C "$GIT_REPO" rev-list --count HEAD 2>/dev/null)
-_atomic_log=$(cd "$GIT_REPO" && count_imported_git_changes)
+require_capture "count imported parity changes" count_imported_git_changes
+_atomic_log="$COMMAND_OUTPUT"
 if [[ "$_atomic_log" -eq "$_git_count" ]]; then
     _pass "change count matches git ($_git_count)"
 else

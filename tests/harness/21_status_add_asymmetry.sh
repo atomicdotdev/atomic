@@ -5,19 +5,14 @@
 #   "I run atomic status and it shows me tons of things that aren't tracked,
 #    then I run atomic add and it says there's nothing to add."
 #
-# Root cause: `status` uses the view's change filter to decide which TREE
-# entries are "tracked" (view-aware), while `add` / `is_tracked` checks the
-# global TREE table (view-unaware).  Files recorded on a child/sibling view
-# are in TREE but their introducing change isn't visible on the current
-# view.  Result:
-#   - status: file in TREE but filtered out → filesystem walk finds it → "Untracked"
-#   - add: file in TREE → is_tracked() = true → "already tracked" → skip
+# A file recorded only on another view must disappear when switching away.
+# If independently recreated on disk, it is untracked on this view and `add`
+# must stage it; a global TREE row alone does not grant view ownership.
 #
 # Scenarios tested:
-#   1. File recorded on child draft view, parent view shows it as untracked
-#   2. File recorded on sibling view, other sibling shows it as untracked
-#   3. Agent workflow: auto-created draft view records files, parent is confused
-#   4. After fix: no file should be simultaneously "Untracked" AND "already tracked"
+#   1. Switching away from a child or sibling removes that view's file.
+#   2. An independently recreated path is untracked until added on this view.
+#   3. `add` stages such paths, and recording preserves their bytes.
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
@@ -32,75 +27,46 @@ begin_section "Status/Add Asymmetry: Child draft view leaks into parent"
 #   3. Create a draft child view (like the agent would)
 #   4. Switch to draft, create+add+record a new file
 #   5. Switch back to dev
-#   6. BUG: status shows the file as Untracked (it's on disk from the
-#           draft view's record, but the change isn't in dev's filter)
-#   7. BUG: atomic add says "already tracked" (it's in the global TREE)
-#
-# Expected after fix:
-#   - The file should NOT appear as Untracked on dev
-#   - atomic add should not produce a contradictory state
+#   6. Verify the file is absent, then recreate it independently on dev.
+#   7. Verify untracked → added without a contradictory "already tracked".
 
 make_temp_repo "status-add-child-draft"
 init_repo
 
 # Step 1: Record a base file on dev so the view isn't empty
 create_file "base.txt" "base content"
-assert_success "add base.txt on dev" atomic add base.txt
-record_change "Add base.txt on dev" >/dev/null 2>&1 || true
+require_success "add base.txt on dev" atomic add base.txt
+require_success "record base.txt on dev" record_change "Add base.txt on dev"
 assert_clean "dev is clean after recording base.txt"
 
 # Step 2: Create a draft child view (simulates agent session)
-out="$(atomic view create agent-session --draft --parent dev 2>&1)" || true
-if echo "$out" | grep -qiE "created|view"; then
-    _pass "create draft view agent-session"
-else
-    _fail "create draft view agent-session" "output: $out"
-fi
+require_success "create draft view agent-session" atomic view create agent-session --draft --parent dev
 
 # Step 3: Switch to the draft view and create+add+record a file
-switch_view "agent-session" >/dev/null 2>&1 || true
+require_success "switch to agent-session" switch_view "agent-session"
 assert_current_view "on agent-session" "agent-session"
 
 create_file "agent_file.txt" "created by agent"
-assert_success "add agent_file.txt on agent-session" atomic add agent_file.txt
-record_change "Agent creates agent_file.txt" >/dev/null 2>&1 || true
+require_success "add agent_file.txt on agent-session" atomic add agent_file.txt
+require_success "record agent_file.txt" record_change "Agent creates agent_file.txt"
 
 # Verify it's clean on the draft view
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*agent_file\.txt"; then
-    _fail "agent_file.txt is clean on agent-session" "still dirty: $out"
-else
-    _pass "agent_file.txt is clean on agent-session after record"
-fi
+assert_status_no_entry "agent_file.txt is clean on agent-session after record" "agent_file.txt"
 
 # Step 4: Switch back to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_current_view "back on dev" "dev"
 
-# Step 5: THE BUG — status should NOT show agent_file.txt as Untracked
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^\?.*agent_file\.txt"; then
-    _fail "agent_file.txt NOT shown as Untracked on dev" \
-        "BUG: status shows '?' for a file that is in TREE (from draft view). Status: $out"
-else
-    _pass "agent_file.txt NOT shown as Untracked on dev"
-fi
+# Step 5: The draft-only file must be absent on dev.
+assert_file_not_exists "agent_file.txt is absent on dev" "agent_file.txt"
+assert_status_no_entry "agent_file.txt absent from dev status" "agent_file.txt"
 
-# Step 6: THE BUG — add should not claim "already tracked" for an "Untracked" file
-# If the file shows as Untracked, trying to add it should succeed.
-# If the file doesn't show at all (correct behavior), add should say "already tracked".
-# The BROKEN state is: status=Untracked + add=already-tracked (contradictory).
-add_out="$(atomic add agent_file.txt 2>&1)" || true
-status_out="$(get_status_short)"
-has_untracked=$(echo "$status_out" | grep -cE "^\?.*agent_file\.txt" || true)
-has_already_tracked=$(echo "$add_out" | grep -ci "already tracked" || true)
-
-if [[ "$has_untracked" -gt 0 && "$has_already_tracked" -gt 0 ]]; then
-    _fail "no contradictory status+add state" \
-        "BUG: status says Untracked but add says 'already tracked'. Status: $status_out | Add: $add_out"
-else
-    _pass "no contradictory status+add state"
-fi
+# Step 6: An independently recreated file must be addable on dev.
+create_file "agent_file.txt" "independently recreated"
+assert_status_flag "recreated agent_file.txt is untracked on dev" "?" "agent_file.txt"
+require_success "add independently recreated agent_file.txt" atomic add agent_file.txt
+assert_status_flag "recreated agent_file.txt is staged on dev" "A" "agent_file.txt"
+assert_file_content "adding recreated file preserves bytes" "agent_file.txt" "independently recreated"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Status/Add Asymmetry: Sibling views don't leak"
@@ -119,44 +85,33 @@ init_repo
 
 # Record base on dev
 create_file "base.txt" "base"
-assert_success "add base.txt" atomic add base.txt
-record_change "Add base" >/dev/null 2>&1 || true
+require_success "add base.txt" atomic add base.txt
+require_success "record base" record_change "Add base"
 
 # Create two sibling draft views
-atomic view create feature-a --draft --parent dev >/dev/null 2>&1 || true
-atomic view create feature-b --draft --parent dev >/dev/null 2>&1 || true
+require_success "create feature-a" atomic view create feature-a --draft --parent dev
+require_success "create feature-b" atomic view create feature-b --draft --parent dev
 
 # Record on feature-a
-switch_view "feature-a" >/dev/null 2>&1 || true
+require_success "switch to feature-a" switch_view "feature-a"
 create_file "only_on_a.txt" "feature-a content"
-assert_success "add only_on_a.txt on feature-a" atomic add only_on_a.txt
-record_change "Add only_on_a.txt on feature-a" >/dev/null 2>&1 || true
+require_success "add only_on_a.txt on feature-a" atomic add only_on_a.txt
+require_success "record only_on_a.txt" record_change "Add only_on_a.txt on feature-a"
 
 # Switch to feature-b
-switch_view "feature-b" >/dev/null 2>&1 || true
+require_success "switch to feature-b" switch_view "feature-b"
 assert_current_view "on feature-b" "feature-b"
 
 # File from feature-a should NOT appear as Untracked on feature-b
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^\?.*only_on_a\.txt"; then
-    _fail "only_on_a.txt NOT shown as Untracked on feature-b" \
-        "BUG: sibling view file leaks as Untracked. Status: $out"
-else
-    _pass "only_on_a.txt NOT shown as Untracked on feature-b"
-fi
+assert_file_not_exists "only_on_a.txt absent on feature-b" "only_on_a.txt"
+assert_status_no_entry "only_on_a.txt absent from feature-b status" "only_on_a.txt"
 
-# No contradictory state
-add_out="$(atomic add only_on_a.txt 2>&1)" || true
-status_out="$(get_status_short)"
-has_untracked=$(echo "$status_out" | grep -cE "^\?.*only_on_a\.txt" || true)
-has_already_tracked=$(echo "$add_out" | grep -ci "already tracked" || true)
-
-if [[ "$has_untracked" -gt 0 && "$has_already_tracked" -gt 0 ]]; then
-    _fail "no contradictory state on feature-b" \
-        "BUG: status=Untracked + add='already tracked'. Status: $status_out | Add: $add_out"
-else
-    _pass "no contradictory state on feature-b"
-fi
+# Recreate the name independently and verify status/add agree.
+create_file "only_on_a.txt" "independent sibling content"
+assert_status_flag "recreated sibling path is untracked" "?" "only_on_a.txt"
+require_success "add recreated sibling path" atomic add only_on_a.txt
+assert_status_flag "recreated sibling path is staged" "A" "only_on_a.txt"
+assert_file_content "sibling re-add preserves bytes" "only_on_a.txt" "independent sibling content"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Status/Add Asymmetry: Agent batch-add workflow"
@@ -173,67 +128,37 @@ init_repo
 
 # Base content on dev
 create_file "README.md" "# Project"
-assert_success "add README.md" atomic add README.md
-record_change "Initial commit" >/dev/null 2>&1 || true
+require_success "add README.md" atomic add README.md
+require_success "record initial commit" record_change "Initial commit"
 
 # Agent creates a draft view and records multiple files
-atomic view create agent-turn-1 --draft --parent dev >/dev/null 2>&1 || true
-switch_view "agent-turn-1" >/dev/null 2>&1 || true
+require_success "create agent-turn-1" atomic view create agent-turn-1 --draft --parent dev
+require_success "switch to agent-turn-1" switch_view "agent-turn-1"
 
 create_file "src/main.rs" "fn main() {}"
 create_file "src/lib.rs" "pub mod util;"
 create_file "src/util.rs" "pub fn helper() {}"
-create_file "Cargo.toml" "[package]\nname = \"test\""
+create_file "Cargo.toml" $'[package]\nname = "test"'
 
-assert_success "add src/main.rs" atomic add src/main.rs
-assert_success "add src/lib.rs" atomic add src/lib.rs
-assert_success "add src/util.rs" atomic add src/util.rs
-assert_success "add Cargo.toml" atomic add Cargo.toml
-record_change "Agent adds project structure" >/dev/null 2>&1 || true
+require_success "add src/main.rs" atomic add src/main.rs
+require_success "add src/lib.rs" atomic add src/lib.rs
+require_success "add src/util.rs" atomic add src/util.rs
+require_success "add Cargo.toml" atomic add Cargo.toml
+require_success "record agent project structure" record_change "Agent adds project structure"
 
 # Switch back to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_current_view "on dev after agent work" "dev"
 
 # NO agent files should appear as Untracked on dev
-out="$(get_status_short)"
-agent_untracked=0
 for f in "src/main.rs" "src/lib.rs" "src/util.rs" "Cargo.toml"; do
-    if echo "$out" | grep -qE "^\?.*$(echo "$f" | sed 's/[\/\.]/\\&/g')"; then
-        agent_untracked=$((agent_untracked + 1))
-    fi
+    assert_file_not_exists "$f absent from dev" "$f"
+    assert_status_no_entry "$f absent from dev status" "$f"
 done
 
-if [[ "$agent_untracked" -gt 0 ]]; then
-    _fail "no agent files shown as Untracked on dev (found $agent_untracked)" \
-        "BUG: $agent_untracked agent files leak as Untracked on parent. Status: $out"
-else
-    _pass "no agent files shown as Untracked on dev"
-fi
-
 # atomic add --all should not find contradictory files
-add_all_out="$(atomic add --all 2>&1)" || true
-if echo "$add_all_out" | grep -qiE "already tracked"; then
-    # Check if any of those "already tracked" files were shown as Untracked
-    status_out="$(get_status_short)"
-    has_contradiction=false
-    for f in "src/main.rs" "src/lib.rs" "src/util.rs" "Cargo.toml"; do
-        escaped_f="$(echo "$f" | sed 's/[\/\.]/\\&/g')"
-        is_untracked=$(echo "$status_out" | grep -cE "^\?.*$escaped_f" || true)
-        if [[ "$is_untracked" -gt 0 ]]; then
-            has_contradiction=true
-            break
-        fi
-    done
-    if $has_contradiction; then
-        _fail "add --all not contradictory with status" \
-            "BUG: files shown as Untracked but add says 'already tracked'"
-    else
-        _pass "add --all not contradictory with status"
-    fi
-else
-    _pass "add --all not contradictory with status"
-fi
+require_success "add --all on clean dev" atomic add --all
+assert_clean "dev stays clean after add --all"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Status/Add Asymmetry: No-switch agent workflow (THE BUG)"
@@ -267,8 +192,8 @@ init_repo
 
 # Base content on dev
 create_file "base.txt" "base"
-assert_success "add base.txt" atomic add base.txt
-record_change "Initial commit" >/dev/null 2>&1 || true
+require_success "add base.txt" atomic add base.txt
+require_success "record base" record_change "Initial commit"
 assert_clean "dev is clean"
 
 # --- Simulate agent hook: create draft, add+record, switch back ---
@@ -277,16 +202,16 @@ create_file "agent_created.txt" "agent was here"
 create_file "src/agent_module.rs" "pub fn agent_fn() {}"
 
 # Step 2: Agent hook creates draft view
-atomic view create agent-draft --draft --parent dev >/dev/null 2>&1 || true
+require_success "create agent-draft" atomic view create agent-draft --draft --parent dev
 
 # Step 3: Agent hook switches to draft, adds, records, switches back
-switch_view "agent-draft" >/dev/null 2>&1 || true
-assert_success "add agent_created.txt on draft" atomic add agent_created.txt
-assert_success "add src/agent_module.rs on draft" atomic add "src/agent_module.rs"
-record_change "Agent turn: add files" >/dev/null 2>&1 || true
+require_success "switch to agent-draft" switch_view "agent-draft"
+require_success "add agent_created.txt on draft" atomic add agent_created.txt
+require_success "add src/agent_module.rs on draft" atomic add "src/agent_module.rs"
+require_success "record agent files" record_change "Agent turn: add files"
 
 # Step 4: Switch back to dev (this is what the hook does after recording)
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_current_view "back on dev after agent hook" "dev"
 
 # Step 5: User manually re-creates files (or they leaked from switch)
@@ -296,101 +221,56 @@ assert_current_view "back on dev after agent hook" "dev"
 create_file "agent_created.txt" "agent was here"
 create_file "src/agent_module.rs" "pub fn agent_fn() {}"
 
-# THE BUG: These files are in TREE (agent added them), the change is on
-# the draft view. On dev:
-#   - status: change not in dev's filter → skip from tracked → Untracked
-#   - add: is_tracked() checks global TREE → already tracked → skip
+# The draft's recorded change is not visible on dev. The independently
+# recreated files must be untracked until explicitly added on dev.
 
-out="$(get_status_short)"
-echo "  DEBUG status output: $out" >&2
+assert_status_flag "recreated agent_created.txt is untracked" "?" "agent_created.txt"
+assert_status_flag "recreated agent_module.rs is untracked" "?" "src/agent_module.rs"
 
-# Test 1: Files should NOT be shown as Untracked
-if echo "$out" | grep -qE "^\?.*agent_created\.txt"; then
-    _fail "agent_created.txt NOT Untracked on dev" \
-        "BUG: file in TREE from draft view shows as Untracked. Status: $out"
-else
-    _pass "agent_created.txt NOT Untracked on dev"
-fi
+# Test 2: Adding both untracked paths must stage them.
+require_success "add recreated agent files" atomic add agent_created.txt src/agent_module.rs
+assert_status_flag "agent_created.txt is staged on dev" "A" "agent_created.txt"
+assert_status_flag "agent_module.rs is staged on dev" "A" "src/agent_module.rs"
 
-if echo "$out" | grep -qE "^\?.*agent_module\.rs"; then
-    _fail "agent_module.rs NOT Untracked on dev" \
-        "BUG: file in TREE from draft view shows as Untracked. Status: $out"
-else
-    _pass "agent_module.rs NOT Untracked on dev"
-fi
-
-# Test 2: The contradictory state must not exist
-add_out="$(atomic add agent_created.txt 2>&1)" || true
-status_out="$(get_status_short)"
-has_untracked=$(echo "$status_out" | grep -cE "^\?.*agent_created\.txt" || true)
-has_already_tracked=$(echo "$add_out" | grep -ci "already tracked" || true)
-
-if [[ "$has_untracked" -gt 0 && "$has_already_tracked" -gt 0 ]]; then
-    _fail "no status+add contradiction for agent_created.txt" \
-        "BUG: status=Untracked + add='already tracked'. Status: $status_out | Add: $add_out"
-else
-    _pass "no status+add contradiction for agent_created.txt"
-fi
-
-# Test 3: If on disk + in TREE, the correct status should be Added
-# (tracked but not recorded on THIS view)
-if echo "$out" | grep -qE "^A.*agent_created\.txt"; then
-    _pass "agent_created.txt shown as Added (correct: tracked, needs record on dev)"
-else
-    # Also acceptable: not shown at all (file shouldn't be on disk)
-    if echo "$out" | grep -q "agent_created\.txt"; then
-        _fail "agent_created.txt shown as Added" \
-            "File shown with wrong status. Status: $out"
-    else
-        _pass "agent_created.txt shown as Added (or correctly hidden)"
-    fi
-fi
+# Test 3: Record the independently added files and preserve their bytes.
+require_success "record recreated agent files on dev" record_change "Record recreated agent files"
+assert_clean "dev is clean after recording recreated files"
+assert_file_content "agent_created.txt bytes preserved" "agent_created.txt" "agent was here"
+assert_file_content "agent module bytes preserved" "src/agent_module.rs" "pub fn agent_fn() {}"
 
 # ═══════════════════════════════════════════════════════════════════════════
-begin_section "Status/Add Asymmetry: File on disk from other view shows as Added"
+begin_section "Status/Add Asymmetry: Recreated path stages on the current view"
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# If a file IS on disk and IS in TREE (from another view), the correct
-# status should be "Added" (tracked, needs recording on this view) — NOT
-# "Untracked" (which implies it's unknown to the system).
-#
-# This test verifies that the file shows as Added when it's on disk but
-# its graph content belongs to another view.
+# A file independently recreated after switching away is untracked until
+# added on this view, regardless of another view's global TREE row.
 
 make_temp_repo "status-add-shows-added"
 init_repo
 
 # Record base on dev
 create_file "base.txt" "base"
-assert_success "add base.txt" atomic add base.txt
-record_change "Base commit" >/dev/null 2>&1 || true
+require_success "add base.txt" atomic add base.txt
+require_success "record base" record_change "Base commit"
 
 # Create draft, record a file on it
-atomic view create feature --draft --parent dev >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature" atomic view create feature --draft --parent dev
+require_success "switch to feature" switch_view "feature"
 create_file "feature.txt" "feature content"
-assert_success "add feature.txt" atomic add feature.txt
-record_change "Feature file" >/dev/null 2>&1 || true
+require_success "add feature.txt" atomic add feature.txt
+require_success "record feature file" record_change "Feature file"
 
 # Switch to dev — file should be removed from disk by materialization
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
-# If the file was properly removed by switch_view, it should not appear at all
-# If it still exists on disk (materialization bug), it should show as Added, NOT Untracked
-if [[ -f "feature.txt" ]]; then
-    # File leaked onto disk — at minimum it should be Added, not Untracked
-    out="$(get_status_short)"
-    if echo "$out" | grep -qE "^\?.*feature\.txt"; then
-        _fail "leaked file shows as Added not Untracked" \
-            "BUG: file on disk from another view shows as '?' instead of 'A'. Status: $out"
-    elif echo "$out" | grep -qE "^A.*feature\.txt"; then
-        _pass "leaked file shows as Added not Untracked"
-    else
-        _pass "leaked file handled correctly (not shown or shown with other status)"
-    fi
-else
-    _pass "leaked file shows as Added not Untracked (file correctly removed by switch)"
-fi
+# Switching removes the recorded draft-only file; re-creation is explicit.
+assert_file_not_exists "feature.txt removed on switch to dev" "feature.txt"
+assert_status_no_entry "removed feature.txt absent from dev status" "feature.txt"
+create_file "feature.txt" "recreated on dev"
+assert_status_flag "recreated feature.txt is untracked" "?" "feature.txt"
+require_success "add recreated feature.txt" atomic add feature.txt
+assert_status_flag "recreated feature.txt is added" "A" "feature.txt"
+assert_file_content "recreated feature.txt bytes are preserved" "feature.txt" "recreated on dev"
 
 # ═══════════════════════════════════════════════════════════════════════════
 print_summary

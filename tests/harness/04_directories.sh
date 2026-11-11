@@ -38,54 +38,23 @@ begin_section "Directory: Add directory recursively → status(added)"
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Add the entire directory (should recurse)
-add_out="$(atomic add mydir 2>&1)" || true
-if [[ $? -eq 0 ]] || echo "$add_out" | grep -qiE "added|tracked"; then
-    _pass "add mydir recursively"
-else
-    # Try adding files individually as fallback
-    atomic add mydir/a.txt >/dev/null 2>&1 || true
-    atomic add mydir/b.txt >/dev/null 2>&1 || true
-    _pass "add mydir files individually (fallback)"
-fi
+require_success "add mydir recursively" atomic add mydir
 
 # Both files should now be added
-out="$(get_status_short)"
-added=0
 for f in mydir/a.txt mydir/b.txt; do
-    if echo "$out" | grep -qE "^A.*${f}"; then
-        added=$((added + 1))
-    fi
+    assert_status_flag "$f is added" "A" "$f"
 done
-if [[ $added -ge 2 ]]; then
-    _pass "both files in mydir show as added ($added/2)"
-else
-    _pass "directory add result ($added/2 files added)"
-fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Record directory → status(clean)"
 # ═══════════════════════════════════════════════════════════════════════════
 
-rec_out="$(record_change "Add mydir with contents" 2>&1)" || true
-if echo "$rec_out" | grep -qiE "hash|recorded|created|change"; then
-    _pass "record directory succeeds"
-else
-    _pass "record directory completes"
-fi
+require_success "record directory succeeds" record_change "Add mydir with contents"
 
 # All files should be clean
-out="$(get_status_short)"
-dirty=0
 for f in mydir/a.txt mydir/b.txt; do
-    if echo "$out" | grep -qE "^[MADU?].*$(echo "$f" | sed 's/\//\\\//g')"; then
-        dirty=$((dirty + 1))
-    fi
+    assert_status_no_entry "$f is clean after record" "$f"
 done
-if [[ $dirty -eq 0 ]]; then
-    _pass "all directory files clean after record"
-else
-    _fail "all directory files clean after record" "$dirty files still dirty"
-fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Modify file inside directory"
@@ -96,14 +65,9 @@ overwrite_file "mydir/a.txt" "modified a"
 assert_status_flag "mydir/a.txt is modified" "M" "mydir/a.txt"
 
 # b.txt should still be clean
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MAD].*mydir/b\.txt"; then
-    _fail "mydir/b.txt still clean" "shown as dirty"
-else
-    _pass "mydir/b.txt still clean after modifying sibling"
-fi
+assert_status_no_entry "mydir/b.txt still clean after modifying sibling" "mydir/b.txt"
 
-record_change "Modify mydir/a.txt" >/dev/null 2>&1 || true
+require_success "record mydir/a.txt modification" record_change "Modify mydir/a.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Add new file inside existing directory"
@@ -113,18 +77,13 @@ create_file "mydir/c.txt" "new file c"
 
 assert_status_flag "mydir/c.txt is untracked" "?" "mydir/c.txt"
 
-assert_success "add mydir/c.txt" atomic add mydir/c.txt
+require_success "add mydir/c.txt" atomic add mydir/c.txt
 
 assert_status_flag "mydir/c.txt is added" "A" "mydir/c.txt"
 
-record_change "Add mydir/c.txt" >/dev/null 2>&1 || true
+require_success "record mydir/c.txt" record_change "Add mydir/c.txt"
 
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*mydir/c\.txt"; then
-    _fail "mydir/c.txt is clean after record" "still dirty"
-else
-    _pass "mydir/c.txt is clean after record"
-fi
+assert_status_no_entry "mydir/c.txt is clean after record" "mydir/c.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Delete file inside directory"
@@ -134,16 +93,9 @@ rm -f mydir/b.txt
 
 assert_file_not_exists "mydir/b.txt removed from disk" "mydir/b.txt"
 
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^D.*mydir/b\.txt"; then
-    _pass "mydir/b.txt shows as deleted"
-elif echo "$out" | grep -qF "mydir/b.txt"; then
-    _pass "mydir/b.txt appears in status after deletion"
-else
-    _fail "mydir/b.txt shows as deleted" "not found in status"
-fi
+assert_status_flag "mydir/b.txt shows as deleted" "D" "mydir/b.txt"
 
-record_change "Delete mydir/b.txt" >/dev/null 2>&1 || true
+require_success "record mydir/b.txt deletion" record_change "Delete mydir/b.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Delete all files → directory remains (or not)"
@@ -155,34 +107,21 @@ init_repo
 create_file "rmdir/x.txt" "x"
 create_file "rmdir/y.txt" "y"
 
-assert_success "add rmdir/x.txt" atomic add rmdir/x.txt
-assert_success "add rmdir/y.txt" atomic add rmdir/y.txt
-record_change "Add rmdir files" >/dev/null 2>&1 || true
+require_success "add rmdir/x.txt" atomic add rmdir/x.txt
+require_success "add rmdir/y.txt" atomic add rmdir/y.txt
+require_success "record rmdir files" record_change "Add rmdir files"
 
 # Delete both files
 rm -f rmdir/x.txt rmdir/y.txt
 
-out="$(get_status_short)"
-deleted=0
 for f in rmdir/x.txt rmdir/y.txt; do
-    if echo "$out" | grep -qE "^D.*$(echo "$f" | sed 's/\//\\\//g')"; then
-        deleted=$((deleted + 1))
-    fi
+    assert_status_flag "$f shows as deleted" "D" "$f"
 done
-if [[ $deleted -ge 1 ]]; then
-    _pass "deleted files show as D ($deleted/2)"
-else
-    _pass "deleted files status ($deleted found)"
-fi
 
-record_change "Delete all files in rmdir" >/dev/null 2>&1 || true
+require_success "record rmdir deletions" record_change "Delete all files in rmdir"
 
 # After recording the deletions, the empty directory may or may not persist
-if [[ -d "rmdir" ]]; then
-    _pass "empty rmdir persists on disk (implementation choice)"
-else
-    _pass "empty rmdir cleaned up (implementation choice)"
-fi
+# Directory presence is not asserted here; file deletions are verified above.
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Deeply nested directories"
@@ -196,22 +135,12 @@ create_file "a/b/c/d/e/deep.txt" "very deep"
 assert_file_exists "deeply nested file exists" "a/b/c/d/e/deep.txt"
 assert_dir_exists "deep dir chain exists" "a/b/c/d/e"
 
-assert_success "add deep file" atomic add "a/b/c/d/e/deep.txt"
+require_success "add deep file" atomic add "a/b/c/d/e/deep.txt"
 assert_status_flag "deep file is added" "A" "a/b/c/d/e/deep.txt"
 
-rec_out="$(record_change "Add deeply nested file" 2>&1)" || true
-if echo "$rec_out" | grep -qiE "hash|recorded|created|change"; then
-    _pass "record deeply nested file succeeds"
-else
-    _pass "record deeply nested file completes"
-fi
+require_success "record deeply nested file succeeds" record_change "Add deeply nested file"
 
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*a/b/c/d/e/deep\.txt"; then
-    _fail "deep file is clean after record" "still dirty"
-else
-    _pass "deep file is clean after record"
-fi
+assert_status_no_entry "deep file is clean after record" "a/b/c/d/e/deep.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Add explicit empty directory"
@@ -224,21 +153,10 @@ create_dir "empty_mod"
 
 assert_dir_exists "empty_mod exists" "empty_mod"
 
-# Try to add as explicit directory
-add_out="$(atomic add --directory empty_mod 2>&1)" || true
-if [[ $? -eq 0 ]] || echo "$add_out" | grep -qiE "added|tracked|director"; then
-    _pass "add --directory empty_mod"
-else
-    _skip "add --directory empty_mod" "explicit directory tracking may not be supported"
-fi
+require_success "add --directory empty_mod" atomic add --directory empty_mod
 
 # Record
-rec_out="$(record_change "Add empty directory" 2>&1)" || true
-if echo "$rec_out" | grep -qiE "hash|recorded|created|change|nothing"; then
-    _pass "record empty directory completes"
-else
-    _pass "record empty directory does not crash"
-fi
+require_success "record empty directory" record_change "Add empty directory"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Multiple directories at same level"
@@ -259,20 +177,11 @@ for f in dirA/file1.txt dirB/file2.txt dirC/file3.txt; do
     assert_status_flag "$f is added" "A" "$f"
 done
 
-record_change "Add three sibling directories" >/dev/null 2>&1 || true
+require_success "record three sibling directories" record_change "Add three sibling directories"
 
-out="$(get_status_short)"
-dirty=0
 for f in dirA/file1.txt dirB/file2.txt dirC/file3.txt; do
-    if echo "$out" | grep -qE "^[MADU?].*$(echo "$f" | sed 's/\//\\\//g')"; then
-        dirty=$((dirty + 1))
-    fi
+    assert_status_no_entry "$f is clean after record" "$f"
 done
-if [[ $dirty -eq 0 ]]; then
-    _pass "all sibling directory files clean after record"
-else
-    _fail "all sibling directory files clean" "$dirty still dirty"
-fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Directory with mixed file types"
@@ -289,15 +198,9 @@ printf '\x89PNG\r\n\x1a\n' > mixed/image.png  # fake PNG header
 assert_success "add mixed/readme.md" atomic add mixed/readme.md
 assert_success "add mixed/code.rs" atomic add mixed/code.rs
 assert_success "add mixed/data.json" atomic add mixed/data.json
-add_out="$(atomic add mixed/image.png 2>&1)" || true
-if [[ $? -eq 0 ]]; then
-    _pass "add binary file in directory"
-else
-    _skip "add binary file in directory" "binary files may be skipped"
-fi
+require_success "add binary file in directory" atomic add mixed/image.png
 
-record_change "Add mixed directory" >/dev/null 2>&1 || true
-_pass "record directory with mixed file types completes"
+require_success "record directory with mixed file types" record_change "Add mixed directory"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Unrecord directory change"
@@ -311,35 +214,22 @@ create_file "undodir/beta.txt" "beta"
 
 assert_success "add undodir/alpha.txt" atomic add undodir/alpha.txt
 assert_success "add undodir/beta.txt" atomic add undodir/beta.txt
-record_change "Add undodir" >/dev/null 2>&1 || true
+require_success "record undodir" record_change "Add undodir"
 
 # Verify clean
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*undodir/"; then
-    _fail "undodir files clean before unrecord" "still dirty"
-else
-    _pass "undodir files clean before unrecord"
-fi
+assert_status_no_entry "undodir/alpha.txt clean before unrecord" "undodir/alpha.txt"
+assert_status_no_entry "undodir/beta.txt clean before unrecord" "undodir/beta.txt"
 
 # Unrecord
-unrec_out="$(unrecord_last)"
-if echo "$unrec_out" | grep -qiE "unrecord|removed|hash"; then
-    _pass "unrecord directory change succeeds"
-else
-    _pass "unrecord directory change completes"
-fi
+require_success "unrecord directory change succeeds" unrecord_last
 
 # Files should still be on disk
 assert_file_exists "undodir/alpha.txt still on disk" "undodir/alpha.txt"
 assert_file_exists "undodir/beta.txt still on disk" "undodir/beta.txt"
 
-# Files should revert to added status
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MA].*undodir/"; then
-    _pass "undodir files revert to added/modified after unrecord"
-else
-    _pass "undodir status after unrecord (implementation-dependent)"
-fi
+# The original additions were unrecorded, so both files are untracked.
+assert_status_flag "undodir/alpha.txt is untracked" "?" "undodir/alpha.txt"
+assert_status_flag "undodir/beta.txt is untracked" "?" "undodir/beta.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Cross-view directory isolation"
@@ -350,15 +240,15 @@ begin_section "Directory: Cross-view directory isolation"
 make_temp_repo "dir-cross-view"
 init_repo
 
-new_view "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "switch to feature" switch_view "feature"
 
 create_file "feature_dir/module.rs" "mod feature;"
 create_file "feature_dir/types.rs" "struct Foo;"
 
 assert_success "add feature_dir/module.rs" atomic add feature_dir/module.rs
 assert_success "add feature_dir/types.rs" atomic add feature_dir/types.rs
-record_change "Add feature directory" >/dev/null 2>&1 || true
+require_success "record feature directory" record_change "Add feature directory"
 
 # Verify on feature
 assert_dir_exists "feature_dir on feature" "feature_dir"
@@ -366,7 +256,7 @@ assert_file_exists "feature_dir/module.rs on feature" "feature_dir/module.rs"
 assert_file_exists "feature_dir/types.rs on feature" "feature_dir/types.rs"
 
 # Switch to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
 # Directory and contents should NOT exist
 assert_file_not_exists "feature_dir/module.rs NOT on dev" "feature_dir/module.rs"
@@ -374,7 +264,7 @@ assert_file_not_exists "feature_dir/types.rs NOT on dev" "feature_dir/types.rs"
 assert_dir_not_exists "feature_dir NOT on dev" "feature_dir"
 
 # Switch back to feature — everything reappears
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 assert_dir_exists "feature_dir on feature (round 2)" "feature_dir"
 assert_file_exists "feature_dir/module.rs on feature (round 2)" "feature_dir/module.rs"
 assert_file_exists "feature_dir/types.rs on feature (round 2)" "feature_dir/types.rs"
@@ -389,20 +279,20 @@ begin_section "Directory: Cross-view nested directory cleanup"
 make_temp_repo "dir-cross-nested-cleanup"
 init_repo
 
-new_view "deep-feature" >/dev/null 2>&1 || true
-switch_view "deep-feature" >/dev/null 2>&1 || true
+require_success "create deep-feature view" new_view "deep-feature"
+require_success "switch to deep-feature" switch_view "deep-feature"
 
 create_file "src/services/auth/handler.rs" "fn auth() {}"
 create_file "src/services/auth/middleware.rs" "fn middleware() {}"
 
 assert_success "add handler.rs" atomic add src/services/auth/handler.rs
 assert_success "add middleware.rs" atomic add src/services/auth/middleware.rs
-record_change "Add auth service" >/dev/null 2>&1 || true
+require_success "record auth service" record_change "Add auth service"
 
 assert_dir_exists "src/services/auth on deep-feature" "src/services/auth"
 
 # Switch to dev — entire src/services/auth tree should vanish
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
 assert_file_not_exists "handler.rs NOT on dev" "src/services/auth/handler.rs"
 assert_file_not_exists "middleware.rs NOT on dev" "src/services/auth/middleware.rs"
@@ -411,7 +301,7 @@ assert_dir_not_exists "src/services/auth NOT on dev" "src/services/auth"
 assert_dir_not_exists "src/services NOT on dev" "src/services"
 
 # Switch back
-switch_view "deep-feature" >/dev/null 2>&1 || true
+require_success "switch back to deep-feature" switch_view "deep-feature"
 assert_dir_exists "src/services/auth reappears" "src/services/auth"
 assert_file_exists "handler.rs reappears" "src/services/auth/handler.rs"
 
@@ -420,9 +310,9 @@ begin_section "Directory: Insert directory from feature to dev"
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Continuing from previous
-insert_from_view "deep-feature" "dev" >/dev/null 2>&1 || true
+require_success "insert deep-feature into dev" insert_from_view "deep-feature" "dev"
 
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev after insert" switch_view "dev"
 
 assert_dir_exists "src/services/auth on dev after insert" "src/services/auth"
 assert_file_exists "handler.rs on dev after insert" "src/services/auth/handler.rs"
@@ -444,16 +334,9 @@ assert_success "add partial/top.txt only" atomic add partial/top.txt
 assert_status_flag "partial/top.txt is added" "A" "partial/top.txt"
 
 # inner.txt should still be untracked
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^\?.*partial/sub/inner\.txt"; then
-    _pass "partial/sub/inner.txt still untracked"
-elif echo "$out" | grep -qE "^A.*partial/sub/inner\.txt"; then
-    _fail "partial/sub/inner.txt should be untracked" "shown as added (recursive add when not expected)"
-else
-    _pass "partial add only includes specified file"
-fi
+assert_status_flag "partial/sub/inner.txt still untracked" "?" "partial/sub/inner.txt"
 
-record_change "Add only top.txt" >/dev/null 2>&1 || true
+require_success "record only top.txt" record_change "Add only top.txt"
 
 # inner.txt should still be untracked
 assert_status_flag "partial/sub/inner.txt still untracked after record" "?" "partial/sub/inner.txt"
@@ -478,33 +361,15 @@ assert_success "add db/migrations/001.sql" atomic add db/migrations/001.sql
 assert_success "add config/app.toml" atomic add config/app.toml
 
 # All five should be added
-added=0
-out="$(get_status_short)"
 for f in api/routes.rs api/handlers.rs db/schema.rs db/migrations/001.sql config/app.toml; do
-    if echo "$out" | grep -qE "^A.*$(echo "$f" | sed 's/\//\\\//g')"; then
-        added=$((added + 1))
-    fi
+    assert_status_flag "$f is added" "A" "$f"
 done
-if [[ $added -ge 4 ]]; then
-    _pass "all multi-dir files show as added ($added/5)"
-else
-    _pass "multi-dir add result ($added/5 added)"
-fi
 
-record_change "Add files across api, db, config" >/dev/null 2>&1 || true
+require_success "record files across api, db, config" record_change "Add files across api, db, config"
 
-out="$(get_status_short)"
-dirty=0
 for f in api/routes.rs api/handlers.rs db/schema.rs db/migrations/001.sql config/app.toml; do
-    if echo "$out" | grep -qE "^[MADU?].*$(echo "$f" | sed 's/\//\\\//g')"; then
-        dirty=$((dirty + 1))
-    fi
+    assert_status_no_entry "$f is clean after record" "$f"
 done
-if [[ $dirty -eq 0 ]]; then
-    _pass "all multi-dir files clean after record"
-else
-    _fail "all multi-dir files clean" "$dirty still dirty"
-fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Remove directory from tracking"
@@ -554,33 +419,17 @@ assert_success "add child1 file" atomic add parent/child1/file1.txt
 assert_success "add child2 file" atomic add parent/child2/file2.txt
 assert_success "add child3 file" atomic add parent/child3/file3.txt
 
-record_change "Add parent with children" >/dev/null 2>&1 || true
+require_success "record parent with children" record_change "Add parent with children"
 
 # Verify all clean
-out="$(get_status_short)"
-dirty=0
 for f in parent/child1/file1.txt parent/child2/file2.txt parent/child3/file3.txt; do
-    if echo "$out" | grep -qE "^[MADU?].*$(echo "$f" | sed 's/\//\\\//g')"; then
-        dirty=$((dirty + 1))
-    fi
+    assert_status_no_entry "$f is clean" "$f"
 done
-if [[ $dirty -eq 0 ]]; then
-    _pass "all child directory files clean"
-else
-    _fail "all child directory files clean" "$dirty still dirty"
-fi
 
 # Delete one child directory's contents
 rm -f parent/child2/file2.txt
 
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^D.*parent/child2/file2\.txt"; then
-    _pass "deleted child2/file2.txt shows as deleted"
-elif echo "$out" | grep -qF "parent/child2"; then
-    _pass "child2 deletion appears in status"
-else
-    _fail "child2/file2.txt shows as deleted" "not in status"
-fi
+assert_status_flag "deleted child2/file2.txt shows as deleted" "D" "parent/child2/file2.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Hidden directory (.hidden)"
@@ -595,12 +444,7 @@ assert_dir_exists ".hidden exists" ".hidden"
 assert_file_exists ".hidden/secret.txt exists" ".hidden/secret.txt"
 
 # Try to add — hidden dirs may be excluded by default
-add_out="$(atomic add .hidden/secret.txt 2>&1)" || true
-if [[ $? -eq 0 ]]; then
-    _pass "add file in hidden directory"
-else
-    _skip "add file in hidden directory" "hidden dirs may be ignored"
-fi
+assert_success "add file in hidden directory" atomic add .hidden/secret.txt
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Cross-view with shared and unique directories"
@@ -615,18 +459,18 @@ init_repo
 
 # Record src/core on dev
 create_file "src/core/engine.rs" "fn engine() {}"
-assert_success "add src/core/engine.rs" atomic add src/core/engine.rs
-record_change "Add core engine" >/dev/null 2>&1 || true
+require_success "add src/core/engine.rs" atomic add src/core/engine.rs
+require_success "record core engine" record_change "Add core engine"
 
 # Create feature from dev
-new_view "feature" >/dev/null 2>&1 || true
-insert_from_view "dev" "feature" >/dev/null 2>&1 || true
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "create feature view" new_view "feature"
+require_success "insert dev into feature" insert_from_view "dev" "feature"
+require_success "switch to feature" switch_view "feature"
 
 # Add feature-specific directory
 create_file "src/feature/widget.rs" "fn widget() {}"
-assert_success "add src/feature/widget.rs" atomic add src/feature/widget.rs
-record_change "Add feature widget" >/dev/null 2>&1 || true
+require_success "add src/feature/widget.rs" atomic add src/feature/widget.rs
+require_success "record feature widget" record_change "Add feature widget"
 
 # On feature: both dirs exist
 assert_dir_exists "src/core on feature" "src/core"
@@ -635,7 +479,7 @@ assert_dir_exists "src/feature on feature" "src/feature"
 assert_file_exists "src/feature/widget.rs on feature" "src/feature/widget.rs"
 
 # Switch to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 
 # src/core should exist, src/feature should NOT
 assert_dir_exists "src/core on dev" "src/core"
@@ -647,7 +491,7 @@ assert_dir_not_exists "src/feature NOT on dev" "src/feature"
 assert_dir_exists "src/ still exists on dev (has core/)" "src"
 
 # Switch back
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch back to feature" switch_view "feature"
 assert_dir_exists "src/feature reappears on feature" "src/feature"
 assert_file_exists "src/feature/widget.rs reappears" "src/feature/widget.rs"
 
@@ -656,29 +500,21 @@ begin_section "Directory: Unrecord directory change on feature, then switch"
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Continuing from previous
-unrec_out="$(unrecord_last)"
-if echo "$unrec_out" | grep -qiE "unrecord|removed|hash"; then
-    _pass "unrecord feature directory change succeeds"
-else
-    _pass "unrecord feature directory change completes"
-fi
+require_success "unrecord feature directory change succeeds" unrecord_last
 
 # src/feature/widget.rs should still be on disk (reverted to added)
 assert_file_exists "widget.rs still on disk after unrecord" "src/feature/widget.rs"
 
 # Switch to dev
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev after unrecord" switch_view "dev"
 
 # src/core should still be here
 assert_file_exists "src/core/engine.rs still on dev" "src/core/engine.rs"
 
 # widget.rs: since it was unrecorded (no INODES position), it persists as
 # an untracked file across the switch
-if [[ -f "src/feature/widget.rs" ]]; then
-    _pass "unrecorded widget.rs persists as untracked"
-else
-    _pass "unrecorded widget.rs cleaned up on switch"
-fi
+assert_file_content "unrecorded widget.rs persists with its bytes" "src/feature/widget.rs" "fn widget() {}"
+assert_status_flag "unrecorded widget.rs remains untracked" "?" "src/feature/widget.rs"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Stress — many directories"
@@ -691,27 +527,18 @@ init_repo
 for i in $(seq 1 10); do
     create_file "dir${i}/file_a.txt" "dir${i} a"
     create_file "dir${i}/file_b.txt" "dir${i} b"
-    atomic add "dir${i}/file_a.txt" >/dev/null 2>&1 || true
-    atomic add "dir${i}/file_b.txt" >/dev/null 2>&1 || true
+    require_success "add dir${i}/file_a.txt" atomic add "dir${i}/file_a.txt"
+    require_success "add dir${i}/file_b.txt" atomic add "dir${i}/file_b.txt"
 done
 
-out="$(get_status_short)"
-added_count="$(echo "$out" | grep -cE '^A' || true)"
-if [[ $added_count -ge 15 ]]; then
-    _pass "bulk directory add: $added_count files added"
-else
-    _pass "bulk directory add: $added_count files found"
-fi
+for i in $(seq 1 10); do
+    assert_status_flag "dir${i}/file_a.txt is added" "A" "dir${i}/file_a.txt"
+    assert_status_flag "dir${i}/file_b.txt is added" "A" "dir${i}/file_b.txt"
+done
 
-record_change "Bulk add 10 directories" >/dev/null 2>&1 || true
+require_success "record 10 directories" record_change "Bulk add 10 directories"
 
-out="$(get_status_short)"
-dirty_count="$(echo "$out" | grep -cE '^[MADU?].*dir[0-9]' || true)"
-if [[ $dirty_count -eq 0 ]]; then
-    _pass "all 10 directories clean after record"
-else
-    _pass "bulk record status ($dirty_count remaining)"
-fi
+assert_clean "all 10 directories clean after record"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Directory: Directory with .atomicignore patterns"
@@ -721,7 +548,7 @@ make_temp_repo "dir-ignore"
 init_repo
 
 # Create an ignore file
-create_file ".atomicignore" "*.log\nbuild/"
+create_file ".atomicignore" $'*.log\nbuild/\n'
 
 create_file "src/main.rs" "fn main() {}"
 create_file "debug.log" "log output"
@@ -730,23 +557,19 @@ create_file "build/output.bin" "binary output"
 # main.rs should be addable, debug.log and build/ should be ignored
 assert_success "add src/main.rs" atomic add src/main.rs
 
-add_log="$(atomic add debug.log 2>&1)" || true
-if echo "$add_log" | grep -qiE "ignored|cannot|skip"; then
-    _pass "debug.log correctly ignored"
-elif [[ $? -ne 0 ]]; then
-    _pass "debug.log rejected (non-zero exit)"
-else
-    _pass "add debug.log result (ignore rules may vary)"
+if ! add_log="$(atomic add debug.log 2>&1)"; then
+    if ! printf '%s\n' "$add_log" | grep -qi 'ignor'; then
+        _fail "add debug.log reports an ignore refusal" "$add_log"
+    fi
 fi
+assert_status_no_entry "debug.log is ignored" "debug.log"
 
-add_build="$(atomic add build/output.bin 2>&1)" || true
-if echo "$add_build" | grep -qiE "ignored|cannot|skip"; then
-    _pass "build/ directory correctly ignored"
-elif [[ $? -ne 0 ]]; then
-    _pass "build/ directory rejected (non-zero exit)"
-else
-    _pass "add build/ result (ignore rules may vary)"
+if ! add_build="$(atomic add build/output.bin 2>&1)"; then
+    if ! printf '%s\n' "$add_build" | grep -qi 'ignor'; then
+        _fail "add build/output.bin reports an ignore refusal" "$add_build"
+    fi
 fi
+assert_status_no_entry "build/output.bin is ignored" "build/output.bin"
 
 # ═══════════════════════════════════════════════════════════════════════════
 

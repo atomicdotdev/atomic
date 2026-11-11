@@ -85,7 +85,7 @@ pub(crate) fn enter_remediation_workspace_budgeted(
 pub(crate) fn remediation_error(remediation: WorkspaceRemediation) -> CliError {
     CliError::StaleBaseline {
         report: format!(
-            "workspace reconciliation required: {}",
+            "workspace reconciliation required: {}\nInspect with 'atomic status --no-reconcile'; then run 'atomic git shim reconcile' before retrying.",
             remediation.describe()
         ),
     }
@@ -105,6 +105,19 @@ pub(crate) fn prepare_service_query(allow_git_operation: bool) -> CliResult<bool
         return Ok(true);
     }
     drop(repo);
+    if let Some(remediation) =
+        Repository::preflight_workspace_boundary(&root).map_err(CliError::Repository)?
+    {
+        if allow_git_operation
+            && matches!(
+                &remediation,
+                WorkspaceRemediation::GitOperationInProgress { .. }
+            )
+        {
+            return Ok(false);
+        }
+        return Err(remediation_error(remediation));
+    }
     let mut repo = Repository::open_for_workspace_transaction_wait(
         &root,
         atomic_repository::database_lock_wait(),

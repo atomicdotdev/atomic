@@ -3,8 +3,8 @@
 use super::*;
 
 use crate::pristine::tables::{
-    BRIDGE_EVENT_CAPTURES, BRIDGE_EVENT_CAPTURE_ANCHORS, GIT_COMMIT_CLOSURES, GIT_SHA_INDEX,
-    TAG_NAME_INDEX, TAG_RECORDS,
+    BRIDGE_EVENT_CAPTURES, BRIDGE_EVENT_CAPTURE_ANCHORS, GIT_CLOSURE_NODES, GIT_COMMIT_CLOSURES,
+    GIT_SHA_INDEX, TAG_NAME_INDEX, TAG_RECORDS,
 };
 use crate::pristine::traits::tag::{
     BridgeEventCaptureMutTxnT, BridgeEventCaptureTxnT, GitCommitClosureMutTxnT,
@@ -288,44 +288,6 @@ impl<'a> GitShaIndexMutTxnT for WriteTxn<'a> {
 // GIT COMMIT INTERPRETATION CLOSURES (CB-9B review R1)
 // ============================================================================
 
-/// Encode a closure as u32 count + concatenated 32-byte hashes.
-fn encode_git_commit_closure(closure: &[Hash]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(4 + closure.len() * 32);
-    bytes.extend_from_slice(&(closure.len() as u32).to_le_bytes());
-    for hash in closure {
-        bytes.extend_from_slice(hash.as_bytes());
-    }
-    bytes
-}
-
-fn decode_git_commit_closure(bytes: &[u8]) -> PristineResult<Vec<Hash>> {
-    if bytes.len() < 4 {
-        return Err(PristineError::Serialization {
-            message: format!(
-                "git commit closure is truncated: {} byte(s), need at least 4",
-                bytes.len()
-            ),
-        });
-    }
-    let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
-    if bytes.len() != 4 + count * 32 {
-        return Err(PristineError::Serialization {
-            message: format!(
-                "git commit closure claims {count} hashes but holds {} bytes",
-                bytes.len()
-            ),
-        });
-    }
-    let mut closure = Vec::with_capacity(count);
-    for index in 0..count {
-        let start = 4 + index * 32;
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&bytes[start..start + 32]);
-        closure.push(Hash::from_bytes(hash));
-    }
-    Ok(closure)
-}
-
 impl<'a> GitCommitClosureTxnT for WriteTxn<'a> {
     fn get_git_commit_closure(&self, sha: &str) -> PristineResult<Option<Vec<Hash>>> {
         let decoded = {
@@ -340,7 +302,16 @@ impl<'a> GitCommitClosureTxnT for WriteTxn<'a> {
                 None => return Ok(None),
             }
         };
-        Ok(Some(decode_git_commit_closure(&decoded)?))
+        let nodes = match self.txn.open_table(GIT_CLOSURE_NODES) {
+            Ok(table) => Some(table),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(error) => return Err(error.into()),
+        };
+        crate::pristine::git_closure::decode(&decoded, |id| match &nodes {
+            Some(table) => Ok(table.get(id)?.map(|value| *value.value())),
+            None => Ok(None),
+        })
+        .map(Some)
     }
 
     fn has_git_commit_closure(&self, sha: &str) -> PristineResult<bool> {
@@ -354,10 +325,9 @@ impl<'a> GitCommitClosureTxnT for WriteTxn<'a> {
 
 impl<'a> GitCommitClosureMutTxnT for WriteTxn<'a> {
     fn put_git_commit_closure(&mut self, sha: &str, closure: &[Hash]) -> PristineResult<()> {
-        let encoded = encode_git_commit_closure(closure);
-        let mut table = self.txn.open_table(GIT_COMMIT_CLOSURES)?;
-        if let Some(existing) = table.get(sha)? {
-            if existing.value() != encoded.as_slice() {
+        use crate::pristine::{CapabilityMutTxnT, GIT_CLOSURE_SHARING_CAPABILITY};
+        if let Some(existing) = self.get_git_commit_closure(sha)? {
+            if existing != closure {
                 return Err(PristineError::Serialization {
                     message: format!(
                         "git commit {sha} already has a different persisted interpretation \
@@ -368,6 +338,26 @@ impl<'a> GitCommitClosureMutTxnT for WriteTxn<'a> {
             }
             return Ok(());
         }
+        let encoded = {
+            let mut nodes = self.txn.open_table(GIT_CLOSURE_NODES)?;
+            crate::pristine::git_closure::encode(closure, |id, node| {
+                let existing = nodes.get(id)?.map(|value| *value.value());
+                match existing {
+                    Some(existing) if existing != *node => Err(PristineError::Serialization {
+                        message: "Git closure trie node has conflicting content".into(),
+                    }),
+                    Some(_) => Ok(()),
+                    None => {
+                        nodes.insert(id, node)?;
+                        Ok(())
+                    }
+                }
+            })?
+        };
+        if crate::pristine::git_closure::is_shared(&encoded) {
+            self.put_required_capability(GIT_CLOSURE_SHARING_CAPABILITY)?;
+        }
+        let mut table = self.txn.open_table(GIT_COMMIT_CLOSURES)?;
         table.insert(sha, encoded.as_slice())?;
         Ok(())
     }

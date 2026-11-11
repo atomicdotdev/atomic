@@ -50,12 +50,15 @@ start_colocated_repo() {
     create_file tracked.txt "checkpoint\n"
     git add tracked.txt
     git commit --no-gpg-sign --quiet -m "checkpoint"
-    atomic git import --no-vault >/dev/null
-    atomic git shim reconcile >/dev/null
+    require_success "$label: import Git" atomic git import --no-vault
+    require_success "$label: reconcile Git shim" atomic git shim reconcile
     if [[ -s .atomic/bridge/workspace.json ]]; then
         _pass "$label: valid shim checkpoint established"
     else
         _fail "$label: valid shim checkpoint established" ".atomic/bridge/workspace.json missing"
+        _skip "guard matrix and subsequent checks" "fixture checkpoint unavailable"
+        print_summary || true
+        exit 1
     fi
 }
 
@@ -89,15 +92,40 @@ snapshot_guard_state() {
     } > "$destination"
 }
 
+snapshot_operations() {
+    local scope="$1" destination="$2"
+    python3 -c '
+import json, subprocess, sys
+binary, scope = sys.argv[1:]
+args = [binary, "op", "log", "--json"] + (["--repository"] if scope == "repository" else [])
+log = json.loads(subprocess.check_output(args, text=True))
+details = [json.loads(subprocess.check_output([binary, "op", "show", entry["id"], "--json"], text=True)) for entry in log["entries"]]
+print(json.dumps({"log": log, "details": details}, sort_keys=True))' "$ATOMIC_BIN" "$scope" > "$destination"
+}
+
 assert_guard_refusal() {
     local label="$1"
     local operation="$2"
     shift 2
-    local before after output rc lines
+    local before baseline after before_ops after_ops before_repo_ops after_repo_ops output rc lines
     before="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-before-XXXXXX")"
+    baseline="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-baseline-XXXXXX")"
     after="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-after-XXXXXX")"
-    _HARNESS_TMPDIRS+=("$before" "$after")
+    _HARNESS_TMPDIRS+=("$before" "$baseline" "$after")
+    before_ops="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-before-ops-XXXXXX")"
+    after_ops="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-after-ops-XXXXXX")"
+    before_repo_ops="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-before-repo-ops-XXXXXX")"
+    after_repo_ops="$(mktemp "${TMPDIR:-/tmp}/atomic-cb0c-after-repo-ops-XXXXXX")"
+    _HARNESS_TMPDIRS+=("$before_ops" "$after_ops" "$before_repo_ops" "$after_repo_ops")
+    require_success "$label: capture working-copy operations before command" snapshot_operations working-copy "$before_ops"
+    require_success "$label: capture repository operations before command" snapshot_operations repository "$before_repo_ops"
+    snapshot_guard_state "$baseline"
     snapshot_guard_state "$before"
+    if cmp -s "$baseline" "$before"; then
+        _pass "$label: consecutive snapshots are stable before command"
+    else
+        _fail "$label: consecutive snapshots are stable before command" "$(diff -u "$baseline" "$before" || true)"
+    fi
 
     set +e
     output="$("$@" 2>&1)"
@@ -111,34 +139,16 @@ assert_guard_refusal() {
     fi
 
     local evidence_ok=1
+    # The current workspace boundary exposes a typed reason and explicit
+    # remediation. Full checkpoint/manifest evidence belongs to the separate
+    # read-only forensic command, not the retired shadow guard's prose format.
     for expected in \
-        "Unsafe operation: $operation" \
-        "Refusal: Git moved away from the shim checkpoint" \
-        "Old checkpoint Atomic view: main" \
-        "Old checkpoint Atomic state:" \
-        "Old checkpoint Atomic manifest root: atomic-visible-regular-files-blake3-v1:" \
-        "Old checkpoint Git HEAD: attached refs/heads/main at" \
-        "Old checkpoint Git HEAD tree:" \
-        "Old checkpoint Git index tree:" \
-        "Old checkpoint Git index digest:" \
-        "Old checkpoint Git refs digest:" \
-        "Old checkpoint Git refs: digest-only checkpoint evidence" \
-        "Old checkpoint Git manifest root: git-tree-oid:" \
-        "Current Atomic view: main" \
-        "Current Atomic state:" \
-        "Current Atomic manifest root: atomic-visible-regular-files-blake3-v1:" \
-        "Current Git HEAD: attached refs/heads/raw-drift at" \
-        "Current Git HEAD tree:" \
-        "Current Git index tree:" \
-        "Current Git index digest:" \
-        "Current Git refs digest:" \
-        "Current Git refs:" \
-        "refs/heads/main ->" \
-        "refs/heads/raw-drift ->" \
-        "Current Git manifest root: git-tree-oid:" \
-        "Remediation: Reconcile the observed Git baseline before retrying the refused operation." \
-        "  atomic status --no-reconcile" \
-        "  atomic git shim reconcile"
+        'workspace reconciliation required:' \
+        'HeadSymrefChanged' \
+        'checkpoint: "refs/heads/main"' \
+        'observed: "refs/heads/raw-drift"' \
+        'atomic status --no-reconcile' \
+        'atomic git shim reconcile'
     do
         if ! printf '%s\n' "$output" | grep -qF -- "$expected"; then
             evidence_ok=0
@@ -146,9 +156,9 @@ assert_guard_refusal() {
         fi
     done
     if [[ "$evidence_ok" -eq 1 ]]; then
-        _pass "$label: reports old/current Atomic+Git, refs/index/roots, operation, and exact remediation"
+        _pass "$label: reports typed drift, old/new refs and exact remediation"
     else
-        _fail "$label: reports old/current Atomic+Git, refs/index/roots, operation, and exact remediation" "$output"
+        _fail "$label: reports typed drift, old/new refs and exact remediation" "$output"
     fi
 
     lines="$(printf '%s\n' "$output" | wc -l | tr -d '[:space:]')"
@@ -164,19 +174,26 @@ assert_guard_refusal() {
     else
         _fail "$label: refusal is non-mutating" "$(diff -u "$before" "$after" || true)"
     fi
+    require_success "$label: capture working-copy operations after command" snapshot_operations working-copy "$after_ops"
+    require_success "$label: capture repository operations after command" snapshot_operations repository "$after_repo_ops"
+    assert_success "$label: refusal preserves working-copy operation DAG and receipts" cmp -s "$before_ops" "$after_ops"
+    assert_success "$label: refusal preserves repository operation DAG and receipts" cmp -s "$before_repo_ops" "$after_repo_ops"
 }
 
 begin_section "Every working-copy boundary shares one early refusal"
 start_colocated_repo "git-shim-guard-matrix"
-atomic view create feature --draft --parent main >/dev/null
-CHANGE="$(atomic log -f oneline --full-hash | awk 'NR == 1 { print $1 }')"
-HISTORY_BEFORE="$(atomic diff --change "$CHANGE" --name-only --no-color)"
+require_success "create feature view" atomic view create feature --draft --parent main
+require_capture "read latest change hash" atomic log -f json --count 1
+require_capture "extract latest change hash" python3 -c 'import json,sys; rows=json.loads(sys.argv[1]); assert len(rows)==1 and len(rows[0]["hash"])==52; print(rows[0]["hash"])' "$COMMAND_OUTPUT"
+CHANGE="$COMMAND_OUTPUT"
+require_capture "read historical diff before drift" atomic diff --change "$CHANGE" --name-only --no-color
+HISTORY_BEFORE="$COMMAND_OUTPUT"
 
-atomic git shim enable >/dev/null
+require_success "enable shim" atomic git shim enable
 HOOK_PATH="$(git rev-parse --git-path hooks/post-checkout)"
 rm -f "$HOOK_PATH"
 raw_git_drift raw-drift
-if [[ ! -e .atomic/bridge/git-events.jsonl ]]; then
+if [[ ! -e .atomic/bridge/git-events.jsonl ]] || ! grep -q '"record_type":"post-checkout"' .atomic/bridge/git-events.jsonl; then
     _pass "removing the advisory hook leaves no checkout journal"
 else
     _fail "removing the advisory hook leaves no checkout journal" "$(cat .atomic/bridge/git-events.jsonl)"
@@ -215,7 +232,7 @@ else
     _fail "diff --change bypasses the guard and remains history-only" "exit $HISTORY_RC: $HISTORY_AFTER"
 fi
 
-begin_section "Ordinary edits and Atomic-only advancement remain allowed"
+begin_section "Ordinary edits and enrolled Atomic projection remain allowed"
 start_colocated_repo "git-shim-guard-atomic-advance"
 GIT_HEAD_BEFORE="$(git rev-parse HEAD)"
 overwrite_file tracked.txt "ordinary edit\n"
@@ -230,11 +247,13 @@ else
     _fail "ordinary edit passes diff" "$DIFF_OUT"
 fi
 assert_success "ordinary edit passes record" atomic record -m "Atomic-only advancement"
-if [[ "$(git rev-parse HEAD)" == "$GIT_HEAD_BEFORE" ]]; then
-    _pass "Atomic record does not move Git HEAD"
+if [[ "$(git rev-parse HEAD)" != "$GIT_HEAD_BEFORE" ]] && \
+    [[ "$(git show HEAD:tracked.txt)" == 'ordinary edit\n' ]]; then
+    _pass "enrolled Atomic record advances Git with the recorded bytes"
 else
-    _fail "Atomic record does not move Git HEAD" "Git HEAD changed"
+    _fail "enrolled Atomic record advances Git with the recorded bytes" "Git projection missing or incorrect"
 fi
+assert_success "recorded projection passes shim verification" atomic git shim verify
 assert_success "status passes after Atomic-only advancement" atomic status --short
 create_file atomic-only.txt "further Atomic work\n"
 assert_success "add passes after Atomic-only advancement" atomic add atomic-only.txt
