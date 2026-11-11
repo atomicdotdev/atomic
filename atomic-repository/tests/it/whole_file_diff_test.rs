@@ -19,7 +19,8 @@ fn record(repo: &Repository) -> Hash {
         .hash()
 }
 
-fn replacement(before: &[u8], after: &[u8]) -> (TempDir, Repository, Hash, Change) {
+/// Record `before`, then `after`, and return the second change.
+fn edit(before: &[u8], after: &[u8]) -> (TempDir, Repository, Hash, Change) {
     let dir = TempDir::new().unwrap();
     let repo = Repository::init(dir.path()).unwrap();
     std::fs::write(dir.path().join("file.txt"), before).unwrap();
@@ -33,6 +34,12 @@ fn replacement(before: &[u8], after: &[u8]) -> (TempDir, Repository, Hash, Chang
     std::fs::write(dir.path().join("file.txt"), after).unwrap();
     let hash = record(&repo);
     let change = repo.change_store().load_change(&hash).unwrap();
+    (dir, repo, hash, change)
+}
+
+/// An edit that must be stored as a whole-file rewrite.
+fn replacement(before: &[u8], after: &[u8]) -> (TempDir, Repository, Hash, Change) {
+    let (dir, repo, hash, change) = edit(before, after);
     assert_eq!(
         whole_file_replacement_text(&change.file_ops()[0], &change.contents, || Some(
             before.to_vec()
@@ -89,8 +96,9 @@ fn replacement_diff_uses_historical_text_for_all_output_formats() {
 
 #[test]
 fn replacement_deletion_does_not_show_survivors_as_added() {
-    let (_dir, repo, hash, change) =
-        replacement(b"keep\nold one\nold two\ntail\n", b"keep\ntail\n");
+    // Pure deletions are recorded as line deletes, not as a rewrite; the
+    // review delta must read the same either way.
+    let (_dir, repo, hash, change) = edit(b"keep\nold one\nold two\ntail\n", b"keep\ntail\n");
     let (files, _) = change_file_diffs(&repo, &change, &hash, &DiffOutputConfig::new()).unwrap();
     assert_eq!(files[0].stats.insertions, 0);
     assert_eq!(files[0].stats.deletions, 2);
@@ -106,7 +114,7 @@ fn replacement_deletion_does_not_show_survivors_as_added() {
 
 #[test]
 fn replacement_truncation_keeps_modified_file_status() {
-    let (_dir, repo, hash, change) = replacement(b"one\ntwo\n", b"");
+    let (_dir, repo, hash, change) = edit(b"one\ntwo\n", b"");
     let (files, _) = change_file_diffs(
         &repo,
         &change,
@@ -122,7 +130,8 @@ fn replacement_truncation_keeps_modified_file_status() {
 
 #[test]
 fn replacement_diff_preserves_blank_lines_and_unterminated_last_line() {
-    let (_dir, repo, hash, change) = replacement(b"head\n\nold\n", b"head\n\nnew");
+    // A missing final newline alone no longer forces a rewrite.
+    let (_dir, repo, hash, change) = edit(b"head\n\nold\n", b"head\n\nnew");
     let (files, _) = change_file_diffs(&repo, &change, &hash, &DiffOutputConfig::new()).unwrap();
     assert_eq!(files[0].stats.insertions, 1);
     assert_eq!(files[0].stats.deletions, 1);

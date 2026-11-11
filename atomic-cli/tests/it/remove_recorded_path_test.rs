@@ -74,7 +74,7 @@ fn record_file(root: &Path, name: &str, bytes: &[u8]) {
 fn change_count(root: &Path) -> usize {
     cli(root, &["log", "-f", "oneline"])
         .lines()
-        .filter(|line| line.starts_with('#'))
+        .filter(|line| !line.trim().is_empty())
         .count()
 }
 
