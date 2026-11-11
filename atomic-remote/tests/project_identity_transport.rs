@@ -3,11 +3,13 @@
 //! Covers the four behaviors the daemon and CLI depend on: reading a bound
 //! identity, distinguishing unbound from unsupported servers, binding on the
 //! first push, and mapping the server's 409 to a typed conflict that carries
-//! the remote's document.
+//! the server's error body and what the follow-up read of the binding
+//! resolved to.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
+use atomic_remote::http::identity::ConflictRemote;
 use atomic_remote::{HttpRemote, HttpRemoteConfig};
 use serde_json::json;
 
@@ -144,8 +146,92 @@ async fn a_conflict_reports_the_remote_binding() {
         .await
         .expect("bind")
     {
-        atomic_remote::http::identity::BindOutcome::Conflict { remote } => {
-            assert_eq!(remote, Some(remote_document));
+        atomic_remote::http::identity::BindOutcome::Conflict { remote, server } => {
+            assert_eq!(remote, ConflictRemote::Bound(remote_document));
+            assert_eq!(
+                server,
+                Some(atomic_remote::http::identity::BindServerError {
+                    code: Some("IDENTITY_CONFLICT".into()),
+                    message: None,
+                }),
+                "the nested error body's code is surfaced"
+            );
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_conflict_body_surfaces_the_server_code_and_message() {
+    let document = identity_document(&"A".repeat(52));
+    let (url, _) = serve(vec![
+        (
+            409,
+            json!({"code": "IDENTITY_CONFLICT", "message": "project already bound"}).to_string(),
+        ),
+        (
+            200,
+            json!({"bound": true, "hash": "cd".repeat(32), "identity": document}).to_string(),
+        ),
+    ]);
+    match remote(&url)
+        .bind_project_identity(&document)
+        .await
+        .expect("bind")
+    {
+        atomic_remote::http::identity::BindOutcome::Conflict { remote, server } => {
+            assert!(matches!(remote, ConflictRemote::Bound(_)));
+            assert_eq!(
+                server,
+                Some(atomic_remote::http::identity::BindServerError {
+                    code: Some("IDENTITY_CONFLICT".into()),
+                    message: Some("project already bound".into()),
+                }),
+            );
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_conflict_followed_by_an_unbound_read_maps_to_unbound() {
+    // The server contradicts its own 409: the follow-up read says the project
+    // is unbound (the atomic-storage#113 ref-scoping bug).
+    let document = identity_document(&"A".repeat(52));
+    let (url, _) = serve(vec![
+        (409, json!({"code": "IDENTITY_CONFLICT"}).to_string()),
+        (200, json!({"bound": false}).to_string()),
+    ]);
+    match remote(&url)
+        .bind_project_identity(&document)
+        .await
+        .expect("bind")
+    {
+        atomic_remote::http::identity::BindOutcome::Conflict { remote, server } => {
+            assert_eq!(remote, ConflictRemote::Unbound);
+            assert_eq!(
+                server.map(|s| s.code),
+                Some(Some("IDENTITY_CONFLICT".into())),
+            );
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_conflict_whose_follow_up_read_fails_maps_to_unknown() {
+    let document = identity_document(&"A".repeat(52));
+    let (url, _) = serve(vec![
+        (409, json!({"code": "IDENTITY_CONFLICT"}).to_string()),
+        (500, "storage error".to_string()),
+    ]);
+    match remote(&url)
+        .bind_project_identity(&document)
+        .await
+        .expect("bind")
+    {
+        atomic_remote::http::identity::BindOutcome::Conflict { remote, .. } => {
+            assert_eq!(remote, ConflictRemote::Unknown);
         }
         other => panic!("expected Conflict, got {other:?}"),
     }
