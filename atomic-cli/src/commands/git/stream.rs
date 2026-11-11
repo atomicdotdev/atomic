@@ -1876,6 +1876,11 @@ mod tests {
         );
     }
 
+    // Raw-reads the open redb database to assert prefix validation is
+    // read-only. On Windows, redb holds a byte-range lock on the
+    // memory-mapped file, so a second-handle read fails with a sharing
+    // violation (OS error 33) before the assertion can run.
+    #[cfg(unix)]
     #[test]
     fn span_compiler_replays_imported_prefix_and_matches_fresh_extension() {
         use atomic_core::pristine::{GitShaIndexTxnT, GraphTxnT, MutTxnT};
@@ -2007,6 +2012,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn incremental_span_private_stage_promotes_only_after_final_tree_proof() {
         use atomic_core::operation::OperationScope;
@@ -2442,6 +2448,7 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"native user work\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn incremental_span_private_stage_accepts_two_successive_updates() {
         let (_git_dir, git, tip, files) = fixture(7);
@@ -2738,6 +2745,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn incremental_span_git_observation_failure_keeps_target_and_resumes() {
         let (_git_dir, git, tip, files) = fixture(5);
@@ -2815,6 +2823,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn span_import_without_semantic_history_records_native_edit() {
         use atomic_core::operation::OperationScope;
@@ -2922,6 +2931,7 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"alpha\nworking edit\nlast\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn projected_native_span_edits_transfer_and_reopen() {
         use atomic_core::pristine::MutTxnT;
@@ -3251,6 +3261,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn projected_native_span_edits_compose_across_views_and_refuse_overlap() {
         let (_git_dir, git, tip, _) = fixture(2);
@@ -3352,6 +3363,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn projected_native_record_undo_keeps_semantic_capability() {
         use atomic_core::pristine::{
@@ -3451,6 +3463,7 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"alpha\nworking edit\nlast\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn projected_native_edits_preserve_empty_binary_and_line_endings() {
         let (_git_dir, git, tip, _) = fixture(2);
@@ -3509,6 +3522,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn projected_token_edits_roundtrip_common_sequences() {
         let (_git_dir, git, tip, _) = fixture(2);
@@ -3581,6 +3595,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn projected_native_edit_retains_unchanged_token_authorship() {
         use atomic_core::pristine::span_patch_storage::SpanRenderContext;
@@ -3673,6 +3688,7 @@ mod tests {
         assert_eq!(unicode.lines[0].tokens[1].authors[0].target.owner, beta);
     }
 
+    #[cfg(unix)]
     #[test]
     fn projected_token_budget_refuses_before_record_publication() {
         use atomic_core::operation::OperationScope;
@@ -3746,6 +3762,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn projected_and_native_crdt_files_can_share_one_record() {
         let (_git_dir, git, tip, _) = fixture(2);
@@ -3888,6 +3905,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn projected_edit_with_wrong_baseline_or_path_refuses_before_publication() {
         use atomic_core::change::span_patch::SpanProjectionId;
@@ -3995,6 +4013,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn projected_record_object_collision_aborts_prepared_operation() {
         use atomic_core::operation::{OperationKind, OperationScope};
@@ -4092,6 +4111,7 @@ mod tests {
         assert_eq!(std::fs::read(stored).unwrap(), before_bytes);
     }
 
+    #[cfg(unix)]
     #[test]
     fn stale_projected_record_refuses_overlap_before_graph_commit() {
         use atomic_core::operation::OperationScope;

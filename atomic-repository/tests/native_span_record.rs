@@ -169,6 +169,7 @@ fn native_span_sandbox_images_use_recorded_view_bytes() {
     assert_eq!(std::fs::read(path).unwrap(), b"unrecorded\n");
 }
 
+#[cfg(unix)]
 #[test]
 fn native_span_project_tree_uses_exact_recorded_bytes() {
     use atomic_core::operation::GitHashAlgorithm;
@@ -1828,6 +1829,7 @@ fn native_text_binary_transitions_keep_content_and_semantics() {
     assert_eq!(std::fs::read(&path).unwrap(), b"new\ntext");
 }
 
+#[cfg(unix)]
 #[test]
 fn missing_span_root_refuses_without_overwriting_working_bytes() {
     use atomic_core::pristine::TreeTxnT;
