@@ -169,8 +169,9 @@ impl Repository {
 
     /// Reject ordinary Git imports into a span repository before any writable
     /// open or recovery. Hold the returned guard until import completes.
-    /// Databases requiring repair or migration are refused rather than opened
-    /// writable to inspect them.
+    /// Databases requiring migration or repository recovery are refused rather
+    /// than opened writable to inspect them. The one exception is redb's own
+    /// repair after a killed process, which runs under the common lock.
     pub fn try_lock_git_import_without_span<P: AsRef<Path>>(
         path: P,
         dry_run: bool,
@@ -204,7 +205,13 @@ impl Repository {
         if layout.working_root != requested {
             return Ok(None);
         }
-        let inspect = || -> Result<bool, RepositoryError> {
+        // A process killed mid-write leaves the database needing redb's
+        // storage-level repair before it can be read at all. That repair
+        // changes no repository state, so `repair` allows it once the common
+        // lock is held and the caller may write; otherwise the database only
+        // counts as present here and the locked pass decides. Format upgrades
+        // and repository recovery are still refused.
+        let inspect = |repair: bool| -> Result<bool, RepositoryError> {
             let mut found = false;
             for name in [super::DATABASE_FILE, super::LEGACY_PRISTINE_FILE] {
                 let database = layout.common_dot_dir.join(name);
@@ -222,7 +229,23 @@ impl Repository {
                     Err(error) => return Err(error.into()),
                 }
                 found = true;
-                let pristine = Pristine::open_readonly_without_recovery(&database)?;
+                let pristine = match Pristine::open_readonly_without_recovery(&database) {
+                    Ok(pristine) => pristine,
+                    Err(atomic_core::pristine::PristineError::Database(error))
+                        if matches!(*error, redb::DatabaseError::RepairAborted) =>
+                    {
+                        if !repair {
+                            if dry_run {
+                                return Err(
+                                    atomic_core::pristine::PristineError::Database(error).into()
+                                );
+                            }
+                            continue;
+                        }
+                        Pristine::open_readonly_after_crash_repair(&database)?
+                    }
+                    Err(error) => return Err(error.into()),
+                };
                 let has_span =
                     pristine
                         .required_repository_capabilities()?
@@ -248,7 +271,7 @@ impl Repository {
         // A refusal for an already-span-backed repository must not create a
         // lock file. Recheck under the common lock to close the race with a
         // concurrent span-capability installation.
-        if !inspect()? {
+        if !inspect(false)? {
             return Ok(None);
         }
         let lock_path = layout.common_dot_dir.join(COMMON_OPERATION_LOCK);
@@ -258,7 +281,7 @@ impl Repository {
             });
         }
         let common = try_lock_file(&lock_path, RepositoryLockKind::Common, true)?;
-        if !inspect()? {
+        if !inspect(!dry_run)? {
             return Err(RepositoryError::InvalidOperation {
                 message: "repository database disappeared during Git import preflight".into(),
             });

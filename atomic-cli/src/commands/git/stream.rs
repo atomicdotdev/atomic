@@ -699,6 +699,17 @@ impl ParallelImporter {
         })
     }
 
+    /// Refuse unless the handle's current view is already this importer's
+    /// target. Incremental span import never selects or switches a view.
+    pub(crate) fn require_target_is_current_view(&self, repo: &Repository) -> CliResult<()> {
+        if self.options.target_view != repo.current_view() {
+            return Err(git_error(
+                "span incremental import requires the current Atomic view to match the Git branch",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn import_span_incremental_prevalidated<F>(
         &self,
         repo: &mut Repository,

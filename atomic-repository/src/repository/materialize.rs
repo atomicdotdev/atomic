@@ -658,6 +658,11 @@ impl Repository {
     ) -> Result<(), RepositoryError> {
         use atomic_core::pristine::span_patch_storage::SpanRenderContext;
 
+        // Nothing to read means nothing to project: a switch that writes no
+        // files must not require the target view's dependency closure.
+        if paths.is_empty() {
+            return Ok(());
+        }
         let txn = self
             .pristine
             .read_txn()

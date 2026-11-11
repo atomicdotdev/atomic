@@ -493,6 +493,31 @@ impl Pristine {
         Self::open_readonly_with_schema_check(path, true, false)
     }
 
+    /// Open for inspection after letting redb finish its own crash repair.
+    ///
+    /// A process killed mid-write leaves the file needing redb's storage-level
+    /// repair, which a read-only open cannot perform. This runs only that
+    /// repair: it never upgrades a legacy format, initializes tables, or runs
+    /// repository recovery, and it returns the same errors as
+    /// [`Self::open_readonly_without_recovery`] for everything else.
+    pub fn open_readonly_after_crash_repair<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
+        let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
+        let mut builder = Builder::new();
+        builder.set_cache_size(cache_bytes);
+        let db = match builder.open_read_only(path.as_ref()) {
+            Ok(db) => db,
+            Err(redb::DatabaseError::RepairAborted) => {
+                // Close the writable handle cleanly to persist the repaired
+                // allocator state before taking the shared read lock.
+                let backend = SnapshotBackend::open(path.as_ref(), false)?;
+                drop(builder.create_with_backend(backend)?);
+                builder.open_read_only(path.as_ref())?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Self::scan_ids(PristineDatabase::ReadOnly(db), true)
+    }
+
     /// Open an existing database for read-only repair inspection without
     /// initializing tables or requiring a completed PATH_CLAIMS schema.
     ///

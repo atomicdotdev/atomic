@@ -2074,6 +2074,60 @@ mod tests {
         assert!(!dot.join("bridge.lock").exists());
     }
 
+    /// Copy a repository while it is still open: the copy is what a killed
+    /// process leaves behind, a database redb must repair before reading.
+    fn copy_of_open_repository(source: &std::path::Path) -> tempfile::TempDir {
+        fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_dir(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), &target).unwrap();
+                }
+            }
+        }
+        let copy = tempfile::tempdir().unwrap();
+        copy_dir(source, copy.path());
+        copy
+    }
+
+    #[test]
+    fn git_import_preflight_repairs_a_database_left_by_a_killed_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let killed = copy_of_open_repository(dir.path());
+        let dry_run = copy_of_open_repository(dir.path());
+        drop(repo);
+        let database =
+            |root: &std::path::Path| root.join(".atomic").join(super::super::DATABASE_FILE);
+        assert!(
+            atomic_core::pristine::Pristine::open_readonly_without_recovery(database(
+                killed.path()
+            ))
+            .is_err(),
+            "fixture must need redb crash repair"
+        );
+
+        // A dry run may not write, so it still refuses.
+        assert!(Repository::try_lock_git_import_without_span(dry_run.path(), true).is_err());
+        assert!(
+            atomic_core::pristine::Pristine::open_readonly_without_recovery(database(
+                dry_run.path()
+            ))
+            .is_err()
+        );
+
+        let guard = Repository::try_lock_git_import_without_span(killed.path(), false)
+            .expect("a database needing only crash repair must pass the preflight");
+        assert!(guard.is_some());
+        drop(guard);
+        atomic_core::pristine::Pristine::open_readonly_without_recovery(database(killed.path()))
+            .expect("the preflight leaves the database readable without recovery");
+    }
+
     #[test]
     fn failed_final_proof_never_promotes_private_stream() {
         let dir = tempfile::tempdir().unwrap();

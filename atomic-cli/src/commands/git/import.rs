@@ -867,6 +867,7 @@ impl SpanIncrementalGitObservation {
         }
         let branch = head
             .shorthand()
+            .ok()
             .ok_or_else(|| CliError::GitError {
                 message: "Git branch name is not representable".into(),
             })?
@@ -923,7 +924,7 @@ impl SpanIncrementalGitObservation {
                 message: format!("cannot reobserve Git index: {error}"),
             })?;
         if !after_head.is_branch()
-            || after_head.shorthand() != Some(branch.as_str())
+            || after_head.shorthand().ok() != Some(branch.as_str())
             || after_head.target() != Some(tip)
             || after_index != index
             || git.path().join("index.lock").exists()
@@ -974,9 +975,6 @@ impl Import {
             });
         }
         let mut repo = Repository::open(workdir).map_err(CliError::from)?;
-        if repo.current_view() != pinned.branch {
-            return Err(CliError::GitError { message: "span incremental import requires the current Atomic view to match the Git branch".into() });
-        }
         let limits = self.stream_limits()?;
         let importer = ParallelImporter::new(
             git,
@@ -984,10 +982,14 @@ impl Import {
                 graph_only: true,
                 span_stream: true,
                 mainline_only: true,
-                target_view: repo.current_view().to_string(),
+                // The pinned Git branch names the target. The view is never
+                // taken from the handle's ambient selection; the importer
+                // refuses unless the two already agree.
+                target_view: pinned.branch.clone(),
                 ..Default::default()
             },
         );
+        importer.require_target_is_current_view(&repo)?;
         let plan =
             importer.validate_graph_stream_prospectively(&pinned.branch, pinned.tip, limits)?;
         let expected_tree = plan.expected_git_tree().ok_or_else(|| CliError::GitError {

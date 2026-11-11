@@ -32,25 +32,43 @@
 //! timing. There is no network RTT: the atomic transport is a loopback Unix
 //! socket and Git uses loopback `file://` pack negotiation; treat absolute
 //! numbers as transport-plus-work measurements, not WAN estimates.
+#[cfg(unix)]
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::net::UnixListener as StdUnixListener;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Instant;
 
+#[cfg(unix)]
 use anyhow::{bail, ensure, Context, Result};
+#[cfg(unix)]
 use hyper_util::rt::TokioIo;
+#[cfg(unix)]
 use libatomic::atomic::{sandbox_service_client::SandboxServiceClient, MaterializeRequest};
+#[cfg(unix)]
 use libatomic::daemon::services_sandbox::SandboxImpl;
+#[cfg(unix)]
 use libatomic::daemon::state::DaemonState;
+#[cfg(unix)]
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
+#[cfg(unix)]
 use tonic::transport::{Endpoint, Uri};
+#[cfg(unix)]
 use tower::service_fn;
 
+#[cfg(unix)]
 const CASES: &[&str] = &[
     "atomic_rpc_full",
     "atomic_rpc_partial",
@@ -59,8 +77,10 @@ const CASES: &[&str] = &[
 ];
 
 /// The partial subtree every partial case fetches: `files/east/`.
+#[cfg(unix)]
 const PARTIAL_PREFIX: &str = "files/east";
 
+#[cfg(unix)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Config {
     output: PathBuf,
@@ -75,6 +95,7 @@ struct Config {
     span: bool,
 }
 
+#[cfg(unix)]
 impl Config {
     fn parse() -> Result<Self> {
         let mut config = Self {
@@ -158,21 +179,25 @@ impl Config {
 
 // ————————————————————————————— fixture —————————————————————————————
 
+#[cfg(unix)]
 fn generated_line(tree: &str, file: usize, line: usize) -> String {
     format!("{tree} file_{file:04} line_{line:06} value_00000000\n")
 }
 
+#[cfg(unix)]
 fn edited_line(line: usize, edit: usize) -> String {
     format!("east file_0000 line_{line:06} value_{edit:08}\n")
 }
 
 /// One tracked file's golden bytes.
+#[cfg(unix)]
 #[derive(Clone)]
 struct Golden {
     path: String,
     content: Vec<u8>,
 }
 
+#[cfg(unix)]
 fn build_golden(config: &Config) -> Vec<Golden> {
     let mut golden = Vec::new();
     for (tree, count) in [("east", config.files_east), ("west", config.files_west)] {
@@ -193,12 +218,14 @@ fn build_golden(config: &Config) -> Vec<Golden> {
     golden
 }
 
+#[cfg(unix)]
 fn east_paths(config: &Config) -> Vec<String> {
     (0..config.files_east)
         .map(|file| format!("files/east/file_{file:04}.txt"))
         .collect()
 }
 
+#[cfg(unix)]
 fn git(root: &Path, args: &[&str], tick: Option<usize>) -> Result<()> {
     let output = Command::new("git")
         .args(args)
@@ -228,6 +255,7 @@ fn git(root: &Path, args: &[&str], tick: Option<usize>) -> Result<()> {
 
 /// Build the atomic host repository and the Git bare repository with the
 /// same synthetic content. Returns the atomic golden and the bare path.
+#[cfg(unix)]
 fn prepare_fixtures(
     parent: &Path,
     config: &Config,
@@ -343,6 +371,7 @@ fn prepare_fixtures(
     Ok((directory, golden, bare))
 }
 
+#[cfg(unix)]
 fn record(repo: &atomic_repository::Repository, message: &str, tick: usize) -> Result<()> {
     use atomic_core::change::ChangeHeader;
     use atomic_repository::RecordOptions;
@@ -366,6 +395,7 @@ fn record(repo: &atomic_repository::Repository, message: &str, tick: usize) -> R
 /// Bind the production sandbox handlers on a private Unix socket. This is
 /// the `atomicd` shape minus the shell: one `DaemonState`, one registered
 /// repository, the generated tonic server.
+#[cfg(unix)]
 fn serve(
     state: Arc<DaemonState>,
     host_root: PathBuf,
@@ -401,6 +431,7 @@ fn serve(
 
 // ————————————————————————————— client —————————————————————————————
 
+#[cfg(unix)]
 async fn connect(socket: &Path) -> Result<SandboxServiceClient<tonic::transport::Channel>> {
     let socket = socket.to_path_buf();
     let channel = Endpoint::from_static("http://localhost")
@@ -418,6 +449,7 @@ async fn connect(socket: &Path) -> Result<SandboxServiceClient<tonic::transport:
 /// One cold sandbox materialize: fresh channel, `Materialize` RPC, write
 /// every streamed entry. Connect, request and stream run on one runtime —
 /// a tonic channel is bound to the runtime that created it.
+#[cfg(unix)]
 fn atomic_sandbox(
     socket: &Path,
     repository: libatomic::atomic::RepositoryRef,
@@ -495,6 +527,7 @@ fn atomic_sandbox(
 
 // ————————————————————————————— git cases —————————————————————————————
 
+#[cfg(unix)]
 fn git_clone_full(bare: &Path, sandbox: &Path) -> Result<BTreeMap<String, u128>> {
     let mut phases = BTreeMap::new();
     let started = Instant::now();
@@ -514,6 +547,7 @@ fn git_clone_full(bare: &Path, sandbox: &Path) -> Result<BTreeMap<String, u128>>
 
 // ————————————————————————————— verification —————————————————————————————
 
+#[cfg(unix)]
 fn file_mode(path: &Path) -> Result<u32> {
     use std::os::unix::fs::PermissionsExt;
     Ok(fs::metadata(path)?.permissions().mode() & 0o7777)
@@ -521,6 +555,7 @@ fn file_mode(path: &Path) -> Result<u32> {
 
 /// Full sandboxes hold every tracked file; partial sandboxes hold exactly
 /// the east subtree and nothing else from the west or the root.
+#[cfg(unix)]
 fn verify(sandbox: &Path, golden: &[Golden], partial: bool, east: &[String]) -> Result<()> {
     if partial {
         for path in east {
@@ -565,6 +600,7 @@ fn verify(sandbox: &Path, golden: &[Golden], partial: bool, east: &[String]) -> 
 
 // ————————————————————————————— harness —————————————————————————————
 
+#[cfg(unix)]
 #[derive(Debug, Serialize)]
 struct Sample {
     case: String,
@@ -576,6 +612,7 @@ struct Sample {
     output_bytes: usize,
 }
 
+#[cfg(unix)]
 fn run(config: Config) -> Result<()> {
     config.validate()?;
     let parent = config
@@ -716,11 +753,19 @@ fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+/// The benchmark drives the daemon over a Unix domain socket, so there is
+/// nothing to run elsewhere; the target still has to build on every platform.
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("agent_sandbox_bench requires a Unix platform");
+}
+
+#[cfg(unix)]
 fn main() -> Result<()> {
     run(Config::parse()?)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

@@ -343,7 +343,7 @@ fn memory_new_without_json_preserves_the_human_summary() {
     assert_eq!(
         output,
         format!(
-            "Created memory: {id}\n  file: .vault/memory/{id}.md\n  kind: context\n  status: active\n"
+            "Created memory: {id}\n  file: .vault/memory/{id}.md\n  kind: context\n  status: active\n\n  atomic memory validate {id}\n  atomic memory attest {id}\n"
         )
     );
 }
