@@ -867,6 +867,7 @@ impl SpanIncrementalGitObservation {
         }
         let branch = head
             .shorthand()
+            .ok()
             .ok_or_else(|| CliError::GitError {
                 message: "Git branch name is not representable".into(),
             })?
@@ -923,7 +924,7 @@ impl SpanIncrementalGitObservation {
                 message: format!("cannot reobserve Git index: {error}"),
             })?;
         if !after_head.is_branch()
-            || after_head.shorthand() != Some(branch.as_str())
+            || after_head.shorthand().ok() != Some(branch.as_str())
             || after_head.target() != Some(tip)
             || after_index != index
             || git.path().join("index.lock").exists()
