@@ -811,6 +811,12 @@ impl GitIdentityConfig {
 /// independently of the signer (RFC §5.2), so an unknown signer can supply
 /// correct content but can never satisfy a publication gate.
 ///
+/// The publication gate evaluates a second self-root the same way: the
+/// host's default identity, which signs agent session attestations
+/// (`PublicationGateConfig::signer_trust` in `atomic-repository`). It is
+/// passed to [`GitTrustConfig::evaluate`] as a root, so revocation still
+/// wins over it.
+///
 /// Web-of-trust via delegation certificates was considered and **deferred**:
 /// it broadens who can satisfy gates without a repository-local decision, and
 /// enabling it later requires an explicit policy decision (delegation

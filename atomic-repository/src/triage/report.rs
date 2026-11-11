@@ -710,10 +710,7 @@ pub fn build_report(
             match repo.evaluate_publication_gate(
                 &candidate_hashes,
                 &crate::repository::provenance_gate::PublicationGateConfig::from_repo(repo)
-                    .unwrap_or(crate::repository::provenance_gate::PublicationGateConfig {
-                        trust: Default::default(),
-                        repository_identity: None,
-                    }),
+                    .unwrap_or_default(),
                 Some(&provider),
                 Some(&did_provider),
             ) {

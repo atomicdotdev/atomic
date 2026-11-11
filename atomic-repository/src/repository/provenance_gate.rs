@@ -20,8 +20,11 @@
 //!    provider: without the key (e.g. on a receiving remote) the attestation
 //!    is **unverifiable and fails closed** — it is never silently accepted.
 //! 5. **Trusted signer** — the attestation signer is evaluated against the
-//!    explicitly configured `[git.trust]` policy (`SignerTrust::Trusted`).
-//!    Revocation always wins; unknown signers are untrusted.
+//!    explicitly configured `[git.trust]` policy (`SignerTrust::Trusted`)
+//!    plus the two self-roots: the repository identity (`[author] identity`,
+//!    resolved to its DID) and this host's default identity — the key
+//!    session attestations are signed with. Revocation always wins; any
+//!    other signer is unknown and untrusted.
 //! 6. **No unexplained Git commit** — a change with
 //!    `ChangeOrigin::GitSynthesized` attributed to a managed session whose
 //!    ledger does not carry the corresponding incomplete marker is unexplained
@@ -41,8 +44,16 @@
 //! operation ancestry and leases are absent (F4/F5). A passing gate
 //! therefore proves *configured-policy enforcement over the available
 //! evidence*, nothing stronger. RFC §19 Q4 (open-source trust default) is
-//! UNRESOLVED: no default trust is granted or invented here; only
-//! explicitly configured signers ever satisfy the trust check.
+//! UNRESOLVED: no third-party default trust (web of trust, delegation
+//! chains, content inference) is granted or invented here; only the
+//! self-roots and explicitly configured signers satisfy the trust check.
+//!
+//! The host's default identity is a self-root for the same reason the
+//! repository identity is: an attestation that verifies under that key was
+//! signed with this machine's own secret key — the key
+//! `create_session_attestation` signs with when an agent session ends.
+//! Without it, every hook-recorded change was refused at every boundary
+//! with the user's own DID reported as "unknown" (atomicdotdev/atomic#330).
 //!
 //! # Content vs provenance separation (RFC §5.2/§12.8)
 //!
@@ -86,30 +97,98 @@ pub type MacKeyProvider<'a> = &'a dyn Fn(&str) -> Option<String>;
 pub type DidKeyProvider<'a> = &'a dyn Fn(&str) -> Option<[u8; 32]>;
 
 /// Configuration for one gate evaluation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PublicationGateConfig {
     /// Explicitly configured binding signer trust policy (`[git.trust]`).
     pub trust: GitTrustConfig,
     /// The repository's own signer DID (stated default trust root), if any.
     pub repository_identity: Option<String>,
+    /// DID of this host's default identity, if any: the key session
+    /// attestations are signed with, and therefore a self-root alongside
+    /// the repository identity.
+    pub local_identity: Option<String>,
 }
 
 impl PublicationGateConfig {
     /// Load the gate configuration from the repository's `.atomic/config.toml`.
+    ///
+    /// `[author] identity` may name the repository identity by DID, identity
+    /// name, or identity ID; names and IDs are resolved to the DID through
+    /// the repository-local identity store, then the host's default store.
+    /// The host's default identity is read from the default store without
+    /// creating it.
     pub fn from_repo(repo: &Repository) -> Result<Self, RepositoryError> {
         let config = atomic_config::RepoConfig::load(&repo.dot_dir().join("config.toml")).map_err(
             |error| RepositoryError::InvalidOperation {
                 message: error.to_string(),
             },
         )?;
+        let repository_identity = config
+            .author
+            .as_ref()
+            .and_then(|author| author.identity.as_deref())
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty())
+            .map(|reference| {
+                resolve_identity_did(repo, reference).unwrap_or_else(|| reference.to_string())
+            });
         Ok(Self {
-            repository_identity: config
-                .author
-                .as_ref()
-                .and_then(|author| author.identity.clone()),
+            repository_identity,
+            local_identity: local_default_identity_did(),
             trust: config.git.trust,
         })
     }
+
+    /// Evaluate one attestation signer against the configured policy and
+    /// both self-roots. Revocation wins over either root.
+    pub fn signer_trust(&self, signer: &str) -> SignerTrust {
+        match self
+            .trust
+            .evaluate(signer, self.repository_identity.as_deref())
+        {
+            SignerTrust::Unknown => self.trust.evaluate(signer, self.local_identity.as_deref()),
+            decided => decided,
+        }
+    }
+}
+
+/// Resolve an identity reference (DID, identity name, or identity ID) to
+/// its `did:atomic` DID through the repository-local store, then the host's
+/// default store. `None` when no store knows the reference.
+fn resolve_identity_did(repo: &Repository, reference: &str) -> Option<String> {
+    if reference.starts_with("did:") {
+        return Some(reference.to_string());
+    }
+    let lookup = |store: atomic_identity::IdentityStore| {
+        store
+            .load_by_name(reference)
+            .ok()
+            .or_else(|| {
+                atomic_identity::IdentityId::from_base32(reference)
+                    .ok()
+                    .and_then(|id| store.load(&id).ok())
+            })
+            .map(|identity| atomic_canonical::did::did_for_public_key(&identity.public_key))
+    };
+    atomic_identity::IdentityStore::open_existing(&repo.dot_dir().join("identities"))
+        .ok()
+        .and_then(lookup)
+        .or_else(|| {
+            atomic_identity::IdentityStore::open_default_existing()
+                .ok()
+                .and_then(lookup)
+        })
+}
+
+/// The DID of the host's default identity — the identity
+/// `create_session_attestation` signs session attestations with. Read-only:
+/// a missing store yields `None` and is never created.
+fn local_default_identity_did() -> Option<String> {
+    let store = atomic_identity::IdentityStore::open_default_existing().ok()?;
+    let identity = store.get_default().ok()??;
+    Some(atomic_canonical::did::did_for_public_key(
+        &identity.public_key,
+    ))
 }
 
 /// A single reason the gate refused one change.
@@ -131,8 +210,14 @@ pub enum GateBlocker {
         unbound_commits: Vec<String>,
         paths: Vec<String>,
     },
-    /// No same-session attestation covers this change.
-    MissingAttestation { change: String, session: String },
+    /// No same-session attestation covers this change. `session_active` is
+    /// set while the session ledger still reports the session as active:
+    /// session attestations are only written when the session ends.
+    MissingAttestation {
+        change: String,
+        session: String,
+        session_active: bool,
+    },
     /// A same-session attestation exists but its signature does not verify.
     AttestationNotVerifying {
         change: String,
@@ -235,11 +320,24 @@ impl std::fmt::Display for GateBlocker {
                 }
                 Ok(())
             }
-            Self::MissingAttestation { change, session } => {
+            Self::MissingAttestation {
+                change,
+                session,
+                session_active,
+            } => {
                 write!(
                     f,
                     "change {change}: no same-session attestation for session {session}"
-                )
+                )?;
+                if *session_active {
+                    write!(
+                        f,
+                        "; the session is still active and its attestation is written when \
+                         the session ends (the agent's SessionEnd hook): end the agent session, \
+                         then retry"
+                    )?;
+                }
+                Ok(())
             }
             Self::AttestationNotVerifying {
                 change,
@@ -265,11 +363,37 @@ impl std::fmt::Display for GateBlocker {
                 attestation,
                 signer,
                 verdict,
-            } => write!(
-                f,
-                "change {change}: attestation {attestation} (session {session}) signer '{signer}' \
-                 is {verdict} under the configured trust policy and cannot satisfy a publication gate"
-            ),
+            } => {
+                write!(
+                    f,
+                    "change {change}: attestation {attestation} (session {session}) signer \
+                     '{signer}' is {verdict} under the configured trust policy and cannot satisfy \
+                     a publication gate"
+                )?;
+                if *verdict != trust_label(SignerTrust::Unknown) {
+                    // Revoked: deliberately not configurable from here.
+                } else if signer.starts_with("session-mac:") {
+                    // MAC-signed evidence is what a session produces when no
+                    // default identity exists to sign it; allowlisting a
+                    // per-session MAC is not the remedy.
+                    write!(
+                        f,
+                        "; the attestation was signed with the session MAC because no default \
+                         identity was available when the session ended — create one with \
+                         `atomic identity new <name> --set-default` so future sessions are \
+                         signed by it"
+                    )?;
+                } else {
+                    write!(
+                        f,
+                        "; trusted signers are the repository identity ([author] identity), this \
+                         host's default identity, and the DIDs listed under [git.trust] signers \
+                         in .atomic/config.toml — to trust this signer, add \
+                         `signers = [\"{signer}\"]` to the [git.trust] section"
+                    )?;
+                }
+                Ok(())
+            }
             Self::UnexplainedGitCommit { change, session } => write!(
                 f,
                 "change {change}: Git-synthesized change attributed to session {session} without \
@@ -321,8 +445,9 @@ fn default_limitations() -> Vec<String> {
         "full boundary/manifest/ref/operation ancestry and repair leases are not yet enforced \
          (CB-12A review F4/F5)"
             .to_string(),
-        "RFC section 19 Q4 (open-source trust default) is unresolved: only explicitly configured \
-         signers satisfy the trust check; no default trust is granted"
+        "RFC section 19 Q4 (open-source trust default) is unresolved: only the repository \
+         identity, this host's default identity, and explicitly configured [git.trust] signers \
+         satisfy the trust check; no third-party default trust is granted"
             .to_string(),
         "this verdict enforces configured policy over available evidence; content correctness is \
          verified independently of signatures"
@@ -333,7 +458,10 @@ fn default_limitations() -> Vec<String> {
 /// Cached per-session ledger status.
 enum LedgerStatus {
     Missing,
-    Ok,
+    /// The session is still running: attestations arrive at session end.
+    Active,
+    /// The session ended normally.
+    Ended,
     Incomplete {
         reason: String,
         unbound_commits: Vec<String>,
@@ -599,7 +727,7 @@ impl Repository {
                         });
                         false
                     }
-                    LedgerStatus::Ok => false,
+                    LedgerStatus::Active | LedgerStatus::Ended => false,
                     LedgerStatus::Incomplete {
                         reason,
                         unbound_commits,
@@ -634,8 +762,12 @@ impl Repository {
                                 });
                                 true
                             }
-                            _ => {
-                                vacant.insert(LedgerStatus::Ok);
+                            SessionStatus::Active => {
+                                vacant.insert(LedgerStatus::Active);
+                                false
+                            }
+                            SessionStatus::Ended => {
+                                vacant.insert(LedgerStatus::Ended);
                                 false
                             }
                         },
@@ -659,6 +791,7 @@ impl Repository {
                     status
                 }
             };
+            let session_active = matches!(ledger_cache.get(&session), Some(LedgerStatus::Active));
 
             // Unexplained Git commit: synthesized origin attributed to a
             // managed session whose ledger never recorded the incompleteness.
@@ -778,6 +911,7 @@ impl Repository {
                     verdict.blocks.push(GateBlocker::MissingAttestation {
                         change: change_b32.clone(),
                         session: session.clone(),
+                        session_active,
                     });
                 }
                 Some(AttestationCheck {
@@ -802,9 +936,7 @@ impl Repository {
                     } else {
                         // Signature authenticates; now the trust policy.
                         let signer = signer.unwrap_or_default();
-                        let trust = config
-                            .trust
-                            .evaluate(&signer, config.repository_identity.as_deref());
+                        let trust = config.signer_trust(&signer);
                         if trust != SignerTrust::Trusted {
                             verdict
                                 .blocks
@@ -907,6 +1039,7 @@ mod tests {
                 revoked: Vec::new(),
             },
             repository_identity: None,
+            local_identity: None,
         }
     }
 
@@ -1314,6 +1447,7 @@ mod tests {
                 &PublicationGateConfig {
                     trust: GitTrustConfig::default(),
                     repository_identity: None,
+                    local_identity: None,
                 },
                 Some(&no_provider),
                 Some(&did_provider),
@@ -1438,6 +1572,7 @@ mod tests {
                 &PublicationGateConfig {
                     trust: GitTrustConfig::default(),
                     repository_identity: None,
+                    local_identity: None,
                 },
                 Some(&provider),
                 None,
@@ -1452,6 +1587,7 @@ mod tests {
                 revoked: vec!["session-mac:sess-gate".to_string()],
             },
             repository_identity: None,
+            local_identity: None,
         };
         let verdict = repo
             .evaluate_publication_gate(&[hash], &revoked_config, Some(&provider), None)
@@ -1681,6 +1817,237 @@ mod tests {
             None => std::env::remove_var("ATOMIC_CONFIG_DIR"),
         }
     }
+
+    // ---------------------------------------------------------------------
+    // atomicdotdev/atomic#330: the host's default identity — the key
+    // session attestations are signed with — is a self-root; refusals say
+    // how to recover.
+    // ---------------------------------------------------------------------
+
+    /// A gate config that trusts nothing but the given host identity.
+    fn config_with_local_identity(did: &str) -> PublicationGateConfig {
+        PublicationGateConfig {
+            local_identity: Some(did.to_string()),
+            ..PublicationGateConfig::default()
+        }
+    }
+
+    /// A DID-signed managed change, fully evidenced except for trust.
+    fn did_attested_change(repo: &Repository, keypair: &atomic_identity::KeyPair) -> Hash {
+        let change = managed_change("did signed by the host identity");
+        let hash = repo.save_change(&change).expect("save");
+        install_provenance_root_and_ledger(repo, &hash);
+        install_did_attestation(repo, &hash, keypair);
+        hash
+    }
+
+    #[test]
+    fn host_default_identity_is_a_trust_root() {
+        let (_dir, repo) = create_temp_repo();
+        let (keypair, did) = agent_keypair();
+        let hash = did_attested_change(&repo, &keypair);
+
+        let public = *keypair.public.as_bytes();
+        let did_provider = move |_signer: &str| Some(public);
+        let verdict = repo
+            .evaluate_publication_gate(
+                &[hash],
+                &config_with_local_identity(&did),
+                Some(&no_provider),
+                Some(&did_provider),
+            )
+            .expect("gate runs");
+        assert!(
+            verdict.allowed(),
+            "an attestation signed by this host's default identity must pass: {}",
+            verdict.refusal_report()
+        );
+    }
+
+    #[test]
+    fn revoked_host_default_identity_cannot_satisfy_the_gate() {
+        let (_dir, repo) = create_temp_repo();
+        let (keypair, did) = agent_keypair();
+        let hash = did_attested_change(&repo, &keypair);
+
+        let public = *keypair.public.as_bytes();
+        let did_provider = move |_signer: &str| Some(public);
+        let config = PublicationGateConfig {
+            trust: GitTrustConfig {
+                signers: Vec::new(),
+                revoked: vec![did.clone()],
+            },
+            ..config_with_local_identity(&did)
+        };
+        assert_eq!(config.signer_trust(&did), SignerTrust::Revoked);
+        let verdict = repo
+            .evaluate_publication_gate(&[hash], &config, Some(&no_provider), Some(&did_provider))
+            .expect("gate runs");
+        assert_eq!(blocker_kinds(&verdict), vec!["signer"], "{verdict:?}");
+        let report = verdict.refusal_report();
+        assert!(report.contains("is revoked"), "{report}");
+        assert!(
+            !report.contains("to trust this signer"),
+            "a revoked signer must not be advertised as configurable: {report}"
+        );
+    }
+
+    #[test]
+    fn host_default_identity_does_not_vouch_for_other_signers() {
+        let (_dir, repo) = create_temp_repo();
+        let (keypair, signer) = agent_keypair();
+        let (_host, host_did) = agent_keypair();
+        let hash = did_attested_change(&repo, &keypair);
+
+        let public = *keypair.public.as_bytes();
+        let did_provider = move |_signer: &str| Some(public);
+        let verdict = repo
+            .evaluate_publication_gate(
+                &[hash],
+                &config_with_local_identity(&host_did),
+                Some(&no_provider),
+                Some(&did_provider),
+            )
+            .expect("gate runs");
+        assert_eq!(blocker_kinds(&verdict), vec!["signer"], "{verdict:?}");
+        let report = verdict.refusal_report();
+        assert!(
+            report.contains(&format!("signer '{signer}' is unknown (not configured)")),
+            "{report}"
+        );
+        assert!(
+            report.contains("[git.trust]")
+                && report.contains(".atomic/config.toml")
+                && report.contains(&format!("signers = [\"{signer}\"]")),
+            "an unknown signer's refusal must say how to trust it: {report}"
+        );
+    }
+
+    #[test]
+    fn session_mac_signer_refusal_points_at_creating_a_default_identity() {
+        let (_dir, repo) = create_temp_repo();
+        let change = managed_change("mac signed without an identity");
+        let hash = repo.save_change(&change).expect("save");
+        install_provenance_root_and_ledger(&repo, &hash);
+        install_attestation(&repo, &hash, true);
+
+        let verdict = repo
+            .evaluate_publication_gate(
+                &[hash],
+                &PublicationGateConfig::default(),
+                Some(&provider),
+                None,
+            )
+            .expect("gate runs");
+        assert_eq!(blocker_kinds(&verdict), vec!["signer"], "{verdict:?}");
+        let report = verdict.refusal_report();
+        assert!(
+            report.contains("signed with the session MAC")
+                && report.contains("atomic identity new"),
+            "{report}"
+        );
+        assert!(
+            !report.contains("signers = ["),
+            "a per-session MAC must not be suggested for the allowlist: {report}"
+        );
+    }
+
+    #[test]
+    fn active_session_without_attestation_says_it_is_written_at_session_end() {
+        let (_dir, repo) = create_temp_repo();
+        let change = managed_change("attested only at session end");
+        let hash = repo.save_change(&change).expect("save");
+        install_provenance_root_and_ledger(&repo, &hash);
+        repo.upsert_session_lifecycle(SESSION, None, None, None)
+            .expect("session marked active");
+
+        let verdict = repo
+            .evaluate_publication_gate(
+                &[hash],
+                &config_with_signer("session-mac:sess-gate"),
+                Some(&provider),
+                None,
+            )
+            .expect("gate runs");
+        assert_eq!(blocker_kinds(&verdict), vec!["attestation"], "{verdict:?}");
+        assert!(matches!(
+            &verdict.blocks[0],
+            GateBlocker::MissingAttestation {
+                session_active: true,
+                ..
+            }
+        ));
+        let report = verdict.refusal_report();
+        assert!(
+            report.contains("still active") && report.contains("session ends"),
+            "{report}"
+        );
+
+        // Once the session has ended, a missing attestation is a genuine
+        // evidence hole: no "end the session" advice.
+        repo.upsert_session_lifecycle(SESSION, None, None, Some(1))
+            .expect("session marked ended");
+        let verdict = repo
+            .evaluate_publication_gate(
+                &[hash],
+                &config_with_signer("session-mac:sess-gate"),
+                Some(&provider),
+                None,
+            )
+            .expect("gate runs");
+        assert_eq!(blocker_kinds(&verdict), vec!["attestation"], "{verdict:?}");
+        assert!(
+            !verdict.refusal_report().contains("still active"),
+            "{}",
+            verdict.refusal_report()
+        );
+    }
+
+    #[test]
+    fn from_repo_resolves_author_identity_names_to_dids() {
+        use atomic_identity::{Identity, IdentityStore, KeyPair};
+
+        let (_dir, repo) = create_temp_repo();
+        let keypair = KeyPair::generate();
+        let identity = Identity::new("repo-owner", &keypair);
+        let did = atomic_canonical::did::did_for_public_key(&keypair.public);
+        IdentityStore::open(&repo.dot_dir().join("identities"))
+            .expect("repo-local identity store opens")
+            .save(&identity)
+            .expect("identity saved into the repository");
+
+        let config_path = repo.dot_dir().join("config.toml");
+        let write_author = |reference: &str| {
+            std::fs::write(
+                &config_path,
+                format!("[author]\nname = \"Owner\"\nidentity = \"{reference}\"\n"),
+            )
+            .expect("write repo config");
+        };
+
+        // By name, as `atomic org set` writes it.
+        write_author("repo-owner");
+        let config = PublicationGateConfig::from_repo(&repo).expect("config loads");
+        assert_eq!(config.repository_identity.as_deref(), Some(did.as_str()));
+        assert_eq!(config.signer_trust(&did), SignerTrust::Trusted);
+
+        // By identity ID.
+        write_author(&identity.id.to_base32());
+        let config = PublicationGateConfig::from_repo(&repo).expect("config loads");
+        assert_eq!(config.repository_identity.as_deref(), Some(did.as_str()));
+
+        // A DID is used verbatim; an unresolvable reference is kept as-is
+        // (it simply matches no signer).
+        write_author(&did);
+        let config = PublicationGateConfig::from_repo(&repo).expect("config loads");
+        assert_eq!(config.repository_identity.as_deref(), Some(did.as_str()));
+        write_author("nobody-by-this-name");
+        let config = PublicationGateConfig::from_repo(&repo).expect("config loads");
+        assert_eq!(
+            config.repository_identity.as_deref(),
+            Some("nobody-by-this-name")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1735,6 +2102,7 @@ mod privacy_tests {
                 &PublicationGateConfig {
                     trust: GitTrustConfig::default(),
                     repository_identity: None,
+                    local_identity: None,
                 },
                 Some(&|_| Some("dd44dd44".to_string())),
                 None,
