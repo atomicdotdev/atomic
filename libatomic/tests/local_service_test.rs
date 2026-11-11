@@ -82,6 +82,11 @@ async fn rejects_invalid_requests_and_unknown_methods() {
     for method in [
         "/atomic.RepositoryMutationService/AddFiles",
         "/atomic.RepositoryMutationService/Record",
+        "/atomic.RepositoryMutationService/InsertChanges",
+        "/atomic.SyncService/PushChanges",
+        "/atomic.SyncService/PullChanges",
+        "/atomic.SyncService/ListRemotes",
+        "/atomic.SyncService/ManageRemotes",
         "/atomic.RepositoryQueryService/Log",
         "/atomic.RepositoryQueryService/GetChange",
         "/atomic.ViewService/ListViews",
@@ -89,6 +94,7 @@ async fn rejects_invalid_requests_and_unknown_methods() {
         "/atomic.ViewService/SwitchView",
         "/atomic.ViewService/DeleteView",
         "/atomic.KnowledgeService/QueryGraph",
+        "/atomic.KnowledgeService/GetWorkflowSnapshot",
     ] {
         let error = service.call(method, &[]).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument, "{method}");
@@ -943,4 +949,164 @@ async fn recorded_file_preview_returns_graph_bytes_and_view_without_restoring_or
         b"working\n"
     );
     assert!(!dir.path().join("deleted.txt").exists());
+}
+
+#[tokio::test]
+async fn native_remote_registry_persists_defaults_and_reports_domain_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Repository::init(dir.path()).unwrap());
+    let service = LocalService::new();
+    let reference = resolve(&service, dir.path()).await;
+    for (name, url, default) in [
+        ("origin", "https://example.com/origin", false),
+        ("upstream", "https://example.com/upstream", true),
+    ] {
+        let _: proto::ManageRemotesResponse = invoke(
+            &service,
+            "/atomic.SyncService/ManageRemotes",
+            &proto::ManageRemotesRequest {
+                repository: Some(reference.clone()),
+                action: proto::RemoteAction::Add as i32,
+                name: Some(name.into()),
+                url: Some(url.into()),
+                set_default: default,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    let reopened = LocalService::new();
+    let fresh = resolve(&reopened, dir.path()).await;
+    let listed: proto::ListRemotesResponse = invoke(
+        &reopened,
+        "/atomic.SyncService/ListRemotes",
+        &proto::ListRemotesRequest {
+            repository: Some(fresh.clone()),
+        },
+    )
+    .await;
+    assert_eq!(listed.remotes.len(), 2);
+    assert!(listed
+        .remotes
+        .iter()
+        .any(|r| r.name == "upstream" && r.default));
+    assert_eq!(
+        Repository::open_readonly(dir.path())
+            .unwrap()
+            .get_default_remote()
+            .unwrap()
+            .0,
+        "upstream"
+    );
+    for action in [proto::RemoteAction::Add, proto::RemoteAction::Remove] {
+        let request = proto::ManageRemotesRequest {
+            repository: Some(fresh.clone()),
+            action: action as i32,
+            name: Some(
+                if action == proto::RemoteAction::Add {
+                    "origin"
+                } else {
+                    "missing"
+                }
+                .into(),
+            ),
+            url: Some("https://example.com/duplicate".into()),
+            ..Default::default()
+        };
+        assert!(reopened
+            .call(
+                "/atomic.SyncService/ManageRemotes",
+                &request.encode_to_vec()
+            )
+            .await
+            .is_err());
+    }
+    for (method, bytes) in [
+        (
+            "/atomic.SyncService/PushChanges",
+            proto::PushChangesRequest {
+                repository: Some(reference.clone()),
+                remote_url: Some("https://evil.example".into()),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ),
+        (
+            "/atomic.SyncService/PullChanges",
+            proto::PullChangesRequest {
+                repository: Some(reference),
+                auth_headers: [("Authorization".into(), "secret".into())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ),
+    ] {
+        let error = service.call(method, &bytes).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("does not accept"));
+    }
+}
+
+#[tokio::test]
+async fn native_insert_from_view_preserves_source_scope_and_host_tree() {
+    use atomic_core::change::ChangeHeader;
+    use atomic_repository::record::RecordOptions;
+    let dir = tempfile::tempdir().unwrap();
+    let mut repo = Repository::init(dir.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let source = repo.current_view().to_string();
+    repo.create_shared_view("insert-target").unwrap();
+    let file = dir.path().join("dependent.txt");
+    std::fs::write(&file, b"first\n").unwrap();
+    repo.add(wc, "dependent.txt", Default::default()).unwrap();
+    let options = || {
+        RecordOptions::new()
+            .with_all(true)
+            .save_to_store(true)
+            .apply_after_record(true)
+    };
+    let first = *repo
+        .record(wc, ChangeHeader::new("dependency"), options())
+        .unwrap()
+        .hash();
+    std::fs::write(&file, b"second\n").unwrap();
+    let second = *repo
+        .record(wc, ChangeHeader::new("dependent"), options())
+        .unwrap()
+        .hash();
+    let before = repo.get_view_changes(Some(&source)).unwrap();
+    let source_scope = repo.get_view_info(&source).unwrap().scope;
+    let target_scope = repo.get_view_info("insert-target").unwrap().scope;
+    let host = std::fs::read(&file).unwrap();
+    drop(repo);
+    let service = LocalService::new();
+    let reference = resolve(&service, dir.path()).await;
+    let _: proto::InsertChangesResponse = invoke(
+        &service,
+        "/atomic.RepositoryMutationService/InsertChanges",
+        &proto::InsertChangesRequest {
+            repository: Some(reference),
+            target_view: Some("insert-target".into()),
+            source: Some(proto::insert_changes_request::Source::FromView(
+                source.clone(),
+            )),
+            apply_dependencies: Some(true),
+            ..Default::default()
+        },
+    )
+    .await;
+    let repo = Repository::open_readonly(dir.path()).unwrap();
+    let target = repo.get_view_changes(Some("insert-target")).unwrap();
+    assert!(target.iter().any(|(_, hash)| *hash == first));
+    assert!(target.iter().any(|(_, hash)| *hash == second));
+    assert_eq!(repo.get_view_changes(Some(&source)).unwrap(), before);
+    assert_eq!(repo.get_view_info(&source).unwrap().scope, source_scope);
+    assert_eq!(
+        repo.get_view_info("insert-target").unwrap().scope,
+        target_scope
+    );
+    assert_eq!(std::fs::read(file).unwrap(), host);
+    assert_eq!(repo.current_view(), source);
 }

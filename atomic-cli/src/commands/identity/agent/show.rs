@@ -4,10 +4,10 @@ use clap::Parser;
 
 use atomic_identity::IdentityStore;
 
-use crate::commands::delegation::load_for_delegate;
 use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{print_hint, print_warning};
+use atomic_remote::auth::delegation::load_for_delegate;
 
 use super::humanize_remaining;
 

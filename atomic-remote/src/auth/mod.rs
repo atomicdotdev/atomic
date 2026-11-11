@@ -1,25 +1,27 @@
-//! Shared authentication helpers for remote commands.
+//! Shared local authentication for repository remote operations.
 //!
 //! Resolves the caller's identity from the remote URL (or an explicit
 //! override), mints a short-lived self-signed EdDSA JWT for that identity,
 //! and attaches it as the `Authorization: Bearer` header.
 //!
 //! A raw public key is NOT a credential — the JWT (signed with the identity's
-//! private key) proves possession of that key. See [`crate::commands::token`]
+//! private key) proves possession of that key. See [`token`]
 //! for the minting mechanics.
 //!
 //! Identity resolution order:
 //! 1. Explicit override — `identity_override` from the `--identity` flag.
-//! 2. URL userinfo — `http://bob@alice.localhost:8080/...` → identity "bob"
-//! 3. Configured server binding — a `[servers.*]`/`[server]` profile whose host
-//!    is the longest suffix of the remote host supplies its `identity`. Identity
+//! 2. `ATOMIC_AGENT_IDENTITY`, when nonempty after trimming whitespace.
+//! 3. URL userinfo — `http://bob@alice.localhost:8080/...` → identity "bob"
+//! 4. Configured server binding — a `[servers.*]`/`[server]` profile whose host
+//!    is the longest suffix of the remote host supplies its `agent_identity`
+//!    when configured, otherwise its human `identity`. Identity
 //!    follows the server you registered with (the binding `atomic identity
 //!    register` writes), so any tenant under it resolves without `--identity`.
 //!    When two profiles' hosts match equally well, the **active** profile
 //!    (per `default_server`, else the legacy `[server]` block) wins.
-//! 4. Subdomain — `http://alice.localhost:8080/...` → identity "alice" (legacy
+//! 5. Subdomain — `http://alice.localhost:8080/...` → identity "alice" (legacy
 //!    last resort).
-//! 5. Default identity — if none of the above resolves to an identity that
+//! 6. Default identity — if none of the above resolves to an identity that
 //!    exists locally, the store's default identity is used. This makes the
 //!    common single-identity case "just work": pushing to
 //!    `https://aaron.atomic.storage/...` with a default identity named
@@ -27,11 +29,26 @@
 //!    The default fallback does NOT apply when `--identity` explicitly names an
 //!    identity that doesn't exist (that's a clear error, not a substitution).
 
+use crate::HttpRemoteConfig;
 use atomic_identity::{Identity, IdentityStore};
-use atomic_remote::HttpRemoteConfig;
 use url::Url;
 
-use crate::error::{CliError, CliResult};
+/// Shared authentication failures, preserving credential and delegation remedies.
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error("Internal error: {0}")]
+    Internal(#[from] anyhow::Error),
+    #[error("Authentication failed for remote '{remote}'")]
+    AuthenticationFailed { remote: String },
+    #[error("Delegation error: {message}")]
+    DelegationError { message: String },
+}
+
+/// Result of resolving or producing local remote credentials.
+pub type AuthResult<T> = Result<T, AuthError>;
+
+pub mod delegation;
+pub mod token;
 
 /// Environment override naming the agent identity to authenticate as.
 ///
@@ -62,14 +79,15 @@ struct ServerBinding {
 ///
 /// Priority:
 /// 1. An explicit override (the `--identity` flag).
-/// 2. URL userinfo (`http://bob@host/...`).
-/// 3. A configured server profile whose host is the longest dot-boundary
+/// 2. A nonempty `ATOMIC_AGENT_IDENTITY` environment override.
+/// 3. URL userinfo (`http://bob@host/...`).
+/// 4. A configured server profile whose host is the longest dot-boundary
 ///    suffix of the remote host (`[servers.prod] url=... identity=...`). This is
 ///    the binding that makes pushes to *any* tenant under a server you've
 ///    registered with ("just works" without `--identity`): identity follows the
 ///    server, not the tenant subdomain. Equal-length matches are won by the
-///    active profile.
-/// 4. The remote host's leading subdomain label (`http://bob.host/...`) — the
+///    active profile. Its agent binding is preferred over its human binding.
+/// 5. The remote host's leading subdomain label (`http://bob.host/...`) — the
 ///    legacy heuristic, kept only as a last resort.
 ///
 /// Returns `None` only when there is no override and nothing inferable from the
@@ -404,7 +422,7 @@ pub async fn attach_identity(
     };
 
     let identity_name = identity.name.clone();
-    match crate::commands::token::get_token(&server, &identity).await {
+    match crate::auth::token::get_token(&server, &identity).await {
         Ok(jwt) => {
             log::debug!("Attaching Bearer JWT for identity '{}'", identity_name);
             let config = config.with_header("Authorization", format!("Bearer {}", jwt));
@@ -442,7 +460,7 @@ fn delegation_header(store: &IdentityStore, identity: &Identity, server: &str) -
         return None;
     }
 
-    match crate::commands::delegation::active_for(store, identity, Some(server)) {
+    match crate::auth::delegation::active_for(store, identity, Some(server)) {
         Ok(resolved) => Some(atomic_canonical::delegation::encode_for_transport(
             &resolved.document,
         )),
@@ -458,9 +476,9 @@ fn delegation_header(store: &IdentityStore, identity: &Identity, server: &str) -
 
 /// What went wrong (if anything) when checking for usable push credentials.
 ///
-/// Authentication for atomic-storage is a *self-signed* EdDSA JWT: the CLI
+/// Authentication for atomic-storage is a *self-signed* EdDSA JWT: the client
 /// mints a fresh, short-lived token per request by signing with the identity's
-/// Ed25519 private key (see [`crate::commands::token`]). There is no stored
+/// Ed25519 private key (see [`token`]). There is no stored
 /// token to inspect for expiry — a token is only ever created at the moment of
 /// use and is valid for its full TTL. So "having usable credentials" reduces to
 /// three local conditions, each a distinct failure with its own remedy:
@@ -535,9 +553,9 @@ const REMEDY_SUFFIX: &str =
 /// "just work" without `--identity`. The fallback does **not** apply when
 /// `--identity` explicitly names an identity that doesn't exist — that is a
 /// clear error, not a silent substitution.
-pub fn check_push_credentials(remote_url: &str, identity_override: Option<&str>) -> CliResult<()> {
+pub fn check_push_credentials(remote_url: &str, identity_override: Option<&str>) -> AuthResult<()> {
     let store = IdentityStore::open_default()
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to open identity store: {e}")))?;
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("Failed to open identity store: {e}")))?;
 
     let inferred = resolve_identity_name_with_override(remote_url, identity_override);
     let explicit = identity_override.is_some();
@@ -560,7 +578,7 @@ pub fn check_push_credentials(remote_url: &str, identity_override: Option<&str>)
     );
 
     match issue {
-        Some(issue) => Err(CliError::AuthenticationFailed {
+        Some(issue) => Err(AuthError::AuthenticationFailed {
             remote: format!("{remote_url}: {}", issue.message()),
         }),
         None => Ok(()),
@@ -634,15 +652,6 @@ fn apex_server_url(remote_url: &str) -> Option<String> {
     }
 }
 
-/// Extract the identity name from a remote URL alone (no server config).
-///
-/// Tries URL userinfo first (`bob@host`), then the subdomain (`bob.host`).
-/// This is the config-free path; [`resolve_identity_name_with_override`] layers
-/// the `--identity` override and configured server bindings on top.
-fn resolve_identity_name(remote_url: &str) -> Option<String> {
-    resolve_identity_from_url(remote_url, &[])
-}
-
 /// Extract the first subdomain label from a host string.
 ///
 /// `"alice.localhost"` → `Some("alice")`
@@ -665,6 +674,10 @@ fn extract_subdomain(host: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Config-free URL identity resolution for these tests.
+    fn resolve_identity_name(remote_url: &str) -> Option<String> {
+        resolve_identity_from_url(remote_url, &[])
+    }
 
     #[test]
     fn apex_strips_subdomain_with_port() {

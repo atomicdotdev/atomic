@@ -5270,7 +5270,7 @@ fn sync_auth_headers(remote_url: &str, identity: Option<&str>) -> HashMap<String
         .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to create async runtime: {}", e)))
         .ok();
     let Some(rt) = rt else { return HashMap::new() };
-    let config = rt.block_on(crate::commands::auth::attach_identity(
+    let config = rt.block_on(atomic_remote::auth::attach_identity(
         atomic_remote::HttpRemoteConfig::new(),
         remote_url,
         identity,
@@ -5377,7 +5377,7 @@ pub fn push(args: &super::push::Push) -> CliResult<bool> {
         style_view(&remote_name),
         hint(&remote_url)
     );
-    crate::commands::auth::check_push_credentials(&remote_url, args.identity.as_deref())?;
+    atomic_remote::auth::check_push_credentials(&remote_url, args.identity.as_deref())?;
     let auth_headers = sync_auth_headers(&remote_url, args.identity.as_deref());
     stage_line("Connected");
 
@@ -5396,6 +5396,7 @@ pub fn push(args: &super::push::Push) -> CliResult<bool> {
         timeout_secs: args.timeout,
         auth_headers: auth_headers.clone(),
         remote_url: Some(remote_url.clone()),
+        identity: args.identity.clone(),
     };
     let response = match session.push_changes(request) {
         Ok(response) => response,

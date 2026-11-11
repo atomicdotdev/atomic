@@ -110,7 +110,6 @@ pub mod view;
 pub mod agent;
 
 // Phase 3: Remote Commands
-pub mod auth;
 pub mod blame;
 pub mod clone;
 pub mod pull;
@@ -130,9 +129,7 @@ pub mod query;
 
 // Storage management commands (always available)
 pub mod client;
-pub mod delegation;
 pub mod project;
-pub mod token;
 pub mod workspace;
 pub(crate) mod workspace_txn;
 

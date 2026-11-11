@@ -425,6 +425,20 @@ pub enum CliError {
     Repository(#[from] atomic_repository::RepositoryError),
 }
 
+impl From<atomic_remote::auth::AuthError> for CliError {
+    fn from(error: atomic_remote::auth::AuthError) -> Self {
+        match error {
+            atomic_remote::auth::AuthError::Internal(error) => Self::Internal(error),
+            atomic_remote::auth::AuthError::AuthenticationFailed { remote } => {
+                Self::AuthenticationFailed { remote }
+            }
+            atomic_remote::auth::AuthError::DelegationError { message } => {
+                Self::DelegationError { message }
+            }
+        }
+    }
+}
+
 impl CliError {
     // Constructor Helpers
 
@@ -744,6 +758,30 @@ impl CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_auth_errors_preserve_cli_categories_and_context() {
+        use atomic_remote::auth::AuthError;
+
+        let error = CliError::from(AuthError::Internal(anyhow::anyhow!("key store failure")));
+        assert!(
+            matches!(&error, CliError::Internal(source) if source.to_string() == "key store failure")
+        );
+
+        let error = CliError::from(AuthError::AuthenticationFailed {
+            remote: "https://example.com: missing signing key".into(),
+        });
+        assert!(
+            matches!(&error, CliError::AuthenticationFailed { remote } if remote == "https://example.com: missing signing key")
+        );
+
+        let error = CliError::from(AuthError::DelegationError {
+            message: "certificate expired; renew it".into(),
+        });
+        assert!(
+            matches!(&error, CliError::DelegationError { message } if message == "certificate expired; renew it")
+        );
+    }
 
     // -------------------------------------------------------------------------
     // Error Display Tests
