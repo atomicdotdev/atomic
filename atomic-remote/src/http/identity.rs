@@ -19,7 +19,7 @@
 
 use reqwest::header::CONTENT_TYPE;
 use reqwest::StatusCode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::HttpRemote;
@@ -36,14 +36,81 @@ pub enum IdentityFetch {
     Unsupported,
 }
 
+/// The server's structured error body on a `409` bind rejection. Both fields
+/// are optional and the body itself may be empty or non-JSON, in which case
+/// the caller simply gets no reason to quote.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BindServerError {
+    /// The server's machine-readable reason (e.g. `IDENTITY_CONFLICT`).
+    #[serde(default)]
+    pub code: Option<String>,
+    /// The server's human-readable reason, quoted verbatim to the operator.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+impl BindServerError {
+    /// Parse a `409` response body; `None` when it is not a usable JSON
+    /// object. The flat `{"code", "message"}` spelling is expected, and the
+    /// nested `{"error": {…}}` spelling is accepted so either server shape
+    /// surfaces its reason.
+    fn from_body(body: &str) -> Option<Self> {
+        let parsed: Value = serde_json::from_str(body).ok()?;
+        let (code, message) = match parsed.get("error") {
+            Some(nested) => (
+                nested.get("code").and_then(|v| v.as_str()),
+                nested.get("message").and_then(|v| v.as_str()),
+            ),
+            None => (
+                parsed.get("code").and_then(|v| v.as_str()),
+                parsed.get("message").and_then(|v| v.as_str()),
+            ),
+        };
+        Some(Self {
+            code: code.map(str::to_owned),
+            message: message.map(str::to_owned),
+        })
+    }
+}
+
+/// What the follow-up read of the remote binding resolved to after a `409`,
+/// so callers can tell a genuine divergence from a server that disagrees with
+/// its own rejection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictRemote {
+    /// The follow-up GET resolved to a bound identity document.
+    Bound(Value),
+    /// The follow-up GET succeeded but the server reports the project unbound
+    /// (server disagrees with its own 409).
+    Unbound,
+    /// The follow-up GET failed or the document was unusable.
+    Unknown,
+}
+
+impl ConflictRemote {
+    fn from_fetch(fetched: RemoteResult<IdentityFetch>) -> Self {
+        match fetched {
+            Ok(IdentityFetch::Bound(identity)) => Self::Bound(identity),
+            Ok(IdentityFetch::Unbound) => Self::Unbound,
+            // A pre-transport ping or any transport trouble leaves the
+            // binding unreadable.
+            Ok(IdentityFetch::Unsupported) | Err(_) => Self::Unknown,
+        }
+    }
+}
+
 /// The result of offering the local identity to a remote.
 #[derive(Debug, Clone)]
 pub enum BindOutcome {
     /// Bound now, or already identically bound.
     Bound,
-    /// A *different* identity is already bound; carries the remote's document
-    /// when it could be read.
-    Conflict { remote: Option<Value> },
+    /// A *different* identity is already bound; carries what the follow-up
+    /// read of the remote binding resolved to and the server's error body
+    /// when it sent one.
+    Conflict {
+        remote: ConflictRemote,
+        server: Option<BindServerError>,
+    },
     /// The remote predates the identity transport; nothing to do.
     Unsupported,
 }
@@ -114,13 +181,13 @@ impl HttpRemote {
         match response.status() {
             StatusCode::OK | StatusCode::CREATED => Ok(BindOutcome::Bound),
             StatusCode::CONFLICT => {
-                // Read the binding the server already holds so the caller can
-                // name the divergence; failure to read it is not fatal here.
-                let remote = match self.fetch_project_identity().await {
-                    Ok(IdentityFetch::Bound(identity)) => Some(identity),
-                    _ => None,
-                };
-                Ok(BindOutcome::Conflict { remote })
+                // Read the rejection body (the server's reason) and the
+                // binding the server already holds so the caller can name the
+                // divergence; neither read is fatal here.
+                let body = response.text().await.unwrap_or_default();
+                let server = BindServerError::from_body(&body);
+                let remote = ConflictRemote::from_fetch(self.fetch_project_identity().await);
+                Ok(BindOutcome::Conflict { remote, server })
             }
             StatusCode::NOT_FOUND
             | StatusCode::METHOD_NOT_ALLOWED
