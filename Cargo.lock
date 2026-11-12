@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agent"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -242,7 +242,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-canonical"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "atomic-identity",
  "blake3",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-cli"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "atomic-agent",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-client"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "atomic-repository",
  "hyper-util",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-config"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -348,7 +348,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-core"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "bitflags 2.13.2",
@@ -382,7 +382,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-identity"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "atomic-config",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-objects"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-remote"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-repository"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "atomic-canonical",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-semantic"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -507,7 +507,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-shacl"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "atomic-canonical",
  "atomic-core",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-teams"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "atomic-remote",
  "chrono",
@@ -547,7 +547,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "atomic-wasm"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "atomic-canonical",
  "atomic-identity",
@@ -2266,7 +2266,7 @@ checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "libatomic"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "atomic-agent",
