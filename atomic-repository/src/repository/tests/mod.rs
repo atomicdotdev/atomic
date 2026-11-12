@@ -57,6 +57,7 @@ mod tag_projection_tests;
 mod tracking_tests;
 mod tree_projection_tests;
 mod verify_tests;
+mod view_entries_span_context_tests;
 mod view_tests;
 mod working_copy_identity_tests;
 mod working_copy_reconcile_tests;

@@ -1092,8 +1092,13 @@ where
 /// transaction and visibility closure. `retrieve_span_if_present` builds a
 /// fresh context per call — which decodes and verifies the whole visible
 /// closure — so a per-file caller on a large view pays the closure decode
-/// thousands of times; holders of this struct pay it once. Safe to share
-/// across rayon workers: first use builds, the rest reuse.
+/// thousands of times; holders of this struct pay it once.
+///
+/// Building the context runs rayon jobs, so a caller never waits for another
+/// caller's build: the worker building it may itself be waiting for a worker
+/// that needs the context for another file of the same walk. A caller that
+/// finds none builds its own, and the first one finished is kept. Parallel
+/// walks call [`Self::prime`] first so that only one is ever built.
 pub(super) struct SharedSpanContext<'a, T, C>
 where
     T: atomic_core::pristine::span_patch_storage::SpanPatchReadTxn
@@ -1135,22 +1140,55 @@ where
         if !has_visible_span_root(self.txn, self.store, inode, self.visibility)? {
             return Ok(None);
         }
-        let context = self
-            .context
-            .get_or_init(|| {
-                atomic_core::pristine::span_patch_storage::SpanRenderContext::new(
+        self.context()?
+            .render(inode)
+            .map(Some)
+            .map_err(|error| RepositoryError::Database(error.to_string()))
+    }
+
+    /// Build the context on the calling thread when any of `inodes` is
+    /// span-rooted on this view, so that a parallel walk over them shares one
+    /// build instead of every worker that arrives early making its own. A
+    /// failure is left for the walk to report at the path that hits it.
+    pub(super) fn prime(&self, inodes: impl IntoIterator<Item = Inode>) {
+        let any_span_root = inodes.into_iter().any(|inode| {
+            // Only an indexed root can need the context. Asking about a file
+            // without one would load its origin change, which the walk does
+            // for each file on its own workers.
+            matches!(self.txn.span_root(inode), Ok(Some(_)))
+                && matches!(
+                    has_visible_span_root(self.txn, self.store, inode, self.visibility),
+                    Ok(true)
+                )
+        });
+        if any_span_root {
+            // The outcome, an error included, is stored for the renders.
+            let _stored = self.context();
+        }
+    }
+
+    fn context(
+        &self,
+    ) -> Result<&atomic_core::pristine::span_patch_storage::SpanRenderContext<'a, T>, RepositoryError>
+    {
+        let stored = match self.context.get() {
+            Some(stored) => stored,
+            None => {
+                // Built outside the cell: initialising it in place would park
+                // every other caller behind a build that may be waiting for
+                // one of them.
+                let built = atomic_core::pristine::span_patch_storage::SpanRenderContext::new(
                     self.txn,
                     self.store,
                     self.visibility,
                 )
-                .map_err(|error| error.to_string())
-            })
+                .map_err(|error| error.to_string());
+                self.context.get_or_init(|| built)
+            }
+        };
+        stored
             .as_ref()
-            .map_err(|error| RepositoryError::Database(error.clone()))?;
-        context
-            .render(inode)
-            .map(Some)
-            .map_err(|error| RepositoryError::Database(error.to_string()))
+            .map_err(|error| RepositoryError::Database(error.clone()))
     }
 }
 

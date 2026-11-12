@@ -2605,9 +2605,18 @@ impl Repository {
         let filter = crate::content_filter::GitAttributesFilter::for_repository(&self.root);
         // One span context per walk: per-file contexts each decode and
         // verify the whole visible closure, which on a large span-backed
-        // view costs more than the render itself.
+        // view costs more than the render itself. It is built here rather
+        // than by whichever workers reach a span-rooted file first.
         let shared_spans =
             super::content::SharedSpanContext::new(&txn, &self.change_store, &visibility);
+        shared_spans.prime(
+            paths
+                .iter()
+                .filter(|path| !conflict_entries.contains_key(*path))
+                .map(|path| &projection.present[path])
+                .filter(|item| !item.is_directory)
+                .map(|item| item.inode),
+        );
         for chunk in paths.chunks(256) {
             let rendered: Vec<Result<ViewEntry, RepositoryError>> = chunk
                 .par_iter()
