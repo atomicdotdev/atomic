@@ -43,14 +43,42 @@ println!("{}", status.view);
 # Ok(()) }
 ```
 
-Supported local methods are ResolveRepository, Status, VaultService.GetVaultEntry,
-ListVaultEntries, GetVaultContext, and AttestationService.VerifyAttestation.
-Mutations and other methods return `Unimplemented`. Malformed messages and missing
-repository references return `InvalidArgument`.
+Supported local methods include repository resolution; status, log, change and
+restore-preview reads; add/record and view lifecycle operations; knowledge
+queries; repository-wide vault get/list/context; attestation verification; and
+SyncService PushChanges, PullChanges, ListRemotes and ManageRemotes plus
+RepositoryMutationService.InsertChanges. Other methods return `Unimplemented`.
+Malformed messages and missing repository references return `InvalidArgument`.
 Repository references belong to the resolving service instance; its clones share
 them. Methods delegate to the existing handlers, not a parallel implementation.
 This API is for trusted local callers and does not run remote authentication
 middleware. Existing redb locking and database-open recovery behavior remain.
+
+### Trusted-local sync credentials
+
+Push and pull select a remote by `remote` (configured name or direct URL; empty
+selects the default, falling back to `origin`) and optionally select a local
+identity by `identity` (Push field 15, Pull field 11). The native boundary resolves
+the remote and invokes the same
+`atomic_remote::auth` implementation as the CLI: explicit identity, agent
+environment override, URL userinfo, configured server/agent binding, legacy
+subdomain inference, then the existing default-identity fallback. An explicit
+missing identity never falls back. Push checks for a usable identity/signing key
+before network access; pull retains unauthenticated public reads.
+
+JWT signing and delegation-certificate selection stay in Rust at this trusted
+client boundary. Native requests supplying `auth_headers` or `remote_url` are
+rejected; generated credentials never appear in responses. Transport RPC handlers
+still consume caller-resolved headers and never consult ambient identity stores.
+There is no CLI subprocess, socket, daemon, or JavaScript private key/token flow.
+
+Push/pull execute the existing sync protocol, including manifests, dependencies,
+ref compare-and-swap, and sidecar handling. Pull and insertion retain the existing
+handler's current-target working-copy refresh/precondition policy; non-current
+targets do not materialize host files. From-view insertion adds membership and
+dependencies without changing source membership or view scope. Structured push
+conflicts and pull partial-failure reports must be inspected by callers, not
+treated as unconditional success.
 
 `FILE_DESCRIPTOR_SET` contains the canonical protobuf descriptor compiled into
 this crate. Bindings can generate matching codecs/types without vendoring proto
@@ -177,6 +205,8 @@ extension-host compatibility, which needs consumer testing on each platform.
 
 ```sh
 cargo test --locked -p libatomic --test local_service_test
+cargo test --locked -p libatomic --test local_sync_test
+cargo test --locked -p atomic-remote auth::
 node --test libatomic/scripts/package-runtime.test.mjs
 ```
 

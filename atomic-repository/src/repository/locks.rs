@@ -30,6 +30,20 @@ pub struct RepositoryCommonLockGuard {
     reentrant: bool,
 }
 
+/// Holds the common lock across a Git-import capability preflight and import.
+/// Like the underlying lock bookkeeping, this guard must stay on its thread.
+pub struct GitImportPreflightGuard {
+    _common: AdvisoryFileLock,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+/// Holds the repository-common lock during physical database maintenance.
+/// It is thread-bound and does not keep a database handle open.
+pub struct RepositoryMaintenanceGuard {
+    _common: AdvisoryFileLock,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
 /// A repository operation lock scoped to one persistent working copy.
 ///
 /// The embedded common guard keeps the repository-common lock alive until this
@@ -135,6 +149,149 @@ enum FinalResource {
 }
 
 impl Repository {
+    /// Acquire the common operation lock without opening or modifying the
+    /// repository database. The caller must preflight and recheck repository
+    /// capabilities and operation heads while this guard is held.
+    pub fn try_lock_database_maintenance<P: AsRef<Path>>(
+        path: P,
+    ) -> Result<RepositoryMaintenanceGuard, RepositoryError> {
+        let layout = super::working_copy::discover_layout(path.as_ref())?;
+        let common = try_lock_file(
+            &layout.common_dot_dir.join(COMMON_OPERATION_LOCK),
+            RepositoryLockKind::Common,
+            false,
+        )?;
+        Ok(RepositoryMaintenanceGuard {
+            _common: common,
+            _thread_bound: std::marker::PhantomData,
+        })
+    }
+
+    /// Reject ordinary Git imports into a span repository before any writable
+    /// open or recovery. Hold the returned guard until import completes.
+    /// Databases requiring migration or repository recovery are refused rather
+    /// than opened writable to inspect them. The one exception is redb's own
+    /// repair after a killed process, which runs under the common lock.
+    pub fn try_lock_git_import_without_span<P: AsRef<Path>>(
+        path: P,
+        dry_run: bool,
+    ) -> Result<Option<GitImportPreflightGuard>, RepositoryError> {
+        Self::try_lock_git_import_preflight(path, dry_run, false)
+    }
+
+    /// Hold the common lock for an explicitly span-aware Git import. Existing
+    /// databases must already require the span capability; an unreadable or
+    /// unsupported database is refused before writable recovery.
+    pub fn try_lock_git_import_for_span<P: AsRef<Path>>(
+        path: P,
+        dry_run: bool,
+    ) -> Result<Option<GitImportPreflightGuard>, RepositoryError> {
+        Self::try_lock_git_import_preflight(path, dry_run, true)
+    }
+
+    fn try_lock_git_import_preflight<P: AsRef<Path>>(
+        path: P,
+        dry_run: bool,
+        require_span: bool,
+    ) -> Result<Option<GitImportPreflightGuard>, RepositoryError> {
+        let layout = match super::working_copy::discover_layout(path.as_ref()) {
+            Ok(layout) => layout,
+            Err(RepositoryError::NotFound { .. } | RepositoryError::NotInRepository) => {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        let requested = std::fs::canonicalize(path.as_ref())?;
+        if layout.working_root != requested {
+            return Ok(None);
+        }
+        // A process killed mid-write leaves the database needing redb's
+        // storage-level repair before it can be read at all. That repair
+        // changes no repository state, so `repair` allows it once the common
+        // lock is held and the caller may write; otherwise the database only
+        // counts as present here and the locked pass decides. Format upgrades
+        // and repository recovery are still refused.
+        let inspect = |repair: bool| -> Result<bool, RepositoryError> {
+            let mut found = false;
+            for name in [super::DATABASE_FILE, super::LEGACY_PRISTINE_FILE] {
+                let database = layout.common_dot_dir.join(name);
+                match std::fs::metadata(&database) {
+                    Ok(metadata) if metadata.is_file() => {}
+                    Ok(_) => {
+                        return Err(RepositoryError::InvalidOperation {
+                            message: format!(
+                                "repository database is not a file: {}",
+                                database.display()
+                            ),
+                        })
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                }
+                found = true;
+                let pristine = match Pristine::open_readonly_without_recovery(&database) {
+                    Ok(pristine) => pristine,
+                    Err(atomic_core::pristine::PristineError::Database(error))
+                        if matches!(*error, redb::DatabaseError::RepairAborted) =>
+                    {
+                        if !repair {
+                            if dry_run {
+                                return Err(
+                                    atomic_core::pristine::PristineError::Database(error).into()
+                                );
+                            }
+                            continue;
+                        }
+                        Pristine::open_readonly_after_crash_repair(&database)?
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let has_span =
+                    pristine
+                        .required_repository_capabilities()?
+                        .iter()
+                        .any(|capability| {
+                            capability.id == atomic_core::pristine::SPAN_RANGE_CAPABILITY.id()
+                        });
+                if has_span && !require_span {
+                    return Err(RepositoryError::InvalidOperation {
+                        message: "Git import into an existing span repository is not supported; no import was started".into(),
+                    });
+                }
+                if require_span && !has_span {
+                    return Err(RepositoryError::InvalidOperation {
+                        message:
+                            "span-aware incremental Git import requires an existing span repository"
+                                .into(),
+                    });
+                }
+            }
+            Ok(found)
+        };
+        // A refusal for an already-span-backed repository must not create a
+        // lock file. Recheck under the common lock to close the race with a
+        // concurrent span-capability installation.
+        if !inspect(false)? {
+            return Ok(None);
+        }
+        let lock_path = layout.common_dot_dir.join(COMMON_OPERATION_LOCK);
+        if dry_run && !lock_path.is_file() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "Git import dry-run cannot safely lock this repository without creating a lock file".into(),
+            });
+        }
+        let common = try_lock_file(&lock_path, RepositoryLockKind::Common, true)?;
+        if !inspect(!dry_run)? {
+            return Err(RepositoryError::InvalidOperation {
+                message: "repository database disappeared during Git import preflight".into(),
+            });
+        }
+        Ok(Some(GitImportPreflightGuard {
+            _common: common,
+            _thread_bound: std::marker::PhantomData,
+        }))
+    }
+
     pub(super) fn common_operation_lock_path(&self) -> PathBuf {
         common_operation_lock_path(&self.dot_dir)
     }

@@ -123,6 +123,8 @@ struct JsonDiffFile {
     code: char,
 
     binary: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    git_rename_identity_unproven: bool,
     insertions: usize,
     deletions: usize,
     hunks: Vec<JsonDiffHunk>,
@@ -137,6 +139,7 @@ impl From<&FileDiff> for JsonDiffFile {
             status: diff.status.description(),
             code: diff.status.status_char(),
             binary: diff.is_binary,
+            git_rename_identity_unproven: diff.git_rename_identity_unproven,
             insertions: diff.stats.insertions,
             deletions: diff.stats.deletions,
             hunks: diff.hunks.iter().map(JsonDiffHunk::from).collect(),
@@ -325,6 +328,19 @@ mod tests {
         assert_eq!(file["path"], "src/new.rs");
         assert_eq!(file["status"], "added");
         assert_eq!(file["code"], "A");
+    }
+
+    #[test]
+    fn git_rename_json_marks_unproven_identity() {
+        let mut diff = FileDiff::new("new.txt", FileChangeStatus::Renamed);
+        diff.old_path = "old.txt".into();
+        diff.git_rename_identity_unproven = true;
+        let diffs = vec![diff];
+        let document = JsonDiff::new(&diffs, &sample_stats(&diffs), None, None);
+        let value = serde_json::to_value(document).unwrap();
+        assert_eq!(value["files"][0]["old_path"], "old.txt");
+        assert_eq!(value["files"][0]["new_path"], "new.txt");
+        assert_eq!(value["files"][0]["git_rename_identity_unproven"], true);
     }
 
     #[test]

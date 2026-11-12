@@ -427,6 +427,11 @@ impl Repository {
             })?;
         let visibility = graph_visibility_closure(&txn, &view)?;
         let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        if !projection.name_conflicts.is_empty() {
+            return Err(RepositoryError::InvalidOperation {
+                message: "cannot package a view with unresolved path claims".to_string(),
+            });
+        }
         let cached_txn =
             CachedGraphTxn::new(&txn).map_err(|e| RepositoryError::Database(e.to_string()))?;
 
@@ -435,15 +440,25 @@ impl Repository {
             if item.is_directory {
                 continue;
             }
-            let options = RetrieveOptions::new().with_graph_visibility(visibility.clone());
-            let bytes = retrieve_content_with_filter_fast(
-                &cached_txn,
+            let bytes = match super::content::retrieve_span_if_present(
+                &txn,
                 &self.change_store,
                 item.inode,
-                item.position,
-                options,
-            )
-            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                &visibility,
+            )? {
+                Some(content) => content,
+                None => {
+                    let options = RetrieveOptions::new().with_graph_visibility(visibility.clone());
+                    retrieve_content_with_filter_fast(
+                        &cached_txn,
+                        &self.change_store,
+                        item.inode,
+                        item.position,
+                        options,
+                    )
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                }
+            };
             files.insert(item.path, bytes);
         }
         Ok(files)

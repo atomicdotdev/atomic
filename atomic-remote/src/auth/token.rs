@@ -1,6 +1,6 @@
 //! Client-self-signed EdDSA JWT bearer tokens for remote commands.
 //!
-//! Atomic Storage authenticates with short-lived JWTs that the CLI **signs
+//! Atomic Storage authenticates with short-lived JWTs that the client **signs
 //! itself** with the identity's Ed25519 private key (EdDSA, RFC 8037). There is
 //! no server login endpoint and no token cache: minting a token is a local,
 //! cheap signing operation, so we just mint a fresh one per request.
@@ -51,7 +51,7 @@ use uuid::Uuid;
 
 use atomic_identity::{Identity, IdentityStore};
 
-use crate::error::{CliError, CliResult};
+use super::{AuthError, AuthResult};
 
 /// How long a self-signed token is valid. Kept short (5 minutes) since there is
 /// no server-side issuance to revoke — a leaked token has a small blast radius.
@@ -112,13 +112,7 @@ struct Actor {
 /// `server` is the bare server URL (e.g. `https://atomic.storage`), NOT an org
 /// subdomain. The token is keyed by the identity's own Ed25519 public key, so
 /// no prior registration state needs to be on file locally to mint it.
-pub async fn get_token(server: &str, identity: &Identity) -> CliResult<String> {
-    mint_token(server, identity)
-}
-
-/// Mint a fresh token. Tokens are not cached, so this is identical to
-/// [`get_token`]; kept for call-site compatibility (e.g. retry-after-401).
-pub async fn refresh_token(server: &str, identity: &Identity) -> CliResult<String> {
+pub async fn get_token(server: &str, identity: &Identity) -> AuthResult<String> {
     mint_token(server, identity)
 }
 
@@ -126,16 +120,16 @@ pub async fn refresh_token(server: &str, identity: &Identity) -> CliResult<Strin
 // Minting
 // ---------------------------------------------------------------------------
 
-fn mint_token(server: &str, identity: &Identity) -> CliResult<String> {
+fn mint_token(server: &str, identity: &Identity) -> AuthResult<String> {
     // The token is keyed by the signer's own public key — no server-assigned
     // identifier to look up. For an agent the signer is the agent itself.
     let public_key_b32 = identity.public_key_base32();
 
     // Load the keypair (needs the secret key to sign).
     let store = IdentityStore::open_default()
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to open identity store: {e}")))?;
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("Failed to open identity store: {e}")))?;
     let keypair = store.load_keypair(&identity.id, None).map_err(|e| {
-        CliError::Internal(anyhow::anyhow!(
+        AuthError::Internal(anyhow::anyhow!(
             "Failed to load keypair for '{}': {e}",
             identity.name
         ))
@@ -146,11 +140,11 @@ fn mint_token(server: &str, identity: &Identity) -> CliResult<String> {
     // certificate here means an unusable delegation is reported before any
     // request is made, with the command that fixes it.
     let (sub, act, dlg) = if identity.identity_type.is_delegated() {
-        let resolved = crate::commands::delegation::active_for(&store, identity, Some(server))?;
+        let resolved = crate::auth::delegation::active_for(&store, identity, Some(server))?;
         let delegator_key = atomic_canonical::delegation::delegator_public_key(
             &resolved.delegation,
         )
-        .map_err(|e| CliError::DelegationError {
+        .map_err(|e| AuthError::DelegationError {
             message: format!("Delegation for '{}' is malformed: {e}", identity.name),
         })?;
         (
@@ -182,9 +176,9 @@ fn mint_token(server: &str, identity: &Identity) -> CliResult<String> {
     };
 
     let header_json = serde_json::to_vec(&header)
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to encode JWT header: {e}")))?;
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("Failed to encode JWT header: {e}")))?;
     let claims_json = serde_json::to_vec(&claims)
-        .map_err(|e| CliError::Internal(anyhow::anyhow!("Failed to encode JWT claims: {e}")))?;
+        .map_err(|e| AuthError::Internal(anyhow::anyhow!("Failed to encode JWT claims: {e}")))?;
 
     let header_b64 = BASE64URL_NOPAD.encode(&header_json);
     let claims_b64 = BASE64URL_NOPAD.encode(&claims_json);

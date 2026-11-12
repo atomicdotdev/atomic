@@ -116,6 +116,25 @@ IDs are refused. No operation uses atomicd's cwd. Bootstrap Git import requires
 an explicit destination when no RepositoryRef exists. Physical paths occur only
 in locally authorized operations; content search paths are logical index filters.
 
+### Embedded trusted-local client boundary
+
+`LocalService::call` is an in-process API for trusted applications, not another
+network transport or an authentication-middleware bypass for RPC callers. Its
+sync dispatch resolves a configured remote and caller-selected local identity,
+then uses the shared `atomic-remote` client authentication policy before invoking
+the existing SyncService handler. Push's optional `identity` field 15 and Pull's
+optional `identity` field 11 select credentials only at that boundary; transport
+handlers do not read ambient config, identities, signing keys, or delegations.
+
+Native Push/Pull reject caller-provided `auth_headers` and `remote_url`. Headers
+are minted internally and never returned through protobuf responses. Existing
+transport clients continue resolving and supplying their own outbound headers;
+transport method allowlists, principal/capability checks and authorization remain
+unchanged. Push preserves its identity/keypair preflight; public pulls may remain
+unauthenticated. All supported embedded repository operations require a reference
+resolved by the same LocalService instance (or one of its clones).
+
+
 ## Sandbox grants and visibility
 
 The issuing local admin supplies a stable ViewRef and an explicit capability

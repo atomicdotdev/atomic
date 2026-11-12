@@ -362,6 +362,7 @@ impl Pristine {
 
             // Persistent Git commit interpretation closures (CB-9B review R1)
             write_txn.open_table(GIT_COMMIT_CLOSURES)?;
+            write_txn.open_table(GIT_CLOSURE_NODES)?;
 
             // Immutable captured bridge hook events (CB-9B review R4)
             write_txn.open_table(BRIDGE_EVENT_CAPTURES)?;
@@ -492,6 +493,31 @@ impl Pristine {
         Self::open_readonly_with_schema_check(path, true, false)
     }
 
+    /// Open for inspection after letting redb finish its own crash repair.
+    ///
+    /// A process killed mid-write leaves the file needing redb's storage-level
+    /// repair, which a read-only open cannot perform. This runs only that
+    /// repair: it never upgrades a legacy format, initializes tables, or runs
+    /// repository recovery, and it returns the same errors as
+    /// [`Self::open_readonly_without_recovery`] for everything else.
+    pub fn open_readonly_after_crash_repair<P: AsRef<Path>>(path: P) -> PristineResult<Self> {
+        let cache_bytes = 8 * 1024 * 1024 * 1024; // 8 GiB
+        let mut builder = Builder::new();
+        builder.set_cache_size(cache_bytes);
+        let db = match builder.open_read_only(path.as_ref()) {
+            Ok(db) => db,
+            Err(redb::DatabaseError::RepairAborted) => {
+                // Close the writable handle cleanly to persist the repaired
+                // allocator state before taking the shared read lock.
+                let backend = SnapshotBackend::open(path.as_ref(), false)?;
+                drop(builder.create_with_backend(backend)?);
+                builder.open_read_only(path.as_ref())?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Self::scan_ids(PristineDatabase::ReadOnly(db), true)
+    }
+
     /// Open an existing database for read-only repair inspection without
     /// initializing tables or requiring a completed PATH_CLAIMS schema.
     ///
@@ -602,6 +628,11 @@ impl Pristine {
 
         let mut write_txn = self.db.writable_db()?.begin_write()?;
         let _ = write_txn.set_durability(redb::Durability::Immediate);
+        if capabilities.iter().any(|capability| {
+            capability.id() == crate::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY.id()
+        }) {
+            crate::pristine::schema::require_projected_semantics_schema(&write_txn)?;
+        }
         let mut metadata = write_txn.open_table(PRISTINE_META)?;
 
         let mut existing_requirements = Vec::new();

@@ -641,16 +641,16 @@ fn make_two_incarnation_name_conflict() -> (TempDir, TestRepository, std::path::
 }
 
 /// A name conflict whose working tree already holds exactly one incarnation's
-/// bytes must be resolved by a normal managed record even when no conflict row
-/// was ever persisted. "Content-clean" must not mean the two live claims are
+/// bytes must be resolved by a normal managed record even when no conflict
+/// markers were ever materialized. "Content-clean" must not mean the two live claims are
 /// silently ignored; the winning side is chosen by byte equality (never by
 /// timestamp) and the losing claims are superseded, not erased.
 #[test]
 fn content_clean_name_conflict_is_resolved_by_record() {
     let (_temp, repo, new_file) = make_two_incarnation_name_conflict();
 
-    // No materialize ran, so there is no persisted conflict row; the working
-    // tree simply keeps one side's bytes.
+    // No materialize ran. Derived Name rows may already exist, but they carry
+    // no observed marker line; the working tree simply keeps one side's bytes.
     std::fs::write(&new_file, "from-base\n").unwrap();
     let on_disk = std::fs::read_to_string(&new_file).unwrap();
     assert!(

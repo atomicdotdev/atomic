@@ -176,6 +176,11 @@ run_cmd atomic intent new "Fix authentication"
 assert_ran "intent create returns an ID" "Created intent: [A-Za-z0-9:_-]+::[0-9]+"
 
 first_id="$(echo "$OUT" | sed -n 's/.*Created intent: \([A-Za-z0-9:_-]*\).*/\1/p' | head -1)"
+if [[ -z "$first_id" ]]; then
+    _fail "extract first intent ID" "create output: $OUT"
+    print_summary || true
+    exit 1
+fi
 
 # List intents — the new intent must appear under its assigned key
 run_cmd atomic intent list --json
@@ -227,16 +232,10 @@ init_repo --vault
 
 # Create and track a file
 create_file "src/main.rs" 'fn main() { println!("hello"); }'
-add_files "src/main.rs"
+require_success "add main.rs" atomic add "src/main.rs"
 
 # Record should succeed (and auto-enrich the KG)
-rc=0
-record_change "Add main.rs" >/dev/null 2>&1 || rc=$?
-if [[ $rc -eq 0 ]]; then
-    _pass "record succeeds with vault enabled"
-else
-    _fail "record succeeds with vault enabled" "exit $rc"
-fi
+require_success "record succeeds with vault enabled" record_change "Add main.rs"
 
 # Record auto-enriches: search must surface the recorded change or file
 run_cmd atomic vault query search "main" --json
@@ -252,10 +251,10 @@ make_temp_repo "vault-kg"
 init_repo --vault --view main
 
 # Create some tracked files
-create_file "src/auth.rs" "pub fn authenticate() { }\npub fn verify() { }"
+create_file "src/auth.rs" $'pub fn authenticate() { }\npub fn verify() { }'
 create_file "src/main.rs" "fn main() { authenticate(); }"
-add_files "src/auth.rs" "src/main.rs"
-record_change "Add auth module" >/dev/null 2>&1
+require_success "add query source files" atomic add "src/auth.rs" "src/main.rs"
+require_success "record auth module" record_change "Add auth module"
 
 # The service reports the processed total; keep this strict about successful
 # execution and a positive count rather than expecting the old local renderer.
@@ -322,19 +321,8 @@ else
     else
         cd "$GIT_KG_DIR"
 
-        run_cmd atomic init --vault --view main
-        if [[ $RC -eq 0 ]]; then
-            _pass "init --vault in git checkout"
-        else
-            _fail "init --vault in git checkout" "exit $RC: $(echo "$OUT" | head -2 | tr '\n' ' ')"
-        fi
-
-        run_cmd atomic git import
-        if [[ $RC -eq 0 ]]; then
-            _pass "git import completes with vault"
-        else
-            _fail "git import completes with vault" "exit $RC: $(echo "$OUT" | tail -2 | tr '\n' ' ')"
-        fi
+        require_success "init --vault in git checkout" atomic init --vault --view main
+        require_success "git import completes with vault" atomic git import
 
         # Enrich KG from imported data
         run_cmd atomic vault query enrich
@@ -367,6 +355,11 @@ init_repo --vault
 run_cmd atomic memory new --kind lesson --text "Prefer atomic intent new over the removed vault verb"
 assert_ran "memory create returns an ID" "Created memory:"
 mem_id="$(echo "$OUT" | sed -n 's/.*Created memory: \([A-Za-z0-9]*\).*/\1/p' | head -1)"
+if [[ -z "$mem_id" ]]; then
+    _fail "extract memory ID" "create output: $OUT"
+    print_summary || true
+    exit 1
+fi
 
 run_cmd atomic memory list --json
 assert_ran "memory list shows the created memory" "$mem_id"
@@ -411,19 +404,19 @@ begin_section "Queries: View Isolation"
 make_temp_repo "query-view-scope"
 init_repo
 create_file "src/lib.rs" $'pub fn target() {}\npub fn caller() { target(); }\n'
-add_files "src/lib.rs"
-assert_success "record base query source" atomic record -m "base query source"
-assert_success "create inheriting query view" atomic view create query-feature --draft --parent dev
-assert_success "switch to query feature" atomic view switch query-feature --force
+require_success "add base query source" atomic add "src/lib.rs"
+require_success "record base query source" atomic record -m "base query source"
+require_success "create inheriting query view" atomic view create query-feature --draft --parent dev
+require_success "switch to query feature" atomic view switch query-feature --force
 
 # Same paths/symbols, different signatures and call bodies: filtering paths alone
 # would still expose the wrong view's source or caller relationships.
 create_file "src/lib.rs" $'pub fn target(secret: SiblingSecret) {}\npub fn caller() {}\n'
 create_file "src/sibling.rs" $'pub fn sibling_only() { target(); }\n// sibling_marker\n'
-add_files "src/sibling.rs"
-assert_success "record sibling query source" atomic record -m "sibling query source"
-assert_success "enrich feature query data" atomic query enrich
-assert_success "build working-copy index on feature" atomic query index --rebuild
+require_success "add sibling query source" atomic add "src/sibling.rs"
+require_success "record sibling query source" atomic record -m "sibling query source"
+require_success "enrich feature query data" atomic query enrich
+require_success "build working-copy index on feature" atomic query index --rebuild
 
 run_cmd atomic query code "SiblingSecret" --json
 assert_ran "feature code includes its own signature" 'SiblingSecret'
@@ -435,7 +428,7 @@ else
     _fail "feature does not retain base caller's removed call" "exit $RC: $OUT"
 fi
 
-assert_success "switch back to base query view" atomic view switch dev --force
+require_success "switch back to base query view" atomic view switch dev --force
 create_file "src/lib.rs" $'pub fn disk_only() {}\n'
 
 run_cmd atomic query search "SiblingSecret" --json

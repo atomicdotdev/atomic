@@ -11,7 +11,8 @@
 #   5. The server switches to that view and outputs the working copy
 #   6. The file on disk must have correct content — no duplication
 #
-# This is the exact code path that the API push handler follows.
+# This simulates transfer by copying change objects; it does not exercise the
+# API server, network transport, authentication, or remote push protocol.
 # The bug being tested: after inserting a change (with dependencies on a
 # shared view) into a draft view and outputting the working copy, the
 # file content was duplicated on the server.
@@ -29,6 +30,8 @@
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
+SNAPSHOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/atomic-test-push-snapshots-XXXXXX")"
+_HARNESS_TMPDIRS+=("$SNAPSHOT_DIR")
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Server Push: Setup client repo with two changes"
@@ -57,13 +60,15 @@ const message = greet("World");
 console.log(message);
 EOF
 
-add_files src/index.ts
+require_success "add client source" atomic add src/index.ts
+CLIENT_V1="$SNAPSHOT_DIR/client-v1"
+cp src/index.ts "$CLIENT_V1"
 
 # Extract the exact hash of the change file created by the most recent
 # record operation. Sorting by filename is unsafe because repo init writes
 # bootstrap changes whose hashes may sort after later user changes.
 capture_change_hashes() {
-    find "$REPO_DIR/.atomic/changes" -name "*.change" -type f 2>/dev/null \
+    find "$REPO_DIR/.atomic/changes" -name "*.change" -type f \
         | xargs -I{} basename {} .change | sort
 }
 
@@ -71,17 +76,25 @@ find_new_change_hash() {
     local before_file="$1"
     local after_file="$2"
 
-    comm -13 "$before_file" "$after_file" | tail -1
+    local changes
+    changes="$(comm -13 "$before_file" "$after_file")"
+    if [[ -z "$changes" || "$changes" == *$'\n'* ]]; then
+        echo "expected exactly one new change object, got: $changes" >&2
+        return 1
+    fi
+    printf '%s\n' "$changes"
 }
 
-BEFORE_1="$(mktemp)"
-AFTER_1="$(mktemp)"
+BEFORE_1="$SNAPSHOT_DIR/before-1"
+AFTER_1="$SNAPSHOT_DIR/after-1"
 capture_change_hashes > "$BEFORE_1"
 
-REC1_OUT="$(record_change "Initial TypeScript file" 2>&1)"
+require_capture "record initial TypeScript file" record_change "Initial TypeScript file"
+REC1_OUT="$COMMAND_OUTPUT"
 
 capture_change_hashes > "$AFTER_1"
-HASH1="$(find_new_change_hash "$BEFORE_1" "$AFTER_1")"
+require_capture "identify first change object" find_new_change_hash "$BEFORE_1" "$AFTER_1"
+HASH1="$COMMAND_OUTPUT"
 
 if [[ -n "$HASH1" ]]; then
     _pass "Recorded change 1 on client: ${HASH1:0:12}"
@@ -106,14 +119,16 @@ console.log(message);
 EOF
 
 # Mark before recording so we can find the NEW change file
-BEFORE_2="$(mktemp)"
-AFTER_2="$(mktemp)"
+BEFORE_2="$SNAPSHOT_DIR/before-2"
+AFTER_2="$SNAPSHOT_DIR/after-2"
 capture_change_hashes > "$BEFORE_2"
 
-REC2_OUT="$(record_change "Add ANSI color codes" 2>&1)"
+require_capture "record ANSI color codes" record_change "Add ANSI color codes"
+REC2_OUT="$COMMAND_OUTPUT"
 
 capture_change_hashes > "$AFTER_2"
-HASH2="$(find_new_change_hash "$BEFORE_2" "$AFTER_2")"
+require_capture "identify second change object" find_new_change_hash "$BEFORE_2" "$AFTER_2"
+HASH2="$COMMAND_OUTPUT"
 
 if [[ -n "$HASH2" && "$HASH2" != "$HASH1" ]]; then
     _pass "Recorded change 2 on client: ${HASH2:0:12}"
@@ -126,8 +141,8 @@ fi
 # Save the client's final file content for comparison
 CLIENT_CONTENT="$(cat src/index.ts)"
 CLIENT_LINES="$(wc -l < src/index.ts | tr -d ' ')"
-
-_pass "Client file has $CLIENT_LINES lines"
+CLIENT_V2="$SNAPSHOT_DIR/client-v2"
+cp src/index.ts "$CLIENT_V2"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Server Push: Init server and copy change files"
@@ -159,8 +174,7 @@ copy_change_file() {
     fi
 
     if [[ -n "$src_file" && -f "$src_file" ]]; then
-        cp "$src_file" "$dst_dir/"
-        return 0
+        cp "$src_file" "$dst_dir/" && cmp -s "$src_file" "$dst_dir/${hash}.change"
     else
         echo "  DEBUG: looking for ${hash}.change in $src_dir" >&2
         echo "  DEBUG: files in $src_dir:" >&2
@@ -194,13 +208,7 @@ begin_section "Server Push: Insert change 1 into dev (shared view)"
 
 cd "$SERVER_DIR"
 
-APPLY1_OUT="$(atomic insert "$HASH1" --view dev 2>&1)" || true
-
-if echo "$APPLY1_OUT" | grep -qiE "applied|success|state"; then
-    _pass "Inserted change 1 into dev"
-else
-    _pass "Insert change 1 into dev completed: $(echo "$APPLY1_OUT" | head -3)"
-fi
+require_success "insert change 1 into dev" atomic insert "$HASH1" --view dev
 
 # Verify the file exists and has correct content
 assert_file_exists \
@@ -218,8 +226,7 @@ else
         "'function greet' appears $GREET_COUNT_1 times (expected 1). Content: $(echo "$CONTENT_AFTER_1" | head -20)"
 fi
 
-LINES_AFTER_1="$(echo "$CONTENT_AFTER_1" | wc -l | tr -d ' ')"
-_pass "After change 1: file has $LINES_AFTER_1 lines"
+assert_success "first server content matches client bytes" cmp -s "$CLIENT_V1" src/index.ts
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Server Push: Create draft view and insert change 2"
@@ -231,27 +238,14 @@ begin_section "Server Push: Create draft view and insert change 2"
 LOCAL_VIEW="agent-ses_test-harness"
 
 # Create the draft view (same as what the API push handler does)
-NEW_OUT="$(new_view "$LOCAL_VIEW" 2>&1)" || true
-
-if echo "$NEW_OUT" | grep -qiE "created|view"; then
-    _pass "Created draft view '$LOCAL_VIEW'"
-else
-    _pass "Draft view creation completed"
-fi
+require_success "create draft view '$LOCAL_VIEW'" new_view "$LOCAL_VIEW"
 
 assert_view_exists "Draft view exists" "$LOCAL_VIEW"
 
 # Insert change 2 into the draft view.
 # Change 2 depends on change 1, which is on dev (shared).
-# The draft view's overlay should see change 1's edges through GRAPH,
-# and change 2's edges should go to STACK_GRAPH.
-APPLY2_OUT="$(atomic insert "$HASH2" --view "$LOCAL_VIEW" 2>&1)" || true
-
-if echo "$APPLY2_OUT" | grep -qiE "applied|success|state"; then
-    _pass "Inserted change 2 into draft view"
-else
-    _pass "Insert change 2 completed: $(echo "$APPLY2_OUT" | head -3)"
-fi
+# The draft inherits change 1 and selects change 2 through its view filter.
+require_success "insert change 2 into draft view" atomic insert "$HASH2" --view "$LOCAL_VIEW"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Server Push: Switch to draft view and verify output"
@@ -261,7 +255,7 @@ begin_section "Server Push: Switch to draft view and verify output"
 # This is where the bug manifested — the file was duplicated or showed
 # the wrong content.
 
-switch_view "$LOCAL_VIEW" >/dev/null 2>&1 || true
+require_success "switch to draft view" switch_view "$LOCAL_VIEW"
 assert_current_view "Switched to draft view" "$LOCAL_VIEW"
 
 # The file must exist
@@ -336,6 +330,7 @@ else
     _fail "Draft view: content matches client" \
         "Server content differs from client. Server ($LINES_LOCAL lines): $(echo "$CONTENT_LOCAL" | head -15) --- Client ($CLIENT_LINES lines): $(echo "$CLIENT_CONTENT" | head -15)"
 fi
+assert_success "draft content matches client byte-for-byte" cmp -s "$CLIENT_V2" src/index.ts
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Server Push: Dev perspective unaffected by draft view"
@@ -344,8 +339,9 @@ begin_section "Server Push: Dev perspective unaffected by draft view"
 # After switching back to dev, the file should show change 1's content
 # (the original without color codes). Change 2 is only on the draft view.
 
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev" switch_view "dev"
 assert_current_view "Back on dev" "dev"
+assert_success "dev content matches original client bytes" cmp -s "$CLIENT_V1" src/index.ts
 
 CONTENT_DEV="$(cat src/index.ts 2>/dev/null || echo "")"
 
@@ -381,7 +377,7 @@ begin_section "Server Push: Round-trip — draft view still correct"
 # Switch back to the draft view. The file should still have the correct
 # content — no corruption from the dev→draft round trip.
 
-switch_view "$LOCAL_VIEW" >/dev/null 2>&1 || true
+require_success "switch back to draft" switch_view "$LOCAL_VIEW"
 assert_current_view "Back on draft view" "$LOCAL_VIEW"
 
 CONTENT_ROUNDTRIP="$(cat src/index.ts 2>/dev/null || echo "")"
@@ -393,6 +389,7 @@ else
     _fail "Round-trip: no duplication" \
         "'function greet' appears $GREET_COUNT_RT times after round-trip"
 fi
+assert_success "round-trip content matches client byte-for-byte" cmp -s "$CLIENT_V2" src/index.ts
 
 if [[ "$CONTENT_ROUNDTRIP" == "$CLIENT_CONTENT" ]]; then
     _pass "Round-trip: content still matches client"
@@ -430,16 +427,20 @@ console.log(message);
 console.log(farewell("World"));
 EOF
 
-BEFORE_3="$(mktemp)"
-AFTER_3="$(mktemp)"
+BEFORE_3="$SNAPSHOT_DIR/before-3"
+AFTER_3="$SNAPSHOT_DIR/after-3"
 capture_change_hashes > "$BEFORE_3"
 
-REC3_OUT="$(record_change "Add farewell function" 2>&1)"
+require_capture "record farewell function" record_change "Add farewell function"
+REC3_OUT="$COMMAND_OUTPUT"
 
 capture_change_hashes > "$AFTER_3"
-HASH3="$(find_new_change_hash "$BEFORE_3" "$AFTER_3")"
+require_capture "identify third change object" find_new_change_hash "$BEFORE_3" "$AFTER_3"
+HASH3="$COMMAND_OUTPUT"
 
 CLIENT_CONTENT_V3="$(cat src/index.ts)"
+CLIENT_V3="$SNAPSHOT_DIR/client-v3"
+cp src/index.ts "$CLIENT_V3"
 
 if [[ -n "$HASH3" ]]; then
     _pass "Recorded change 3 on client: ${HASH3:0:12}"
@@ -462,15 +463,9 @@ else
 fi
 
 # Make sure we're on the draft view
-switch_view "$LOCAL_VIEW" >/dev/null 2>&1 || true
+require_success "select draft view" switch_view "$LOCAL_VIEW"
 
-APPLY3_OUT="$(atomic insert "$HASH3" --view "$LOCAL_VIEW" 2>&1)" || true
-
-if echo "$APPLY3_OUT" | grep -qiE "applied|success|state"; then
-    _pass "Inserted change 3 into draft view"
-else
-    _pass "Insert change 3 completed"
-fi
+require_success "insert change 3 into draft view" atomic insert "$HASH3" --view "$LOCAL_VIEW"
 
 # Re-output working copy (switch_view already did this, but be explicit)
 # In the API, output_working_copy is called after insert.
@@ -487,6 +482,7 @@ else
     _fail "After change 3: no greet duplication" \
         "'function greet' appears $GREET_COUNT_V3 times. Content: $(echo "$CONTENT_V3" | head -25)"
 fi
+assert_success "third change matches client byte-for-byte" cmp -s "$CLIENT_V3" src/index.ts
 
 if [[ "$FAREWELL_COUNT" -eq 1 ]]; then
     _pass "After change 3: 'function farewell' appears exactly once"
@@ -513,7 +509,9 @@ fi
 begin_section "Server Push: Dev still unaffected after 3 draft changes"
 # ═══════════════════════════════════════════════════════════════════════════
 
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch to dev after third change" switch_view "dev"
+assert_current_view "on dev after third change" "dev"
+assert_success "dev still matches original client bytes" cmp -s "$CLIENT_V1" src/index.ts
 
 CONTENT_DEV_FINAL="$(cat src/index.ts 2>/dev/null || echo "")"
 

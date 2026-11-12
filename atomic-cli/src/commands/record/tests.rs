@@ -55,6 +55,22 @@ mod tests {
     // Record Command Construction Tests
 
     #[test]
+    fn record_statistics_render_graph_and_semantic_counts() {
+        let stats = atomic_repository::record::RecordStats {
+            files_recorded: 1,
+            vertices_added: 2,
+            content_bytes: 12,
+            lines_added: 3,
+            tokens_added: 4,
+            ..Default::default()
+        };
+        let output = format_record_stats(&stats);
+        assert!(output.contains("1 file changed"), "{output}");
+        assert!(output.contains("3 lines (+3 -0 ~0)"), "{output}");
+        assert!(output.contains("4 tokens (+4 -0 ~0)"), "{output}");
+    }
+
+    #[test]
     fn test_record_new() {
         let record = Record::new();
         assert!(record.message.is_none());

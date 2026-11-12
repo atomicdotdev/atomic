@@ -15,7 +15,7 @@
 //! 3. **Identity** — the server profile's `identity` field, if set, overrides
 //!    the global default identity.
 //! 4. **Bearer token** — a short-lived, client-self-signed EdDSA JWT minted
-//!    for the resolved identity (see [`crate::commands::token`]). The raw
+//!    for the resolved identity (see [`atomic_remote::auth::token`]). The raw
 //!    public key is never sent as a credential.
 //!
 //! # Identity resolution
@@ -97,7 +97,7 @@ pub async fn build_apex_client(server_override: Option<&str>) -> CliResult<Stora
 
     // Self-signed EdDSA JWT keyed by the identity's own public key; minted
     // against the apex URL (the token is portable across the deployment).
-    let bearer_token = crate::commands::token::get_token(&apex_url, &identity).await?;
+    let bearer_token = atomic_remote::auth::token::get_token(&apex_url, &identity).await?;
 
     let delegation = delegation_for(&identity, &apex_url);
     let client =
@@ -120,7 +120,8 @@ fn delegation_for(identity: &atomic_identity::Identity, server: &str) -> Option<
         return None;
     }
     let store = IdentityStore::open_default().ok()?;
-    let resolved = crate::commands::delegation::active_for(&store, identity, Some(server)).ok()?;
+    let resolved =
+        atomic_remote::auth::delegation::active_for(&store, identity, Some(server)).ok()?;
     Some(atomic_canonical::delegation::encode_for_transport(
         &resolved.document,
     ))
@@ -170,7 +171,7 @@ pub async fn build_apex_client_as(
     server_override: Option<&str>,
 ) -> CliResult<(StorageClient, String)> {
     let apex_url = apex_server_url(server_override)?;
-    let bearer_token = crate::commands::token::get_token(&apex_url, identity).await?;
+    let bearer_token = atomic_remote::auth::token::get_token(&apex_url, identity).await?;
     let delegation = delegation_for(identity, &apex_url);
 
     let client =
@@ -220,7 +221,7 @@ pub async fn build_client_with_org(
     let identity = resolve_identity_for_server(server)?;
 
     // Log in against the server apex for a JWT bearer token.
-    let bearer_token = crate::commands::token::get_token(&server_url, &identity).await?;
+    let bearer_token = atomic_remote::auth::token::get_token(&server_url, &identity).await?;
 
     let client = StorageClient::new(&base_url, &org_slug, &bearer_token).map_err(|e| {
         CliError::Internal(anyhow::anyhow!("Failed to create storage client: {}", e))

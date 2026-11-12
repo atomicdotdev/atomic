@@ -1184,8 +1184,8 @@ pub(super) fn git_object_id(
 }
 
 impl Repository {
-    /// Build the canonical repository manifest and Git tree directly from graph state.
-    /// Stored graph bytes are used verbatim; no smudge filter or working-copy read occurs.
+    /// Build the canonical repository manifest and Git tree from recorded view state.
+    /// Stored bytes are used verbatim; no smudge filter or working-copy read occurs.
     pub fn project_tree(
         &self,
         view_name: &str,
@@ -1229,6 +1229,7 @@ impl Repository {
             )));
         }
         let mut entries = Vec::new();
+        let spans = super::content::SharedSpanContext::new(&txn, &self.change_store, &closure);
         for item in projection
             .present
             .values()
@@ -1261,14 +1262,20 @@ impl Repository {
                 )));
             }
             let materialization = attrs.materialization;
-            let bytes = super::content::retrieve_content_with_filter_fast(
-                &txn,
-                &self.change_store,
-                item.inode,
-                item.position,
-                RetrieveOptions::new().with_graph_visibility(closure.clone()),
-            )
-            .map_err(|error| ProjectTreeError::Repository(error.to_string()))?;
+            let bytes = match spans
+                .render_if_present(item.inode)
+                .map_err(ProjectTreeError::from)?
+            {
+                Some(content) => content,
+                None => super::content::retrieve_content_with_filter_fast(
+                    &txn,
+                    &self.change_store,
+                    item.inode,
+                    item.position,
+                    RetrieveOptions::new().with_graph_visibility(closure.clone()),
+                )
+                .map_err(|error| ProjectTreeError::Repository(error.to_string()))?,
+            };
             let gitlink = if materialization.kind == InodeKind::Gitlink {
                 Some(parse_gitlink_bytes(policy.object_format, &bytes)?)
             } else {
@@ -1371,7 +1378,9 @@ impl Repository {
             + atomic_core::pristine::TreeTxnT
             + atomic_core::pristine::PathClaimTxnT
             + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
-            + atomic_core::pristine::InodeAttrTxnT,
+            + atomic_core::pristine::InodeAttrTxnT
+            + atomic_core::pristine::span_patch_storage::SpanPatchReadTxn
+            + atomic_core::pristine::CapabilityTxnT,
     {
         self.project_change_closure_with_conflict_markers(txn, roots, policy, &Default::default())
     }
@@ -1396,7 +1405,9 @@ impl Repository {
             + atomic_core::pristine::TreeTxnT
             + atomic_core::pristine::PathClaimTxnT
             + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>
-            + atomic_core::pristine::InodeAttrTxnT,
+            + atomic_core::pristine::InodeAttrTxnT
+            + atomic_core::pristine::span_patch_storage::SpanPatchReadTxn
+            + atomic_core::pristine::CapabilityTxnT,
     {
         use atomic_core::pristine::{EffectiveProjectionClosure, ViewMembershipSet};
 
@@ -1431,6 +1442,7 @@ impl Repository {
         }
         let mut entries = Vec::new();
         let mut projected_paths = std::collections::BTreeSet::new();
+        let spans = super::content::SharedSpanContext::new(txn, &self.change_store, &closure);
         for item in projection
             .present
             .values()
@@ -1454,14 +1466,20 @@ impl Repository {
             let materialization = attrs.materialization;
             let bytes = match marker_bytes.get(item.path.as_str()) {
                 Some(override_bytes) => override_bytes.clone(),
-                None => super::content::retrieve_content_with_filter_fast(
-                    txn,
-                    &self.change_store,
-                    item.inode,
-                    item.position,
-                    RetrieveOptions::new().with_graph_visibility(closure.clone()),
-                )
-                .map_err(|error| ProjectTreeError::Repository(error.to_string()))?,
+                None => match spans
+                    .render_if_present(item.inode)
+                    .map_err(ProjectTreeError::from)?
+                {
+                    Some(content) => content,
+                    None => super::content::retrieve_content_with_filter_fast(
+                        txn,
+                        &self.change_store,
+                        item.inode,
+                        item.position,
+                        RetrieveOptions::new().with_graph_visibility(closure.clone()),
+                    )
+                    .map_err(|error| ProjectTreeError::Repository(error.to_string()))?,
+                },
             };
             let gitlink = if materialization.kind == InodeKind::Gitlink && marker_bytes.is_empty() {
                 Some(parse_gitlink_bytes(policy.object_format, &bytes)?)

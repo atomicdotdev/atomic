@@ -22,6 +22,136 @@ async fn resolve(service: &LocalService, root: &std::path::Path) -> proto::Repos
         .unwrap()
 }
 
+#[tokio::test]
+async fn memory_create_honors_explicit_identity_and_status_without_overwriting() {
+    use libatomic::atomic::daemon_service_server::DaemonService;
+    use libatomic::atomic::vault_service_server::VaultService;
+    use libatomic::daemon::{services::DaemonImpl, services_agent::VaultImpl, state::DaemonState};
+    use std::sync::Arc;
+    use tonic::Request;
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    repo.init_vault().unwrap();
+    drop(repo);
+    let state = Arc::new(DaemonState::new());
+    let daemon = DaemonImpl {
+        state: state.clone(),
+    };
+    let capabilities = daemon
+        .get_capabilities(Request::new(proto::GetCapabilitiesRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        capabilities
+            .features
+            .iter()
+            .any(|feature| feature
+                == libatomic::daemon::services::VAULT_MEMORY_CREATE_OPTIONS_FEATURE)
+    );
+    let reference = daemon
+        .resolve_repository(Request::new(proto::ResolveRepositoryRequest {
+            path: dir.path().display().to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .repository
+        .unwrap();
+    let service = VaultImpl { state };
+    let request = proto::CreateVaultEntityRequest {
+        repository: Some(reference.clone()),
+        kind: proto::VaultEntityKind::Memory as i32,
+        memory_kind: Some("lesson".into()),
+        memory_id: Some("inherited-note".into()),
+        memory_status: Some("superseded".into()),
+        body: Some("preserve this memory".into()),
+        ..Default::default()
+    };
+    let entry = service
+        .create_vault_entity(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner()
+        .entry
+        .unwrap();
+    assert_eq!(entry.id, "inherited-note");
+    assert_eq!(
+        entry.status,
+        Some(proto::VaultEntityStatus::Superseded as i32)
+    );
+    assert_eq!(
+        entry.vault_path.as_deref(),
+        Some(".vault/memory/inherited-note.md")
+    );
+    let path = dir.path().join(".vault/memory/inherited-note.md");
+    let before = std::fs::read(&path).unwrap();
+    let duplicate = service
+        .create_vault_entity(Request::new(request.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(duplicate.code(), tonic::Code::AlreadyExists);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    let invalid = proto::CreateVaultEntityRequest {
+        repository: Some(reference.clone()),
+        memory_id: Some("../escape".into()),
+        ..request.clone()
+    };
+    assert_eq!(
+        service
+            .create_vault_entity(Request::new(invalid))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert!(!dir.path().join(".vault/escape.md").exists());
+    let untracked_path = dir.path().join(".vault/memory/untracked.md");
+    std::fs::write(&untracked_path, b"untracked user bytes").unwrap();
+    let untracked = proto::CreateVaultEntityRequest {
+        repository: Some(reference.clone()),
+        memory_id: Some("untracked".into()),
+        ..request.clone()
+    };
+    assert_eq!(
+        service
+            .create_vault_entity(Request::new(untracked))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::AlreadyExists
+    );
+    assert_eq!(
+        std::fs::read(&untracked_path).unwrap(),
+        b"untracked user bytes"
+    );
+    let invalid_status = proto::CreateVaultEntityRequest {
+        repository: Some(reference),
+        memory_id: Some("bad-status".into()),
+        memory_status: Some("not-a-status".into()),
+        ..request.clone()
+    };
+    assert_eq!(
+        service
+            .create_vault_entity(Request::new(invalid_status))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert!(!dir.path().join(".vault/memory/bad-status.md").exists());
+    let repo = Repository::open(dir.path()).unwrap();
+    let stored = repo
+        .vault_retrieve("memory/inherited-note.md")
+        .unwrap()
+        .unwrap();
+    let frontmatter: serde_json::Value = serde_json::from_str(&stored.frontmatter_json).unwrap();
+    assert_eq!(frontmatter["uid"], "inherited-note");
+    assert_eq!(frontmatter["status"], "superseded");
+    assert_eq!(stored.content_bytes, b"preserve this memory\n");
+}
+
 fn create() -> (tempfile::TempDir, String, String) {
     let dir = tempfile::tempdir().unwrap();
     let repo = Repository::init(dir.path()).unwrap();

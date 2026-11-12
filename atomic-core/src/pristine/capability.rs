@@ -20,11 +20,29 @@ pub const SHIM_CUTOVER_CAPABILITY: RepositoryCapability =
 
 pub const KG_SEMWEB_CAPABILITY: RepositoryCapability = RepositoryCapability::new("kg-semweb-v1", 1);
 
+/// Required once Git interpretation closures use shared immutable trees.
+pub const GIT_CLOSURE_SHARING_CAPABILITY: RepositoryCapability =
+    RepositoryCapability::new("git-closure-sharing", 1);
+
+/// Repository contains immutable, typed span changes. Older readers must not
+/// interpret their namespace-only graph hunks as complete file content.
+/// Version 3 additionally requires portable semantic-owner mappings.
+pub const SPAN_RANGE_CAPABILITY: RepositoryCapability =
+    RepositoryCapability::new("span-range-graph", 3);
+
+/// Repository contains semantic edits referencing span-derived baselines.
+/// Clients must validate those baselines instead of treating them as CRDT IDs.
+pub const SPAN_PROJECTED_SEMANTICS_CAPABILITY: RepositoryCapability =
+    RepositoryCapability::new("span-projected-semantics", 1);
+
 /// Capabilities supported by this Atomic build.
 pub const SUPPORTED_REPOSITORY_CAPABILITIES: &[RepositoryCapability] = &[
     CHANGE_FORMAT_VNEXT_CAPABILITY,
     SHIM_CUTOVER_CAPABILITY,
     KG_SEMWEB_CAPABILITY,
+    GIT_CLOSURE_SHARING_CAPABILITY,
+    SPAN_RANGE_CAPABILITY,
+    SPAN_PROJECTED_SEMANTICS_CAPABILITY,
 ];
 
 /// A repository capability and the minimum version required to use it.
@@ -114,7 +132,13 @@ pub(crate) fn unsupported_requirements(
                 .iter()
                 .find(|supported| supported.id == required.id)
                 .map(|supported| supported.minimum_version);
-            if supported_version.is_some_and(|version| version >= required.minimum_version) {
+            // Version 1 used an ambiguous metadata envelope, not the typed
+            // section. It needs explicit migration, not reinterpretation.
+            let legacy_span =
+                required.id == SPAN_RANGE_CAPABILITY.id() && required.minimum_version == 1;
+            if !legacy_span
+                && supported_version.is_some_and(|version| version >= required.minimum_version)
+            {
                 None
             } else {
                 Some(UnsupportedRepositoryCapability {

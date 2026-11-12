@@ -194,6 +194,7 @@ fn test_section_type_byte_values() {
     assert_eq!(SectionType::Dependencies.to_byte(), 0x02);
     assert_eq!(SectionType::Provenance.to_byte(), 0x03);
     assert_eq!(SectionType::Graph.to_byte(), 0x10);
+    assert_eq!(SectionType::Span.to_byte(), 0x11);
     assert_eq!(SectionType::Content.to_byte(), 0x20);
     assert_eq!(SectionType::Semantic.to_byte(), 0x30);
     assert_eq!(SectionType::Unhashed.to_byte(), 0xF0);
@@ -206,6 +207,7 @@ fn test_section_type_from_byte_roundtrip() {
         SectionType::Dependencies,
         SectionType::Provenance,
         SectionType::Graph,
+        SectionType::Span,
         SectionType::Content,
         SectionType::Semantic,
         SectionType::Unhashed,
@@ -221,9 +223,25 @@ fn test_section_type_from_byte_roundtrip() {
 #[test]
 fn test_section_type_from_byte_invalid() {
     // Test some invalid bytes
-    for byte in [0x00, 0x0F, 0x11, 0x21, 0x31, 0xFF] {
+    for byte in [0x00, 0x0F, 0x12, 0x21, 0x31, 0xFF] {
         let result = SectionType::from_byte(byte);
         assert!(result.is_err(), "byte 0x{:02X} should be invalid", byte);
+    }
+}
+
+#[test]
+fn old_section_type_postcard_ordinals_are_unchanged() {
+    for (section, ordinal) in [
+        (SectionType::Header, 0),
+        (SectionType::Dependencies, 1),
+        (SectionType::Provenance, 2),
+        (SectionType::Signature, 3),
+        (SectionType::Graph, 4),
+        (SectionType::Content, 5),
+        (SectionType::Semantic, 6),
+        (SectionType::Unhashed, 7),
+    ] {
+        assert_eq!(postcard::to_allocvec(&section).unwrap(), vec![ordinal]);
     }
 }
 
@@ -234,6 +252,7 @@ fn test_section_type_is_hashed() {
     assert!(SectionType::Provenance.is_hashed());
     assert!(!SectionType::Signature.is_hashed());
     assert!(SectionType::Graph.is_hashed());
+    assert!(SectionType::Span.is_hashed());
     assert!(SectionType::Content.is_hashed());
     assert!(SectionType::Semantic.is_hashed());
 

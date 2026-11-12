@@ -989,6 +989,7 @@ impl Repository {
         } else {
             self.apply_deferred_tree_ops_in_txn(txn, &journal, &visibility)?
         };
+        super::name_resolution::refresh_name_conflict_caches(txn, view.id)?;
         if changed {
             self.persist_deferred_tree_journal(&journal)?;
         }
@@ -1056,6 +1057,31 @@ impl Repository {
             + PathClaimTxnT
             + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
     {
+        match wanted {
+            Some(path) => self.project_tree_for_visibility_wanted(
+                txn,
+                visibility,
+                Some(&HashSet::from([path.to_string()])),
+            ),
+            None => self.project_tree_for_visibility_wanted(txn, visibility, None),
+        }
+    }
+
+    /// Set-scoped variant of [`Self::project_tree_for_visibility_scoped`]:
+    /// the absent-liveness check runs only for the `wanted` paths, so a
+    /// batch of path reads costs what the same reads cost one by one.
+    pub(super) fn project_tree_for_visibility_wanted<T>(
+        &self,
+        txn: &T,
+        visibility: &GraphVisibilityClosure,
+        wanted: Option<&HashSet<String>>,
+    ) -> Result<TreeProjection, RepositoryError>
+    where
+        T: GraphTxnT
+            + TreeTxnT
+            + PathClaimTxnT
+            + atomic_core::pristine::InodeGraphOps<InodeError = atomic_core::pristine::PristineError>,
+    {
         let reduced = super::name_resolution::reduce_path_claims(txn, visibility)?;
         if std::env::var("ATOMIC_DEBUG_PROJECTION").is_ok() {
             eprintln!(
@@ -1104,7 +1130,7 @@ impl Repository {
         let mut absent_check_ms = 0u128;
         let visible_changes = visibility.iter_dependency_first().copied().collect();
         for absent in reduced.absent {
-            let wanted_here = wanted.is_none_or(|path| path == absent.path.as_str());
+            let wanted_here = wanted.is_none_or(|paths| paths.contains(absent.path.as_str()));
             if wanted_here
                 && !absent.directory
                 && !alive_inodes.contains(&absent.inode)
@@ -1604,7 +1630,9 @@ impl Repository {
             &*txn,
             &super::filter::view_membership(txn, &view)?,
         )?;
-        self.apply_deferred_tree_ops_in_txn(txn, &journal, &visibility)
+        let affected = self.apply_deferred_tree_ops_in_txn(txn, &journal, &visibility)?;
+        super::name_resolution::refresh_name_conflict_caches(txn, view.id)?;
+        Ok(affected)
     }
 
     fn apply_deferred_tree_ops_in_txn(

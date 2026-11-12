@@ -418,6 +418,7 @@ impl Record {
 mod builder;
 mod command;
 mod format;
+pub(crate) use format::format_record_stats;
 mod provenance;
 
 pub(super) use command::*;

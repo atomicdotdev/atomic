@@ -15,6 +15,7 @@ categories = ["development-tools"]
 # Internal crates
 atomic-core = { workspace = true }
 atomic-objects = { workspace = true }
+atomic-config = { workspace = true }
 
 # HTTP client
 reqwest = { workspace = true, features = ["json", "gzip", "deflate", "stream"] }
@@ -35,12 +36,13 @@ anyhow = { workspace = true }
 url = { workspace = true }
 bytes = { workspace = true }
 log = { workspace = true }
+data-encoding = { workspace = true }
 
 # Time
 chrono = { workspace = true }
 
 # IDs
-uuid = { version = "1.0", features = ["serde"] }
+uuid = { version = "1.0", features = ["serde", "v4"] }
 
 # URL encoding
 urlencoding = "2"
@@ -52,6 +54,7 @@ atomic-identity = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = { workspace = true }
 env_logger = { workspace = true }
+serial_test = { workspace = true }
 
 [features]
 default = []

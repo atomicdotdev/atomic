@@ -416,7 +416,7 @@ impl Pull {
             .with_timeout(Duration::from_secs(self.timeout))
             .danger_accept_invalid_certs(self.insecure);
 
-        crate::commands::auth::attach_identity(config, remote_url, identity_hint).await
+        atomic_remote::auth::attach_identity(config, remote_url, identity_hint).await
     }
 
     /// Display the dry run preview.

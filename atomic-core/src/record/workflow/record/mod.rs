@@ -156,7 +156,6 @@ pub use types::{RecordedFile, RecordingResult, RecordingStats};
 
 use crate::change::{Encoding, FileOps, Local};
 use crate::crdt::{BranchId, TrunkId};
-use crate::diff::DiffOp;
 use crate::diff::Line;
 use crate::output::WorkingCopyRead;
 use crate::pristine::PathClaimId;
@@ -614,29 +613,18 @@ fn record_modified_file_with_semantics<W: WorkingCopyRead>(
     // can render exactly.
     //
     // The diff is computed before the force decision so the multi-line
-    // deletion check below can inspect its ops.
+    // replacement check below can inspect its ops.
     let comparison = compare_content(old_content, &new_content, options.get_algorithm());
 
-    // ::26 R1 third follow-up (2026-10-13): a contiguous multi-line deletion
-    // region recorded against a graph whose vertices span an earlier
-    // insertion commit leaves the additive graph in a state the alive walk
-    // classifies as a cyclic conflict — the staged render emits conflict
-    // markers and `atomic status` reports the file modified immediately after
-    // a clean record. Reproduced natively (record an insertion commit, then a
-    // commit deleting a 38-line contiguous region: the render keeps the
-    // deleted lines and adds markers) and through `atomic git import`, whose
-    // staged verification refused the change ("staged path ... renders 27472
-    // byte(s) but the commit tree expects 23819 byte(s)"). Single-line
-    // deletions are unaffected. Route the modify through the sentinel
-    // whole-file replace below — the same fail-safe shape used for binary
-    // content: every alive vertex is deleted and the full content inserted
-    // fresh, which renders byte-exact regardless of the graph's diamond
-    // structure.
-    let has_multi_line_deletion = comparison.diff_ops.iter().any(|op| match op {
-        DiffOp::Delete { len, .. } => *len > 1,
-        DiffOp::Replace { old_len, .. } => *old_len > 1,
-        _ => false,
-    });
+    // Keep the conservative fallback for multi-line replacements, but not
+    // pure deletions. A deletion must only tombstone its targeted vertices:
+    // rewriting the surviving prefix/suffix makes concurrent insertions inside
+    // the deleted region conflict with unrelated survivor content (rubric A9).
+    // Structural ambiguity still requests a whole-file rewrite explicitly.
+    let has_multi_line_replacement = comparison
+        .diff_ops
+        .iter()
+        .any(|op| matches!(op, crate::diff::DiffOp::Replace { old_len, .. } if *old_len > 1));
     // ::26 R1 fifth follow-up (2026-10-13): count LINES — newline-split
     // segments including a no-trailing-newline remainder — matching the
     // graph's per-line vertex split, the CRDT branch-per-line model, and the
@@ -646,27 +634,17 @@ fn record_modified_file_with_semantics<W: WorkingCopyRead>(
     let old_line_count = Line::from_bytes(old_content).len();
     recorded.set_old_line_count(old_line_count);
 
-    // ::26 R1 sixth follow-up (2026-10-14): an edit at the EOF boundary of a
-    // file without a trailing newline — replacing or extending the final
-    // no-newline line, or adding one — loses or shifts the final byte in the
-    // per-line hunk slicing (observed: a +1-byte trailing-newline commit
-    // rendered 1,934 of 1,935 bytes). Either side lacking the final newline
-    // puts the edit boundary at EOF, where partial-hunk slicing is
-    // fragile; route through the sentinel whole-file replace, which
-    // rewrites the file byte-exactly.
-    // Identical content (a pure move of the file) is no edit at all: without
-    // this guard a moved file lacking a trailing newline took the whole-file
-    // replace below, re-inserting every line of content that never changed.
+    // A missing final newline alone does not require a whole-file rewrite.
+    // The hunk byte ranges below clamp to new_content.len(), including the
+    // final unterminated line. Rewriting unchanged lines here turns independent
+    // cross-view edits into overlapping replacements and duplicates their
+    // shared content on insert (harness 17).
     let content_differs = old_content != new_content.as_slice();
-    let eof_boundary_edit = content_differs
-        && (old_content.last().is_some_and(|&b| b != b'\n')
-            || new_content.last().is_some_and(|&b| b != b'\n'));
     // A pure move of an unchanged generated file records only the move.
     let force_whole_file = options.get_force_whole_file_replace()
         || (content_differs
             && opaque_with_semantic_state(&detected.path, existing_trunk_id, existing_branches))
-        || has_multi_line_deletion
-        || eof_boundary_edit;
+        || has_multi_line_replacement;
 
     // Whole-file-replace safety fallback: if the caller's `old_content` came
     // from resolving a fork or cyclic conflict (see

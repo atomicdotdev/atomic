@@ -47,6 +47,10 @@ pub const LEGACY_FORMAT_VERSION: u32 = 1;
 /// Current ATOM streaming schema version emitted by writers.
 pub const FORMAT_VERSION: u32 = 2;
 
+/// Schema for changes carrying one separately hashed span section. Ordinary
+/// changes retain schema 2 and their existing identities.
+pub const SPAN_FORMAT_VERSION: u32 = 3;
+
 /// Maximum number of unique hashes in the deduplication table.
 ///
 /// This is `u16::MAX - 1` because index `0xFFFF` is reserved as a sentinel

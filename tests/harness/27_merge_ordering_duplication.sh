@@ -150,11 +150,11 @@ fi
 
 begin_section "Post-merge repository state"
 
-assert_success "status runs after a conflicted merge" atomic status
+require_success "status runs after a conflicted merge" atomic status
 assert_occurrences "re-materializing does not add further copies" f.txt "header" 1
 
-switch_view side-a >/dev/null 2>&1 || true
-switch_view "$BASE_VIEW" >/dev/null 2>&1 || true
+require_success "switch to side-a" switch_view side-a
+require_success "switch back to base view" switch_view "$BASE_VIEW"
 
 tail_after=$(grep -cE '^tail[0-9]+$' f.txt 2>/dev/null || true)
 if [[ "$tail_after" == "30" ]]; then

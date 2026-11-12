@@ -407,11 +407,14 @@ pub const GIT_SHA_INDEX: TableDefinition<&str, u64> = TableDefinition::new("git_
 /// imported in an earlier run reconstructs the exact parent visibility a
 /// sibling lineage must be excluded against — a per-run ledger cannot.
 ///
-/// Value encoding: little-endian u32 count, then that many 32-byte change
-/// hashes concatenated (canonical order is the caller's responsibility; the
-/// count makes decoding total).
+/// Legacy rows hold a count and complete hashes. Shared rows hold a versioned
+/// root into immutable trie nodes and require `git-closure-sharing`.
 pub const GIT_COMMIT_CLOSURES: TableDefinition<&str, &[u8]> =
     TableDefinition::new("git_commit_closures");
+
+/// Content-addressed Git closure trie nodes: node hash → (left, right).
+pub const GIT_CLOSURE_NODES: TableDefinition<&[u8; 32], &[u8; 64]> =
+    TableDefinition::new("git_closure_nodes");
 
 // ============================================================================
 // Bridge event captures (RFC-ATOMIC-GIT-CAUSAL-BRIDGE §5.4, review R4)

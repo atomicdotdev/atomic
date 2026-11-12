@@ -49,15 +49,27 @@
 
 HARNESS_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HARNESS_DIR/helpers.sh"
+SNAPSHOT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/atomic-test-diff-snapshots-XXXXXX")"
+_HARNESS_TMPDIRS+=("$SNAPSHOT_DIR")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Helper: get the full hash of the latest change
 # ═══════════════════════════════════════════════════════════════════════════
 
-get_last_change_hash() {
-    # Find the newest .change file by modification time
-    find "$REPO_DIR/.atomic/changes" -name "*.change" -type f -print0 2>/dev/null \
-        | xargs -0 ls -t 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.change$//'
+record_for_diff() {
+    local message="$1" output hash
+    find "$REPO_DIR/.atomic/changes" -name '*.change' -type f | xargs -I{} basename {} .change | sort > "$SNAPSHOT_DIR/before" || return 1
+    if ! output="$(record_change "$message" 2>&1)"; then
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+    find "$REPO_DIR/.atomic/changes" -name '*.change' -type f | xargs -I{} basename {} .change | sort > "$SNAPSHOT_DIR/after" || return 1
+    hash="$(comm -13 "$SNAPSHOT_DIR/before" "$SNAPSHOT_DIR/after")" || return 1
+    if [[ -z "$hash" || "$hash" == *$'\n'* ]]; then
+        printf 'expected one new change object, got: %s\n' "$hash" >&2
+        return 1
+    fi
+    printf '%s\n' "$hash"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -154,8 +166,8 @@ function greet(name: string): string {
 console.log(greet("World"));
 EOF
 
-add_files src/app.ts
-record_change "Initial file" >/dev/null 2>&1
+require_success "add app.ts" atomic add src/app.ts
+require_success "record initial file" record_change "Initial file"
 
 # Modify: add imports at top, change the console.log call
 cat > src/app.ts << 'EOF'
@@ -175,9 +187,8 @@ rl.question("Name: ", (answer) => {
 });
 EOF
 
-record_change "Add readline, modify console.log" >/dev/null 2>&1
-
-HASH="$(get_last_change_hash)"
+require_capture "record readline modification" record_for_diff "Add readline, modify console.log"
+HASH="$COMMAND_OUTPUT"
 
 if [[ -z "$HASH" ]]; then
     _fail "Get change hash" "Could not find change hash"
@@ -185,7 +196,8 @@ if [[ -z "$HASH" ]]; then
     exit 1
 fi
 
-DIFF_OUT="$(atomic diff --no-color -c "$HASH" 2>&1)"
+require_capture "diff readline modification" atomic diff --no-color -c "$HASH"
+DIFF_OUT="$COMMAND_OUTPUT"
 
 # The old line: console.log(greet("World"));
 # The new line: console.log(greet(name));
@@ -226,8 +238,8 @@ export const RETRIES = 3;
 export const DEBUG = false;
 EOF
 
-add_files src/config.ts
-record_change "Initial config" >/dev/null 2>&1
+require_success "add config.ts" atomic add src/config.ts
+require_success "record initial config" record_change "Initial config"
 
 # Change only one value: TIMEOUT 30 → 60
 cat > src/config.ts << 'EOF'
@@ -237,10 +249,10 @@ export const RETRIES = 3;
 export const DEBUG = false;
 EOF
 
-record_change "Increase timeout" >/dev/null 2>&1
-
-HASH="$(get_last_change_hash)"
-DIFF_OUT="$(atomic diff --no-color -c "$HASH" 2>&1)"
+require_capture "record timeout modification" record_for_diff "Increase timeout"
+HASH="$COMMAND_OUTPUT"
+require_capture "diff timeout modification" atomic diff --no-color -c "$HASH"
+DIFF_OUT="$COMMAND_OUTPUT"
 
 # The delete should contain "TIMEOUT = 30" and the insert "TIMEOUT = 60"
 # and they should be adjacent
@@ -288,8 +300,8 @@ function start() {
 start();
 EOF
 
-add_files src/server.ts
-record_change "Initial server config" >/dev/null 2>&1
+require_success "add server.ts" atomic add src/server.ts
+require_success "record initial server config" record_change "Initial server config"
 
 # Change HOST, PORT, and DB_HOST (3 modifications, rest unchanged)
 cat > src/server.ts << 'EOF'
@@ -307,10 +319,10 @@ function start() {
 start();
 EOF
 
-record_change "Production config" >/dev/null 2>&1
-
-HASH="$(get_last_change_hash)"
-DIFF_OUT="$(atomic diff --no-color -c "$HASH" 2>&1)"
+require_capture "record production config" record_for_diff "Production config"
+HASH="$COMMAND_OUTPUT"
+require_capture "diff production config" atomic diff --no-color -c "$HASH"
+DIFF_OUT="$COMMAND_OUTPUT"
 CHANGE_LINES="$(printf '%s\n' "$DIFF_OUT" | extract_atomic_change_lines)"
 
 assert_paired_diff \
@@ -362,8 +374,8 @@ function hello(): string {
 console.log(hello());
 EOF
 
-add_files src/main.ts
-record_change "Simple hello" >/dev/null 2>&1
+require_success "add main.ts" atomic add src/main.ts
+require_success "record simple hello" record_change "Simple hello"
 
 # Major refactor: add error handling, logging, config — AND modify the
 # console.log call (World → name). The modification is line 5 old → line 20+ new.
@@ -402,10 +414,10 @@ try {
 }
 EOF
 
-record_change "Major refactor with modified hello call" >/dev/null 2>&1
-
-HASH="$(get_last_change_hash)"
-DIFF_OUT="$(atomic diff --no-color -c "$HASH" 2>&1)"
+require_capture "record major refactor" record_for_diff "Major refactor with modified hello call"
+HASH="$COMMAND_OUTPUT"
+require_capture "diff major refactor" atomic diff --no-color -c "$HASH"
+DIFF_OUT="$COMMAND_OUTPUT"
 
 # The old line: console.log(hello());
 # In the new file, the call is now: console.log(message);
@@ -443,8 +455,8 @@ export function add(a: number, b: number): number {
 }
 EOF
 
-add_files src/utils.ts
-record_change "Initial utils" >/dev/null 2>&1
+require_success "add utils.ts" atomic add src/utils.ts
+require_success "record initial utils" record_change "Initial utils"
 
 # Add a new function (pure addition) — no modification of existing lines
 cat > src/utils.ts << 'EOF'
@@ -457,10 +469,10 @@ export function multiply(a: number, b: number): number {
 }
 EOF
 
-record_change "Add multiply function" >/dev/null 2>&1
-
-HASH="$(get_last_change_hash)"
-DIFF_OUT="$(atomic diff --no-color -c "$HASH" 2>&1)"
+require_capture "record multiply function" record_for_diff "Add multiply function"
+HASH="$COMMAND_OUTPUT"
+require_capture "diff multiply function" atomic diff --no-color -c "$HASH"
+DIFF_OUT="$COMMAND_OUTPUT"
 
 # Should have only additions, no deletions
 # Exclude diff header lines (--- a/file) from the count
@@ -496,8 +508,8 @@ export function currentHelper(): void {
 }
 EOF
 
-add_files src/legacy.ts
-record_change "Initial legacy" >/dev/null 2>&1
+require_success "add legacy.ts" atomic add src/legacy.ts
+require_success "record initial legacy" record_change "Initial legacy"
 
 # Delete the old function, keep the current one
 cat > src/legacy.ts << 'EOF'
@@ -506,10 +518,10 @@ export function currentHelper(): void {
 }
 EOF
 
-record_change "Remove deprecated function" >/dev/null 2>&1
-
-HASH="$(get_last_change_hash)"
-DIFF_OUT="$(atomic diff --no-color -c "$HASH" 2>&1)"
+require_capture "record removal of deprecated function" record_for_diff "Remove deprecated function"
+HASH="$COMMAND_OUTPUT"
+require_capture "diff deprecated function removal" atomic diff --no-color -c "$HASH"
+DIFF_OUT="$COMMAND_OUTPUT"
 
 # Should have only deletions, no additions
 # Exclude diff header lines (+++ b/file) from the count
@@ -547,8 +559,8 @@ mkdir -p src
     done
 } > src/constants.ts
 
-add_files src/constants.ts
-record_change "Initial 20 constants" >/dev/null 2>&1
+require_success "add constants.ts" atomic add src/constants.ts
+require_success "record initial constants" record_change "Initial 20 constants"
 
 # Modify even-numbered lines (10 modifications) and add 5 new lines
 # between each pair of constants (50 additions total)
@@ -571,10 +583,10 @@ record_change "Initial 20 constants" >/dev/null 2>&1
     done
 } > src/constants.ts
 
-record_change "Update even constants, add comments" >/dev/null 2>&1
-
-HASH="$(get_last_change_hash)"
-DIFF_OUT="$(atomic diff --no-color -c "$HASH" 2>&1)"
+require_capture "record updated constants" record_for_diff "Update even constants, add comments"
+HASH="$COMMAND_OUTPUT"
+require_capture "diff updated constants" atomic diff --no-color -c "$HASH"
+DIFF_OUT="$COMMAND_OUTPUT"
 CHANGE_LINES="$(printf '%s\n' "$DIFF_OUT" | extract_atomic_change_lines)"
 
 # Check that each modified line is paired
@@ -611,11 +623,11 @@ for i in 2 4 6 8 10 12 14 16 18 20; do
     fi
 done
 
-if [[ "$PAIR_SUCCESS" -ge 8 ]]; then
+if [[ "$PAIR_SUCCESS" -eq 10 ]]; then
     _pass "Scale: $PAIR_SUCCESS/10 modifications correctly paired"
 else
     _fail "Scale: pairing at scale" \
-        "Only $PAIR_SUCCESS/10 modifications paired ($PAIR_FAIL failed). Expected ≥8."
+        "Only $PAIR_SUCCESS/10 modifications paired ($PAIR_FAIL failed). Expected 10."
 fi
 
 # Verify unchanged lines are NOT among the +/- change lines. They may appear
@@ -672,8 +684,8 @@ export function handle(req: Request): void {
 }
 EOF
 
-add_files src/handler.ts
-record_change "Initial handler" >/dev/null 2>&1
+require_success "add handler.ts" atomic add src/handler.ts
+require_success "record initial handler" record_change "Initial handler"
 
 # Complex change:
 #   - ADD: import for Response type (pure add)
@@ -711,10 +723,10 @@ export function handle(req: Request, res: Response): void {
 }
 EOF
 
-record_change "Refactor handler with types and logging" >/dev/null 2>&1
-
-HASH="$(get_last_change_hash)"
-DIFF_OUT="$(atomic diff --no-color -c "$HASH" 2>&1)"
+require_capture "record handler refactor" record_for_diff "Refactor handler with types and logging"
+HASH="$COMMAND_OUTPUT"
+require_capture "diff handler refactor" atomic diff --no-color -c "$HASH"
+DIFF_OUT="$COMMAND_OUTPUT"
 
 # The validate function signature changed: boolean → ValidationResult
 assert_paired_diff \

@@ -899,6 +899,25 @@ mod tests {
     }
 
     #[test]
+    fn git_stream_pure_rename_is_evidence_not_an_authoritative_move() {
+        use atomic_core::change::ChangeHeader;
+
+        let mut change = Change::empty(ChangeHeader::new("Git rename evidence"));
+        change.unhashed = Some(serde_json::json!({"git": {
+            "diff_lines": [{"path": "new.txt", "old_path": "old.txt", "operation": "renamed", "lines": []}],
+            "stream": {"rename_identity_loss": [{"from": "old.txt", "to": "new.txt"}]}
+        }}));
+        let (files, _) = Diff::build_git_import_file_diffs(&change).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].old_path, "old.txt");
+        assert_eq!(files[0].new_path, "new.txt");
+        assert_eq!(files[0].status, FileChangeStatus::Renamed);
+        assert!(files[0].hunks.is_empty());
+        assert!(files[0].has_changes());
+        assert!(files[0].git_rename_identity_unproven);
+    }
+
+    #[test]
     fn test_diff_with_algorithm() {
         let diff = Diff::new().with_algorithm("patience");
         assert_eq!(diff.algorithm, "patience");

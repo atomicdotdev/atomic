@@ -23,18 +23,7 @@ init_repo
 
 assert_current_view "initial view is dev" "dev"
 
-# An empty repo should be clean
-out="$(get_status)"
-if echo "$out" | grep -qiE "clean|no changes|nothing"; then
-    _pass "empty repo status is clean"
-else
-    # Accept no output at all (also clean)
-    if [[ -z "$(echo "$out" | xargs)" ]]; then
-        _pass "empty repo status is clean (empty output)"
-    else
-        _fail "empty repo status is clean" "got: $(echo "$out" | head -5)"
-    fi
-fi
+assert_clean "empty repo status is clean"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Create → Status (untracked)"
@@ -58,7 +47,7 @@ assert_status_flag "short status shows ? for hello.txt" "?" "hello.txt"
 begin_section "Single File: Add → Status (added)"
 # ═══════════════════════════════════════════════════════════════════════════
 
-assert_success "add hello.txt succeeds" atomic add hello.txt
+require_success "add hello.txt succeeds" atomic add hello.txt
 
 # File should now be tracked
 assert_success "hello.txt is tracked after add" atomic status
@@ -66,34 +55,16 @@ assert_success "hello.txt is tracked after add" atomic status
 # Short format: A = added
 assert_status_flag "short status shows A for hello.txt" "A" "hello.txt"
 
-# Adding again should be idempotent (or warn)
-add_output="$(atomic add hello.txt 2>&1)" || true
-# Should not error fatally
-_pass "re-adding an already-tracked file does not crash"
+assert_success "re-adding an already-tracked file succeeds" atomic add hello.txt
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Record → Status (clean)"
 # ═══════════════════════════════════════════════════════════════════════════
 
-rec_out="$(record_change "Add hello.txt")"
-if echo "$rec_out" | grep -qiE "hash|recorded|created|change"; then
-    _pass "record succeeds and prints hash"
-else
-    # Even if the output format is different, as long as exit 0 we pass
-    if atomic status >/dev/null 2>&1; then
-        _pass "record succeeds (status still works)"
-    else
-        _fail "record succeeds" "output: $(echo "$rec_out" | head -5)"
-    fi
-fi
+require_success "record hello.txt succeeds" record_change "Add hello.txt"
 
 # Status should be clean now
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*hello\.txt"; then
-    _fail "status is clean after record" "hello.txt still has a dirty flag: $(echo "$out" | head -5)"
-else
-    _pass "status is clean after record"
-fi
+assert_status_no_entry "status is clean after record" "hello.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Modify → Status (modified)"
@@ -109,63 +80,33 @@ assert_status_flag "short status shows M for modified hello.txt" "M" "hello.txt"
 begin_section "Single File: Record modification → Status (clean)"
 # ═══════════════════════════════════════════════════════════════════════════
 
-rec_out2="$(record_change "Modify hello.txt")"
-if echo "$rec_out2" | grep -qiE "hash|recorded|created|change"; then
-    _pass "record modification succeeds"
-else
-    _pass "record modification completes"
-fi
+require_success "record modification succeeds" record_change "Modify hello.txt"
 
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MADU?].*hello\.txt"; then
-    _fail "status is clean after recording modification" "got: $(echo "$out" | head -5)"
-else
-    _pass "status is clean after recording modification"
-fi
+assert_status_no_entry "status is clean after recording modification" "hello.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Unrecord → Status"
 # ═══════════════════════════════════════════════════════════════════════════
 
-unrec_out="$(unrecord_last)"
-if echo "$unrec_out" | grep -qiE "unrecord|removed|hash"; then
-    _pass "unrecord succeeds"
-else
-    # As long as it doesn't crash we continue
-    _pass "unrecord completes without crash"
-fi
+require_success "unrecord succeeds" unrecord_last
 
 # After unrecording the modification, the file should show as modified
 # (disk has the new content, graph has the old content)
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^[MA].*hello\.txt"; then
-    _pass "hello.txt shows as modified or added after unrecord"
-else
-    # Might also be clean if unrecord left content as-is
-    _pass "status after unrecord completed (may vary by impl)"
-fi
+assert_status_flag "hello.txt shows as modified after unrecord" "M" "hello.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Delete from disk → Status (deleted)"
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Re-record so we have a clean state to delete from
-record_change "Re-record hello.txt" >/dev/null 2>&1 || true
+require_success "re-record hello.txt" record_change "Re-record hello.txt"
 
 rm -f hello.txt
 
 assert_file_not_exists "hello.txt is gone from disk" "hello.txt"
 
 # Status should show as deleted (D)
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^D.*hello\.txt"; then
-    _pass "short status shows D for deleted hello.txt"
-elif echo "$out" | grep -qF "hello.txt"; then
-    # Some implementations might use a different flag
-    _pass "status mentions deleted hello.txt"
-else
-    _fail "status shows hello.txt as deleted" "got: $(echo "$out" | head -5)"
-fi
+assert_status_flag "short status shows D for deleted hello.txt" "D" "hello.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Empty file"
@@ -177,19 +118,19 @@ init_repo
 create_file "empty.txt" ""
 
 assert_file_exists "empty.txt exists" "empty.txt"
+if [[ ! -s empty.txt ]]; then
+    _pass "empty.txt contains zero bytes"
+else
+    _fail "empty.txt contains zero bytes" "file is not empty"
+fi
 
 # Add and record empty file
-assert_success "add empty.txt" atomic add empty.txt
+require_success "add empty.txt" atomic add empty.txt
 
 assert_status_flag "empty.txt shows as added" "A" "empty.txt"
 
-rec_out="$(record_change "Add empty file" 2>&1)" || true
-# Recording an empty file might succeed or might skip (implementation-dependent)
-if echo "$rec_out" | grep -qiE "hash|recorded|nothing"; then
-    _pass "record of empty file completes"
-else
-    _pass "record of empty file does not crash"
-fi
+require_success "record empty file" record_change "Add empty file"
+assert_status_no_entry "empty file is clean after record" "empty.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: File with spaces in name"
@@ -202,12 +143,7 @@ create_file "my file.txt" "content with spaces in filename"
 
 assert_file_exists "file with spaces exists" "my file.txt"
 
-add_out="$(atomic add "my file.txt" 2>&1)" || true
-if [[ $? -eq 0 ]] || echo "$add_out" | grep -qiE "added|tracked"; then
-    _pass "add file with spaces in name"
-else
-    _skip "add file with spaces in name" "may not be supported yet"
-fi
+assert_success "add file with spaces in name" atomic add "my file.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: File with unicode name"
@@ -220,12 +156,7 @@ create_file "héllo_wörld.txt" "unicode filename content"
 
 assert_file_exists "unicode filename exists" "héllo_wörld.txt"
 
-add_out="$(atomic add "héllo_wörld.txt" 2>&1)" || true
-if [[ $? -eq 0 ]] || echo "$add_out" | grep -qiE "added|tracked"; then
-    _pass "add file with unicode name"
-else
-    _skip "add file with unicode name" "may not be supported yet"
-fi
+assert_success "add file with unicode name" atomic add "héllo_wörld.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Nested file (deep path)"
@@ -242,12 +173,7 @@ assert_success "add deeply nested file" atomic add "src/pkg/deep/main.rs"
 
 assert_status_flag "nested file shows as added" "A" "src/pkg/deep/main.rs"
 
-rec_out="$(record_change "Add nested file")"
-if echo "$rec_out" | grep -qiE "hash|recorded|created"; then
-    _pass "record nested file succeeds"
-else
-    _pass "record nested file completes"
-fi
+require_success "record nested file succeeds" record_change "Add nested file"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Binary file"
@@ -261,12 +187,7 @@ printf '\x00\x01\x02\xff\xfe' > binary.dat
 
 assert_file_exists "binary file exists" "binary.dat"
 
-add_out="$(atomic add binary.dat 2>&1)" || true
-if [[ $? -eq 0 ]] || echo "$add_out" | grep -qiE "added|tracked"; then
-    _pass "add binary file"
-else
-    _skip "add binary file" "may not be supported"
-fi
+assert_success "add binary file" atomic add binary.dat
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Large file"
@@ -280,12 +201,7 @@ dd if=/dev/urandom of=large.bin bs=1024 count=1024 2>/dev/null
 
 assert_file_exists "large file exists" "large.bin"
 
-add_out="$(atomic add large.bin 2>&1)" || true
-if [[ $? -eq 0 ]] || echo "$add_out" | grep -qiE "added|tracked"; then
-    _pass "add large file"
-else
-    _skip "add large file" "may not be supported"
-fi
+assert_success "add large file" atomic add large.bin
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Add file then remove tracking"
@@ -300,28 +216,13 @@ assert_success "add removeme.txt" atomic add removeme.txt
 assert_status_flag "removeme.txt shows as added" "A" "removeme.txt"
 
 # Remove from tracking (file stays on disk)
-rm_out="$(atomic remove removeme.txt 2>&1)" || true
-if echo "$rm_out" | grep -qiE "removed|untracked"; then
-    _pass "remove from tracking succeeds"
-elif [[ $? -eq 0 ]]; then
-    _pass "remove from tracking completes"
-else
-    _skip "remove from tracking" "remove command may not exist yet"
-fi
+require_success "remove from tracking succeeds" atomic remove removeme.txt
 
 # File should still exist on disk
 assert_file_exists "file still on disk after remove tracking" "removeme.txt"
 
 # File should now be untracked
-out="$(get_status_short)"
-if echo "$out" | grep -qE "^\?.*removeme\.txt"; then
-    _pass "removeme.txt is untracked after remove"
-elif ! echo "$out" | grep -qF "removeme.txt"; then
-    # Not in status at all could also be valid
-    _pass "removeme.txt not in status after remove"
-else
-    _pass "removeme.txt status after remove (implementation dependent)"
-fi
+assert_status_flag "removeme.txt is untracked after remove" "?" "removeme.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Re-add after unrecord"
@@ -332,21 +233,20 @@ init_repo
 
 create_file "cycle.txt" "v1"
 assert_success "add cycle.txt" atomic add cycle.txt
-record_change "Add cycle.txt v1" >/dev/null 2>&1 || true
+require_success "record cycle.txt v1" record_change "Add cycle.txt v1"
 
 # Unrecord
-unrecord_last >/dev/null 2>&1 || true
+require_success "unrecord cycle.txt v1" unrecord_last
+assert_status_flag "unrecorded cycle.txt is untracked" "?" "cycle.txt"
 
 # Modify
 overwrite_file "cycle.txt" "v2"
+require_success "re-add cycle.txt after unrecord" atomic add cycle.txt
+assert_status_flag "re-added cycle.txt is staged" "A" "cycle.txt"
 
 # Re-record
-rec_out="$(record_change "Re-add cycle.txt v2" 2>&1)" || true
-if echo "$rec_out" | grep -qiE "hash|recorded|created"; then
-    _pass "re-record after unrecord succeeds"
-else
-    _pass "re-record after unrecord completes"
-fi
+require_success "re-record after unrecord succeeds" record_change "Re-add cycle.txt v2"
+assert_status_no_entry "cycle.txt is clean after re-record" "cycle.txt"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Single File: Multiple modifications, single record"
@@ -357,7 +257,7 @@ init_repo
 
 create_file "evolving.txt" "version 1"
 assert_success "add evolving.txt" atomic add evolving.txt
-record_change "Initial evolving.txt" >/dev/null 2>&1 || true
+require_success "record initial evolving.txt" record_change "Initial evolving.txt"
 
 # Make multiple modifications without recording
 overwrite_file "evolving.txt" "version 2"
@@ -367,12 +267,7 @@ overwrite_file "evolving.txt" "version 4 final"
 # Only the final state should be recorded
 assert_status_flag "evolving.txt is modified" "M" "evolving.txt"
 
-rec_out="$(record_change "Final version of evolving.txt" 2>&1)" || true
-if echo "$rec_out" | grep -qiE "hash|recorded|created"; then
-    _pass "record captures final state after multiple edits"
-else
-    _pass "record after multiple edits completes"
-fi
+require_success "record captures final state after multiple edits" record_change "Final version of evolving.txt"
 
 assert_file_content "file has final content after record" "evolving.txt" "version 4 final"
 
@@ -388,12 +283,7 @@ create_file ".config" "dotfile content"
 assert_file_exists ".config exists" ".config"
 
 # Dotfiles may or may not be auto-hidden from status
-add_out="$(atomic add ".config" 2>&1)" || true
-if [[ $? -eq 0 ]]; then
-    _pass "add dotfile"
-else
-    _skip "add dotfile" "dotfiles may be ignored by default"
-fi
+assert_success "add dotfile" atomic add ".config"
 
 # ═══════════════════════════════════════════════════════════════════════════
 begin_section "Large Record: Many files, performance baseline"
@@ -492,14 +382,8 @@ assert_success "add all files" atomic add .
 
 # Time the initial record
 record_start=$SECONDS
-record_out="$(record_change "Initial large record" 2>&1)" || true
+require_success "initial large record completes" record_change "Initial large record"
 record_elapsed=$((SECONDS - record_start))
-
-if echo "$record_out" | grep -qiE "hash|recorded|created|change|file"; then
-    _pass "initial large record completes ($record_elapsed seconds)"
-else
-    _pass "initial large record completes ($record_elapsed seconds)"
-fi
 
 if [ $record_elapsed -le 15 ]; then
     _pass "initial record within 15s threshold (${record_elapsed}s)"
@@ -528,10 +412,8 @@ for j in $(seq 5001 5100); do
 done
 
 modify_start=$SECONDS
-record_out="$(record_change "Modify 10 modules + data" 2>&1)" || true
+require_success "modify record completes" record_change "Modify 10 modules + data"
 modify_elapsed=$((SECONDS - modify_start))
-
-_pass "modify record completes ($modify_elapsed seconds)"
 
 if [ $modify_elapsed -le 10 ]; then
     _pass "modify record within 10s threshold (${modify_elapsed}s)"
@@ -549,14 +431,13 @@ begin_section "Large Record: View switch performance after large record"
 # Validates that the parallel materialize + INODE_GRAPH preload
 # keeps view switching fast even with many files.
 
-atomic view create feature >/dev/null 2>&1 || true
+require_success "create feature view" atomic view create feature
 
 switch_start=$SECONDS
-switch_view "feature" >/dev/null 2>&1 || true
+require_success "switch to feature" switch_view "feature"
 switch_elapsed=$((SECONDS - switch_start))
 
 assert_current_view "on feature" "feature"
-_pass "switch to feature ($switch_elapsed seconds)"
 
 if [ $switch_elapsed -le 5 ]; then
     _pass "switch within 5s threshold (${switch_elapsed}s)"
@@ -566,19 +447,18 @@ fi
 
 # Switch back
 switch_start=$SECONDS
-switch_view "dev" >/dev/null 2>&1 || true
+require_success "switch back to dev" switch_view "dev"
 switch_elapsed=$((SECONDS - switch_start))
 
 assert_current_view "back on dev" "dev"
 assert_clean "dev still clean after round-trip"
-_pass "switch back to dev ($switch_elapsed seconds)"
 
 # Verify file count is preserved
 final_files=$(find . -not -path './.atomic/*' -type f | wc -l | tr -d ' ')
-if [ "$final_files" -ge 50 ]; then
+if [ "$final_files" -eq "$total_files" ]; then
     _pass "all files preserved after view round-trip ($final_files files)"
 else
-    _fail "all files preserved after view round-trip" "only $final_files files"
+    _fail "all files preserved after view round-trip" "expected $total_files files, found $final_files"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════

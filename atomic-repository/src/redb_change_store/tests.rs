@@ -19,6 +19,167 @@ fn make_test_change(message: &str, content: &[u8]) -> Change {
     Change::new(ChangeHeader::new(message), vec![], content.to_vec(), vec![])
 }
 
+#[test]
+fn typed_span_survives_redb_reopen_and_export() {
+    use atomic_core::change::span_patch::{SpanOp, SpanPatch};
+    let mut change = make_test_change("typed span", b"one\ntwo\n");
+    change.hashed.metadata = b"ATSP arbitrary opaque metadata".to_vec();
+    change.hashed.span = Some(SpanPatch::new(
+        vec![],
+        vec![SpanOp::Root {
+            path: "file.txt".into(),
+            ordinal: 0,
+            start: 0,
+            end: 8,
+        }],
+    ));
+    let mut original = Vec::new();
+    let original_hash = change.serialize(&mut original).unwrap();
+    let (dir, store) = temp_store();
+    let hash = store.import_v3_bytes(&original).unwrap();
+    assert_eq!(hash, *original_hash.as_bytes());
+    drop(store);
+    let store = RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+    assert!(matches!(
+        store.load_graph_sections(&hash),
+        Err(RedbStoreError::UnsupportedSpanSelectiveRead)
+    ));
+    assert!(matches!(
+        store.load_semantic_sections(&hash),
+        Err(RedbStoreError::UnsupportedSpanSelectiveRead)
+    ));
+    assert!(matches!(
+        store.load_content_chunks(&hash),
+        Err(RedbStoreError::UnsupportedSpanSelectiveRead)
+    ));
+    let exported = store.export_v3_bytes(&hash).unwrap();
+    let (loaded, exported_hash) = Change::deserialize(&mut Cursor::new(&exported)).unwrap();
+    assert_eq!(exported_hash, original_hash);
+    assert_eq!(loaded.hashed, change.hashed);
+    assert_eq!(loaded.contents, change.contents);
+    let (_receiver_dir, receiver) = temp_store();
+    assert_eq!(receiver.import_v3_bytes(&exported).unwrap(), hash);
+    assert_eq!(receiver.load_change(&hash).unwrap().hashed, change.hashed);
+}
+
+#[test]
+fn projected_semantic_span_survives_redb_reopen_and_export() {
+    use atomic_core::change::span_patch::{
+        ExternalFile, ExternalSpan, SpanOp, SpanPatch, SpanProjectionId,
+    };
+    let owner = Hash::of(b"historical change");
+    let file = ExternalFile { owner, ordinal: 3 };
+    let baseline = SpanProjectionId(Hash::of(b"verified semantic baseline"));
+    let mut change = Change::new(
+        ChangeHeader::new("native span edit"),
+        vec![],
+        b"new".to_vec(),
+        vec![owner],
+    );
+    change.hashed.span = Some(SpanPatch::new(
+        vec![],
+        vec![SpanOp::Edit {
+            file: file.clone(),
+            target: ExternalSpan {
+                owner,
+                start: 0,
+                end: 4,
+            },
+            start: 0,
+            end: 3,
+            insert_start: 0,
+            insert_end: 3,
+        }],
+    ));
+    change
+        .hashed
+        .file_ops
+        .push(atomic_core::change::FileOps::projected_span_edit(
+            "file.txt".into(),
+            file,
+            baseline,
+        ));
+    let mut original = Vec::new();
+    let original_hash = change.serialize(&mut original).unwrap();
+    let (dir, store) = temp_store();
+    let hash = store.import_v3_bytes(&original).unwrap();
+    assert_eq!(hash, *original_hash.as_bytes());
+    drop(store);
+    let store = RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+    assert!(matches!(
+        store.load_graph_sections(&hash),
+        Err(RedbStoreError::UnsupportedSpanSelectiveRead)
+    ));
+    assert!(matches!(
+        store.load_semantic_sections(&hash),
+        Err(RedbStoreError::UnsupportedSpanSelectiveRead)
+    ));
+    assert!(matches!(
+        store.load_content_chunks(&hash),
+        Err(RedbStoreError::UnsupportedSpanSelectiveRead)
+    ));
+    let exported = store.export_v3_bytes(&hash).unwrap();
+    let (loaded, exported_hash) = Change::deserialize(&mut Cursor::new(&exported)).unwrap();
+    assert_eq!(exported_hash, original_hash);
+    assert_eq!(loaded.hashed, change.hashed);
+    assert_eq!(loaded.contents, change.contents);
+    assert!(
+        matches!(loaded.file_ops()[0].trunk_op(), Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { baseline: saved, .. }) if *saved == baseline)
+    );
+    let (_receiver_dir, receiver) = temp_store();
+    assert_eq!(receiver.import_v3_bytes(&exported).unwrap(), hash);
+    assert_eq!(receiver.load_change(&hash).unwrap().hashed, change.hashed);
+}
+
+#[test]
+fn altered_span_cannot_be_exported_under_its_original_hash() {
+    use atomic_core::change::span_patch::{SpanOp, SpanPatch};
+    let (dir, store) = temp_store();
+    let mut change = make_test_change("typed span", b"one\n");
+    let patch = SpanPatch::new(
+        vec![],
+        vec![SpanOp::Root {
+            path: "a".into(),
+            ordinal: 0,
+            start: 0,
+            end: 4,
+        }],
+    );
+    change.hashed.span = Some(patch.clone());
+    let hash = store.save_change(&change).unwrap();
+    let (meta, header, _) = {
+        let txn = store.db().begin_read().unwrap();
+        store.load_meta_with_header_in_txn(&txn, &hash).unwrap()
+    };
+    let mut altered = patch;
+    if let SpanOp::Root { path, .. } = &mut altered.ops[0] {
+        *path = "b".into();
+    }
+    let mut meta_bytes = postcard::to_allocvec(&meta).unwrap();
+    meta_bytes.extend(
+        postcard::to_allocvec(&StoredChangeMetaExtension::V2 {
+            header_v2: header.unwrap(),
+            span: altered.encode().unwrap(),
+        })
+        .unwrap(),
+    );
+    let compressed = zstd::encode_all(meta_bytes.as_slice(), 3).unwrap();
+    let txn = store.db().begin_write().unwrap();
+    txn.open_table(tables::CHANGE_META)
+        .unwrap()
+        .insert(&hash, compressed.as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+    let destination = dir.path().join("existing.change");
+    std::fs::write(&destination, b"preserve").unwrap();
+    assert!(store
+        .export_v3_file(&hash, &destination)
+        .unwrap_err()
+        .to_string()
+        .contains("does not match requested identity"));
+    assert_eq!(std::fs::read(destination).unwrap(), b"preserve");
+}
+
 /// Helper: create a Change with a hunk.
 fn make_change_with_hunk() -> Change {
     let test_pos = Position::new(Some(Hash::of(b"test")), ChangePosition::new(0));

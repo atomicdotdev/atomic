@@ -53,9 +53,9 @@ assert_file_content "dry-run preserves working content" work.txt "important work
 
 assert_failure "split refuses without a terminal or --confirm" \
     noninteractive view split wip --last 1
-assert_output_contains "refusal explains how to acknowledge the risks" \
+assert_failed_output_contains "refusal explains how to acknowledge the risks" \
     "Re-run with --confirm" noninteractive view split wip --last 1
-assert_output_contains "split warns about later orphaning" \
+assert_failed_output_contains "split warns about later orphaning" \
     "Deleting that draft" noninteractive view split wip --last 1
 assert_failure "refused split creates no draft" view_exists wip
 assert_success "refused split retains the source reference" view_has_change dev "$WORK_HASH"
@@ -75,13 +75,13 @@ assert_success "return to source" switch_view dev
 assert_file_not_exists "extracted file is absent from source" work.txt
 assert_failure "orphaning deletion refuses without a terminal or --force" \
     noninteractive view delete wip
-assert_output_contains "deletion reports orphan count" \
+assert_failed_output_contains "deletion reports orphan count" \
     "would orphan 1 change(s)" noninteractive view delete wip
-assert_output_contains "deletion lists the full orphan hash" \
+assert_failed_output_contains "deletion lists the full orphan hash" \
     "$WORK_HASH" noninteractive view delete wip
-assert_output_contains "deletion gives the explicit acknowledgment flag" \
+assert_failed_output_contains "deletion gives the explicit acknowledgment flag" \
     "Re-run with --force" noninteractive view delete wip
-assert_output_not_contains "inherited base is not an orphan candidate" \
+assert_failed_output_not_contains "inherited base is not an orphan candidate" \
     "$BASE_HASH" noninteractive view delete wip
 assert_success "refused deletion preserves draft" view_exists wip
 assert_success "refused deletion preserves its last reference" view_has_change wip "$WORK_HASH"
@@ -135,9 +135,9 @@ assert_success "cascade dry-run does not prompt" \
     noninteractive view split cascade "$CREATE_HASH" --cascade --dry-run
 assert_failure "cascade still requires explicit confirmation" \
     noninteractive view split cascade "$CREATE_HASH" --cascade
-assert_output_contains "warning includes the full cascaded move count" \
+assert_failed_output_contains "warning includes the full cascaded move count" \
     "removes 2 change(s)" noninteractive view split cascade "$CREATE_HASH" --cascade
-assert_output_contains "warning distinguishes the additional dependent" \
+assert_failed_output_contains "warning distinguishes the additional dependent" \
     "1 dependent change(s) included" noninteractive view split cascade "$CREATE_HASH" --cascade
 assert_success "refused cascade retains creation" view_has_change dev "$CREATE_HASH"
 assert_success "refused cascade retains dependent edit" view_has_change dev "$EDIT_HASH"

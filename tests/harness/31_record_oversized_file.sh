@@ -36,7 +36,7 @@ make_oversized_file() {
     local path="$1"
     mkdir -p "$(dirname "$path")"
     # Sparse allocation: instant, and no multi-megabyte fixture in the repo.
-    dd if=/dev/zero of="$path" bs=1 count=0 seek="$OVERSIZED_BYTES" 2>/dev/null
+    dd if=/dev/zero of="$path" bs=1 count=0 seek="$OVERSIZED_BYTES"
 }
 
 # ── 1 · .gitignore keeps build output out of record ─────────────────────────
@@ -49,13 +49,13 @@ init_repo
 printf '/.next/\n/node_modules\n' > .gitignore
 create_file src/app/page.tsx 'export default function Page() { return null }'
 create_file package.json '{"name":"next-app"}'
-make_oversized_file .next/dev/cache/turbopack/v16.2.10/00000012.sst
+require_success "create oversized build artifact" make_oversized_file .next/dev/cache/turbopack/v16.2.10/00000012.sst
 
 assert_status_no_entry "the build cache is not offered as untracked" ".next"
 assert_status_contains "source files still are"                      "src/app/page.tsx"
 
-add_files . >/dev/null
-assert_success "record succeeds despite the oversized build artifact" \
+require_success "add non-ignored files" atomic add .
+require_success "record succeeds despite the oversized build artifact" \
     atomic record -m "First change with Atomic"
 
 # The whole point: the artifact must not be in history.
@@ -89,23 +89,23 @@ make_temp_repo record-oversized-tracked
 init_repo
 
 create_file README.md 'hello'
-make_oversized_file dataset.bin
-add_files . >/dev/null
+require_success "create oversized tracked file" make_oversized_file dataset.bin
+require_success "add oversized and small files" atomic add .
 
 assert_failure "record fails on the oversized file" \
     atomic record -m "should be refused"
 
-assert_output_not_contains "not reported as an internal error" \
+assert_failed_output_not_contains "not reported as an internal error" \
     "Internal error" atomic record -m "should be refused"
-assert_output_not_contains "does not tell the user to file a bug" \
+assert_failed_output_not_contains "does not tell the user to file a bug" \
     "Please report it" atomic record -m "should be refused"
 
 # Sizes must be human-readable; a raw byte count says nothing about how far
 # over the limit the file is.
-assert_output_contains "names the file"        "dataset.bin" atomic record -m "should be refused"
-assert_output_contains "size in human units"   "10.8 MiB"    atomic record -m "should be refused"
-assert_output_contains "limit in human units"  "10.0 MiB"    atomic record -m "should be refused"
-assert_output_not_contains "no raw byte counts" \
+assert_failed_output_contains "names the file"        "dataset.bin" atomic record -m "should be refused"
+assert_failed_output_contains "size in human units"   "10.8 MiB"    atomic record -m "should be refused"
+assert_failed_output_contains "limit in human units"  "10.0 MiB"    atomic record -m "should be refused"
+assert_failed_output_not_contains "no raw byte counts" \
     "$OVERSIZED_BYTES" atomic record -m "should be refused"
 
 # Exit code: must be a user/data error, never 128.
@@ -127,14 +127,14 @@ fi
 
 begin_section "the suggested escape hatches work"
 
-assert_output_contains "hint mentions .atomicignore" \
+assert_failed_output_contains "hint mentions .atomicignore" \
     ".atomicignore" atomic record -m "should be refused"
-assert_output_contains "hint mentions skip-binary" \
+assert_failed_output_contains "hint mentions skip-binary" \
     "skip-binary"   atomic record -m "should be refused"
-assert_output_contains "hint mentions max-size" \
+assert_failed_output_contains "hint mentions max-size" \
     "max-size"      atomic record -m "should be refused"
 
-assert_success "--skip-binary records everything else" \
+require_success "--skip-binary records everything else" \
     atomic record -m "skip the big one" --skip-binary
 
 # README.md went in; dataset.bin did not.
@@ -157,13 +157,13 @@ make_temp_repo record-oversized-maxsize
 init_repo
 
 create_file notes.txt 'a few hundred bytes would be plenty here'
-add_files . >/dev/null
+require_success "add notes.txt" atomic add .
 
 assert_failure "a lowered --max-size refuses a small file" \
     atomic record -m "should be refused" --max-size 8
-assert_output_contains "and reports it the same way" \
+assert_failed_output_contains "and reports it the same way" \
     "notes.txt" atomic record -m "should be refused" --max-size 8
-assert_success "a raised --max-size accepts it" \
+require_success "a raised --max-size accepts it" \
     atomic record -m "raised ceiling" --max-size 100000
 
 print_summary

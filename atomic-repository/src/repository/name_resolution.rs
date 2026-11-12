@@ -52,6 +52,106 @@ pub(super) struct ReducedPathClaims {
     pub(super) name_claims: HashMap<Position<NodeId>, Vec<(String, PathClaimId)>>,
 }
 
+/// Membership and parent changes alter descendant filters even when those
+/// descendants are not materialized. Keep their derived name-conflict rows in
+/// the same transaction as the publication. This does not render files, touch
+/// snapshot membership, or replace unrelated order-conflict observations.
+pub(super) fn refresh_name_conflict_caches(
+    txn: &mut atomic_core::pristine::WriteTxn<'_>,
+    changed_view: u64,
+) -> Result<(), RepositoryError> {
+    use atomic_core::pristine::{MutTxnT, StoredConflict, StoredConflictKind, ViewTxnT};
+
+    let names: Vec<_> = txn
+        .snapshot_views()?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let mut affected = Vec::new();
+    for name in names {
+        let view = txn
+            .get_view(&name)?
+            .ok_or_else(|| RepositoryError::ViewNotFound { name: name.clone() })?;
+        if txn
+            .resolve_full_view_chain(&view)?
+            .iter()
+            .any(|ancestor| ancestor.id == changed_view)
+        {
+            affected.push(view);
+        }
+    }
+    let claims = txn.iter_path_claims()?;
+    for view in affected {
+        // Match native realignment's compatibility with legacy dependency
+        // indexes. The membership/filter still bounds every visible claim.
+        let membership = super::filter::view_membership(txn, &view)?;
+        let visibility = GraphVisibilityClosure::try_from_membership_lenient(&*txn, &membership)?;
+        let reduced = reduce_path_claim_entries(&*txn, &visibility, &claims)?;
+        let old: BTreeMap<_, _> = txn.iter_conflicts(view.id)?.into_iter().collect();
+        let mut records: BTreeMap<u64, Vec<StoredConflict>> = old
+            .iter()
+            .filter_map(|(inode, conflicts)| {
+                let retained: Vec<_> = conflicts
+                    .iter()
+                    .filter(|conflict| conflict.kind != StoredConflictKind::Name)
+                    .cloned()
+                    .collect();
+                (!retained.is_empty()).then_some((*inode, retained))
+            })
+            .collect();
+        for (path, conflict) in reduced.conflicts.iter().collect::<BTreeMap<_, _>>() {
+            let mut sides = Vec::new();
+            for change in conflict.sides.iter().flat_map(|side| &side.event_changes) {
+                let hash = txn.get_external(*change)?.ok_or_else(|| {
+                    RepositoryError::Database(format!(
+                        "name-conflict side change {} has no external hash",
+                        change.get()
+                    ))
+                })?;
+                sides.push(hash.to_base32());
+            }
+            sides.sort();
+            sides.dedup();
+            let markers_observed = old.values().flatten().any(|record| {
+                record.kind == StoredConflictKind::Name
+                    && record.path == *path
+                    && record.sides == sides
+                    && record.line == Some(1)
+            });
+            for side in conflict.sides_at_path(path) {
+                let record = StoredConflict {
+                    kind: StoredConflictKind::Name,
+                    path: path.clone(),
+                    // Deriving a name conflict is not proof that marker bytes
+                    // have ever been materialized. Preserve only an unchanged,
+                    // valid observation; status uses it for pending resolution.
+                    line: (!side.is_directory() && markers_observed).then_some(1),
+                    sides: sides.clone(),
+                };
+                let rows = records.entry(side.inode.get()).or_default();
+                if !rows.contains(&record) {
+                    rows.push(record);
+                }
+            }
+        }
+        for inode in old
+            .keys()
+            .chain(records.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            match records.get(&inode) {
+                Some(conflicts) if old.get(&inode) != Some(conflicts) => {
+                    txn.put_conflicts(view.id, inode, conflicts)?;
+                }
+                None => txn.del_conflicts(view.id, inode)?,
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn path_claim_events_for_change<T>(
     txn: &T,
     change_id: NodeId,

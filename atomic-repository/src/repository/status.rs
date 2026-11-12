@@ -135,7 +135,10 @@ impl Repository {
             .map_err(|error| RepositoryError::Database(error.to_string()))?
             .into_iter()
             .flat_map(|(_, records)| records)
-            .filter(|record| record.kind == atomic_core::pristine::StoredConflictKind::Name)
+            .filter(|record| {
+                record.kind == atomic_core::pristine::StoredConflictKind::Name
+                    && record.line.is_some()
+            })
             .map(|record| record.path)
             .collect();
 
@@ -452,6 +455,23 @@ impl Repository {
                 })?;
             external_hashes.insert(id, hash);
         }
+        use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
+        let span_context = if txn
+            .required_capability_version(SPAN_RANGE_CAPABILITY.id())
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .is_some()
+        {
+            Some(
+                atomic_core::pristine::span_patch_storage::SpanRenderContext::new(
+                    &txn,
+                    &self.change_store,
+                    &visibility,
+                )
+                .map_err(|error| RepositoryError::Database(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         let index_write_time = now_timestamp();
         let verified_scan = verify_candidates(
             source_result,
@@ -469,12 +489,25 @@ impl Repository {
                 })?;
                 // Status must compare against the bytes materialize actually
                 // renders, including semantic resolution of live-parent forks.
+                if let Some(context) = &span_context {
+                    match context.render_if_visible(item.inode) {
+                        Ok(Some(bytes)) => return Ok(Hash::of(&bytes)),
+                        Ok(None) => {}
+                        Err(error) => {
+                            return Err(ChangeSourceError::CanonicalContent {
+                                path: path.escaped(),
+                                message: error.to_string(),
+                            })
+                        }
+                    }
+                }
                 super::materialize::render_name_conflict_side(
                     &txn,
                     &self.change_store,
                     &inode_graph_table,
                     &visibility,
                     &external_hashes,
+                    None,
                     &item.path,
                     item.inode,
                     item.position,

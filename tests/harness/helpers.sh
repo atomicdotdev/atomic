@@ -34,10 +34,12 @@ TESTS_PASSED=0
 TESTS_FAILED=0
 TESTS_SKIPPED=0
 FAIL_MESSAGES=()
+_HARNESS_SUMMARY_PRINTED=0
 
 # Exit code used when an entire suite cannot run because a prerequisite is
 # unavailable. The top-level runner recognizes 77 as SKIPPED, not PASSED.
 HARNESS_SKIP_EXIT="${HARNESS_SKIP_EXIT:-77}"
+HARNESS_PARTIAL_EXIT="${HARNESS_PARTIAL_EXIT:-78}"
 
 # ── Binary discovery ────────────────────────────────────────────────────────
 
@@ -85,7 +87,19 @@ cleanup_tempdirs() {
         rm -rf "$d" 2>/dev/null || true
     done
 }
-trap cleanup_tempdirs EXIT
+_harness_exit() {
+    local status=$?
+    trap - EXIT
+    cleanup_tempdirs
+    if [[ $status -eq 0 && ${HARNESS_EXPECT_SUMMARY:-0} -eq 1 && $_HARNESS_SUMMARY_PRINTED -eq 0 ]]; then
+        status=1
+        echo "${RED}Suite exited successfully without its assertion summary; remaining assertions were not verified.${RESET}" >&2
+    elif [[ $status -ne 0 && $status -ne $HARNESS_SKIP_EXIT && $_HARNESS_SUMMARY_PRINTED -eq 0 ]]; then
+        echo "${RED}Suite ended before its summary (exit $status; $TESTS_RUN assertions completed). Remaining assertions were not run.${RESET}" >&2
+    fi
+    exit "$status"
+}
+trap _harness_exit EXIT
 
 # Create a fresh temp directory and cd into it.
 # Usage:  make_temp_repo [name]
@@ -104,14 +118,21 @@ make_temp_repo() {
 # Initialise an atomic repository in the current directory.
 # Accepts optional arguments forwarded to `atomic init`.
 init_repo() {
-    atomic init "$@" >/dev/null 2>&1
+    local out status
+    if out="$(atomic init "$@" 2>&1)"; then
+        return 0
+    else
+        status=$?
+        echo "Repository initialization failed (exit $status): $out" >&2
+        return "$status"
+    fi
 }
 
 # Create a file with given content.  Parent dirs are created automatically.
 # Usage:  create_file <path> [content]
 create_file() {
     local path="$1"
-    local content="${2:-hello from $path}"
+    local content="${2-hello from $path}"
     mkdir -p "$(dirname "$path")"
     printf '%s' "$content" > "$path"
 }
@@ -119,14 +140,14 @@ create_file() {
 # Append content to an existing file.
 append_file() {
     local path="$1"
-    local content="${2:-\nappended content}"
+    local content="${2-\nappended content}"
     printf '%s' "$content" >> "$path"
 }
 
 # Overwrite a file with new content.
 overwrite_file() {
     local path="$1"
-    local content="${2:-overwritten content}"
+    local content="${2-overwritten content}"
     printf '%s' "$content" > "$path"
 }
 
@@ -140,12 +161,12 @@ create_dir() {
 
 # Run `atomic status` and capture stdout.
 get_status() {
-    atomic status 2>/dev/null || true
+    atomic status
 }
 
 # Run `atomic status --short` and capture stdout.
 get_status_short() {
-    atomic status --short 2>/dev/null || true
+    atomic status --short
 }
 
 # Add one or more paths.
@@ -161,7 +182,7 @@ record_change() {
 
 # Unrecord the last change.
 unrecord_last() {
-    atomic unrecord 2>&1 || true
+    atomic unrecord 2>&1
 }
 
 # Create a new view.
@@ -186,7 +207,7 @@ insert_from_view() {
 
 # List views.
 list_views() {
-    atomic view list 2>/dev/null || true
+    atomic view list
 }
 
 # ── Assertions ──────────────────────────────────────────────────────────────
@@ -237,18 +258,55 @@ skip_suite() {
 # Usage:  assert_success "description" command args...
 assert_success() {
     local desc="$1"; shift
-    if "$@" >/dev/null 2>&1; then
+    local out status
+    if out="$("$@" 2>&1)"; then
         _pass "$desc"
     else
-        _fail "$desc" "command failed: $*"
+        status=$?
+        _fail "$desc" "command failed (exit $status): $*${out:+
+$out}"
+    fi
+}
+
+# A setup failure invalidates later assertions: report it and stop the suite.
+require_success() {
+    local desc="$1"; shift
+    local out status
+    if out="$("$@" 2>&1)"; then
+        _pass "$desc"
+    else
+        status=$?
+        _fail "$desc" "command failed (exit $status): $*${out:+
+$out}"
+        echo "${RED}Prerequisite failed; remaining assertions were not run.${RESET}" >&2
+        print_summary || true
+        exit 1
+    fi
+}
+
+# Like require_success, retaining the successful output for assertions.
+require_capture() {
+    local desc="$1"; shift
+    local status
+    if COMMAND_OUTPUT="$("$@" 2>&1)"; then
+        _pass "$desc"
+    else
+        status=$?
+        _fail "$desc" "command failed (exit $status): $*${COMMAND_OUTPUT:+
+$COMMAND_OUTPUT}"
+        echo "${RED}Prerequisite failed; remaining assertions were not run.${RESET}" >&2
+        print_summary || true
+        exit 1
     fi
 }
 
 # Assert that the last command failed (non-zero exit).
 assert_failure() {
     local desc="$1"; shift
-    if "$@" >/dev/null 2>&1; then
-        _fail "$desc" "expected failure but command succeeded: $*"
+    local out
+    if out="$("$@" 2>&1)"; then
+        _fail "$desc" "expected failure but command succeeded: $*${out:+
+$out}"
     else
         _pass "$desc"
     fi
@@ -316,30 +374,63 @@ assert_file_content() {
     fi
 }
 
-# Assert that stdout of a command contains a substring.
+# Assert that a successful command's output contains a substring.
 # Usage:  assert_output_contains "desc" "substring" command args...
 assert_output_contains() {
     local desc="$1"
     local needle="$2"
     shift 2
     local out
-    out="$("$@" 2>&1)" || true
-    if echo "$out" | grep -qF "$needle"; then
+    if ! out="$("$@" 2>&1)"; then
+        _fail "$desc" "command failed: $*${out:+
+$out}"
+        return
+    fi
+    if printf '%s\n' "$out" | grep -qF -- "$needle"; then
         _pass "$desc"
     else
         _fail "$desc" "output did not contain '$needle'. Got: $(echo "$out" | head -5)"
     fi
 }
 
-# Assert that stdout of a command does NOT contain a substring.
+# Assert that a successful command's output does NOT contain a substring.
 assert_output_not_contains() {
     local desc="$1"
     local needle="$2"
     shift 2
     local out
-    out="$("$@" 2>&1)" || true
-    if echo "$out" | grep -qF "$needle"; then
+    if ! out="$("$@" 2>&1)"; then
+        _fail "$desc" "command failed: $*${out:+
+$out}"
+        return
+    fi
+    if printf '%s\n' "$out" | grep -qF -- "$needle"; then
         _fail "$desc" "output should not contain '$needle' but does"
+    else
+        _pass "$desc"
+    fi
+}
+
+# Assertions on diagnostics from a command that must fail.
+assert_failed_output_contains() {
+    local desc="$1" needle="$2" out; shift 2
+    if out="$("$@" 2>&1)"; then
+        _fail "$desc" "expected command failure: $*${out:+
+$out}"
+    elif printf '%s\n' "$out" | grep -qF -- "$needle"; then
+        _pass "$desc"
+    else
+        _fail "$desc" "failure output did not contain '$needle': $out"
+    fi
+}
+
+assert_failed_output_not_contains() {
+    local desc="$1" needle="$2" out; shift 2
+    if out="$("$@" 2>&1)"; then
+        _fail "$desc" "expected command failure: $*${out:+
+$out}"
+    elif printf '%s\n' "$out" | grep -qF -- "$needle"; then
+        _fail "$desc" "failure output unexpectedly contained '$needle': $out"
     else
         _pass "$desc"
     fi
@@ -350,7 +441,10 @@ assert_status_contains() {
     local desc="$1"
     local needle="$2"
     local out
-    out="$(get_status)"
+    if ! out="$(get_status 2>&1)"; then
+        _fail "$desc" "status command failed: $out"
+        return
+    fi
     if echo "$out" | grep -qF "$needle"; then
         _pass "$desc"
     else
@@ -363,7 +457,10 @@ assert_status_not_contains() {
     local desc="$1"
     local needle="$2"
     local out
-    out="$(get_status)"
+    if ! out="$(get_status 2>&1)"; then
+        _fail "$desc" "status command failed: $out"
+        return
+    fi
     if echo "$out" | grep -qF "$needle"; then
         _fail "$desc" "status should not contain '$needle' but does"
     else
@@ -378,7 +475,10 @@ assert_status_flag() {
     local flag="$2"
     local path="$3"
     local out
-    out="$(get_status_short)"
+    if ! out="$(get_status_short 2>&1)"; then
+        _fail "$desc" "short status command failed: $out"
+        return
+    fi
     # Escape special regex characters in flag (e.g. ? → \?)
     local escaped_flag
     escaped_flag="$(printf '%s' "$flag" | sed 's/[][\\.^$*+?{}()|]/\\&/g')"
@@ -398,7 +498,10 @@ assert_status_no_entry() {
     local desc="$1"
     local path="$2"
     local out
-    out="$(get_status_short)"
+    if ! out="$(get_status_short 2>&1)"; then
+        _fail "$desc" "short status command failed: $out"
+        return
+    fi
     if echo "$out" | grep -qF -- "$path"; then
         _fail "$desc" "'$path' should not appear in status but does. Status: $(echo "$out" | head -10)"
     else
@@ -410,19 +513,12 @@ assert_status_no_entry() {
 assert_clean() {
     local desc="${1:-working copy is clean}"
     local out
-    out="$(get_status)"
-    # A clean status typically says "clean" or has no entries
-    if echo "$out" | grep -qiE "clean|no changes|nothing to record"; then
+    if ! out="$(get_status_short 2>&1)"; then
+        _fail "$desc" "short status command failed: $out"
+    elif [[ -z "$out" ]]; then
         _pass "$desc"
     else
-        # Also accept empty-ish output
-        local entries
-        entries="$(echo "$out" | grep -cE '^\s*[MADUC?]' || true)"
-        if [[ "$entries" -eq 0 ]]; then
-            _pass "$desc"
-        else
-            _fail "$desc" "working copy not clean. Status: $(echo "$out" | head -10)"
-        fi
+        _fail "$desc" "working copy not clean. Status: $out"
     fi
 }
 
@@ -431,22 +527,14 @@ assert_current_view() {
     local desc="$1"
     local expected="$2"
     local out
-    out="$(list_views)"
-    # The current view is usually prefixed with * or highlighted
-    if echo "$out" | grep -qE "^\*?\s*${expected}(\s|$)"; then
+    if ! out="$(list_views 2>&1)"; then
+        _fail "$desc" "view list command failed: $out"
+        return
+    fi
+    if printf '%s\n' "$out" | awk -v expected="$expected" '{ for (i = 1; i < NF; i++) if ($i == "*" && $(i + 1) == expected) found = 1 } END { exit !found }'; then
         _pass "$desc"
     else
-        # Fallback: check current_view file
-        local view_file=".atomic/current_view"
-        if [[ -f "$view_file" ]]; then
-            local actual
-            actual="$(cat "$view_file")"
-            if [[ "$actual" == "$expected" ]]; then
-                _pass "$desc"
-                return
-            fi
-        fi
-        _fail "$desc" "expected current view '$expected'. Views: $(echo "$out" | head -5)"
+        _fail "$desc" "expected current view '$expected'. Views: $out"
     fi
 }
 
@@ -455,8 +543,11 @@ assert_view_exists() {
     local desc="$1"
     local name="$2"
     local out
-    out="$(list_views)"
-    if echo "$out" | grep -qF "$name"; then
+    if ! out="$(atomic view list --all 2>&1)"; then
+        _fail "$desc" "view list command failed: $out"
+        return
+    fi
+    if printf '%s\n' "$out" | awk -v name="$name" '{ for (i = 1; i <= NF; i++) if ($i == name && (i == 1 || $(i - 1) == "-" || $(i - 1) == "*")) found = 1 } END { exit !found }'; then
         _pass "$desc"
     else
         _fail "$desc" "view '$name' not found. Views: $(echo "$out" | head -5)"
@@ -468,7 +559,10 @@ assert_log_count() {
     local desc="$1"
     local expected="$2"
     local out
-    out="$(atomic log 2>/dev/null || true)"
+    if ! out="$(atomic log 2>&1)"; then
+        _fail "$desc" "log command failed: $out"
+        return
+    fi
     local count
     count="$(echo "$out" | grep -cE '^#|^[0-9a-zA-Z]{10,}' || true)"
     if [[ "$count" -eq "$expected" ]]; then
@@ -578,7 +672,7 @@ git_merge_branch() {
 git_add_submodule() {
     local url="$1"
     local path="$2"
-    git submodule add --quiet "$url" "$path" 2>/dev/null
+    git submodule add --quiet "$url" "$path" || return $?
     git commit --quiet -m "Add submodule $path"
 }
 
@@ -615,7 +709,10 @@ assert_change_author() {
     local ref="$2"
     local expected="$3"
     local out
-    out="$(atomic change "$ref" 2>/dev/null || true)"
+    if ! out="$(atomic change "$ref" 2>&1)"; then
+        _fail "$desc" "change command failed: $out"
+        return
+    fi
     if echo "$out" | grep -qiE "author.*$expected"; then
         _pass "$desc"
     else
@@ -630,7 +727,10 @@ assert_change_message() {
     local ref="$2"
     local expected="$3"
     local out
-    out="$(atomic change "$ref" 2>/dev/null || true)"
+    if ! out="$(atomic change "$ref" 2>&1)"; then
+        _fail "$desc" "change command failed: $out"
+        return
+    fi
     if echo "$out" | grep -qF "$expected"; then
         _pass "$desc"
     else
@@ -649,6 +749,7 @@ begin_section() {
 # ── Summary ─────────────────────────────────────────────────────────────────
 
 print_summary() {
+    _HARNESS_SUMMARY_PRINTED=1
     echo ""
     echo "${BOLD}═══════════════════════════════════════════════${RESET}"
     echo "${BOLD}  Results: ${GREEN}$TESTS_PASSED passed${RESET}, " \
@@ -668,6 +769,9 @@ print_summary() {
 
     if [[ $TESTS_FAILED -gt 0 ]]; then
         return 1
+    fi
+    if [[ $TESTS_SKIPPED -gt 0 ]]; then
+        return "$HARNESS_PARTIAL_EXIT"
     fi
     return 0
 }

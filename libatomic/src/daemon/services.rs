@@ -118,6 +118,11 @@ const METHOD_MATRIX: &[(&str, &str)] = &[
     ("ViewService", "SplitView"),
 ];
 
+/// Feature gate for the add-only explicit memory ID and status fields.
+pub const VAULT_MEMORY_CREATE_OPTIONS_FEATURE: &str = "vault-memory-create-options-v1";
+/// Feature gate for add-only record size and binary options.
+pub const RECORD_FILE_OPTIONS_FEATURE: &str = "record-file-options-v1";
+
 #[tonic::async_trait]
 impl daemon_service_server::DaemonService for DaemonImpl {
     async fn health(
@@ -213,7 +218,11 @@ impl daemon_service_server::DaemonService for DaemonImpl {
             implementation_version: env!("CARGO_PKG_VERSION").to_string(),
             endpoint_kind: EndpointKind::LocalDaemon as i32,
             methods,
-            features: vec!["full-turn-slice".to_string()],
+            features: vec![
+                "full-turn-slice".to_string(),
+                VAULT_MEMORY_CREATE_OPTIONS_FEATURE.to_string(),
+                RECORD_FILE_OPTIONS_FEATURE.to_string(),
+            ],
             limits: Some(Limits {
                 max_message_bytes: 64 * 1024 * 1024,
                 max_frozen_page_fragments: 256,
@@ -400,16 +409,16 @@ impl repository_query_service_server::RepositoryQueryService for QueryImpl {
         self.state.log_rpc("Log", Some(&handle));
         let gate_handle = handle.clone();
         let _gate = gate_handle.exclusive().await;
-        let view = if request.all_views {
-            None
-        } else {
-            Some(
-                request
-                    .view
-                    .clone()
-                    .unwrap_or_else(|| handle.current_view()),
-            )
-        };
+        // `all_views` is the legacy wire name for CLI --all: include the
+        // selected view's inherited history, not discard its explicit target.
+        // Dropping `view` here made `log --view dev --all` read the current
+        // Draft instead, falsely showing unpromoted records on the Shared view.
+        let view = Some(
+            request
+                .view
+                .clone()
+                .unwrap_or_else(|| handle.current_view()),
+        );
         let include_inherited = request.all_views;
         let tags_only = request.tags_only;
         let path_filter = request.path_filter.clone();
@@ -1508,6 +1517,8 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
         let identity_name = request.identity_name;
         let expected = request.expected;
         let ai = request.ai_authorship;
+        let skip_binary = request.skip_binary.unwrap_or(false);
+        let max_file_size = request.max_file_size;
         let result = tokio::task::spawn_blocking(move || {
             if message.trim().is_empty() {
                 return Err(domain_status(
@@ -1539,7 +1550,12 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 header = header.author(author);
             }
             let header = header.build();
-            let mut options = RecordOptions::new().message(message.clone());
+            let mut options = RecordOptions::new()
+                .message(message.clone())
+                .with_skip_binary(skip_binary);
+            if let Some(max_file_size) = max_file_size {
+                options = options.with_max_file_size(max_file_size);
+            }
             if !paths.is_empty() {
                 options = options.paths(paths.clone());
             }
@@ -1573,7 +1589,30 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
             }
             let outcome = repo
                 .record(working_copy, header, options)
-                .map_err(|error| domain_status(ErrorCode::ChangeRejected, error.to_string()))?;
+                .map_err(|error| {
+                    let mut status = domain_status(ErrorCode::ChangeRejected, error.to_string());
+                    if let atomic_repository::RecordError::FileTooLarge { path, size, limit } =
+                        error
+                    {
+                        status.metadata_mut().insert(
+                            "atomic-record-error",
+                            "file-too-large".parse().expect("static metadata"),
+                        );
+                        status.metadata_mut().insert_bin(
+                            "atomic-file-path-bin",
+                            tonic::metadata::MetadataValue::from_bytes(path.as_bytes()),
+                        );
+                        status.metadata_mut().insert(
+                            "atomic-file-size",
+                            size.to_string().parse().expect("numeric metadata"),
+                        );
+                        status.metadata_mut().insert(
+                            "atomic-file-limit",
+                            limit.to_string().parse().expect("numeric metadata"),
+                        );
+                    }
+                    status
+                })?;
             let change = outcome.change();
             Ok::<_, Status>(RecordResponse {
                 change: Some(ChangeInfo {
@@ -1598,6 +1637,30 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 }),
                 view_merkle: outcome.new_state().map(|state| hash_proto(&state)),
                 view: Some(view),
+                statistics: Some(RecordStatistics {
+                    files_recorded: outcome.stats().files_recorded as u64,
+                    directories_recorded: outcome.stats().directories_recorded as u64,
+                    hunks_created: outcome.stats().hunks_created as u64,
+                    vertices_added: outcome.stats().vertices_added as u64,
+                    edges_modified: outcome.stats().edges_modified as u64,
+                    content_bytes: outcome.stats().content_bytes,
+                    lines_added: outcome.stats().lines_added as u64,
+                    lines_deleted: outcome.stats().lines_deleted as u64,
+                    lines_modified: outcome.stats().lines_modified as u64,
+                    tokens_added: outcome.stats().tokens_added as u64,
+                    tokens_deleted: outcome.stats().tokens_deleted as u64,
+                    tokens_replaced: outcome.stats().tokens_replaced as u64,
+                }),
+                recorded_paths: outcome.recorded_files().to_vec(),
+                skipped_paths: outcome.skipped_files().to_vec(),
+                file_errors: outcome
+                    .errors()
+                    .iter()
+                    .map(|(path, message)| RecordFileError {
+                        path: path.clone(),
+                        message: message.clone(),
+                    })
+                    .collect(),
                 meta: Some(ResponseMeta {
                     request_id: meta.request_id,
                     replayed: false,
@@ -1990,6 +2053,34 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                          name paths explicitly or pass force",
                 ));
             }
+            // One projection decides which Modified/Deleted paths the view
+            // still records; rendering every file here only to discard the
+            // bytes would decode the view's history once per file. A
+            // projection error therefore fails the request before any path is
+            // untracked, and a render error now surfaces from materialization
+            // (which plans before it writes). The walk below keeps status
+            // order, so untracking and a name-conflict failure happen at the
+            // same position as before.
+            let content_paths: Vec<String> = dirty
+                .iter()
+                .filter(|(_, file_status)| {
+                    *file_status != atomic_repository::status::FileStatus::Added
+                })
+                .map(|(path, _)| path.clone())
+                .collect();
+            let presence: std::collections::HashMap<String, atomic_repository::RecordedPresence> =
+                if content_paths.is_empty() {
+                    Default::default()
+                } else {
+                    content_paths
+                        .iter()
+                        .cloned()
+                        .zip(
+                            repo.recorded_presence_on_view(&content_paths, repo.current_view())
+                                .map_err(repository_error)?,
+                        )
+                        .collect()
+                };
             let mut restored: Vec<String> = Vec::new();
             let mut materialize = std::collections::HashSet::new();
             for (path, file_status) in dirty {
@@ -2005,16 +2096,26 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                         restored.push(path);
                     }
                     // Modified/Deleted: pristine content back to disk.
-                    _ => {
-                        let content = repo
-                            .get_file_content(std::path::Path::new(&path))
-                            .map_err(repository_error)?;
-                        if content.is_some() {
+                    _ => match presence.get(&path) {
+                        Some(atomic_repository::RecordedPresence::Present) => {
                             materialize.insert(path.clone());
                             restored.push(path);
                         }
                         // No pristine content: skip (nothing safe to do).
-                    }
+                        Some(atomic_repository::RecordedPresence::Absent) | None => {}
+                        Some(atomic_repository::RecordedPresence::NameConflict {
+                            paths,
+                            claimants,
+                        }) => {
+                            return Err(repository_error(atomic_repository::name_conflict_error(
+                                &atomic_repository::tracking::normalize_path(std::path::Path::new(
+                                    &path,
+                                )),
+                                *paths,
+                                *claimants,
+                            )));
+                        }
+                    },
                 }
             }
             if !materialize.is_empty() {

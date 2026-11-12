@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 39_git_shim_mvp.sh — Offline contract test for `atomic git shim reconcile`.
+# HISTORICAL: coverage migrated to ../39_git_shim_workflow.sh and ../40_git_shim_safety.sh.
 #
 # The MVP imports the checked-out Git branch, aligns it with an Atomic view,
 # reconciles later Git commits without disturbing either working tree, is
@@ -17,14 +17,16 @@ begin_section "Prerequisites"
 require_git
 
 atomic_current_view() {
-    atomic view list 2>/dev/null | awk '/^\*/ { print $2 }'
+    local output
+    output="$(atomic view list --all --json 2>&1)" || return 1
+    printf '%s\n' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["current_view"])'
 }
 
 assert_clean_statuses() {
     local label="$1"
     local git_status atomic_status
-    git_status="$(git status --short)"
-    atomic_status="$(atomic status --short 2>/dev/null || true)"
+    if ! git_status="$(git status --short 2>&1)"; then _fail "$label: read Git status" "$git_status"; return; fi
+    if ! atomic_status="$(atomic status --short 2>&1)"; then _fail "$label: read Atomic status" "$atomic_status"; return; fi
     if [[ -z "$git_status" ]]; then
         _pass "$label: git status is clean"
     else
@@ -67,18 +69,22 @@ git add README.md src/nested/base.txt tracked-empty.txt
 git commit --quiet -m "Initial"
 
 MAIN="$(git_current_branch)"
-assert_success "initial git import" atomic git import --no-vault
+require_success "initial git import" atomic git import --no-vault
 assert_view_exists "initial branch has matching Atomic view" "$MAIN"
 assert_clean_statuses "after initial import"
 
-assert_success "create matching Atomic feature view" \
+require_success "create matching Atomic feature view" \
     atomic view create feature --draft --parent "$MAIN"
-assert_success "switch to aligned Atomic feature view" atomic view switch feature --force
-if [[ "$(git_current_branch)" == "feature" ]]; then
+require_success "switch to aligned Atomic feature view" atomic view switch feature --force
+if branch="$(git symbolic-ref --short HEAD 2>&1)" && [[ "$branch" == "feature" ]]; then
     _pass "Atomic view switch aligns Git on feature branch"
 else
-    _fail "Atomic view switch aligns Git on feature branch" \
-        "expected feature, got $(git_current_branch)"
+    _fail "Atomic view switch aligns Git on feature branch" "expected feature, got $branch"
+    assert_current_view "switch preserves intended Atomic view" feature
+    assert_file_content "switch preserves tracked source" src/nested/base.txt 'base\n'
+    _skip "feature reconciliation and subsequent scenarios" "Git branch not aligned"
+    print_summary || true
+    exit 1
 fi
 create_file "src/nested/feature.txt" "feature\n"
 : > feature-empty.txt

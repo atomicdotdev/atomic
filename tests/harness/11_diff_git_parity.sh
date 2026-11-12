@@ -25,12 +25,16 @@ ATOMIC_HASHES=()
 GIT_SHAS=()
 GIT_REPO=""
 
+atomic_in_git_repo() {
+    (cd "$GIT_REPO" && atomic "$@")
+}
+
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 # Extract only +/- change lines from git unified diff output.
 # Strips headers (diff, ---, +++, @@) and context lines.
 extract_git_change_lines() {
-    grep -E '^\+[^+]|^-[^-]' || true
+    awk '/^diff --git / { hunk = 0; next } /^@@ / { hunk = 1; next } hunk && /^[+-]/ { print }'
 }
 
 # Extract only +/- change lines from atomic diff output.
@@ -40,8 +44,20 @@ extract_git_change_lines() {
 # Same as git, so we use the same extractor.
 # But we also need to skip the change header block (change hash, Date, message).
 extract_atomic_change_lines() {
-    grep -E '^\+[^+]|^-[^-]' || true
+    awk '/^diff --atomic / { hunk = 0; next } /^@@ / { hunk = 1; next } hunk && /^[+-]/ { print }'
 }
+
+begin_section "Parity: Diff-line extraction"
+expected_lines=$'+line\n+--- a/content\n+'
+git_fixture=$'diff --git a/file b/file\n--- /dev/null\n+++ b/file\n@@ -0,0 +1,3 @@\n+line\n+--- a/content\n+'
+atomic_fixture=$'diff --atomic /dev/null b/file\n--- /dev/null\n+++ b/file\n@@ -0,0 +1,3 @@\n+line\n+--- a/content\n+'
+git_extracted="$(printf '%s\n' "$git_fixture" | extract_git_change_lines)"
+atomic_extracted="$(printf '%s\n' "$atomic_fixture" | extract_atomic_change_lines)"
+if [[ "$git_extracted" == "$expected_lines" && "$atomic_extracted" == "$expected_lines" ]]; then
+    _pass "diff extraction excludes headers and keeps blank and header-like content"
+else
+    _fail "diff-line extraction" "Git: $git_extracted; Atomic: $atomic_extracted"
+fi
 
 # Create a git repo, apply a sequence of file versions, import into atomic.
 #
@@ -83,13 +99,14 @@ setup_git_and_import() {
     done
 
     # Run atomic git import
-    (cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+    require_success "import Git fixture $label" atomic_in_git_repo git import
 
     # Collect atomic change hashes in order (oldest first).
     # `atomic log` lists newest first, so we reverse.
     ATOMIC_HASHES=()
     local log_output
-    log_output=$( (cd "$GIT_REPO" && atomic log --format short --no-color --full-hash 2>/dev/null) || true )
+    require_capture "read imported log for $label" atomic_in_git_repo log --format short --no-color --full-hash
+    log_output="$COMMAND_OUTPUT"
     if [[ -n "${log_output:-}" ]]; then
         # Log lists newest first. Collect into temp, then reverse.
         local _tmp=()
@@ -145,13 +162,14 @@ assert_commit_parity() {
 
     # Git diff (optionally scoped to a single path)
     local git_lines_file="$REPO_DIR/git_lines_$idx.txt"
+    local git_raw
     if [[ -n "$path_filter" ]]; then
-        git -C "$GIT_REPO" --no-pager diff "$prev_sha" "$curr_sha" -- "$path_filter" 2>/dev/null \
-            | extract_git_change_lines > "$git_lines_file"
+        require_capture "$desc: read Git diff" git -C "$GIT_REPO" --no-pager diff "$prev_sha" "$curr_sha" -- "$path_filter"
     else
-        git -C "$GIT_REPO" --no-pager diff "$prev_sha" "$curr_sha" 2>/dev/null \
-            | extract_git_change_lines > "$git_lines_file"
+        require_capture "$desc: read Git diff" git -C "$GIT_REPO" --no-pager diff "$prev_sha" "$curr_sha"
     fi
+    git_raw="$COMMAND_OUTPUT"
+    printf '%s\n' "$git_raw" | extract_git_change_lines > "$git_lines_file"
 
     # Atomic diff
     set +u
@@ -164,12 +182,19 @@ assert_commit_parity() {
     local atomic_lines_file="$REPO_DIR/atomic_lines_$idx.txt"
 
     if [[ -z "$atomic_hash" ]]; then
-        touch "$atomic_lines_file"
-    else
-        local raw
-        raw=$( (cd "$GIT_REPO" && atomic diff -c "$atomic_hash" --no-color 2>/dev/null) || true )
-        if [[ -n "$raw" ]]; then
-            if [[ -n "$path_filter" ]]; then
+        _fail "$desc: imported change" "missing Atomic change at index $idx"
+        return
+    fi
+    local raw detail
+    require_capture "$desc: read imported change" atomic_in_git_repo change "$atomic_hash" --full-hash
+    detail="$COMMAND_OUTPUT"
+    if [[ "$detail" != *"Git source revision: $curr_sha"* ]]; then
+        _fail "$desc: imported change identity" "expected Git revision $curr_sha in $atomic_hash: $detail"
+        return
+    fi
+    require_capture "$desc: read Atomic diff" atomic_in_git_repo diff -c "$atomic_hash" --no-color
+    raw="$COMMAND_OUTPUT"
+    if [[ -n "$path_filter" ]]; then
                 # Extract only the +/- lines from the section of the atomic diff
                 # that belongs to path_filter.  awk handles both cases: when
                 # path_filter is the last section (no following "diff --atomic")
@@ -177,13 +202,9 @@ assert_commit_parity() {
                 printf '%s\n' "$raw" | awk -v pat="$path_filter" '
                     /^diff --atomic/ { in_sec = ($0 ~ pat) ? 1 : 0; next }
                     in_sec { print }
-                ' | extract_atomic_change_lines > "$atomic_lines_file" || true
-            else
-                printf '%s\n' "$raw" | extract_atomic_change_lines > "$atomic_lines_file"
-            fi
-        else
-            touch "$atomic_lines_file"
-        fi
+                ' | extract_atomic_change_lines > "$atomic_lines_file"
+    else
+        printf '%s\n' "$raw" | extract_atomic_change_lines > "$atomic_lines_file"
     fi
 
     local git_count atomic_count
@@ -348,10 +369,11 @@ SHA2=$(git -C "$GIT_REPO" rev-parse HEAD 2>/dev/null)
 
 GIT_SHAS=("$SHA1" "$SHA2")
 
-(cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+require_success "import deleted-file fixture" atomic_in_git_repo git import
 
 ATOMIC_HASHES=()
-log_output=$( (cd "$GIT_REPO" && atomic log --format short --no-color --full-hash 2>/dev/null) || true )
+require_capture "read deleted-file fixture log" atomic_in_git_repo log --format short --no-color --full-hash
+log_output="$COMMAND_OUTPUT"
 if [[ -n "${log_output:-}" ]]; then
     _tmp=()
     while IFS= read -r line; do
@@ -392,10 +414,11 @@ SHA2=$(git -C "$GIT_REPO" rev-parse HEAD 2>/dev/null)
 
 GIT_SHAS=("$SHA1" "$SHA2")
 
-(cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+require_success "import multi-file fixture" atomic_in_git_repo git import
 
 ATOMIC_HASHES=()
-log_output=$( (cd "$GIT_REPO" && atomic log --format short --no-color --full-hash 2>/dev/null) || true )
+require_capture "read multi-file fixture log" atomic_in_git_repo log --format short --no-color --full-hash
+log_output="$COMMAND_OUTPUT"
 if [[ -n "${log_output:-}" ]]; then
     _tmp=()
     while IFS= read -r line; do
@@ -443,13 +466,13 @@ begin_section "Parity: Hyperfine first 4 commits (real repo)"
 
 make_temp_repo "parity-hyperfine"
 
-if ! git clone --quiet https://github.com/sharkdp/hyperfine.git "$REPO_DIR/hyperfine" 2>/dev/null; then
-    _skip "hyperfine clone failed (no network?)"
+if ! clone_out="$(git clone --quiet https://github.com/sharkdp/hyperfine.git "$REPO_DIR/hyperfine" 2>&1)"; then
+    _fail "clone hyperfine" "$clone_out"
 else
     GIT_REPO="$REPO_DIR/hyperfine"
 
     # Import into atomic
-    (cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+    require_success "import hyperfine" atomic_in_git_repo git import
 
     # The first 4 commits that touch src/main.rs
     COMMIT_SHAS=("a658ab8c" "d4ebdd7b" "197f9fb" "68fdc2c")
@@ -457,26 +480,29 @@ else
     # Resolve full SHAs
     GIT_SHAS=()
     for short in "${COMMIT_SHAS[@]}"; do
-        full=$(git -C "$GIT_REPO" rev-parse "$short" 2>/dev/null) || true
+        require_capture "resolve hyperfine Git revision $short" git -C "$GIT_REPO" rev-parse "$short"
+        full="$COMMAND_OUTPUT"
         GIT_SHAS+=("$full")
     done
 
     # Build a map from git short SHA → atomic hash by scanning every
-    # atomic change's metadata for the "Commit:" line.
+    # atomic change's metadata for the "Git source revision:" line.
     # Use parallel arrays for bash 3.2 compatibility (no associative arrays).
     MAP_GIT_SHAS=()
     MAP_ATOMIC_HASHES=()
 
-    all_hashes_output=$( (cd "$GIT_REPO" && atomic log --format short --no-color --full-hash 2>/dev/null) || true )
+    require_capture "read hyperfine imported log" atomic_in_git_repo log --format short --no-color --full-hash --reverse
+    all_hashes_output="$COMMAND_OUTPUT"
     while IFS= read -r logline; do
         atomic_h=$(echo "$logline" | awk '{print $1}')
         [[ -z "$atomic_h" ]] && continue
-        change_detail=$( (cd "$GIT_REPO" && atomic change "$atomic_h" 2>/dev/null) || true )
-        # Not every change has "Commit:" metadata — the vault-scaffold and
+        require_capture "read hyperfine change $atomic_h" atomic_in_git_repo change "$atomic_h" --full-hash
+        change_detail="$COMMAND_OUTPUT"
+        # Not every change has Git revision metadata — the vault-scaffold and
         # .atomicignore changes atomic git import creates alongside the
         # actual git-derived history don't. Under set -e/pipefail, grep
         # finding no match must not abort the whole script.
-        git_sha=$(echo "$change_detail" | grep "Commit:" | awk '{print $2}' || true)
+        git_sha=$(printf '%s\n' "$change_detail" | sed -n 's/^.*Git source revision: //p')
         if [[ -n "$git_sha" ]]; then
             # Store the full git SHA so we can match short SHAs of any length
             MAP_GIT_SHAS+=("$git_sha")
@@ -518,8 +544,10 @@ else
         PREV_SHORT="${COMMIT_SHAS[$((i-1))]}"
         ATOMIC_H=$(_lookup_atomic_hash "$SHORT")
 
-        prev_full=$(git -C "$GIT_REPO" rev-parse "$PREV_SHORT" 2>/dev/null) || true
-        curr_full=$(git -C "$GIT_REPO" rev-parse "$SHORT" 2>/dev/null) || true
+        require_capture "resolve previous hyperfine revision $PREV_SHORT" git -C "$GIT_REPO" rev-parse "$PREV_SHORT"
+        prev_full="$COMMAND_OUTPUT"
+        require_capture "resolve hyperfine revision $SHORT" git -C "$GIT_REPO" rev-parse "$SHORT"
+        curr_full="$COMMAND_OUTPUT"
 
         if [[ -z "$ATOMIC_H" ]]; then
             _fail "hyperfine ($SHORT)" "could not find atomic hash for git SHA $SHORT"
@@ -528,12 +556,13 @@ else
 
         # Git diff scoped to src/main.rs
         git_lf="$REPO_DIR/hf_git_$i.txt"
-        git -C "$GIT_REPO" --no-pager diff "$prev_full" "$curr_full" -- src/main.rs 2>/dev/null \
-            | extract_git_change_lines > "$git_lf"
+        require_capture "hyperfine $SHORT: read Git diff" git -C "$GIT_REPO" --no-pager diff "$prev_full" "$curr_full" -- src/main.rs
+        printf '%s\n' "$COMMAND_OUTPUT" | extract_git_change_lines > "$git_lf"
 
         # Atomic diff scoped to src/main.rs
         atomic_lf="$REPO_DIR/hf_atomic_$i.txt"
-        hf_raw=$( (cd "$GIT_REPO" && atomic diff -c "$ATOMIC_H" --no-color 2>/dev/null) || true )
+        require_capture "hyperfine $SHORT: read Atomic diff" atomic_in_git_repo diff -c "$ATOMIC_H" --no-color
+        hf_raw="$COMMAND_OUTPUT"
         if [[ -n "$hf_raw" ]]; then
             printf '%s\n' "$hf_raw" | awk -v pat="src/main.rs" '
                 /^diff --atomic/ { in_sec = ($0 ~ pat) ? 1 : 0; next }
@@ -579,10 +608,9 @@ fi
 begin_section "Parity: Pure rename (no content change)"
 # ═══════════════════════════════════════════════════════════════════════════
 #
-# A pure rename produces ZERO +/- lines in both git diff and atomic diff.
-# git diff --follow sees no content change; atomic treats the rename as a
-# TrunkOp::Move which has no associated line operations.
-# Both sides must produce an empty set of change lines.
+# A pure Git-detected rename produces zero text change lines. The graph-only
+# stream records delete+add, not an authoritative inode move; the diff must
+# explicitly disclose that distinction while displaying Git's rename evidence.
 
 make_temp_repo "parity-rename-pure"
 GIT_REPO="$REPO_DIR"
@@ -604,10 +632,11 @@ SHA2=$(git -C "$GIT_REPO" rev-parse HEAD 2>/dev/null)
 
 GIT_SHAS=("$SHA1" "$SHA2")
 
-(cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+require_success "import pure-rename fixture" atomic_in_git_repo git import
 
 ATOMIC_HASHES=()
-_log=$( (cd "$GIT_REPO" && atomic log --format short --no-color --full-hash 2>/dev/null) || true )
+require_capture "read pure-rename fixture log" atomic_in_git_repo log --format short --no-color --full-hash
+_log="$COMMAND_OUTPUT"
 if [[ -n "${_log:-}" ]]; then
     _tmp=()
     while IFS= read -r line; do
@@ -627,22 +656,32 @@ if [[ ${#ATOMIC_HASHES[@]} -ge 2 ]]; then
     _rename_atomic_hash="${ATOMIC_HASHES[1]}"
 fi
 
-_git_lines_rename=$(git -C "$GIT_REPO" --no-pager diff "$SHA1" "$SHA2" \
-    2>/dev/null | grep -E '^\+[^+]|^-[^-]' || true)
+require_capture "read Git pure-rename diff" git -C "$GIT_REPO" --no-pager diff "$SHA1" "$SHA2"
+_git_lines_rename=$(printf '%s\n' "$COMMAND_OUTPUT" | extract_git_change_lines)
 
 _atomic_lines_rename=""
-if [[ -n "$_rename_atomic_hash" ]]; then
-    _atomic_raw=$( (cd "$GIT_REPO" && atomic diff -c "$_rename_atomic_hash" --no-color 2>/dev/null) || true )
-    _atomic_lines_rename=$(printf '%s\n' "$_atomic_raw" | grep -E '^\+[^+]|^-[^-]' || true)
+if [[ -z "$_rename_atomic_hash" ]]; then
+    _fail "pure rename: imported change" "missing change for $SHA2"
+    print_summary || true
+    exit 1
 fi
+require_capture "read pure-rename change" atomic_in_git_repo change "$_rename_atomic_hash" --full-hash
+if [[ "$COMMAND_OUTPUT" != *"Git source revision: $SHA2"* ]]; then
+    _fail "pure rename: imported change identity" "expected Git revision $SHA2: $COMMAND_OUTPUT"
+    print_summary || true
+    exit 1
+fi
+require_capture "read Atomic pure-rename diff" atomic_in_git_repo diff -c "$_rename_atomic_hash" --no-color
+assert_output_contains "pure rename labels unproven inode identity" "Git-detected rename; Atomic recorded delete+add (inode identity unproven)" printf '%s\n' "$COMMAND_OUTPUT"
+_atomic_lines_rename=$(printf '%s\n' "$COMMAND_OUTPUT" | extract_atomic_change_lines)
 
 if [[ -z "$_git_lines_rename" && -z "$_atomic_lines_rename" ]]; then
     _pass "pure rename: both sides have zero change lines (correct)"
 elif [[ "$_git_lines_rename" == "$_atomic_lines_rename" ]]; then
     _pass "pure rename: change lines match"
 else
-    _git_n=$(printf '%s\n' "$_git_lines_rename" | grep -c '.' 2>/dev/null || echo 0)
-    _atomic_n=$(printf '%s\n' "$_atomic_lines_rename" | grep -c '.' 2>/dev/null || echo 0)
+    _git_n=$(printf '%s\n' "$_git_lines_rename" | awk 'length($0) { n++ } END { print n + 0 }')
+    _atomic_n=$(printf '%s\n' "$_atomic_lines_rename" | awk 'length($0) { n++ } END { print n + 0 }')
     _fail "pure rename: change lines" "git=$_git_n lines, atomic=$_atomic_n lines"
 fi
 
@@ -685,10 +724,11 @@ SHA2=$(git -C "$GIT_REPO" rev-parse HEAD 2>/dev/null)
 
 GIT_SHAS=("$SHA1" "$SHA2")
 
-(cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+require_success "import rename-and-modify fixture" atomic_in_git_repo git import
 
 ATOMIC_HASHES=()
-_log=$( (cd "$GIT_REPO" && atomic log --format short --no-color --full-hash 2>/dev/null) || true )
+require_capture "read rename-and-modify fixture log" atomic_in_git_repo log --format short --no-color --full-hash
+_log="$COMMAND_OUTPUT"
 if [[ -n "${_log:-}" ]]; then
     _tmp=()
     while IFS= read -r line; do
@@ -713,8 +753,8 @@ fi
 #   rename to renamed.txt
 # and the diff shows only the content delta.
 # We extract only the +/- lines from that section.
-_git_full_rmod=$(git -C "$GIT_REPO" --no-pager diff -M10% "$SHA1" "$SHA2" \
-    2>/dev/null || true)
+require_capture "read Git rename-and-modify diff" git -C "$GIT_REPO" --no-pager diff -M10% "$SHA1" "$SHA2"
+_git_full_rmod="$COMMAND_OUTPUT"
 _git_lines_rmod=$(printf '%s\n' "$_git_full_rmod" | awk -v pat="renamed.txt" '
     /^diff --git/ {
         # A rename section header looks like: diff --git a/old b/new
@@ -727,33 +767,47 @@ _git_lines_rmod=$(printf '%s\n' "$_git_full_rmod" | awk -v pat="renamed.txt" '
         next
     }
     in_sec { print }
-' | grep -E '^\+[^+]|^-[^-]' || true)
+' | extract_git_change_lines)
 
 # Atomic: extract +/- lines from the "renamed.txt" section.
 _atomic_lines_rmod=""
 if [[ -n "$_rename_mod_hash" ]]; then
-    _raw=$( (cd "$GIT_REPO" && atomic diff -c "$_rename_mod_hash" --no-color 2>/dev/null) || true )
+    require_capture "read rename-and-modify change" atomic_in_git_repo change "$_rename_mod_hash" --full-hash
+    if [[ "$COMMAND_OUTPUT" != *"Git source revision: $SHA2"* ]]; then
+        _fail "rename+modify: imported change identity" "expected Git revision $SHA2: $COMMAND_OUTPUT"
+        print_summary || true
+        exit 1
+    fi
+    require_capture "read Atomic rename-and-modify diff" atomic_in_git_repo diff -c "$_rename_mod_hash" --no-color
+    _raw="$COMMAND_OUTPUT"
     _atomic_lines_rmod=$(printf '%s\n' "$_raw" | awk -v pat="renamed.txt" '
         /^diff --atomic/ {
             in_sec = (index($0, " b/" pat) > 0 && \
                       (index($0, " b/" pat " ") > 0 || \
-                       substr($0, length($0) - length(pat)) == pat)) ? 1 : 0
+                       substr($0, length($0) - length(pat) + 1) == pat)) ? 1 : 0
             next
         }
         in_sec { print }
-    ' | grep -E '^\+[^+]|^-[^-]' || true)
+    ' | extract_atomic_change_lines)
+else
+    _fail "rename+modify: imported change" "missing change for $SHA2"
+    print_summary || true
+    exit 1
 fi
 
 # Sort both sides before comparing (hunk-ordering may differ).
+if [[ "$_git_lines_rmod" != *'-gamma'* || "$_git_lines_rmod" != *'+GAMMA-MODIFIED'* || "$_git_lines_rmod" != *'+epsilon'* ]]; then
+    _fail "rename+modify: Git fixture has expected changes" "got: $_git_lines_rmod"
+fi
 _sorted_git=$(printf '%s\n' "$_git_lines_rmod" | sort)
 _sorted_atomic=$(printf '%s\n' "$_atomic_lines_rmod" | sort)
 
 if [[ "$_sorted_git" == "$_sorted_atomic" ]]; then
-    _n=$(printf '%s\n' "$_git_lines_rmod" | grep -c '.' 2>/dev/null || echo 0)
+    _n=$(printf '%s\n' "$_git_lines_rmod" | awk 'length($0) { n++ } END { print n + 0 }')
     _pass "rename+modify: change lines match ($_n lines)"
 else
-    _gn=$(printf '%s\n' "$_git_lines_rmod" | grep -c '.' 2>/dev/null || echo 0)
-    _an=$(printf '%s\n' "$_atomic_lines_rmod" | grep -c '.' 2>/dev/null || echo 0)
+    _gn=$(printf '%s\n' "$_git_lines_rmod" | awk 'length($0) { n++ } END { print n + 0 }')
+    _an=$(printf '%s\n' "$_atomic_lines_rmod" | awk 'length($0) { n++ } END { print n + 0 }')
     _first=$(diff \
         <(printf '%s\n' "$_git_lines_rmod" | sort) \
         <(printf '%s\n' "$_atomic_lines_rmod" | sort) \
@@ -790,10 +844,11 @@ SHA2=$(git -C "$GIT_REPO" rev-parse HEAD 2>/dev/null)
 
 GIT_SHAS=("$SHA1" "$SHA2")
 
-(cd "$GIT_REPO" && atomic git import 2>/dev/null) || true
+require_success "import cross-directory rename fixture" atomic_in_git_repo git import
 
 ATOMIC_HASHES=()
-_log=$( (cd "$GIT_REPO" && atomic log --format short --no-color --full-hash 2>/dev/null) || true )
+require_capture "read cross-directory rename fixture log" atomic_in_git_repo log --format short --no-color --full-hash
+_log="$COMMAND_OUTPUT"
 if [[ -n "${_log:-}" ]]; then
     _tmp=()
     while IFS= read -r line; do
@@ -810,22 +865,32 @@ if [[ ${#ATOMIC_HASHES[@]} -ge 2 ]]; then
     _dir_rename_hash="${ATOMIC_HASHES[1]}"
 fi
 
-_git_lines_dir=$(git -C "$GIT_REPO" --no-pager diff "$SHA1" "$SHA2" \
-    2>/dev/null | grep -E '^\+[^+]|^-[^-]' || true)
+require_capture "read Git cross-directory rename diff" git -C "$GIT_REPO" --no-pager diff "$SHA1" "$SHA2"
+_git_lines_dir=$(printf '%s\n' "$COMMAND_OUTPUT" | extract_git_change_lines)
 
 _atomic_lines_dir=""
-if [[ -n "$_dir_rename_hash" ]]; then
-    _raw=$( (cd "$GIT_REPO" && atomic diff -c "$_dir_rename_hash" --no-color 2>/dev/null) || true )
-    _atomic_lines_dir=$(printf '%s\n' "$_raw" | grep -E '^\+[^+]|^-[^-]' || true)
+if [[ -z "$_dir_rename_hash" ]]; then
+    _fail "cross-dir rename: imported change" "missing change for $SHA2"
+    print_summary || true
+    exit 1
 fi
+require_capture "read cross-directory rename change" atomic_in_git_repo change "$_dir_rename_hash" --full-hash
+if [[ "$COMMAND_OUTPUT" != *"Git source revision: $SHA2"* ]]; then
+    _fail "cross-dir rename: imported change identity" "expected Git revision $SHA2: $COMMAND_OUTPUT"
+    print_summary || true
+    exit 1
+fi
+require_capture "read Atomic cross-directory rename diff" atomic_in_git_repo diff -c "$_dir_rename_hash" --no-color
+assert_output_contains "cross-directory rename labels unproven inode identity" "Git-detected rename; Atomic recorded delete+add (inode identity unproven)" printf '%s\n' "$COMMAND_OUTPUT"
+_atomic_lines_dir=$(printf '%s\n' "$COMMAND_OUTPUT" | extract_atomic_change_lines)
 
 if [[ -z "$_git_lines_dir" && -z "$_atomic_lines_dir" ]]; then
     _pass "cross-dir rename: both sides have zero change lines (correct)"
 elif [[ "$_git_lines_dir" == "$_atomic_lines_dir" ]]; then
     _pass "cross-dir rename: change lines match"
 else
-    _gn=$(printf '%s\n' "$_git_lines_dir" | grep -c '.' 2>/dev/null || echo 0)
-    _an=$(printf '%s\n' "$_atomic_lines_dir" | grep -c '.' 2>/dev/null || echo 0)
+    _gn=$(printf '%s\n' "$_git_lines_dir" | awk 'length($0) { n++ } END { print n + 0 }')
+    _an=$(printf '%s\n' "$_atomic_lines_dir" | awk 'length($0) { n++ } END { print n + 0 }')
     _fail "cross-dir rename: change lines" "git=$_gn lines, atomic=$_an lines"
 fi
 

@@ -19,13 +19,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 authors = ["Atomic Contributors"]
 license = "Apache-2.0"
 repository = "https://github.com/atomicdotdev/atomic"
 homepage = "https://atomic.dev"
-rust-version = "1.98"
+rust-version = "1.90"
 
 [workspace.dependencies]
 # Core

@@ -102,6 +102,8 @@ pub struct WriteTxn<'a> {
     pub(crate) next_view_id: &'a AtomicU64,
     pub(crate) next_inode: &'a AtomicU64,
     pub(crate) pending_next_inode: Option<PendingInodeReset>,
+    /// Local-only allocation counters for an explicitly abort-only preview.
+    preview_allocations: Option<(u64, u64, u64)>,
 }
 
 impl<'a> WriteTxn<'a> {
@@ -119,6 +121,33 @@ impl<'a> WriteTxn<'a> {
             next_view_id,
             next_inode,
             pending_next_inode: None,
+            preview_allocations: None,
+        }
+    }
+
+    /// Use private IDs for a speculative transaction that must be aborted.
+    /// This prevents rejected previews from consuming shared allocation IDs.
+    pub fn enable_abort_only_allocations(&mut self) -> PristineResult<()> {
+        if self.pending_next_inode.is_some() || self.preview_allocations.is_some() {
+            return Err(PristineError::Inconsistent {
+                message: "transaction already has local allocation state".into(),
+            });
+        }
+        self.preview_allocations = Some((
+            self.next_node_id.load(Ordering::SeqCst),
+            self.next_inode.load(Ordering::SeqCst),
+            self.next_view_id.load(Ordering::SeqCst),
+        ));
+        Ok(())
+    }
+
+    fn allocate_view_id(&mut self) -> PristineResult<u64> {
+        if let Some((_, _, next)) = &mut self.preview_allocations {
+            let id = *next;
+            *next = next.checked_add(1).ok_or(PristineError::IdSpaceExhausted)?;
+            Ok(id)
+        } else {
+            Ok(self.next_view_id.fetch_add(1, Ordering::SeqCst))
         }
     }
 
@@ -1115,7 +1144,13 @@ impl<'a> WriteTxn<'a> {
         }
 
         // Allocate a new ID
-        let id = self.next_node_id.fetch_add(1, Ordering::SeqCst);
+        let id = if let Some((next, _, _)) = &mut self.preview_allocations {
+            let id = *next;
+            *next = next.checked_add(1).ok_or(PristineError::IdSpaceExhausted)?;
+            id
+        } else {
+            self.next_node_id.fetch_add(1, Ordering::SeqCst)
+        };
         let node_id = NodeId::new(id);
 
         // Insert into both tables
@@ -1226,7 +1261,7 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         }
 
         // Create new view (defaults to Shared, no parent for backward compat)
-        let id = self.next_view_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.allocate_view_id()?;
         let state = ViewState::new(id, name.to_string());
 
         // Save it
@@ -1294,7 +1329,7 @@ impl<'a> MutTxnT for WriteTxn<'a> {
         }
 
         // Allocate ID and create state
-        let id = self.next_view_id.fetch_add(1, Ordering::SeqCst);
+        let id = self.allocate_view_id()?;
         let state = ViewState::with_scope(id, name.to_string(), kind, parent);
 
         // Save it
@@ -2093,6 +2128,13 @@ impl<'a> MutTxnT for WriteTxn<'a> {
     }
 
     fn alloc_inode(&mut self) -> PristineResult<Inode> {
+        if let Some((_, next, _)) = &mut self.preview_allocations {
+            let inode = (*next).max(1);
+            *next = inode
+                .checked_add(1)
+                .ok_or(PristineError::IdSpaceExhausted)?;
+            return Ok(Inode::new(inode));
+        }
         match self.pending_next_inode.as_mut() {
             Some(pending) => pending.allocate(),
             None => allocate_shared_inode(self.next_inode),
@@ -2214,6 +2256,11 @@ impl<'a> MutTxnT for WriteTxn<'a> {
     }
 
     fn commit(self) -> PristineResult<()> {
+        if self.preview_allocations.is_some() {
+            return Err(PristineError::Inconsistent {
+                message: "abort-only preview transaction cannot commit".into(),
+            });
+        }
         let pending_next_inode = self.pending_next_inode;
         let shared_next_inode = self.next_inode;
         self.txn.commit()?;

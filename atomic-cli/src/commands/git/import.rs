@@ -113,6 +113,16 @@ pub struct Import {
     #[arg(long = "with-crdt")]
     pub with_crdt: bool,
 
+    /// Experimentally use compact span-backed history for a fresh first-parent stream.
+    ///
+    /// Historical semantic FileOps are not synthesized. Native content edits
+    /// use experimental span-derived semantics; unsupported operations refuse.
+    /// Incremental import requires unchanged first-parent span history and a
+    /// clean checked-out Git tip.
+    #[cfg(feature = "experimental-span-import")]
+    #[arg(long, conflicts_with_all = ["no_stream", "with_crdt", "all_branches"])]
+    pub span: bool,
+
     /// Use the rolling first-parent graph stream (default for fresh imports).
     /// Verifies the final tip, not every historical state. Unsupported input
     /// refuses; use --no-stream for the ordinary importer. Without --stream,
@@ -263,9 +273,21 @@ fn emit_import_synthesis(repo: &Repository, stats: &ImportStats) {
 }
 
 impl Import {
+    fn uses_span(&self) -> bool {
+        #[cfg(feature = "experimental-span-import")]
+        {
+            self.span
+        }
+        #[cfg(not(feature = "experimental-span-import"))]
+        {
+            false
+        }
+    }
+
     fn uses_stream(&self, repository_exists: bool) -> bool {
         !self.no_stream
             && (self.stream
+                || self.uses_span()
                 || (!repository_exists
                     && !self.with_crdt
                     && !self.incremental
@@ -301,6 +323,7 @@ impl Import {
             repo_name,
             mainline_only: mode.mainline_only,
             graph_only: !self.with_crdt,
+            span_stream: self.uses_span(),
             preserve_working_copy: mode.preserve_working_copy,
             target_view: branch_name.to_string(),
             known_states: known_states.clone(),
@@ -777,10 +800,255 @@ impl Command for Import {
     }
 }
 
+#[cfg(feature = "experimental-span-import")]
+#[derive(Debug, PartialEq, Eq)]
+struct SpanIncrementalGitObservation {
+    branch: String,
+    tip: git2::Oid,
+    index: Vec<u8>,
+}
+
+#[cfg(all(test, unix, feature = "experimental-span-import"))]
+fn pause_span_incremental_before_checkpoint_for_test() {
+    use std::io::Write;
+    if std::env::var_os("ATOMIC_TEST_SPAN_INCREMENTAL_CHECKPOINT_PAUSE").is_none() {
+        return;
+    }
+    println!("ATOMIC_SPAN_INCREMENTAL_BEFORE_CHECKPOINT");
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[cfg(all(test, unix, feature = "experimental-span-import"))]
+fn pause_span_incremental_final_git_check_for_test() {
+    use std::io::{Read, Write};
+    if std::env::var_os("ATOMIC_TEST_SPAN_INCREMENTAL_GIT_PAUSE").is_none() {
+        return;
+    }
+    println!("ATOMIC_SPAN_INCREMENTAL_FINAL_GIT_CHECK");
+    std::io::stdout().flush().unwrap();
+    let mut signal = [0u8; 1];
+    std::io::stdin().read_exact(&mut signal).unwrap();
+}
+
+#[cfg(feature = "experimental-span-import")]
+impl SpanIncrementalGitObservation {
+    fn capture(git: &GitRepository) -> CliResult<Self> {
+        // libgit2's repository index and a Git process using GIT_INDEX_FILE
+        // need not observe the same index. Until the override is explicitly
+        // supported, do not claim a clean checkout based on the wrong file.
+        if std::env::var_os("GIT_INDEX_FILE").is_some() {
+            return Err(CliError::GitError {
+                message:
+                    "span incremental import does not support GIT_INDEX_FILE; no import was started"
+                        .into(),
+            });
+        }
+        if git.state() != git2::RepositoryState::Clean {
+            return Err(CliError::GitError {
+                message: "Git has an in-progress operation; span incremental import was refused"
+                    .into(),
+            });
+        }
+        if git.path().join("index.lock").exists() {
+            return Err(CliError::GitError {
+                message: "Git index is locked; span incremental import was refused".into(),
+            });
+        }
+        let head = git.head().map_err(|error| CliError::GitError {
+            message: format!("cannot observe Git HEAD: {error}"),
+        })?;
+        if !head.is_branch() {
+            return Err(CliError::GitError {
+                message: "span incremental import requires an attached Git branch".into(),
+            });
+        }
+        let branch = head
+            .shorthand()
+            .ok()
+            .ok_or_else(|| CliError::GitError {
+                message: "Git branch name is not representable".into(),
+            })?
+            .to_string();
+        let tip = head.target().ok_or_else(|| CliError::GitError {
+            message: "Git branch has no commit".into(),
+        })?;
+        let index =
+            std::fs::read(git.path().join("index")).map_err(|error| CliError::GitError {
+                message: format!("cannot inspect Git index: {error}"),
+            })?;
+        let mut parsed_index = git.index().map_err(|error| CliError::GitError {
+            message: format!("cannot inspect Git index entries: {error}"),
+        })?;
+        parsed_index
+            .read(true)
+            .map_err(|error| CliError::GitError {
+                message: format!("cannot refresh Git index observation: {error}"),
+            })?;
+        if parsed_index.iter().any(|entry| {
+            // These flags tell Git status not to compare a tracked file with
+            // the worktree, so clean status cannot establish its bytes.
+            entry.flags & 0x8000 != 0 || entry.flags_extended & 0x4000 != 0
+        }) {
+            return Err(CliError::GitError {
+                message: "span incremental import cannot verify Git index entries marked assume-unchanged or skip-worktree".into(),
+            });
+        }
+        let mut options = git2::StatusOptions::new();
+        options
+            .include_untracked(false)
+            .include_ignored(false)
+            .exclude_submodules(false);
+        let statuses = git
+            .statuses(Some(&mut options))
+            .map_err(|error| CliError::GitError {
+                message: format!("cannot inspect Git working tree: {error}"),
+            })?;
+        if statuses.iter().any(|entry| !entry.status().is_empty()) {
+            return Err(CliError::GitError {
+                message:
+                    "span incremental import requires a clean Git index and tracked working tree"
+                        .into(),
+            });
+        }
+        // Status and index reads are separate operations. Refuse a snapshot
+        // assembled from different HEAD/index generations rather than pinning
+        // an internally inconsistent observation.
+        let after_head = git.head().map_err(|error| CliError::GitError {
+            message: format!("cannot reobserve Git HEAD: {error}"),
+        })?;
+        let after_index =
+            std::fs::read(git.path().join("index")).map_err(|error| CliError::GitError {
+                message: format!("cannot reobserve Git index: {error}"),
+            })?;
+        if !after_head.is_branch()
+            || after_head.shorthand().ok() != Some(branch.as_str())
+            || after_head.target() != Some(tip)
+            || after_index != index
+            || git.path().join("index.lock").exists()
+            || git.state() != git2::RepositoryState::Clean
+        {
+            return Err(CliError::GitError {
+                message: "Git HEAD or index changed while observing span incremental import".into(),
+            });
+        }
+        Ok(Self { branch, tip, index })
+    }
+}
+
 impl Import {
+    #[cfg(feature = "experimental-span-import")]
+    fn run_span_incremental(&self, git: &GitRepository, workdir: &Path) -> CliResult<()> {
+        if self.dry_run {
+            return Err(CliError::GitError {
+                message: "span incremental dry-run is not supported; no import was started".into(),
+            });
+        }
+        if self.all_branches
+            || self.with_crdt
+            || self.no_stream
+            || self.detached_tip.is_some()
+            || self.reactive_budget.is_some()
+        {
+            return Err(CliError::GitError {
+                message: "span incremental import requires a checked-out first-parent branch"
+                    .into(),
+            });
+        }
+        let _preflight = Repository::try_lock_git_import_for_span(workdir, false)
+            .map_err(|error| CliError::GitError {
+                message: format!("span import preflight refused: {error}"),
+            })?
+            .ok_or_else(|| CliError::GitError {
+                message: "span incremental import requires an existing span repository".into(),
+            })?;
+        let pinned = SpanIncrementalGitObservation::capture(git)?;
+        if self
+            .branch
+            .as_ref()
+            .is_some_and(|branch| branch != &pinned.branch)
+        {
+            return Err(CliError::GitError {
+                message: "span incremental import only supports the checked-out Git branch".into(),
+            });
+        }
+        let mut repo = Repository::open(workdir).map_err(CliError::from)?;
+        let limits = self.stream_limits()?;
+        let importer = ParallelImporter::new(
+            git,
+            ParallelImportOptions {
+                graph_only: true,
+                span_stream: true,
+                mainline_only: true,
+                // The pinned Git branch names the target. The view is never
+                // taken from the handle's ambient selection; the importer
+                // refuses unless the two already agree.
+                target_view: pinned.branch.clone(),
+                ..Default::default()
+            },
+        );
+        importer.require_target_is_current_view(&repo)?;
+        let plan =
+            importer.validate_graph_stream_prospectively(&pinned.branch, pinned.tip, limits)?;
+        let expected_tree = plan.expected_git_tree().ok_or_else(|| CliError::GitError {
+            message: "span incremental preflight did not produce a Git tree proof".into(),
+        })?;
+        let raw_tree = plan.raw_git_tree().ok_or_else(|| CliError::GitError {
+            message: "span incremental preflight did not record the raw Git tree".into(),
+        })?;
+        #[cfg(all(test, unix))]
+        let mut observation_count = 0usize;
+        let outcome =
+            importer.import_span_incremental_prevalidated(&mut repo, plan, limits, || {
+                #[cfg(all(test, unix))]
+                {
+                    observation_count += 1;
+                    if observation_count == 3 {
+                        pause_span_incremental_final_git_check_for_test();
+                    }
+                }
+                let current = SpanIncrementalGitObservation::capture(git)?;
+                if current != pinned {
+                    return Err(CliError::GitError {
+                        message: "Git HEAD or index changed during span incremental import".into(),
+                    });
+                }
+                Ok(())
+            })?;
+        #[cfg(all(test, unix))]
+        pause_span_incremental_before_checkpoint_for_test();
+        let current = SpanIncrementalGitObservation::capture(git)?;
+        if current != pinned {
+            return Err(CliError::GitError {
+                message: "Git HEAD or index changed before span checkpoint refresh; the imported view remains recorded, but the checkpoint was not advanced".into(),
+            });
+        }
+        let working_copy = repo.require_working_copy_id().map_err(CliError::from)?;
+        let refresh = super::shim::refresh_checkpoint_after_verified_import(
+            &repo,
+            working_copy,
+            git,
+            &pinned.branch,
+            &expected_tree,
+            &raw_tree,
+        )?;
+        if refresh != super::shim::CheckpointRefresh::Refreshed {
+            return Err(CliError::GitError {
+                message: "span import was recorded, but its verified Git checkpoint could not be refreshed".into(),
+            });
+        }
+        print_success(&format!(
+            "Imported {} incremental span change(s) from branch '{}'",
+            outcome.commits, pinned.branch
+        ));
+        Ok(())
+    }
+
     fn run_import(&self) -> CliResult<()> {
         let run_start = std::time::Instant::now();
-        if self.stream || self.stream_window_mib.is_some() {
+        if self.stream || self.uses_span() || self.stream_window_mib.is_some() {
             self.stream_limits()?;
         }
         if self.no_stream && self.stream {
@@ -796,6 +1064,22 @@ impl Import {
         let workdir = git_repo.workdir().ok_or_else(|| CliError::GitError {
             message: "Git repository has no working directory (bare repository?)".to_string(),
         })?;
+        #[cfg(feature = "experimental-span-import")]
+        if self.span && self.incremental {
+            return self.run_span_incremental(&git_repo, workdir);
+        }
+        // Keep capability inspection and the later workspace entry under one
+        // common lock. Never run writable recovery before this check: the
+        // ordinary importer cannot publish into a span-backed repository.
+        let _import_preflight = Repository::try_lock_git_import_without_span(workdir, self.dry_run)
+            .map_err(|error| CliError::GitError {
+                message: format!("Git import preflight refused: {error}"),
+            })?;
+        if self.uses_span() && workdir.join(".atomic").exists() {
+            return Err(CliError::GitError {
+                message: "--span requires a fresh Git checkout without an Atomic repository".into(),
+            });
+        }
         trace_git_import(format!(
             "discover Git repository: {:?}",
             run_start.elapsed()
@@ -892,7 +1176,7 @@ impl Import {
         }
 
         let mut stream = self.uses_stream(workdir.join(".atomic").exists());
-        if stream && !self.stream && has_binding_transport(&git_repo)? {
+        if stream && !self.stream && !self.uses_span() && has_binding_transport(&git_repo)? {
             // Classify before preflight or mutation, not a fallback after a
             // failed stream. Explicit --stream keeps its strict refusal.
             stream = false;
@@ -1007,6 +1291,7 @@ impl Import {
                 repo_name: self.get_repo_name(&git_repo),
                 mainline_only: !self.all_branches,
                 graph_only: !self.with_crdt,
+                span_stream: self.uses_span(),
                 preserve_working_copy: true,
                 target_view: branch_name.clone(),
                 known_states: known_states.clone(),
@@ -1125,7 +1410,9 @@ impl Import {
         let original_view = workspace.view().name.clone();
         let preserve_current_view = repo_exists && self.incremental;
 
-        if stream {
+        if stream && self.uses_span() {
+            print_hint("Experimental compact span-backed Git history: historical semantic FileOps are not synthesized; native content edits use span-derived semantics and unsupported operations refuse. Incremental span import requires an explicit --span --incremental and a clean, compatible first-parent checkout.");
+        } else if stream {
             print_hint("Streaming graph-only Git history without historical CRDT FileOps; final tip verification remains enabled.");
         } else if self.with_crdt {
             print_info(
@@ -2274,6 +2561,694 @@ mod tests {
         assert!(
             Import::try_parse_from(["import", "--no-stream", "--stream-window-mib", "32"]).is_err()
         );
+    }
+
+    #[cfg(feature = "experimental-span-import")]
+    #[test]
+    fn span_import_is_explicit_and_rejects_incompatible_modes() {
+        let import = Import::try_parse_from(["import", "--span"]).unwrap();
+        assert!(import.uses_span());
+        assert!(import.uses_stream(false));
+        assert!(!Import::try_parse_from(["import"]).unwrap().uses_span());
+        assert!(Import::try_parse_from(["import", "--span", "--incremental"]).is_ok());
+        for mode in ["--no-stream", "--with-crdt", "--all"] {
+            assert!(
+                Import::try_parse_from(["import", "--span", mode]).is_err(),
+                "{mode}"
+            );
+        }
+    }
+
+    #[cfg(all(unix, feature = "experimental-span-import"))]
+    #[test]
+    #[file_serial]
+    fn explicit_span_incremental_import_preserves_git_and_user_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        fs::write(temp.path().join("tracked.txt"), b"original\nsecond\n").unwrap();
+        git_ok(temp.path(), &["add", "tracked.txt"]);
+        git_ok(temp.path(), &["commit", "-qm", "initial"]);
+        let _guard = DirGuard::new();
+        std::env::set_current_dir(temp.path()).unwrap();
+        Import {
+            span: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        fs::write(
+            temp.path().join("tracked.txt"),
+            b"original\nchanged in Git\n",
+        )
+        .unwrap();
+        git_ok(temp.path(), &["add", "tracked.txt"]);
+        git_ok(temp.path(), &["commit", "-qm", "next"]);
+        fs::write(temp.path().join("untracked.txt"), b"untracked user bytes\n").unwrap();
+        let ignore = fs::read(temp.path().join(".atomicignore")).unwrap();
+        let head = fs::read(temp.path().join(".git/HEAD")).unwrap();
+        let index = fs::read(temp.path().join(".git/index")).unwrap();
+        let import = Import {
+            span: true,
+            incremental: true,
+            no_vault: true,
+            ..Default::default()
+        };
+        import.run().unwrap();
+        let repo = Repository::open(temp.path()).unwrap();
+        assert_eq!(
+            repo.get_file_content("tracked.txt").unwrap(),
+            Some(b"original\nchanged in Git\n".to_vec())
+        );
+        assert_eq!(
+            repo.get_file_content(".atomicignore").unwrap(),
+            Some(ignore.clone())
+        );
+        let wc = repo.require_working_copy_id().unwrap();
+        let status = repo
+            .status(
+                wc,
+                atomic_repository::StatusOptions::default().with_untracked(false),
+            )
+            .unwrap();
+        assert!(
+            status.is_clean(),
+            "incremental span import should match the checked-out Git files: {status:?}"
+        );
+        let before_working = repo
+            .operation_log(
+                atomic_core::operation::OperationScope::WorkingCopy(wc),
+                None,
+                false,
+            )
+            .unwrap();
+        let before_global = repo
+            .operation_log(
+                atomic_core::operation::OperationScope::Repository,
+                None,
+                false,
+            )
+            .unwrap();
+        drop(repo);
+        import.run().unwrap();
+        let repo = Repository::open(temp.path()).unwrap();
+        assert_eq!(
+            repo.operation_log(
+                atomic_core::operation::OperationScope::WorkingCopy(wc),
+                None,
+                false
+            )
+            .unwrap(),
+            before_working
+        );
+        assert_eq!(
+            repo.operation_log(
+                atomic_core::operation::OperationScope::Repository,
+                None,
+                false
+            )
+            .unwrap(),
+            before_global
+        );
+        drop(repo);
+        assert_eq!(fs::read(temp.path().join(".git/HEAD")).unwrap(), head);
+        assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), index);
+        assert_eq!(
+            fs::read(temp.path().join("tracked.txt")).unwrap(),
+            b"original\nchanged in Git\n"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("untracked.txt")).unwrap(),
+            b"untracked user bytes\n"
+        );
+        assert_eq!(fs::read(temp.path().join(".atomicignore")).unwrap(), ignore);
+
+        git_ok(
+            temp.path(),
+            &["commit", "--allow-empty", "-qm", "empty follow-up"],
+        );
+        let empty_head = GitRepository::open(temp.path())
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap();
+        import.run().unwrap();
+        let repo = Repository::open(temp.path()).unwrap();
+        let mut empty_changes = Vec::new();
+        for entry in repo.effective_history(None).unwrap() {
+            let change = repo.load_change(&entry.hash).unwrap();
+            if change.hashed.header.message == "empty follow-up" {
+                empty_changes.push(change);
+            }
+        }
+        assert_eq!(empty_changes.len(), 1);
+        assert!(empty_changes[0].hashed.span.is_some());
+        assert!(empty_changes[0].file_ops().is_empty());
+        assert_eq!(
+            repo.get_file_content("tracked.txt").unwrap(),
+            Some(b"original\nchanged in Git\n".to_vec())
+        );
+        drop(repo);
+        assert_eq!(
+            GitRepository::open(temp.path())
+                .unwrap()
+                .head()
+                .unwrap()
+                .target()
+                .unwrap(),
+            empty_head
+        );
+        let index = fs::read(temp.path().join(".git/index")).unwrap();
+
+        fs::write(temp.path().join("tracked.txt"), b"dirty user bytes\n").unwrap();
+        let database = temp.path().join(".atomic/atomic.redb");
+        let before_database = fs::read(&database).unwrap();
+        let error = import.run().unwrap_err();
+        assert!(error.to_string().contains("clean Git index"), "{error}");
+        assert_eq!(fs::read(&database).unwrap(), before_database);
+        assert_eq!(
+            fs::read(temp.path().join("tracked.txt")).unwrap(),
+            b"dirty user bytes\n"
+        );
+        assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), index);
+    }
+
+    #[cfg(all(unix, feature = "experimental-span-import"))]
+    #[test]
+    #[ignore = "child entry point, explicitly exercised by span_incremental_checkpoint_kill_retries"]
+    fn span_incremental_checkpoint_kill_child() {
+        let root =
+            std::env::var_os("ATOMIC_TEST_SPAN_INCREMENTAL_CHECKPOINT_ROOT").expect("child root");
+        std::env::set_current_dir(root).unwrap();
+        Import {
+            span: true,
+            incremental: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        panic!("checkpoint pause was not reached");
+    }
+
+    #[cfg(all(unix, feature = "experimental-span-import"))]
+    #[test]
+    #[file_serial]
+    fn span_incremental_checkpoint_kill_retries() {
+        use atomic_core::operation::OperationScope;
+        use std::io::BufRead;
+        use std::os::unix::process::ExitStatusExt;
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        fs::write(temp.path().join("tracked.txt"), b"before\n").unwrap();
+        git_ok(temp.path(), &["add", "tracked.txt"]);
+        git_ok(temp.path(), &["commit", "-qm", "initial"]);
+        let _guard = DirGuard::new();
+        std::env::set_current_dir(temp.path()).unwrap();
+        Import {
+            span: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        let checkpoint = super::super::checkpoint::checkpoint_path(temp.path());
+        let previous_checkpoint = fs::read(&checkpoint).unwrap();
+        fs::write(temp.path().join("tracked.txt"), b"after\n").unwrap();
+        git_ok(temp.path(), &["add", "tracked.txt"]);
+        git_ok(temp.path(), &["commit", "-qm", "next"]);
+        fs::write(temp.path().join("user.txt"), b"untracked user bytes\n").unwrap();
+        let head = GitRepository::open(temp.path())
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap();
+        let index = fs::read(temp.path().join(".git/index")).unwrap();
+        let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::git::import::tests::span_incremental_checkpoint_kill_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ATOMIC_TEST_SPAN_INCREMENTAL_CHECKPOINT_ROOT", temp.path())
+            .env("ATOMIC_TEST_SPAN_INCREMENTAL_CHECKPOINT_PAUSE", "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            for line in std::io::BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) if line.contains("ATOMIC_SPAN_INCREMENTAL_BEFORE_CHECKPOINT") => {
+                        let _ = send.send(Ok(()));
+                        return;
+                    }
+                    Ok(line) => {
+                        output.push_str(&line);
+                        output.push('\n');
+                    }
+                    Err(error) => {
+                        let _ = send.send(Err(error.to_string()));
+                        return;
+                    }
+                }
+            }
+            let _ = send.send(Err(format!(
+                "child exited before checkpoint seam:\n{output}"
+            )));
+        });
+        let ready = receive.recv_timeout(std::time::Duration::from_secs(60));
+        let killed = child.kill();
+        let status = child.wait().unwrap();
+        if ready.is_ok() {
+            reader.join().unwrap();
+        }
+        ready
+            .expect("child timed out")
+            .expect("checkpoint seam was not reached");
+        assert!(killed.is_ok() && status.signal() == Some(9));
+        assert_eq!(fs::read(&checkpoint).unwrap(), previous_checkpoint);
+        assert_eq!(
+            fs::read(temp.path().join("tracked.txt")).unwrap(),
+            b"after\n"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("user.txt")).unwrap(),
+            b"untracked user bytes\n"
+        );
+        assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), index);
+        let repo = Repository::open(temp.path()).unwrap();
+        assert_eq!(
+            repo.get_file_content("tracked.txt").unwrap(),
+            Some(b"after\n".to_vec())
+        );
+        let wc = repo.require_working_copy_id().unwrap();
+        let before_retry = repo
+            .operation_log(OperationScope::WorkingCopy(wc), None, false)
+            .unwrap();
+        let before_global = repo
+            .operation_log(OperationScope::Repository, None, false)
+            .unwrap();
+        drop(repo);
+        Import {
+            span: true,
+            incremental: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        assert_ne!(fs::read(&checkpoint).unwrap(), previous_checkpoint);
+        assert_eq!(
+            GitRepository::open(temp.path())
+                .unwrap()
+                .head()
+                .unwrap()
+                .target()
+                .unwrap(),
+            head
+        );
+        assert_eq!(fs::read(temp.path().join(".git/index")).unwrap(), index);
+        assert_eq!(
+            fs::read(temp.path().join("user.txt")).unwrap(),
+            b"untracked user bytes\n"
+        );
+        let mut repo = Repository::open(temp.path()).unwrap();
+        assert_eq!(
+            repo.operation_log(OperationScope::WorkingCopy(wc), None, false)
+                .unwrap(),
+            before_retry
+        );
+        assert_eq!(
+            repo.operation_log(OperationScope::Repository, None, false)
+                .unwrap(),
+            before_global
+        );
+        assert!(
+            observe_workspace(&mut repo).unwrap().is_ok(),
+            "retry must restore a coherent checkpoint"
+        );
+    }
+
+    #[cfg(all(unix, feature = "experimental-span-import"))]
+    #[test]
+    #[ignore = "child entry point, explicitly exercised by span_incremental_concurrent_git_edit_refuses"]
+    fn span_incremental_concurrent_git_edit_child() {
+        let root = std::env::var_os("ATOMIC_TEST_SPAN_INCREMENTAL_GIT_ROOT").expect("child root");
+        std::env::set_current_dir(root).unwrap();
+        let error = Import {
+            span: true,
+            incremental: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap_err();
+        assert!(error.to_string().contains("clean Git index"), "{error}");
+    }
+
+    #[cfg(all(unix, feature = "experimental-span-import"))]
+    #[test]
+    #[file_serial]
+    fn span_incremental_concurrent_git_edit_refuses() {
+        use atomic_core::operation::OperationScope;
+        use std::io::{BufRead, Write};
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        fs::write(temp.path().join("tracked.txt"), b"before\n").unwrap();
+        git_ok(temp.path(), &["add", "tracked.txt"]);
+        git_ok(temp.path(), &["commit", "-qm", "initial"]);
+        let _guard = DirGuard::new();
+        std::env::set_current_dir(temp.path()).unwrap();
+        Import {
+            span: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        let repo = Repository::open(temp.path()).unwrap();
+        let original_state = repo.get_view_info(repo.current_view()).unwrap().state;
+        let wc = repo.require_working_copy_id().unwrap();
+        drop(repo);
+        fs::write(temp.path().join("tracked.txt"), b"committed Git version\n").unwrap();
+        git_ok(temp.path(), &["add", "tracked.txt"]);
+        git_ok(temp.path(), &["commit", "-qm", "next"]);
+        fs::write(temp.path().join("user.txt"), b"untracked user bytes\n").unwrap();
+        let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::git::import::tests::span_incremental_concurrent_git_edit_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("ATOMIC_TEST_SPAN_INCREMENTAL_GIT_ROOT", temp.path())
+            .env("ATOMIC_TEST_SPAN_INCREMENTAL_GIT_PAUSE", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut output = String::new();
+            let mut sent = false;
+            for line in std::io::BufReader::new(stdout).lines() {
+                let line = line.unwrap();
+                if !sent && line.contains("ATOMIC_SPAN_INCREMENTAL_FINAL_GIT_CHECK") {
+                    let _ = send.send(());
+                    sent = true;
+                }
+                output.push_str(&line);
+                output.push('\n');
+            }
+            output
+        });
+        if receive
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .is_err()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not reach the final Git observation");
+        }
+        fs::write(temp.path().join("tracked.txt"), b"concurrent user edit\n").unwrap();
+        git_ok(temp.path(), &["add", "tracked.txt"]);
+        let staged_index = fs::read(temp.path().join(".git/index")).unwrap();
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        let status = child.wait().unwrap();
+        let output = reader.join().unwrap();
+        assert!(
+            status.success(),
+            "child must observe and refuse the concurrent edit: {output}"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("tracked.txt")).unwrap(),
+            b"concurrent user edit\n"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("user.txt")).unwrap(),
+            b"untracked user bytes\n"
+        );
+        assert_eq!(
+            fs::read(temp.path().join(".git/index")).unwrap(),
+            staged_index
+        );
+        let repo = Repository::open(temp.path()).unwrap();
+        assert_eq!(
+            repo.get_view_info(repo.current_view()).unwrap().state,
+            original_state
+        );
+        assert_eq!(
+            repo.get_file_content("tracked.txt").unwrap(),
+            Some(b"before\n".to_vec())
+        );
+        let before_retry = repo
+            .operation_log(OperationScope::WorkingCopy(wc), None, false)
+            .unwrap();
+        let before_global = repo
+            .operation_log(OperationScope::Repository, None, false)
+            .unwrap();
+        drop(repo);
+        let error = Import {
+            span: true,
+            incremental: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap_err();
+        assert!(error.to_string().contains("clean Git index"), "{error}");
+        let repo = Repository::open(temp.path()).unwrap();
+        assert_eq!(
+            repo.operation_log(OperationScope::WorkingCopy(wc), None, false)
+                .unwrap(),
+            before_retry
+        );
+        assert_eq!(
+            repo.operation_log(OperationScope::Repository, None, false)
+                .unwrap(),
+            before_global
+        );
+        assert_eq!(
+            fs::read(temp.path().join(".git/index")).unwrap(),
+            staged_index
+        );
+        assert_eq!(
+            fs::read(temp.path().join("tracked.txt")).unwrap(),
+            b"concurrent user edit\n"
+        );
+    }
+
+    #[cfg(all(unix, feature = "experimental-span-import"))]
+    #[test]
+    #[file_serial]
+    fn existing_span_repository_rejects_git_reimport_before_any_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        fs::write(temp.path().join("tracked.txt"), b"initial\n").unwrap();
+        git_ok(temp.path(), &["add", "tracked.txt"]);
+        git_ok(temp.path(), &["commit", "-qm", "initial"]);
+        let _guard = DirGuard::new();
+        std::env::set_current_dir(temp.path()).unwrap();
+        Import {
+            span: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+
+        fs::write(temp.path().join("tracked.txt"), b"next Git version\n").unwrap();
+        git_ok(temp.path(), &["add", "tracked.txt"]);
+        git_ok(temp.path(), &["commit", "-qm", "next"]);
+        fs::write(temp.path().join("untracked.txt"), b"untracked user bytes\n").unwrap();
+        let database = temp.path().join(".atomic/atomic.redb");
+        let index = temp.path().join(".git/index");
+        let expected_database = fs::read(&database).unwrap();
+        let expected_index = fs::read(&index).unwrap();
+        let expected_head = fs::read(temp.path().join(".git/HEAD")).unwrap();
+
+        for (incremental, dry_run, span) in [
+            (true, false, false),
+            (true, true, false),
+            (false, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let error = Import {
+                incremental,
+                dry_run,
+                span,
+                no_vault: true,
+                ..Default::default()
+            }
+            .run()
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("existing span repository"),
+                "{error}"
+            );
+            assert_eq!(
+                fs::read(&database).unwrap(),
+                expected_database,
+                "database changed for incremental={incremental} dry_run={dry_run} span={span}"
+            );
+            assert_eq!(fs::read(&index).unwrap(), expected_index);
+            assert_eq!(
+                fs::read(temp.path().join(".git/HEAD")).unwrap(),
+                expected_head
+            );
+            assert_eq!(
+                fs::read(temp.path().join("tracked.txt")).unwrap(),
+                b"next Git version\n"
+            );
+            assert_eq!(
+                fs::read(temp.path().join("untracked.txt")).unwrap(),
+                b"untracked user bytes\n"
+            );
+        }
+    }
+
+    #[cfg(all(unix, feature = "experimental-span-import"))]
+    #[test]
+    #[file_serial]
+    fn detached_span_shim_reconcile_refuses_before_view_or_journal_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        init_git(temp.path());
+        fs::write(temp.path().join("tracked.txt"), b"initial\n").unwrap();
+        git_ok(temp.path(), &["add", "tracked.txt"]);
+        git_ok(temp.path(), &["commit", "-qm", "initial"]);
+        let _guard = DirGuard::new();
+        std::env::set_current_dir(temp.path()).unwrap();
+        Import {
+            span: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        fs::write(temp.path().join("tracked.txt"), b"new Git version\n").unwrap();
+        git_ok(temp.path(), &["add", "tracked.txt"]);
+        git_ok(temp.path(), &["commit", "-qm", "next"]);
+        git_ok(temp.path(), &["switch", "--quiet", "--detach", "HEAD"]);
+        let database = temp.path().join(".atomic/atomic.redb");
+        let index = temp.path().join(".git/index");
+        let head = temp.path().join(".git/HEAD");
+        let expected_database = fs::read(&database).unwrap();
+        let expected_index = fs::read(&index).unwrap();
+        let expected_head = fs::read(&head).unwrap();
+        let error = super::super::shim::reconcile_transaction_budgeted(
+            temp.path(),
+            atomic_repository::repository::ReconcileEffectBudget::Command,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("existing span repository"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&database).unwrap(), expected_database);
+        assert_eq!(fs::read(&index).unwrap(), expected_index);
+        assert_eq!(fs::read(&head).unwrap(), expected_head);
+        assert_eq!(
+            fs::read(temp.path().join("tracked.txt")).unwrap(),
+            b"new Git version\n"
+        );
+    }
+
+    #[cfg(all(unix, feature = "experimental-span-import"))]
+    #[test]
+    #[file_serial]
+    fn linked_worktree_span_preflight_preserves_common_and_local_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let primary = temp.path().join("primary");
+        let linked = temp.path().join("linked");
+        fs::create_dir(&primary).unwrap();
+        init_git(&primary);
+        fs::write(primary.join("tracked.txt"), b"original\n").unwrap();
+        git_ok(&primary, &["add", "tracked.txt"]);
+        git_ok(&primary, &["commit", "-qm", "initial"]);
+        let _guard = DirGuard::new();
+        std::env::set_current_dir(&primary).unwrap();
+        Import {
+            span: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap();
+        git_ok(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().unwrap(),
+            ],
+        );
+        fs::write(linked.join("tracked.txt"), b"local user edit\n").unwrap();
+        let git = GitRepository::open(&linked).unwrap();
+        let index = git.path().join("index");
+        let head = git.path().join("HEAD");
+        let database = primary.join(".atomic/atomic.redb");
+        let expected_database = fs::read(&database).unwrap();
+        let expected_index = fs::read(&index).unwrap();
+        let expected_head = fs::read(&head).unwrap();
+        assert!(!linked.join(".atomic").exists());
+        std::env::set_current_dir(&linked).unwrap();
+
+        for dry_run in [false, true] {
+            let error = Import {
+                incremental: true,
+                dry_run,
+                no_vault: true,
+                ..Default::default()
+            }
+            .run()
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("existing span repository"),
+                "{error}"
+            );
+        }
+        let error = Import {
+            span: true,
+            incremental: true,
+            no_vault: true,
+            ..Default::default()
+        }
+        .run()
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("existing span repository")
+                || error.to_string().contains("attached Git branch"),
+            "{error}"
+        );
+        let error = super::super::shim::reconcile_transaction_budgeted(
+            &linked,
+            atomic_repository::repository::ReconcileEffectBudget::Command,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("existing span repository"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&database).unwrap(), expected_database);
+        assert_eq!(fs::read(&index).unwrap(), expected_index);
+        assert_eq!(fs::read(&head).unwrap(), expected_head);
+        assert_eq!(
+            fs::read(linked.join("tracked.txt")).unwrap(),
+            b"local user edit\n"
+        );
+        assert!(!linked.join(".atomic").exists());
     }
 
     #[test]

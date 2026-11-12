@@ -107,6 +107,15 @@ impl Repository {
                     hash: hash.to_string(),
                 })?;
             let change = self.load_change(&hash)?;
+            if change
+                .file_ops()
+                .iter()
+                .any(|ops| matches!(ops.trunk_op(), Some(TrunkOp::ProjectedSpanEdit { .. })))
+            {
+                return Err(RepositoryError::InvalidOperation {
+                    message: "projected span semantics cannot be materialized as CRDT rows; use the span-derived semantic view".into(),
+                });
+            }
             if !change.has_file_ops() {
                 continue;
             }

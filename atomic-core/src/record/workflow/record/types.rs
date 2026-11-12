@@ -199,6 +199,11 @@ pub struct RecordedFile {
     /// has a vertex map from content retrieval.
     pre_globalized: Option<Vec<crate::change::GraphOp<Option<crate::types::Hash>>>>,
 
+    /// Span edits whose inserted ranges are relative to this file's content.
+    span_ops: Vec<crate::change::span_patch::SpanOp>,
+    /// Visible file changes observed while recording these span edits.
+    span_dependencies: Vec<Hash>,
+
     /// Causally maximal deletions this record restores.
     ///
     /// Empty means this is an ordinary add/edit/delete. Undelete keeps the
@@ -250,6 +255,8 @@ impl RecordedFile {
             name_conflict_resolution: None,
             name_conflict_bindings: Vec::new(),
             pre_globalized: None,
+            span_ops: Vec::new(),
+            span_dependencies: Vec::new(),
             undelete_changes: Vec::new(),
             attrs: Vec::new(),
         }
@@ -559,6 +566,26 @@ impl RecordedFile {
         self.pre_globalized.as_deref()
     }
 
+    /// Set the range edits produced for a span-backed file.
+    pub fn set_span_ops(&mut self, ops: Vec<crate::change::span_patch::SpanOp>) {
+        self.span_ops = ops;
+    }
+
+    /// Range edits with insert offsets relative to this file's content.
+    pub fn span_ops(&self) -> &[crate::change::span_patch::SpanOp] {
+        &self.span_ops
+    }
+
+    /// Preserve the causal file history observed during span recording.
+    pub fn set_span_dependencies(&mut self, dependencies: Vec<Hash>) {
+        self.span_dependencies = dependencies;
+    }
+
+    /// The visible file changes captured by span recording.
+    pub fn span_dependencies(&self) -> &[Hash] {
+        &self.span_dependencies
+    }
+
     /// Take ownership of pre-globalized graph operations.
     #[must_use]
     pub fn take_pre_globalized(
@@ -589,6 +616,7 @@ impl RecordedFile {
             || self.is_undelete()
             || !self.attrs.is_empty()
             || self.name_conflict_resolution.is_some()
+            || !self.span_ops.is_empty()
         {
             return false;
         }
@@ -598,7 +626,7 @@ impl RecordedFile {
     /// Get number of hunks.
     #[must_use]
     pub fn hunk_count(&self) -> usize {
-        self.hunks.len()
+        self.hunks.len() + self.span_ops.len()
     }
 
     /// Get content length.

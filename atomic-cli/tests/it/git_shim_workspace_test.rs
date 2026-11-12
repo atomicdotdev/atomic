@@ -116,6 +116,227 @@ fn preinit_record(native: bool) {
 }
 
 #[test]
+fn native_addition_keeps_private_snapshot_conflict_cache_current() {
+    use atomic_core::pristine::{GraphTxnT, MutTxnT, ViewTxnT};
+    let f = Fixture::new(false);
+    for (path, bytes) in [
+        ("shared.txt", b"shared\n".as_slice()),
+        ("target-only.txt", b"target\n".as_slice()),
+    ] {
+        fs::write(f.root.path().join(path), bytes).unwrap();
+    }
+    f.atomic(&["add", "shared.txt", "target-only.txt"]);
+    f.atomic(&["record", "-am", "native additions"]);
+    // The parent baseline advanced while wc/<id> still holds its own immutable
+    // capture. That inherited visibility change must update its conflict cache
+    // even though the private view was never materialized.
+    f.atomic(&["doctor", "check"]);
+    let repo = atomic_repository::Repository::open(f.root.path()).unwrap();
+    let wc = repo.require_working_copy_id().unwrap();
+    let snapshot_name = atomic_repository::Repository::snapshot_view_name(wc);
+    let txn = repo.pristine().read_txn().unwrap();
+    let snapshot_view = txn.get_view(&snapshot_name).unwrap().unwrap();
+    let members: Vec<_> = txn
+        .iter_changes(&snapshot_view, 0)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let conflicts = txn.iter_conflicts(snapshot_view.id).unwrap();
+    assert!(
+        !conflicts.is_empty(),
+        "private snapshot's genuine name conflicts must be cached, not ignored"
+    );
+    assert!(conflicts
+        .iter()
+        .flat_map(|(_, records)| records)
+        .any(|conflict| conflict.path == "shared.txt"));
+    let bytes: Vec<_> = members
+        .iter()
+        .map(|(_, id, _)| {
+            let hash = txn.get_external(*id).unwrap().unwrap();
+            (
+                hash,
+                fs::read(repo.change_store().change_path(&hash)).unwrap(),
+            )
+        })
+        .collect();
+    drop(txn);
+    // Prove doctor still detects deliberate missing private-view rows, and the
+    // explicit repair restores them without modifying the snapshot itself.
+    let mut txn = repo.pristine().write_txn().unwrap();
+    txn.del_conflicts(snapshot_view.id, conflicts[0].0).unwrap();
+    txn.commit().unwrap();
+    drop(repo);
+    let output = f.command(env!("CARGO_BIN_EXE_atomic"), &["doctor", "check"]);
+    assert!(!output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("CONFLICTS missing row"), "{text}");
+    f.atomic(&["doctor", "repair-native-indexes"]);
+    f.atomic(&["doctor", "check"]);
+    let repo = atomic_repository::Repository::open(f.root.path()).unwrap();
+    let txn = repo.pristine().read_txn().unwrap();
+    let current = txn.get_view(&snapshot_name).unwrap().unwrap();
+    assert_eq!(current.state, snapshot_view.state);
+    assert_eq!(
+        txn.iter_changes(&current, 0)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        members
+    );
+    drop(txn);
+    for (hash, expected) in &bytes {
+        assert_eq!(
+            fs::read(repo.change_store().change_path(hash)).unwrap(),
+            *expected
+        );
+    }
+    drop(repo);
+
+    f.git(&["switch", "-c", "feature"]);
+    fs::remove_file(f.root.path().join("target-only.txt")).unwrap();
+    fs::create_dir_all(f.root.path().join("source-only")).unwrap();
+    fs::write(f.root.path().join("source-only/first.txt"), b"first\n").unwrap();
+    fs::write(f.root.path().join("source-only/second.txt"), b"second\n").unwrap();
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-qm", "foreign deletion and additions"]);
+    f.atomic(&["git", "shim", "reconcile"]);
+    f.atomic(&["git", "shim", "verify"]);
+    f.atomic(&["doctor", "check"]);
+    assert_eq!(
+        fs::read(f.root.path().join("shared.txt")).unwrap(),
+        b"shared\n"
+    );
+    assert!(!f.root.path().join("target-only.txt").exists());
+    for (hash, expected) in bytes {
+        assert_eq!(
+            fs::read(
+                atomic_repository::Repository::open(f.root.path())
+                    .unwrap()
+                    .change_store()
+                    .change_path(&hash)
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn unbound_git_drift_refuses_before_writable_database_open() {
+    let f = Fixture::new(false);
+    f.atomic(&["view", "create", "feature", "--draft", "--parent", "main"]);
+    f.git(&["switch", "-c", "raw-drift"]);
+    fs::write(f.root.path().join("tracked.txt"), b"foreign Git state\n").unwrap();
+    f.git(&["add", "tracked.txt"]);
+    f.git(&["commit", "-qm", "unbound foreign commit"]);
+    fs::write(
+        f.root.path().join("candidate.txt"),
+        b"untracked user data\n",
+    )
+    .unwrap();
+    let head = f.git(&["rev-parse", "HEAD"]);
+    let refs = f.git(&["show-ref"]);
+    let index = fs::read(f.root.path().join(".git/index")).unwrap();
+    let checkpoint = fs::read(f.root.path().join(".atomic/bridge/workspace.json")).unwrap();
+    for args in [
+        vec!["status", "--short"],
+        vec!["diff", "--name-only"],
+        vec!["add", "candidate.txt"],
+        vec!["record", "--all", "-m", "must refuse"],
+        vec!["view", "switch", "feature", "--force"],
+        vec!["restore", "tracked.txt"],
+    ] {
+        let database = fs::read(f.root.path().join(".atomic/atomic.redb")).unwrap();
+        let output = f.command(env!("CARGO_BIN_EXE_atomic"), &args);
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "{args:?}: {diagnostic}");
+        assert!(
+            diagnostic.contains("reconciliation required"),
+            "{args:?}: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("atomic git shim reconcile"),
+            "{args:?}: {diagnostic}"
+        );
+        assert_eq!(
+            fs::read(f.root.path().join(".atomic/atomic.redb")).unwrap(),
+            database,
+            "raw database changed: {args:?}"
+        );
+        assert_eq!(
+            fs::read(f.root.path().join(".git/index")).unwrap(),
+            index,
+            "{args:?}"
+        );
+        assert_eq!(
+            fs::read(f.root.path().join(".atomic/bridge/workspace.json")).unwrap(),
+            checkpoint,
+            "{args:?}"
+        );
+        assert_eq!(
+            fs::read(f.root.path().join("tracked.txt")).unwrap(),
+            b"foreign Git state\n",
+            "{args:?}"
+        );
+        assert_eq!(
+            fs::read(f.root.path().join("candidate.txt")).unwrap(),
+            b"untracked user data\n",
+            "{args:?}"
+        );
+        assert_eq!(f.git(&["rev-parse", "HEAD"]), head, "{args:?}");
+        assert_eq!(f.git(&["show-ref"]), refs, "{args:?}");
+    }
+}
+
+#[test]
+fn incremental_graph_import_preserves_independent_draft_edit() {
+    let f = Fixture {
+        root: TempDir::new().unwrap(),
+        home: TempDir::new().unwrap(),
+    };
+    let initial = b"app:\n  name: TestApp\n  version: \"1.0\"\n  debug: false\n\ndatabase:\n  host: localhost\n  port: 5432\n";
+    let shared = String::from_utf8(initial.to_vec())
+        .unwrap()
+        .replace("5432", "5433");
+    let draft = String::from_utf8(initial.to_vec())
+        .unwrap()
+        .replace("debug: false", "debug: true");
+    let merged = shared.replace("debug: false", "debug: true");
+    let path = f.root.path().join("config.yml");
+    f.git(&["init", "-q", "-b", "main"]);
+    fs::write(&path, initial).unwrap();
+    f.git(&["add", "config.yml"]);
+    f.git(&["commit", "-qm", "initial"]);
+    f.atomic(&["git", "import", "--no-vault", "--branch", "main"]);
+    f.atomic(&["view", "create", "tweak", "--draft", "--parent", "main"]);
+    f.atomic(&["view", "switch", "tweak", "--force"]);
+    fs::write(&path, &draft).unwrap();
+    f.atomic(&["add", "config.yml"]);
+    f.atomic(&["record", "-m", "draft debug"]);
+    f.atomic(&["view", "switch", "main", "--force"]);
+    fs::write(&path, &shared).unwrap();
+    f.git(&["add", "config.yml"]);
+    f.git(&["commit", "-qm", "upstream port"]);
+    f.atomic(&["git", "import", "--incremental", "--branch", "main"]);
+    assert_eq!(fs::read(&path).unwrap(), shared.as_bytes());
+    f.assert_content("main", "config.yml", shared.as_bytes());
+    f.assert_content("tweak", "config.yml", merged.as_bytes());
+    f.atomic(&["view", "switch", "tweak", "--force"]);
+    assert_eq!(fs::read(&path).unwrap(), merged.as_bytes());
+    f.atomic(&["view", "switch", "main", "--force"]);
+    assert_eq!(fs::read(&path).unwrap(), shared.as_bytes());
+}
+
+#[test]
 fn preinit_record_all_through_service() {
     preinit_record(false);
 }

@@ -47,6 +47,50 @@ async fn busy_reader_and_writer_time_out_then_retry_succeeds() {
 }
 
 #[tokio::test]
+async fn unsupported_capability_refuses_before_writable_database_open() {
+    use atomic_core::pristine::{CapabilityMutTxnT, MutTxnT};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repository::init(dir.path()).unwrap();
+    {
+        let mut txn = repo.pristine().write_txn().unwrap();
+        txn.put_required_capability_exact("unknown-maintenance-test", 1)
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    drop(repo);
+    let path = dir.path().join(".atomic/atomic.redb");
+    let before = std::fs::read(&path).unwrap();
+    let state = Arc::new(DaemonState::new());
+    let handle = state.register(dir.path().to_path_buf());
+    let error = compact(&state, request(&handle), Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error.message().contains("unknown-maintenance-test"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn common_operation_lock_excludes_physical_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Repository::init(dir.path()).unwrap());
+    let guard = Repository::try_lock_database_maintenance(dir.path()).unwrap();
+    let state = Arc::new(DaemonState::new());
+    let handle = state.register(dir.path().to_path_buf());
+    let error = compact(&state, request(&handle), Duration::from_millis(30))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    drop(guard);
+    compact(&state, request(&handle), Duration::from_secs(1))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn refuses_invalid_requests_before_opening_a_database() {
     let dir = tempfile::tempdir().unwrap();
     let state = Arc::new(DaemonState::new());

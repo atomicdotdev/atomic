@@ -252,6 +252,7 @@ impl Repository {
                 });
             }
         }
+        super::name_resolution::refresh_name_conflict_caches(&mut txn, snapshot_view.id)?;
         txn.commit()
             .map_err(|error| RepositoryError::Database(error.to_string()))?;
 

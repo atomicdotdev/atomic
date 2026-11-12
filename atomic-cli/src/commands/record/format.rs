@@ -36,44 +36,7 @@ impl Record {
             view_name, sequence, hash_short, message
         ));
 
-        // Stats line - show graph-based stats
-        let stats = outcome.stats();
-        if stats.has_changes() {
-            output.push_str(&format!(
-                " {} changed, +{} vertices, ~{} edges, {} bytes\n",
-                format_count(stats.files_recorded, "file"),
-                stats.vertices_added,
-                stats.edges_modified,
-                stats.content_bytes
-            ));
-
-            // CRDT token-level statistics (for fine-grained diff tracking)
-            if stats.has_crdt_stats() {
-                // Line-level changes
-                let line_changes = stats.total_line_changes();
-                if line_changes > 0 {
-                    output.push_str(&format!(
-                        " {} (+{} -{} ~{})\n",
-                        format_count(line_changes, "line"),
-                        stats.lines_added,
-                        stats.lines_deleted,
-                        stats.lines_modified
-                    ));
-                }
-
-                // Token-level changes
-                let token_ops = stats.total_token_ops();
-                if token_ops > 0 {
-                    output.push_str(&format!(
-                        " {} (+{} -{} ~{})\n",
-                        format_count(token_ops, "token"),
-                        stats.tokens_added,
-                        stats.tokens_deleted,
-                        stats.tokens_replaced
-                    ));
-                }
-            }
-        }
+        output.push_str(&format_record_stats(outcome.stats()));
 
         if let Ok(Some(evidence)) = outcome.move_evidence() {
             for moved in evidence.authoritative_moves {
@@ -174,6 +137,41 @@ impl Record {
 
         Ok(())
     }
+}
+
+/// Shared rendering for native and service-routed record outcomes.
+pub(crate) fn format_record_stats(stats: &atomic_repository::record::RecordStats) -> String {
+    let mut output = String::new();
+    if stats.has_changes() {
+        output.push_str(&format!(
+            " {} changed, +{} vertices, ~{} edges, {} bytes\n",
+            format_count(stats.files_recorded, "file"),
+            stats.vertices_added,
+            stats.edges_modified,
+            stats.content_bytes
+        ));
+        let line_changes = stats.total_line_changes();
+        if line_changes > 0 {
+            output.push_str(&format!(
+                " {} (+{} -{} ~{})\n",
+                format_count(line_changes, "line"),
+                stats.lines_added,
+                stats.lines_deleted,
+                stats.lines_modified
+            ));
+        }
+        let token_ops = stats.total_token_ops();
+        if token_ops > 0 {
+            output.push_str(&format!(
+                " {} (+{} -{} ~{})\n",
+                format_count(token_ops, "token"),
+                stats.tokens_added,
+                stats.tokens_deleted,
+                stats.tokens_replaced
+            ));
+        }
+    }
+    output
 }
 
 /// The dry-run preview, pure over its inputs — the same lines the local

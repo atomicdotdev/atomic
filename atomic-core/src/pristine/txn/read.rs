@@ -1902,7 +1902,7 @@ impl crate::pristine::traits::CrdtTxnT for ReadTxn {
 /// reuses the handle for all subsequent operations, eliminating the
 /// per-call overhead entirely.
 pub struct CachedGraphTxn<'txn> {
-    txn: &'txn ReadTxn,
+    pub(crate) txn: &'txn ReadTxn,
     graph_table: redb::ReadOnlyMultimapTable<&'static [u8; 24], &'static [u8; 24]>,
     inode_graph_table: redb::ReadOnlyMultimapTable<&'static [u8; 32], &'static [u8; 24]>,
     /// Lazily-loaded per-change span index, so `find_block` / `find_block_end`
@@ -3003,32 +3003,16 @@ impl GitCommitClosureTxnT for ReadTxn {
         };
         match table.get(sha)? {
             Some(bytes) => {
-                let value = bytes.value();
-                if value.len() < 4 {
-                    return Err(PristineError::Serialization {
-                        message: format!(
-                            "git commit closure for {sha} is truncated: {} byte(s)",
-                            value.len()
-                        ),
-                    });
-                }
-                let count = u32::from_le_bytes([value[0], value[1], value[2], value[3]]) as usize;
-                if value.len() != 4 + count * 32 {
-                    return Err(PristineError::Serialization {
-                        message: format!(
-                            "git commit closure for {sha} claims {count} hashes but holds {} bytes",
-                            value.len()
-                        ),
-                    });
-                }
-                let mut closure = Vec::with_capacity(count);
-                for index in 0..count {
-                    let start = 4 + index * 32;
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&value[start..start + 32]);
-                    closure.push(Hash::from_bytes(hash));
-                }
-                Ok(Some(closure))
+                let nodes = match self.txn.open_table(GIT_CLOSURE_NODES) {
+                    Ok(table) => Some(table),
+                    Err(redb::TableError::TableDoesNotExist(_)) => None,
+                    Err(error) => return Err(error.into()),
+                };
+                crate::pristine::git_closure::decode(bytes.value(), |id| match &nodes {
+                    Some(table) => Ok(table.get(id)?.map(|value| *value.value())),
+                    None => Ok(None),
+                })
+                .map(Some)
             }
             None => Ok(None),
         }

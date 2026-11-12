@@ -386,6 +386,16 @@ pub fn get_files_in_change(change: &Change) -> Vec<String> {
             files.insert(path.to_string());
         }
     }
+    // Projected span edits have no graph content hunk: their semantic FileOp
+    // is the portable path needed to fetch before/after bytes for review.
+    for ops in change.file_ops() {
+        if matches!(
+            ops.trunk_op(),
+            Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+        ) {
+            files.insert(ops.path().to_string());
+        }
+    }
 
     files.into_iter().collect()
 }
