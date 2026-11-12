@@ -26,6 +26,7 @@ mod edit_tests;
 mod history_tests;
 mod init_tests;
 mod integration_tests;
+mod legacy_history_span_insert_tests;
 mod materialize_fail_closed_tests;
 mod merge_property_tests;
 mod native_index_repair_tests;

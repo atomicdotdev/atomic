@@ -113,14 +113,21 @@ impl Repository {
             if !active.insert(hash) {
                 return Err(RepositoryError::Apply("cyclic change dependency".into()));
             }
-            let change = self.load_change(&hash)?;
-            if change
-                .hash()
-                .map_err(|e| RepositoryError::Apply(e.to_string()))?
-                != hash
-            {
-                return Err(RepositoryError::Apply("change hash mismatch".into()));
-            }
+            // A change's identity is the hash of its stored encoding. One
+            // recorded before file-header version 2 gets a different hash when
+            // the current writer re-encodes it, so the stored bytes are what
+            // is checked against the requested hash.
+            let verified = self
+                .change_store
+                .load_verified_change(&hash, None)
+                .map_err(|e| match e {
+                    ChangeStoreError::NotFound { hash } => RepositoryError::ChangeNotFound { hash },
+                    ChangeStoreError::HashMismatch { .. } => {
+                        RepositoryError::Apply("change hash mismatch".into())
+                    }
+                    other => RepositoryError::Database(other.to_string()),
+                })?;
+            let change = verified.change();
             stack.push((hash, true));
             for dep in change.dependencies().iter().rev() {
                 stack.push((*dep, false));
