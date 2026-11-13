@@ -273,12 +273,7 @@ fn gate_config(
     repo: &Repository,
 ) -> atomic_repository::repository::provenance_gate::PublicationGateConfig {
     atomic_repository::repository::provenance_gate::PublicationGateConfig::from_repo(repo)
-        .unwrap_or(
-            atomic_repository::repository::provenance_gate::PublicationGateConfig {
-                trust: Default::default(),
-                repository_identity: None,
-            },
-        )
+        .unwrap_or_default()
 }
 
 /// Walk first-parent history from `tip` to the nearest projection commit and

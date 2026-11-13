@@ -9,6 +9,7 @@
 mod adaptation_regression_test;
 mod agent_capture_oracle_cb12a_test;
 mod agent_error_integration_test;
+mod agent_hook_publication_gate_test;
 mod agent_repair_cb12a_test;
 mod bridge_agent_workflow_regression_test;
 mod build_version_integration_test;

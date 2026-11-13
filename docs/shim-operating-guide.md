@@ -376,6 +376,29 @@ an unknown signer trusted. Repository trust settings live under `[git.trust]`:
 explicitly revoked signers remain revoked, and unknown signers' provenance is
 not trusted for publication.
 
+The publication gate (`atomic git push`, `atomic push`, and `atomic insert`
+into a shared view) trusts an attestation signer when it is one of:
+
+- the repository identity, `[author] identity` in `.atomic/config.toml`
+  (a DID, identity name, or identity ID);
+- this machine's default identity (`atomic identity default`), the key that
+  signs agent session attestations when the session ends;
+- a DID listed under `[git.trust] signers`.
+
+A revoked signer stays revoked even when it is also one of these. To trust a
+collaborator's attestations, add their DID:
+
+```toml
+# .atomic/config.toml
+[git.trust]
+signers = ["did:atomic:…"]
+revoked = []
+```
+
+Agent sessions write their attestation when the session ends (the agent's
+SessionEnd hook). Until then, a change recorded during the session is refused
+with "the session is still active". End the session, then publish.
+
 Signed Anchor bindings use the supplied Ed25519 key. Managed-session capture
 currently uses a session MAC, not an agent-DID signature; its signature coverage
 has limits recorded in the RFC tracker.
