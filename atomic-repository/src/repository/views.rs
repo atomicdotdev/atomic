@@ -115,6 +115,7 @@ impl Repository {
         parent_name: Option<&str>,
         seed_from: Option<&str>,
     ) -> Result<(), RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         // The overlay chain is anchored on the nearest Shared ancestor of the
         // current view unless a parent is given. Using the nearest SHARED
@@ -216,6 +217,7 @@ impl Repository {
     ///
     /// Returns `ViewAlreadyExists` if the view already exists.
     pub fn create_shared_view(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         ensure_workspace_dir(&self.dot_dir, name)?;
 
@@ -252,6 +254,7 @@ impl Repository {
     /// This is useful after `git import` which creates Draft views by
     /// default.
     pub fn set_view_scope(&self, name: &str, scope: ViewScope) -> Result<(), RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut txn = self
             .pristine
@@ -307,6 +310,7 @@ impl Repository {
         scope: ViewScope,
         parent_name: Option<&str>,
     ) -> Result<(), RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut txn = self
             .pristine
@@ -594,6 +598,7 @@ impl Repository {
     /// - The view is the current view (cannot delete current view)
     /// - The database operation fails
     pub fn delete_view(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         // Cannot delete the current view
         if name == self.current_view {
@@ -787,6 +792,7 @@ impl Repository {
         scope: ViewScope,
         parent_name: Option<&str>,
     ) -> Result<(), RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         ensure_workspace_dir(&self.dot_dir, name)?;
 
@@ -930,6 +936,7 @@ impl Repository {
         &mut self,
         manifest: &ViewManifest,
     ) -> Result<ManifestApplyOutcome, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         manifest.verify()?;
 
         for hash in &manifest.changes {
@@ -1038,6 +1045,7 @@ impl Repository {
         &mut self,
         manifest: &ViewManifest,
     ) -> Result<ManifestApplyOutcome, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         // 1. Structural integrity: declared state == fold of the log.
         manifest.verify()?;
 

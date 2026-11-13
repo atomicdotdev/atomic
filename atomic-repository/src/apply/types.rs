@@ -149,7 +149,9 @@ pub struct InsertOptions {
     /// Internal escape hatch for callers that have ALREADY gated the complete
     /// reachable closure once (e.g. `insert_change_rec` gates the closure
     /// before looping). This never bypasses the gate for external callers:
-    /// the default is `false`, and every closure entry point re-gates.
+    /// the default is `false`, and external callers cannot set this field.
+    /// Nested closure entry points preserve a previously authorized batch so
+    /// inserting its first dependency does not invalidate its own review pin.
     /// Default: `false`
     pub(crate) skip_publication_gate: bool,
 }

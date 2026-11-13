@@ -30,8 +30,13 @@ message GetProjectIdentityResponse {
 }
 message GetWorkflowSnapshotRequest {
   RepositoryRef repository = 1;
+  // Optional canonical publication-review document for a read-only intent-graph
+  // preview. The server rebuilds/authenticates evidence; caller RDF is not used.
+  optional bytes review_document = 2;
 }
-// One consistent, repository-wide asserted snapshot. SHACL runs client-side.
+// The existing asserted workflow graph. Ordinary SHACL profiles run client-side.
+// With review_document, authenticated preview evidence and the bounded review's
+// validation report are connected as graph nodes; the display is not approval.
 message GetWorkflowSnapshotResponse {
   uint32 api_version = 1;
   uint32 generation = 2;
@@ -39,6 +44,10 @@ message GetWorkflowSnapshotResponse {
   string identity = 4;
   repeated KGNode nodes = 5;
   repeated KGEdge edges = 6;
+  // Echo of the exact document artifact hash, only after preview resolution.
+  // Clients must require this when requesting review_document: old servers must
+  // not silently ignore a preview request and return ordinary graph success.
+  optional string review_preview_identity = 7;
 }
 
 

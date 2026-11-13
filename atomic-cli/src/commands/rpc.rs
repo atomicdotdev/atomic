@@ -7111,6 +7111,7 @@ pub(crate) fn workflow_snapshot(
     })?;
     let response = session.get_workflow_snapshot(pb::GetWorkflowSnapshotRequest {
         repository: Some(session.reference.clone()),
+        review_document: None,
     })?;
     decode_workflow_snapshot(response)
 }
@@ -7144,6 +7145,7 @@ fn decode_workflow_snapshot(
 pub(crate) fn intent_graph(
     id: &str,
     max_nodes: usize,
+    review: Option<&atomic_canonical::publication_review::PublicationReview>,
 ) -> CliResult<atomic_repository::intent_graph::IntentGraph> {
     let root = super::find_repository_root()?;
     let session = Service::open_root(&root)?.ok_or_else(|| CliError::InvalidArgument {
@@ -7183,11 +7185,19 @@ pub(crate) fn intent_graph(
     } else {
         None
     };
-    let snapshot = decode_workflow_snapshot(session.get_workflow_snapshot(
-        pb::GetWorkflowSnapshotRequest {
-            repository: Some(session.reference.clone()),
-        },
-    )?)?;
+    let response = session.get_workflow_snapshot(pb::GetWorkflowSnapshotRequest {
+        repository: Some(session.reference.clone()),
+        review_document: review
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|e| CliError::Internal(e.into()))?,
+    })?;
+    let expected_preview = review.map(|review| review.artifact_hash());
+    require_review_preview_identity(
+        expected_preview.as_deref(),
+        response.review_preview_identity.as_deref(),
+    )?;
+    let snapshot = decode_workflow_snapshot(response)?;
     let canonical = match canonical {
         Some(id) => id,
         None => {
@@ -7206,8 +7216,41 @@ pub(crate) fn intent_graph(
             candidates[0].id.clone()
         }
     };
-    atomic_repository::intent_graph::IntentGraph::from_snapshot(&snapshot, &canonical, max_nodes)
-        .map_err(CliError::Repository)
+    let graph = atomic_repository::intent_graph::IntentGraph::from_snapshot(
+        &snapshot, &canonical, max_nodes,
+    )
+    .map_err(CliError::Repository)?;
+    if let Some(review) = review {
+        let evaluation = format!("urn:atomic:review:evaluation:{}", review.artifact_hash());
+        if !graph.truncated && !graph.nodes.iter().any(|node| node.id == evaluation) {
+            return Err(CliError::InvalidArgument {
+                message: "prepared review is not connected to the selected intent".into(),
+            });
+        }
+    }
+    Ok(graph)
+}
+
+fn require_review_preview_identity(
+    expected: Option<&str>,
+    returned: Option<&str>,
+) -> CliResult<()> {
+    if expected.is_some() && expected != returned {
+        return Err(CliError::InvalidArgument { message: "the repository service did not resolve the requested review preview; update/restart it before retrying".into() });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod intent_review_preview_tests {
+    use super::*;
+    #[test]
+    fn old_or_wrong_service_preview_response_is_not_silent_success() {
+        assert!(require_review_preview_identity(None, None).is_ok());
+        assert!(require_review_preview_identity(Some("exact"), Some("exact")).is_ok());
+        assert!(require_review_preview_identity(Some("exact"), None).is_err());
+        assert!(require_review_preview_identity(Some("exact"), Some("other")).is_err());
+    }
 }
 
 // ---------------------------------------------------------------------------

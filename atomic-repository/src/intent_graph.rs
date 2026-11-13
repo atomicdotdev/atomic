@@ -42,6 +42,8 @@ pub struct IntentGraph {
     /// Recording an intent is evidence, not an implementation assertion.
     pub recording_changes: Vec<String>,
     pub dependency_changes: Vec<String>,
+    /// Exact review scope, never an implementation-attribution shortcut.
+    pub reviewed_changes: Vec<String>,
     pub truncated: bool,
     pub missing_resources: Vec<String>,
     pub diagnostics: Vec<String>,
@@ -88,6 +90,13 @@ enum Role {
     Turn,
     Attestation,
     View,
+    ReviewIntent,
+    Review,
+    ReviewSubject,
+    ReviewChange,
+    ReviewEvidence,
+    Judgment,
+    Evaluation,
 }
 
 impl IntentGraph {
@@ -159,6 +168,7 @@ impl IntentGraph {
         let mut declared = BTreeSet::new();
         let mut recording = BTreeSet::new();
         let mut dependencies = BTreeSet::new();
+        let mut reviewed = BTreeSet::new();
         let mut truncated = false;
         // Join two facts already present in the snapshot: the vault entry's
         // repository path and a recorded File node. Do not use task file refs,
@@ -186,6 +196,77 @@ impl IntentGraph {
                 let next = if forward { &edge.to_id } else { &edge.from_id };
                 let predicate = edge.kind;
                 let transition: Option<Option<Role>> = match (role, forward, predicate) {
+                    (Role::Root, false, P::Reviews) | (Role::Root, true, P::ReviewedBy) => {
+                        Some(Some(Role::ReviewIntent))
+                    }
+                    (Role::Root, false, P::HasReviewIntent) => Some(Some(Role::Review)),
+                    (Role::Root, false, P::IncludesIntent | P::IncludesSetAside) => {
+                        Some(Some(Role::ReviewSubject))
+                    }
+                    (Role::Root, false, P::ObservedIntent) => Some(Some(Role::ReviewEvidence)),
+                    (Role::ReviewIntent, false, P::HasReviewIntent) => Some(Some(Role::Review)),
+                    (
+                        Role::ReviewIntent,
+                        true,
+                        P::HasTask | P::HasAcceptanceCriterion | P::HasConstraint,
+                    ) => Some(Some(Role::Detail)),
+                    (Role::ReviewIntent, true, P::Reviews | P::AuthoredBy) => Some(None),
+                    (Role::Review, true, P::ReviewsClosure) => Some(Some(Role::ReviewSubject)),
+                    (Role::Review, true, P::HasReviewIntent) => Some(Some(Role::ReviewIntent)),
+                    (Role::Review, true, P::HasJudgment) => Some(Some(Role::Judgment)),
+                    (
+                        Role::Review,
+                        true,
+                        P::SignedBy
+                        | P::AuthoredBy
+                        | P::VerificationResult
+                        | P::FreshnessResult
+                        | P::AuthorityResult,
+                    ) => Some(None),
+                    (Role::Review, false, P::EvaluatesReview) => Some(Some(Role::Evaluation)),
+                    (Role::ReviewSubject, false, P::ReviewsClosure) => Some(Some(Role::Review)),
+                    (Role::ReviewSubject, true, P::ReviewsChange) => Some(Some(Role::ReviewChange)),
+                    (
+                        Role::ReviewSubject,
+                        true,
+                        P::IncludesIntent | P::IncludesSetAside | P::References,
+                    ) => Some(None),
+                    (Role::ReviewChange, true, P::DirectlyDependsOnChange) => {
+                        Some(Some(Role::ReviewChange))
+                    }
+                    (Role::ReviewEvidence, false, P::SubjectEvidence) => {
+                        Some(Some(Role::ReviewSubject))
+                    }
+                    (Role::ReviewSubject, true, P::SubjectEvidence) => {
+                        Some(Some(Role::ReviewEvidence))
+                    }
+                    (Role::Change, true, P::HasReviewEvidence)
+                        if implementing.contains(&id) || recording.contains(&id) =>
+                    {
+                        Some(Some(Role::ReviewEvidence))
+                    }
+                    (
+                        Role::ReviewChange,
+                        true,
+                        P::ChangeExplainedBy | P::ModifiesFile | P::GeneratedBy,
+                    ) => Some(None),
+                    (Role::ReviewEvidence, true, P::References) => Some(Some(Role::ReviewEvidence)),
+                    (
+                        Role::ReviewEvidence,
+                        true,
+                        P::EvidenceSource
+                        | P::EvidenceTurn
+                        | P::ObservedIntent
+                        | P::FreshnessResult,
+                    ) => Some(None),
+                    (Role::ReviewEvidence, false, P::HasReviewEvidence) => {
+                        Some(Some(Role::ReviewChange))
+                    }
+                    (Role::Judgment, true, P::JudgesCriterion) => Some(Some(Role::Detail)),
+                    (Role::Judgment, true, P::SupportedBy) => Some(None),
+                    (Role::Detail, true, P::HasVerification) => Some(None),
+                    (Role::Detail, false, P::JudgesCriterion) => Some(Some(Role::Judgment)),
+                    (Role::Judgment, false, P::HasJudgment) => Some(Some(Role::Review)),
                     (Role::IntentArtifact, false, P::ModifiesFile)
                         if nodes
                             .get(next.as_str())
@@ -212,8 +293,7 @@ impl IntentGraph {
                     (
                         Role::Root,
                         false,
-                        P::Reviews
-                        | P::ReviewedBy
+                        P::ReviewedBy
                         | P::Remediates
                         | P::LinkedIntent
                         | P::LinkedGoal
@@ -309,6 +389,9 @@ impl IntentGraph {
                         dependencies.insert(next.clone());
                     }
                 }
+                if next_role == Some(Role::ReviewChange) {
+                    reviewed.insert(next.clone());
+                }
                 if let Some(next_role) = next_role {
                     queue.push_back((next.clone(), next_role));
                 }
@@ -354,6 +437,21 @@ impl IntentGraph {
         if !declared.is_empty() {
             diagnostics.push(format!("{} implementing change(s) have explicit author declarations. Declarations do not repair or prove missing original plan_id/generating-turn provenance.", declared.len()));
         }
+        if !reviewed.is_empty() {
+            diagnostics.push(format!("{} change(s) are connected as review scope/evidence, not inferred implementation. Displayed review references and previews never authorize publication; SHACL evaluates the exact bounded subject separately.", reviewed.len()));
+        }
+        for node in &selected_nodes {
+            if node.has_type(C::ReviewEvaluation) {
+                diagnostics.push(node.label.clone());
+            }
+            if node.has_type(C::PublicationReview)
+                && node.metadata.as_ref().is_some_and(|m| {
+                    m.get("review_reference").and_then(|v| v.as_bool()) == Some(true)
+                })
+            {
+                diagnostics.push("Retained review document references are shown without revalidation; this is not a current approval verdict.".into());
+            }
+        }
         if truncated {
             diagnostics.push("Node limit reached: selection and dependency closure are incomplete. Increase --max-nodes.".into());
         }
@@ -388,7 +486,11 @@ impl IntentGraph {
             snapshot_identity: snapshot.identity.clone(),
             generation: snapshot.generation,
             ontology_version: snapshot.ontology_version.into(),
-            scope: "intent_asserted_lineage_and_recording_evidence_with_dependency_closure",
+            scope: if reviewed.is_empty() {
+                "intent_asserted_lineage_and_recording_evidence_with_dependency_closure"
+            } else {
+                "intent_asserted_lineage_recording_and_review_evidence_with_dependency_closure"
+            },
             nodes: selected_nodes,
             edges,
             implementing_changes: implementing.into_iter().collect(),
@@ -397,6 +499,7 @@ impl IntentGraph {
             intent_artifact,
             recording_changes: recording.into_iter().collect(),
             dependency_changes: dependencies.into_iter().collect(),
+            reviewed_changes: reviewed.into_iter().collect(),
             truncated,
             missing_resources: missing.into_iter().collect(),
             diagnostics,
