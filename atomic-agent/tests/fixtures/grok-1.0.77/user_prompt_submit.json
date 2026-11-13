@@ -1,0 +1,13 @@
+{
+  "hookEventName": "user_prompt_submit",
+  "sessionId": "01a1d576-264a-7530-a25e-d209bd34a860",
+  "cwd": "/Users/you/project",
+  "workspaceRoot": "/Users/you/project",
+  "timestamp": "2026-11-13T15:10:52.842761+00:00",
+  "promptId": "521d4615-47f7-4ad8-adde-307836fe26fc",
+  "permissionMode": "default",
+  "prompt": "Read the file a.txt and tell me its first line. Do not modify anything.",
+  "hook_event_name": "UserPromptSubmit",
+  "session_id": "01a1d576-264a-7530-a25e-d209bd34a860",
+  "permission_mode": "default"
+}
