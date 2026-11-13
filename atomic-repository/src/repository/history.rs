@@ -660,6 +660,7 @@ impl Repository {
         hash: &Hash,
         at_sequence: Option<u64>,
     ) -> Result<(Merkle, u64), RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         let view = self.authoritative_working_copy_view_name()?;
         self.reinsert_change_on_view(&view, hash, at_sequence)
     }
@@ -758,6 +759,7 @@ impl Repository {
         view_name: &str,
         target: &HashSet<Hash>,
     ) -> Result<Vec<Hash>, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         let mut txn = self
             .pristine
             .write_txn()

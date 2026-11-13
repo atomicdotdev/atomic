@@ -1,6 +1,6 @@
 [package]
 name = "atomic-shacl"
-description = "CLI-only RDF snapshot adaptation and PurRDF SHACL validation"
+description = "Versioned RDF snapshot adaptation and PurRDF SHACL validation (Rust 1.98)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

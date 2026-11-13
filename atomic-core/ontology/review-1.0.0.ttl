@@ -1,0 +1,61 @@
+@prefix atomic: <https://atomic.dev/ns/workflow#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+<https://atomic.dev/ns/review> a owl:Ontology ;
+    owl:versionIRI <https://atomic.dev/ns/review/1.0.0> ;
+    owl:imports <https://atomic.dev/ns/workflow/1.0.0> ;
+    rdfs:label "Atomic review ontology" ;
+    rdfs:comment "Exact-scope review of retained per-change knowledge. Reuses workflow identities, intents, sessions, turns and changes. Observations are not governing authority or original execution signatures. SHACL defines executable readiness policy; imports are bundled offline." .
+
+atomic:PublicationReview a owl:Class ; rdfs:subClassOf atomic:Attestation ;
+    rdfs:comment "Present-day signed conclusion over an exact subject, distinct from an original session attestation. An unsigned projection is a preview, never approval." .
+atomic:ReviewSubject a owl:Class ; rdfs:subClassOf owl:Thing ;
+    rdfs:comment "Pinned project, changes and dependency closure, source perspective, intent revisions and policy bundle." .
+atomic:ReviewEvaluation a owl:Class ; rdfs:subClassOf owl:Thing .
+atomic:VerificationRecord a owl:Class ; rdfs:subClassOf owl:Thing .
+atomic:SigningKey a owl:Class ; rdfs:subClassOf owl:Thing .
+atomic:ReviewEvidence a owl:Class ; rdfs:subClassOf owl:Thing ;
+    rdfs:comment "Source-addressed retained evidence. Authentic bytes do not by themselves prove the semantic truth of a recorded statement." .
+atomic:IntentObservation a owl:Class ; rdfs:subClassOf atomic:ReviewEvidence ;
+    rdfs:comment "A retained lifecycle receipt mentioning an intent, pinned to provenance hash, node and matching session/turn. Never implies hasPlan or implements." .
+atomic:CriterionJudgment a owl:Class ; rdfs:subClassOf owl:Thing ;
+    rdfs:comment "Reviewer conclusion about an acceptance criterion, backed by exact verification records. Distinct from observing a historical CLI receipt." .
+atomic:ReviewFinding a owl:Class ; rdfs:subClassOf atomic:Finding ;
+    rdfs:comment "Missing, unresolved or ambiguous evidence or other review blocker. Retained in graph previews rather than erased by discovery." .
+
+atomic:hasReviewEvidence a owl:ObjectProperty ; rdfs:domain atomic:Change ; rdfs:range atomic:ReviewEvidence .
+atomic:subjectEvidence a owl:ObjectProperty ; rdfs:domain atomic:ReviewSubject ; rdfs:range atomic:ReviewEvidence ;
+    rdfs:comment "Evidence within this exact review subject. A shared change or dependency is not a route to another subject's scope." .
+atomic:sourceNode a owl:DatatypeProperty ; rdfs:domain atomic:ReviewEvidence ; rdfs:range xsd:string .
+atomic:observationKind a owl:DatatypeProperty ; rdfs:domain atomic:IntentObservation ; rdfs:range xsd:string .
+atomic:observationRole a owl:DatatypeProperty ; rdfs:domain atomic:IntentObservation ; rdfs:range xsd:string ;
+    rdfs:comment "work or review-context. Only observations of the exact selected review intent are review-context; its metadata lifecycle does not require a recursive independent review of itself." .
+atomic:sourceReference a owl:DatatypeProperty ; rdfs:domain atomic:IntentObservation ; rdfs:range xsd:string .
+atomic:observedIntent a owl:ObjectProperty ; rdfs:domain atomic:IntentObservation ; rdfs:range atomic:WorkIntent .
+atomic:evidenceSource a owl:ObjectProperty ; rdfs:domain atomic:ReviewEvidence ; rdfs:range atomic:ProvenanceGraph .
+atomic:evidenceTurn a owl:ObjectProperty ; rdfs:domain atomic:ReviewEvidence ; rdfs:range atomic:SessionTurn .
+atomic:hasJudgment a owl:ObjectProperty ; rdfs:domain atomic:PublicationReview ; rdfs:range atomic:CriterionJudgment .
+atomic:judgesCriterion a owl:ObjectProperty ; rdfs:domain atomic:CriterionJudgment ; rdfs:range atomic:AcceptanceCriterion .
+atomic:supportedBy a owl:ObjectProperty ; rdfs:domain atomic:CriterionJudgment .
+atomic:reviewsClosure a owl:ObjectProperty ; rdfs:range atomic:ReviewSubject .
+atomic:reviewsChange a owl:ObjectProperty ; rdfs:range atomic:Change .
+atomic:includesIntent a owl:ObjectProperty ; rdfs:domain atomic:ReviewSubject ; rdfs:range atomic:WorkIntent .
+atomic:includesSetAside a owl:ObjectProperty ; rdfs:domain atomic:ReviewSubject ; rdfs:range atomic:WorkIntent ;
+    rdfs:comment "An exact signed terminal intent disposition independently reviewed as set aside. This is not approval that its historical implementation criteria hold in the current product, and cannot supply managed-change implementation coverage." .
+atomic:evaluatesReview a owl:ObjectProperty ; rdfs:domain atomic:ReviewEvaluation ; rdfs:range atomic:PublicationReview .
+atomic:reviewIntent a owl:ObjectProperty ; rdfs:domain atomic:PublicationReview ; rdfs:range atomic:ReviewIntent .
+atomic:authorityResult a owl:ObjectProperty ; rdfs:range atomic:VerificationStatus .
+atomic:freshnessResult a owl:ObjectProperty ; rdfs:range atomic:VerificationStatus .
+atomic:canonicalConformance a owl:ObjectProperty ; rdfs:range atomic:VerificationStatus ; rdfs:comment "Canonical schema conformance, not cryptographic verification or a reviewer judgment." .
+atomic:signingKey a owl:ObjectProperty ; rdfs:domain atomic:Identity ; rdfs:range atomic:SigningKey .
+atomic:hasVerification a owl:ObjectProperty ; rdfs:domain atomic:AcceptanceCriterion ; rdfs:range atomic:VerificationRecord .
+atomic:requiredKind a owl:DatatypeProperty ; rdfs:domain atomic:AcceptanceCriterion ; rdfs:range xsd:string .
+atomic:verificationKind a owl:DatatypeProperty ; rdfs:domain atomic:VerificationRecord ; rdfs:range xsd:string .
+atomic:observedState a owl:DatatypeProperty ; rdfs:domain atomic:VerificationRecord ; rdfs:range xsd:string .
+atomic:reviewedState a owl:DatatypeProperty ; rdfs:domain atomic:ReviewSubject ; rdfs:range xsd:string .
+atomic:reviewedContext a owl:DatatypeProperty ; rdfs:domain atomic:ReviewSubject ; rdfs:range xsd:string .
+atomic:verificationReference a owl:DatatypeProperty ; rdfs:domain atomic:VerificationRecord ; rdfs:range xsd:string .
+atomic:evidenceText a owl:DatatypeProperty ; rdfs:domain atomic:AcceptanceCriterion ; rdfs:range xsd:string .
+atomic:verifiedByText a owl:DatatypeProperty ; rdfs:domain atomic:AcceptanceCriterion ; rdfs:range xsd:string .

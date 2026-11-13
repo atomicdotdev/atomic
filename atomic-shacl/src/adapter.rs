@@ -62,9 +62,59 @@ pub fn snapshot_ntriples(nodes: &[KgNode], edges: &[KgEdge]) -> Result<String, V
             literal(Predicate::DctermsDescription, summary, None)?;
         }
         if let Some(metadata) = &node.metadata {
+            if let Some(kinds) = metadata.get("required_kinds") {
+                let kinds = kinds.as_array().ok_or_else(|| {
+                    ValidationError::Snapshot("required_kinds must be an array".into())
+                })?;
+                for kind in kinds {
+                    literal(
+                        Predicate::RequiredKind,
+                        kind.as_str().ok_or_else(|| {
+                            ValidationError::Snapshot("verification kind must be a string".into())
+                        })?,
+                        Some(Datatype::String),
+                    )?;
+                }
+            }
             for (key, predicate, datatype) in [
                 ("status", Predicate::Status, Datatype::String),
+                ("source_node", Predicate::SourceNode, Datatype::String),
+                (
+                    "observation_role",
+                    Predicate::ObservationRole,
+                    Datatype::String,
+                ),
+                (
+                    "observation_kind",
+                    Predicate::ObservationKind,
+                    Datatype::String,
+                ),
+                (
+                    "source_reference",
+                    Predicate::SourceReference,
+                    Datatype::String,
+                ),
                 ("priority", Predicate::Priority, Datatype::String),
+                ("required_kind", Predicate::RequiredKind, Datatype::String),
+                (
+                    "verification_kind",
+                    Predicate::VerificationKind,
+                    Datatype::String,
+                ),
+                ("observed_state", Predicate::ObservedState, Datatype::String),
+                ("reviewed_state", Predicate::ReviewedState, Datatype::String),
+                (
+                    "reviewed_context",
+                    Predicate::ReviewedContext,
+                    Datatype::String,
+                ),
+                (
+                    "verification_reference",
+                    Predicate::VerificationReference,
+                    Datatype::String,
+                ),
+                ("evidence", Predicate::EvidenceText, Datatype::String),
+                ("verified_by", Predicate::VerifiedByText, Datatype::String),
                 ("finding_code", Predicate::FindingCode, Datatype::String),
                 (
                     "object_availability",

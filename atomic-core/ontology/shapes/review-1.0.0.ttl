@@ -1,0 +1,217 @@
+@prefix atomic: <https://atomic.dev/ns/workflow#> .
+@prefix shape: <https://atomic.dev/ns/shapes/review/1.0.0#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+# Review does not assert the legacy projection's hasPlan/implements equivalence.
+# Ordinary publication and projection policy remain unchanged.
+shape:FullHashIdentity a sh:NodeShape ;
+  sh:targetClass atomic:Change, atomic:ProvenanceGraph, atomic:Attestation ;
+  sh:nodeKind sh:IRI ;
+  sh:pattern "^urn:atomic:(change|provenance|attestation):blake3-256:[A-Z2-7]{51}[AQ]$" .
+
+shape:ReferencedResource a sh:NodeShape ;
+  sh:targetObjectsOf atomic:hasReviewEvidence, atomic:subjectEvidence, atomic:observedIntent,
+    atomic:evidenceSource, atomic:evidenceTurn, atomic:hasJudgment,
+    atomic:judgesCriterion, atomic:supportedBy, atomic:reviewsChange,
+    atomic:includesIntent, atomic:includesSetAside, atomic:reviewsClosure, atomic:reviewIntent,
+    atomic:hasTurn, atomic:generatedChange, atomic:changeExplainedBy,
+    atomic:turnExplainedBy, atomic:directlyDependsOnChange,
+    atomic:reviews, atomic:authoredBy, atomic:signedBy, atomic:signingKey,
+    atomic:coversChange, atomic:attestedBy, atomic:aboutResource,
+    atomic:hasAcceptanceCriterion, atomic:hasVerification ;
+  sh:nodeKind sh:IRI ;
+  sh:property [ sh:path rdf:type ; sh:minCount 1 ] .
+
+# The fixed evaluation target prevents an empty or truncated graph from passing.
+shape:Evaluation a sh:NodeShape ;
+  sh:targetNode <urn:atomic:review:evaluation> ;
+  sh:property [ sh:path atomic:evaluatesReview ; sh:minCount 1 ; sh:maxCount 1 ; sh:class atomic:PublicationReview ] .
+
+shape:Approval a sh:NodeShape ;
+  sh:targetClass atomic:PublicationReview ;
+  sh:property [ sh:path atomic:verificationResult ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:authorityResult ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:freshnessResult ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:signedBy ; sh:minCount 1 ; sh:maxCount 1 ; sh:class atomic:Identity ] ;
+  sh:property [ sh:path atomic:reviewsClosure ; sh:minCount 1 ; sh:maxCount 1 ; sh:class atomic:ReviewSubject ] ;
+  sh:property [ sh:path atomic:reviewIntent ; sh:minCount 1 ; sh:maxCount 1 ; sh:class atomic:ReviewIntent ] ;
+  sh:sparql [
+    sh:message "The approval must be signed by the authenticated review-intent author." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT $this WHERE {
+        $this atomic:signedBy ?signer ; atomic:reviewIntent ?review .
+        FILTER NOT EXISTS { ?review atomic:authoredBy ?signer }
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "Reviewer and every work author must have different authenticated keys." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT $this WHERE {
+        $this atomic:signedBy ?reviewer ; atomic:reviewsClosure ?subject .
+        { ?subject atomic:includesIntent ?work } UNION { ?subject atomic:includesSetAside ?work }
+        ?work atomic:authoredBy ?author .
+        ?reviewer atomic:signingKey ?key . ?author atomic:signingKey ?key .
+      }
+    """
+  ] .
+
+shape:Subject a sh:NodeShape ;
+  sh:targetClass atomic:ReviewSubject ;
+  sh:property [ sh:path atomic:reviewedState ; sh:minCount 1 ; sh:maxCount 1 ; sh:minLength 1 ] ;
+  sh:property [ sh:path atomic:reviewedContext ; sh:minCount 1 ; sh:maxCount 1 ; sh:minLength 1 ] ;
+  sh:property [ sh:path atomic:reviewsChange ; sh:minCount 1 ; sh:class atomic:Change ] ;
+  sh:property [ sh:path atomic:includesIntent ; sh:minCount 1 ; sh:class atomic:WorkIntent ] ;
+  sh:sparql [
+    sh:message "The subject must contain the full dependency closure." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT $this WHERE {
+        $this atomic:reviewsChange ?change . ?change atomic:directlyDependsOnChange ?dep .
+        FILTER NOT EXISTS { $this atomic:reviewsChange ?dep }
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "Include the observed work intent in the original review intent's reviews references, then re-run review. Selected-review lifecycle receipts are context, not work requiring self-review." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT DISTINCT $this ?value WHERE {
+        $this atomic:reviewsChange ?change . ?change atomic:hasReviewEvidence ?evidence . ?evidence atomic:observedIntent ?value ; atomic:observationRole "work" .
+        FILTER NOT EXISTS { $this atomic:includesIntent ?value . ?review atomic:reviewsClosure $this ; atomic:reviewIntent ?intent . ?intent atomic:reviews ?value }
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "A managed change needs resolved source-backed intent evidence or an exact signed implementation declaration." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT DISTINCT $this ?value WHERE {
+        $this atomic:reviewsChange ?value . ?value atomic:status "managed" .
+        FILTER NOT EXISTS { $this atomic:includesIntent ?work . ?value atomic:hasReviewEvidence ?evidence . ?evidence atomic:observedIntent ?work ; atomic:observationRole "work" ; atomic:status "resolved" ; atomic:freshnessResult atomic:Verified }
+        FILTER NOT EXISTS { ?approval atomic:reviewsClosure $this ; atomic:reviewIntent ?review . $this atomic:subjectEvidence ?context . ?value atomic:hasReviewEvidence ?context . ?context atomic:observationRole "review-context" ; atomic:observedIntent ?review ; atomic:status "resolved" ; atomic:freshnessResult atomic:Verified }
+        FILTER NOT EXISTS { $this atomic:includesIntent ?work . ?work atomic:declaresImplementation ?value }
+      }
+    """
+  ] .
+
+shape:IntentObservation a sh:NodeShape ;
+  sh:targetClass atomic:IntentObservation ;
+  sh:property [ sh:path atomic:observationRole ; sh:minCount 1 ; sh:maxCount 1 ; sh:in ("work" "review-context") ] ;
+  sh:property [ sh:path atomic:sourceNode ; sh:minCount 1 ; sh:maxCount 1 ; sh:minLength 1 ] ;
+  sh:property [ sh:path atomic:sourceReference ; sh:minCount 1 ; sh:maxCount 1 ; sh:minLength 1 ] ;
+  sh:property [ sh:path atomic:observationKind ; sh:minCount 1 ; sh:maxCount 1 ; sh:in ("created" "updated" "attested-receipt" "verified-receipt") ] ;
+  sh:property [ sh:path atomic:status ; sh:hasValue "resolved" ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:freshnessResult ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:observedIntent ; sh:minCount 1 ; sh:maxCount 1 ; sh:class atomic:WorkIntent ] ;
+  sh:property [ sh:path atomic:evidenceSource ; sh:minCount 1 ; sh:maxCount 1 ; sh:class atomic:ProvenanceGraph ] ;
+  sh:property [ sh:path atomic:evidenceTurn ; sh:minCount 1 ; sh:maxCount 1 ; sh:class atomic:SessionTurn ] ;
+  sh:sparql [
+    sh:message "Observation source and ledger turn must be the same retained provenance, explaining the reviewed change." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT $this WHERE {
+        ?change atomic:hasReviewEvidence $this .
+        $this atomic:evidenceSource ?source ; atomic:evidenceTurn ?turn .
+        FILTER NOT EXISTS { ?turn atomic:turnExplainedBy ?source . ?change atomic:changeExplainedBy ?source }
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "Review-context must reference the exact selected review intent, never unrelated work." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT $this WHERE {
+        $this atomic:observationRole "review-context" ; atomic:observedIntent ?intent .
+        FILTER NOT EXISTS { ?approval atomic:reviewIntent ?intent ; atomic:reviewsClosure ?subject . ?subject atomic:subjectEvidence $this }
+      }
+    """
+  ] .
+
+shape:CriterionJudgment a sh:NodeShape ;
+  sh:targetClass atomic:CriterionJudgment ;
+  sh:property [ sh:path atomic:status ; sh:hasValue "met" ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:judgesCriterion ; sh:minCount 1 ; sh:maxCount 1 ; sh:class atomic:AcceptanceCriterion ] ;
+  sh:property [ sh:path atomic:supportedBy ; sh:minCount 1 ; sh:class atomic:VerificationRecord ] .
+
+shape:ReviewIntent a sh:NodeShape ;
+  sh:targetObjectsOf atomic:reviewIntent ;
+  sh:property [ sh:path atomic:verificationResult ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:freshnessResult ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:canonicalConformance ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:status ; sh:hasValue "done" ; sh:maxCount 1 ; sh:message "Complete the original review intent after addressing its findings and recording current-state verification." ] ;
+  sh:property [ sh:path atomic:hasAcceptanceCriterion ; sh:minCount 1 ; sh:class atomic:AcceptanceCriterion ; sh:node shape:ExactReviewCriterion ] ;
+  sh:property [ sh:path atomic:reviews ; sh:minCount 1 ; sh:class atomic:WorkIntent ] .
+
+shape:ExactReviewCriterion a sh:NodeShape ;
+  sh:node shape:Criterion ;
+  sh:property [ sh:path atomic:hasVerification ; sh:minCount 1 ] ;
+  sh:sparql [
+    sh:message "Reviewer verification must pass against the exact reviewed source state." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT $this WHERE {
+        ?review atomic:hasAcceptanceCriterion $this .
+        ?approval atomic:reviewIntent ?review ; atomic:reviewsClosure ?subject .
+        ?subject atomic:reviewedState ?state ; atomic:reviewedContext ?context .
+        FILTER NOT EXISTS { $this atomic:hasVerification ?record . ?record atomic:status "pass" ; atomic:observedState ?state ; atomic:verificationReference ?context }
+      }
+    """
+  ] ;
+  sh:sparql [
+    sh:message "Every required reviewer check must pass at the reviewed state, not an unrelated revision." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT $this WHERE {
+        $this atomic:requiredKind ?kind . ?review atomic:hasAcceptanceCriterion $this .
+        ?approval atomic:reviewIntent ?review ; atomic:reviewsClosure ?subject .
+        ?subject atomic:reviewedState ?state ; atomic:reviewedContext ?context .
+        FILTER NOT EXISTS { $this atomic:hasVerification ?record . ?record atomic:verificationKind ?kind ; atomic:status "pass" ; atomic:observedState ?state ; atomic:verificationReference ?context }
+      }
+    """
+  ] .
+
+shape:Work a sh:NodeShape ;
+  sh:targetObjectsOf atomic:includesIntent ;
+  sh:property [ sh:path atomic:freshnessResult ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:verificationResult ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:canonicalConformance ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:hasAcceptanceCriterion ; sh:minCount 1 ; sh:class atomic:AcceptanceCriterion ; sh:node shape:Criterion ] .
+
+shape:Criterion a sh:NodeShape ;
+  sh:property [ sh:path atomic:status ; sh:hasValue "met" ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:evidenceText ; sh:minCount 1 ; sh:minLength 1 ] ;
+  sh:property [ sh:path atomic:verifiedByText ; sh:minCount 1 ; sh:minLength 1 ] ;
+  sh:sparql [
+    sh:message "Each required verification kind needs a passing, state-pinned execution record." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT $this WHERE {
+        $this atomic:requiredKind ?kind .
+        FILTER NOT EXISTS { $this atomic:hasVerification ?record . ?record atomic:verificationKind ?kind ; atomic:status "pass" ; atomic:observedState ?state . FILTER(STRLEN(?state) > 0) }
+      }
+    """
+  ] .
+
+# Archival disposition is still authenticated and independently reviewed. It is
+# deliberately NOT evaluated as a current implementation/criterion approval.
+shape:SetAside a sh:NodeShape ;
+  sh:targetObjectsOf atomic:includesSetAside ;
+  sh:property [ sh:path atomic:status ; sh:hasValue "icebox" ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:freshnessResult ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:verificationResult ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:property [ sh:path atomic:canonicalConformance ; sh:hasValue atomic:Verified ; sh:maxCount 1 ] ;
+  sh:sparql [
+    sh:message "The completed review must explicitly review each set-aside disposition; inactive status alone is not approval." ;
+    sh:select """
+      PREFIX atomic: <https://atomic.dev/ns/workflow#>
+      SELECT $this WHERE {
+        ?subject atomic:includesSetAside $this .
+        FILTER NOT EXISTS { ?approval atomic:reviewsClosure ?subject ; atomic:reviewIntent ?review . ?review atomic:reviews $this }
+      }
+    """
+  ] .

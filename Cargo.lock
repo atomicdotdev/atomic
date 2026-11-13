@@ -453,6 +453,7 @@ dependencies = [
  "atomic-identity",
  "atomic-objects",
  "atomic-semantic",
+ "atomic-shacl",
  "blake3",
  "chrono",
  "data-encoding",
