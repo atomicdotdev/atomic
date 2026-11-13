@@ -535,6 +535,63 @@ fn terminal_disposition_does_not_approve_historical_implementation_goals() {
 }
 
 #[test]
+fn reviewed_set_aside_intent_observed_by_a_change_does_not_block() {
+    let (f, retired) = Fixture::with_second_observed_intent();
+    retire_fixture_work(&f, &retired, &f.author, &f.author_key);
+    extend_fixture_review(&f, &retired);
+    let signed = f.signed();
+    assert_eq!(signed.subject.work.len(), 1);
+    assert_eq!(signed.subject.set_aside.len(), 1);
+    let observed: Vec<_> = signed
+        .subject
+        .changes
+        .iter()
+        .flat_map(|pin| pin.observations.iter())
+        .filter_map(|observation| observation.intent.clone())
+        .collect();
+    assert!(
+        observed.contains(&format!("urn:atomic:intent:{retired}")),
+        "the retained receipt observes the set-aside intent"
+    );
+    let report = f
+        .repo
+        .validate_publication_review(&signed, &f.config(), &|did| f.keys(did))
+        .unwrap();
+    assert!(
+        report.conforms,
+        "an explicitly reviewed set-aside intent is complete review scope: {:#?}",
+        report.results
+    );
+}
+
+#[test]
+fn unreviewed_set_aside_intent_observed_by_a_change_still_blocks() {
+    let (f, retired) = Fixture::with_second_observed_intent();
+    retire_fixture_work(&f, &retired, &f.author, &f.author_key);
+    // The review never references the retired intent, so the resolver pins
+    // nothing for it: inactive status alone must not complete the scope.
+    let signed = f.signed();
+    assert!(signed.subject.set_aside.is_empty());
+    let report = f
+        .repo
+        .validate_publication_review(&signed, &f.config(), &|did| f.keys(did))
+        .unwrap();
+    assert!(!report.conforms);
+    let retired_iri =
+        atomic_core::kg::iri::mint_intent(&f.repo.project_id().unwrap(), &retired).unwrap();
+    assert!(
+        report.results.iter().any(|r| {
+            r["value"].as_str() == Some(retired_iri.as_str())
+                && r["source_shape"]
+                    .as_str()
+                    .is_some_and(|shape| shape.ends_with("#Subject"))
+        }),
+        "the scope rule names the unreviewed set-aside intent: {:#?}",
+        report.results
+    );
+}
+
+#[test]
 fn terminal_disposition_still_requires_an_independent_key() {
     let f = Fixture::new();
     let retired = signed_intent(&f.repo, &f.reviewer, &f.reviewer_key, "feature", None);

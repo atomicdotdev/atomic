@@ -81,11 +81,25 @@ fn signed_intent(
 }
 
 fn receipt_node(work: &str) -> atomic_core::change::provenance_graph::ProvenanceNode {
+    receipt_node_for(&[work])
+}
+
+/// One retained receipt node attesting every listed intent in a single
+/// multi-command invocation, exactly as a session transcript would retain it.
+fn receipt_node_for(intents: &[&str]) -> atomic_core::change::provenance_graph::ProvenanceNode {
+    let command = intents
+        .iter()
+        .map(|id| format!("atomic intent attest {id}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let output = intents
+        .iter()
+        .map(|id| format!("Attested intent: {id}\n"))
+        .collect::<String>();
     serde_json::from_value(json!({
         "id":"fixture-receipt", "kind":"execution", "timestamp":0,
         "summary":"Retained lifecycle receipt", "classified":false,
-        "detail":json!({"command":format!("atomic intent attest {work}"),
-            "output_summary":format!("Attested intent: {work}\n")}).to_string()
+        "detail":json!({"command":command,"output_summary":output}).to_string()
     }))
     .unwrap()
 }
@@ -105,6 +119,17 @@ fn sign_intent(repo: &Repository, id: &str, signer: &Identity, pair: &KeyPair) {
 
 impl Fixture {
     fn new() -> Self {
+        Self::build(false).0
+    }
+
+    /// Like `new`, but the retained receipt also observes a second, independent
+    /// work intent by the same author. Returns that intent's UID.
+    fn with_second_observed_intent() -> (Self, String) {
+        let (fixture, second) = Self::build(true);
+        (fixture, second.expect("second observed intent"))
+    }
+
+    fn build(second_observed: bool) -> (Self, Option<String>) {
         let dir = tempfile::tempdir().unwrap();
         let mut repo = Repository::init(dir.path()).unwrap();
         repo.init_vault().unwrap();
@@ -120,6 +145,8 @@ impl Fixture {
         store.save(&author).unwrap();
         store.save(&reviewer).unwrap();
         let work = signed_intent(&repo, &author, &author_key, "feature", None);
+        let second =
+            second_observed.then(|| signed_intent(&repo, &author, &author_key, "feature", None));
         let dependency = repo
             .save_change(&Change::empty(ChangeHeader::new("unmanaged dependency")))
             .unwrap();
@@ -139,7 +166,11 @@ impl Fixture {
                 .unwrap();
         let change = repo.save_change(&change).unwrap();
         let graph = ProvenanceGraphBuilder::new(SESSION, "fixture")
-            .add_node(receipt_node(&work))
+            .add_node(receipt_node_for(
+                &std::iter::once(work.as_str())
+                    .chain(second.as_deref())
+                    .collect::<Vec<_>>(),
+            ))
             .changes_explained(vec![change])
             .build();
         repo.save_provenance_graph(&graph).unwrap();
@@ -149,17 +180,20 @@ impl Fixture {
         )
         .unwrap();
         let review = signed_intent(&repo, &reviewer, &reviewer_key, "review", Some(&work));
-        Self {
-            _dir: dir,
-            repo,
-            change,
-            author,
-            author_key,
-            reviewer,
-            reviewer_key,
-            work,
-            review,
-        }
+        (
+            Self {
+                _dir: dir,
+                repo,
+                change,
+                author,
+                author_key,
+                reviewer,
+                reviewer_key,
+                work,
+                review,
+            },
+            second,
+        )
     }
     fn keys(&self, did: &str) -> Option<[u8; 32]> {
         [&self.author, &self.reviewer]
