@@ -123,6 +123,28 @@ pub struct NativeIndexRepairOutcome {
     pub operation: Option<OperationId>,
 }
 
+/// Outcome of a span-capability migration (`atomic doctor migrate-spans`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanCapabilityMigrationOutcome {
+    /// The `span-range-graph` version observed before the migration.
+    pub previous: Option<u32>,
+    /// The journaled repository-scoped `Repair` operation, `None` when the
+    /// repository already required the current version.
+    pub operation: Option<OperationId>,
+    /// Whether the repository already required the current version.
+    pub already_migrated: bool,
+}
+
+/// Domain-tagged digest input for the observed span-capability row.
+fn span_capability_digest_bytes(version: Option<u32>) -> [u8; 5] {
+    let mut bytes = [0u8; 5];
+    bytes[0] = u8::from(version.is_some());
+    if let Some(version) = version {
+        bytes[1..].copy_from_slice(&version.to_le_bytes());
+    }
+    bytes
+}
+
 /// Derive the graph-authoritative path-claim set: the complete closure
 /// union across every view, topologically ordered change replay, the
 /// recovered inode owners for every structural claimant, and the derived
@@ -746,6 +768,186 @@ impl Repository {
             already_healthy: false,
             operation: Some(operation.id()),
         })
+    }
+
+    /// Migrate the repository to native span recording by durably requiring
+    /// the `span-range-graph` version 3 capability.
+    ///
+    /// This is a metadata-only transition: existing changes remain
+    /// graph-origin and stay fully readable, and records after the migration
+    /// are span-based (mixed operation is supported). Legacy span
+    /// repositories on version 2 are raised in place; version 1 rows use an
+    /// ambiguous pre-release metadata envelope this build refuses at open,
+    /// so such a repository can never reach this method.
+    ///
+    /// The transition is journaled as a repository-scoped `Repair` operation
+    /// carrying the capability lease (absent or the observed version raised
+    /// to version 3) with a same-transaction verified receipt, so an
+    /// interrupted process leaves either nothing or a complete journal
+    /// entry. The migration is idempotent: an already-migrated repository is
+    /// a successful no-op that journals nothing.
+    pub fn migrate_span_capability(
+        &self,
+    ) -> Result<SpanCapabilityMigrationOutcome, RepositoryError> {
+        use atomic_core::operation::{MetadataTarget, MetadataTransition, MetadataValue};
+        use atomic_core::pristine::{CapabilityMutTxnT, CapabilityTxnT, SPAN_RANGE_CAPABILITY};
+
+        let minimum = SPAN_RANGE_CAPABILITY.minimum_version();
+        let no_op = |previous: Option<u32>| SpanCapabilityMigrationOutcome {
+            previous,
+            operation: None,
+            already_migrated: true,
+        };
+
+        // Cheap read-only observation first: an already-migrated repository
+        // must not journal anything.
+        let observed = self
+            .pristine
+            .read_txn()
+            .map_err(pristine_error)?
+            .required_capability_version(SPAN_RANGE_CAPABILITY.id())
+            .map_err(pristine_error)?;
+        if observed == Some(minimum) {
+            return Ok(no_op(observed));
+        }
+        Self::refuse_unmigratable_span_row(observed)?;
+
+        let common = self.try_lock_common_operation()?;
+        let mut txn = common.begin_write_immediate()?;
+        let parent = self.ensure_repository_anchor_in_txn(
+            &mut txn,
+            &RepoStateRef {
+                view: None,
+                working_copy: None,
+                git: None,
+            },
+        )?;
+
+        // Re-observe inside the committing transaction: the lease below is
+        // written against the same snapshot that journals it.
+        let current = txn
+            .required_capability_version(SPAN_RANGE_CAPABILITY.id())
+            .map_err(pristine_error)?;
+        if current == Some(minimum) {
+            txn.abort()
+                .map_err(|error| RepositoryError::Database(error.to_string()))?;
+            return Ok(no_op(current));
+        }
+        Self::refuse_unmigratable_span_row(current)?;
+
+        let before_digest = Hash::of(&canonical_tagged_bytes(
+            b"repair:span-migration:before",
+            &span_capability_digest_bytes(current),
+        ));
+        let durable = txn
+            .put_required_capability(SPAN_RANGE_CAPABILITY)
+            .map_err(pristine_error)?;
+        if durable != minimum {
+            return Err(RepositoryError::Database(format!(
+                "span capability lease raised to version {durable}, expected {minimum}"
+            )));
+        }
+        let after = txn
+            .required_capability_version(SPAN_RANGE_CAPABILITY.id())
+            .map_err(pristine_error)?;
+        if after != Some(minimum) {
+            return Err(RepositoryError::Database(format!(
+                "span capability lease observed {after:?} after the raise, expected {minimum}"
+            )));
+        }
+        let after_digest = Hash::of(&canonical_tagged_bytes(
+            b"repair:span-migration:after",
+            &span_capability_digest_bytes(after),
+        ));
+
+        let operation = Operation::new(OperationPayload {
+            parents: vec![parent],
+            kind: OperationKind::Repair,
+            relation: None,
+            working_copy: None,
+            before: RepoStateRef {
+                view: None,
+                working_copy: None,
+                git: None,
+            },
+            delta: RepoStateDelta {
+                after: RepoStateRef {
+                    view: None,
+                    working_copy: None,
+                    git: None,
+                },
+                metadata: vec![MetadataTransition {
+                    target: MetadataTarget::Capability {
+                        id: SPAN_RANGE_CAPABILITY.id().to_string(),
+                    },
+                    expected_old: current
+                        .map(|version| MetadataValue::Sequence(u64::from(version)))
+                        .unwrap_or(MetadataValue::Absent),
+                    expected_new: MetadataValue::Sequence(u64::from(minimum)),
+                }],
+                effects: Vec::new(),
+            },
+            git_observed: Vec::new(),
+            evidence: vec![before_digest, after_digest],
+            actor: ActorRef::System {
+                name: "doctor-migrate-spans".to_string(),
+            },
+            timestamp_ms: super::operation::current_operation_timestamp_ms(),
+            lossy: Vec::new(),
+        })
+        .map_err(codec_error)?;
+        txn.put_operation(&operation).map_err(pristine_error)?;
+        txn.compare_and_set_operation_heads(
+            OperationScope::Repository,
+            &[parent],
+            &[operation.id()],
+        )
+        .map_err(pristine_error)?;
+        let verified = super::operation::deterministic_effect_receipt(
+            &operation,
+            None,
+            atomic_core::operation::EffectReceiptKind::Verified,
+            None,
+            None,
+        )?;
+        txn.append_effect_receipt(&verified)
+            .map_err(pristine_error)?;
+        txn.commit()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        Ok(SpanCapabilityMigrationOutcome {
+            previous: current,
+            operation: Some(operation.id()),
+            already_migrated: false,
+        })
+    }
+
+    /// Refuse span-capability rows this migration cannot raise. Only the
+    /// current version and the legacy version 2 (raise in place) are
+    /// migratable; version 1 uses the ambiguous pre-release envelope.
+    fn refuse_unmigratable_span_row(observed: Option<u32>) -> Result<(), RepositoryError> {
+        use atomic_core::pristine::SPAN_RANGE_CAPABILITY;
+        /// The last pre-release span capability version this build can raise.
+        const LEGACY_MIGRATABLE_VERSION: u32 = 2;
+        match observed {
+            None => Ok(()),
+            Some(1) => Err(RepositoryError::InvalidOperation {
+                message: "span-range-graph version 1 uses the ambiguous pre-release metadata \
+                          envelope this build refuses at open; it needs manual recovery, not \
+                          this migration"
+                    .into(),
+            }),
+            Some(version)
+                if version == SPAN_RANGE_CAPABILITY.minimum_version()
+                    || version == LEGACY_MIGRATABLE_VERSION =>
+            {
+                Ok(())
+            }
+            Some(version) => Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "span-range-graph version {version} is not a migratable span capability row"
+                ),
+            }),
+        }
     }
 
     /// Undo a previously-journaled path-claims repair (CB-13A follow-up
