@@ -1,0 +1,12 @@
+{
+  "hookEventName": "session_start",
+  "sessionId": "01a1d576-264a-7530-a25e-d209bd34a860",
+  "cwd": "/Users/you/project",
+  "workspaceRoot": "/Users/you/project",
+  "timestamp": "2026-11-13T15:10:52.790226+00:00",
+  "permissionMode": "default",
+  "source": "new",
+  "hook_event_name": "SessionStart",
+  "session_id": "01a1d576-264a-7530-a25e-d209bd34a860",
+  "permission_mode": "default"
+}

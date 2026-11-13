@@ -19,10 +19,13 @@
 //! # JSON shape
 //!
 //! Grok's stdin envelope uses camelCase throughout (`sessionId`, `toolName`,
-//! `toolResult`, …). Claude Code compatibility aliases are accepted via
-//! serde `alias` so shared scripts still parse. Every event also carries
-//! `cwd` / `workspaceRoot` which we surface as repo-root hints when the
-//! process cwd is not the workspace.
+//! `toolResult`, …) and, for Claude Code compatibility, repeats most
+//! top-level keys in snake_case in the same payload (`session_id`,
+//! `tool_name`, `tool_response`, …). `hookEventName` and `hook_event_name`
+//! even carry different values (`stop` vs `Stop`). Either spelling is
+//! accepted, alone or together; see `FIELD_SPELLINGS`. Every event also
+//! carries `cwd` / `workspaceRoot` which we surface as repo-root hints when
+//! the process cwd is not the workspace.
 //!
 //! `Stop` fires both on genuine turn completion (`reason: "end_turn"`) and
 //! once more at session end (`channel_closed` / `shutdown`). Both map to
@@ -48,17 +51,43 @@ const ATOMIC_HOOK_PREFIX: &str = "atomic agent hooks grok";
 
 // JSON input types (camelCase primary, snake_case aliases)
 
+/// Spellings Grok may send for one [`CommonInput`] field, preferred first.
+///
+/// One payload can carry several spellings of the same field, which serde
+/// `alias` rejects as a duplicate field, so [`canonicalize_fields`] folds
+/// them into the field name before deserializing.
+const FIELD_SPELLINGS: &[(&str, &[&str])] = &[
+    ("session_id", &["sessionId", "session_id"]),
+    ("transcript_path", &["transcriptPath", "transcript_path"]),
+    ("workspace_root", &["workspaceRoot", "workspace_root"]),
+    ("tool_name", &["toolName", "tool_name"]),
+    ("tool_use_id", &["toolUseId", "tool_use_id"]),
+    ("tool_input", &["toolInput", "tool_input"]),
+    (
+        "tool_result",
+        &["toolResult", "tool_result", "tool_response"],
+    ),
+    ("stop_hook_active", &["stopHookActive", "stop_hook_active"]),
+    (
+        "last_assistant_message",
+        &["lastAssistantMessage", "last_assistant_message"],
+    ),
+    ("permission_mode", &["permissionMode", "permission_mode"]),
+    ("hook_event_name", &["hookEventName", "hook_event_name"]),
+];
+
+/// Fields arrive under their own name: [`canonicalize_fields`] has already
+/// folded every spelling in [`FIELD_SPELLINGS`].
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct CommonInput {
-    // Grok primary: camelCase. Aliases accept Claude-style snake_case scripts.
-    #[serde(default, alias = "sessionId")]
+    #[serde(default)]
     session_id: Option<String>,
-    #[serde(default, alias = "transcriptPath")]
+    #[serde(default)]
     transcript_path: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
-    #[serde(default, alias = "workspaceRoot")]
+    #[serde(default)]
     workspace_root: Option<String>,
     #[serde(default)]
     model: Option<String>,
@@ -68,26 +97,26 @@ struct CommonInput {
     source: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
-    #[serde(default, alias = "toolName")]
+    #[serde(default)]
     tool_name: Option<String>,
-    #[serde(default, alias = "toolUseId")]
+    #[serde(default)]
     tool_use_id: Option<String>,
-    #[serde(default, alias = "toolInput")]
+    #[serde(default)]
     tool_input: Option<Value>,
-    #[serde(default, alias = "toolResult", alias = "tool_response")]
+    #[serde(default)]
     tool_result: Option<Value>,
     /// Stop reason: `"end_turn"`, `"channel_closed"`, `"shutdown"`, …
     #[serde(default)]
     reason: Option<String>,
-    #[serde(default, alias = "stopHookActive")]
+    #[serde(default)]
     stop_hook_active: Option<bool>,
-    #[serde(default, alias = "lastAssistantMessage")]
+    #[serde(default)]
     last_assistant_message: Option<String>,
     #[serde(default)]
     timestamp: Option<String>,
-    #[serde(default, alias = "permissionMode")]
+    #[serde(default)]
     permission_mode: Option<String>,
-    #[serde(default, alias = "hookEventName")]
+    #[serde(default)]
     hook_event_name: Option<String>,
 }
 
@@ -171,7 +200,7 @@ impl AgentHook for GrokHook {
     fn parse_event(&self, hook_type: HookType, input: &[u8]) -> AgentResult<TurnEvent> {
         let raw_json = self.parse_json(hook_type, input)?;
         let timestamp = TimestampFormat::Rfc3339.parse(self.name(), hook_type, &raw_json)?;
-        let parsed = self.parse_common(hook_type, raw_json.clone())?;
+        let parsed = self.parse_common(hook_type, canonicalize_fields(&raw_json))?;
 
         let mut raw_json = with_xai_provider(raw_json);
         if hook_type == HookType::TurnEnd {
@@ -295,6 +324,34 @@ impl AgentHook for GrokHook {
 }
 
 // Normalization helpers
+
+/// Rewrite the envelope so each [`CommonInput`] field appears once, under
+/// its own name.
+///
+/// The first spelling in [`FIELD_SPELLINGS`] with a non-null value wins.
+/// Every other key passes through unchanged.
+fn canonicalize_fields(raw: &Value) -> Value {
+    let Some(obj) = raw.as_object() else {
+        return raw.clone();
+    };
+    let is_spelling = |key: &str| {
+        FIELD_SPELLINGS
+            .iter()
+            .any(|(_, spellings)| spellings.contains(&key))
+    };
+    let untouched = obj
+        .iter()
+        .filter(|(key, _)| !is_spelling(key))
+        .map(|(key, value)| (key.clone(), value.clone()));
+    let folded = FIELD_SPELLINGS.iter().filter_map(|(field, spellings)| {
+        spellings
+            .iter()
+            .filter_map(|spelling| obj.get(*spelling))
+            .find(|value| !value.is_null())
+            .map(|value| (field.to_string(), value.clone()))
+    });
+    Value::Object(untouched.chain(folded).collect())
+}
 
 /// Strip Grok harness wrappers from a user prompt.
 ///
@@ -632,6 +689,54 @@ mod tests {
             Some("src/main.rs")
         );
         assert_eq!(raw.get("provider").and_then(Value::as_str), Some("xai"));
+    }
+
+    // Real payloads carrying both spellings of every field are covered in
+    // `tests/grok_real_payloads.rs`.
+    #[test]
+    fn test_parse_prefers_camel_case_when_spellings_disagree() {
+        let hook = make_hook();
+        let input = br#"{"sessionId": "camel", "session_id": "snake"}"#;
+        let event = hook.parse_event(HookType::SessionStart, input).unwrap();
+        assert_eq!(event.session_id, "camel");
+    }
+
+    #[test]
+    fn test_parse_skips_a_null_spelling() {
+        let hook = make_hook();
+        let input = br#"{"sessionId": null, "session_id": "snake"}"#;
+        let event = hook.parse_event(HookType::SessionStart, input).unwrap();
+        assert_eq!(event.session_id, "snake");
+    }
+
+    #[test]
+    fn test_parse_every_spelling_null() {
+        let hook = make_hook();
+        let input = br#"{"sessionId": null, "session_id": null}"#;
+        let event = hook.parse_event(HookType::SessionStart, input).unwrap();
+        assert!(event.session_id.starts_with("grok-"));
+    }
+
+    #[test]
+    fn test_parse_tool_result_under_every_spelling() {
+        let hook = make_hook();
+        let input = br#"{
+            "sessionId": "s1",
+            "toolResult": "camel",
+            "tool_result": "sdk",
+            "tool_response": "claude"
+        }"#;
+        let event = hook.parse_event(HookType::PostToolUse, input).unwrap();
+        let raw = event.raw_json.unwrap();
+        assert_eq!(
+            raw.get("tool_output").and_then(Value::as_str),
+            Some("camel")
+        );
+        // The envelope reaches downstream as Grok sent it.
+        assert_eq!(
+            raw.get("tool_response").and_then(Value::as_str),
+            Some("claude")
+        );
     }
 
     #[test]

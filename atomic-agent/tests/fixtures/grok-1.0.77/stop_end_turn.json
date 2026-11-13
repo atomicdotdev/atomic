@@ -1,0 +1,21 @@
+{
+  "hookEventName": "stop",
+  "sessionId": "01a1d576-264a-7530-a25e-d209bd34a860",
+  "cwd": "/Users/you/project",
+  "workspaceRoot": "/Users/you/project",
+  "timestamp": "2026-11-13T15:11:00.132019+00:00",
+  "transcriptPath": "/Users/you/.grok/sessions/%2FUsers%2Fyou%2Fproject/01a1d576-264a-7530-a25e-d209bd34a860/updates.jsonl",
+  "promptId": "521d4615-47f7-4ad8-adde-307836fe26fc",
+  "permissionMode": "default",
+  "reason": "end_turn",
+  "stopHookActive": false,
+  "lastAssistantMessage": "The first line of `a.txt` is:\n\n```\nfirst line\n```",
+  "backgroundTasks": [],
+  "sessionCrons": [],
+  "hook_event_name": "Stop",
+  "session_id": "01a1d576-264a-7530-a25e-d209bd34a860",
+  "transcript_path": "/Users/you/.grok/sessions/%2FUsers%2Fyou%2Fproject/01a1d576-264a-7530-a25e-d209bd34a860/updates.jsonl",
+  "permission_mode": "default",
+  "stop_hook_active": false,
+  "last_assistant_message": "The first line of `a.txt` is:\n\n```\nfirst line\n```"
+}
