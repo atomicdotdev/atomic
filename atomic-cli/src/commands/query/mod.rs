@@ -9,6 +9,7 @@ use atomic_core::pristine::vault::{KgEdge, KgNode};
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::Repository;
 
+use crate::commands::kind::display_text;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{create_spinner, finish_error, finish_success};
@@ -1147,10 +1148,12 @@ pub(crate) fn emit_html(query: &str, nodes: &[KgNode], edges: &[KgEdge]) -> Stri
     )
 }
 
-/// Truncate display text on character boundaries and append `...`.
+/// Node text made safe for one terminal line, truncated on character boundaries
+/// with `...` appended. See [`display_text`].
 pub(crate) fn truncate_display(s: &str, max_chars: usize) -> String {
+    let s = display_text(s);
     if s.chars().count() <= max_chars {
-        s.to_string()
+        s
     } else {
         let kept: String = s.chars().take(max_chars.saturating_sub(3)).collect();
         format!("{}...", kept)
@@ -1363,12 +1366,35 @@ impl Command for QueryNeighbors {
             for edge in &subgraph.edges {
                 println!(
                     "  {} \u{2192}[{}]\u{2192} {}",
-                    edge.from_id, edge.kind, edge.to_id
+                    edge.from_id,
+                    edge_relation(edge),
+                    edge.to_id
                 );
             }
         }
 
         Ok(())
+    }
+}
+
+/// An edge's relation for the text printers: its predicate, then the labels of
+/// the custom relations it stands for. Every `atomic kind` relation shares one
+/// predicate, so the labels are what tell them apart. No other edge has any.
+pub(crate) fn edge_relation(edge: &atomic_core::KgEdge) -> String {
+    let labels: Vec<String> = edge
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("edges"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(display_text)
+        .collect();
+    if labels.is_empty() {
+        edge.kind.to_string()
+    } else {
+        format!("{} {}", edge.kind, labels.join(","))
     }
 }
 
@@ -1995,10 +2021,14 @@ impl Command for PlanExec {
             if !result.nodes.is_empty() {
                 println!("\nNodes ({}):", result.nodes.len());
                 for node in &result.nodes {
-                    print!("  [{}] {}", compact(node.primary_type()), node.label);
+                    print!(
+                        "  [{}] {}",
+                        compact(node.primary_type()),
+                        display_text(&node.label)
+                    );
                     if let Some(ref s) = node.summary {
                         // Truncate safely for Unicode text.
-                        let short: String = s.chars().take(60).collect();
+                        let short: String = display_text(s).chars().take(60).collect();
                         print!(": {}", short);
                     }
                     println!();
@@ -2019,8 +2049,8 @@ impl Command for PlanExec {
                 println!("\nContent ({} entries):", result.content.len());
                 for (path, text) in &result.content {
                     // Truncate safely for Unicode text.
-                    let preview: String = text.chars().take(100).collect();
-                    println!("  {}: {}...", path, preview.replace('\n', " "));
+                    let preview: String = display_text(text).chars().take(100).collect();
+                    println!("  {}: {}...", display_text(path), preview);
                 }
             }
         }
@@ -2161,6 +2191,42 @@ impl Command for QueryAsk {
 }
 
 #[cfg(test)]
+mod edge_relation_tests {
+    use super::edge_relation;
+    use atomic_core::kg::ontology::Predicate;
+    use atomic_core::KgEdge;
+
+    #[test]
+    fn labels_follow_the_predicate_and_nothing_else_changes() {
+        let plain = KgEdge::new("a", "b", Predicate::References);
+        assert_eq!(edge_relation(&plain), Predicate::References.to_string());
+
+        let other = plain
+            .clone()
+            .with_metadata(serde_json::json!({"derived_from_vault_path": "memory/x.md"}));
+        assert_eq!(edge_relation(&other), Predicate::References.to_string());
+
+        let labelled = plain.with_metadata(serde_json::json!({"edges": ["implements", "tracks"]}));
+        assert_eq!(
+            edge_relation(&labelled),
+            format!("{} implements,tracks", Predicate::References)
+        );
+    }
+
+    #[test]
+    fn labels_cannot_break_out_of_the_line() {
+        let edge = KgEdge::new("a", "b", Predicate::References)
+            .with_metadata(serde_json::json!({"edges": ["x\n\u{1b}[31my", 7]}));
+        let relation = edge_relation(&edge);
+        assert!(
+            !relation.contains('\n') && !relation.contains('\u{1b}'),
+            "{relation}"
+        );
+        assert!(relation.ends_with(" x [31my"), "{relation}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::truncate_display;
 
@@ -2293,5 +2359,17 @@ mod tests {
         let s = "\u{1f680}".repeat(80);
         let out = truncate_display(&s, 50);
         assert_eq!(out, format!("{}...", "\u{1f680}".repeat(47)));
+    }
+
+    #[test]
+    fn test_truncate_display_strips_what_a_terminal_would_act_on() {
+        assert_eq!(
+            truncate_display("a\u{1b}[31mb\nc\u{202e}d", 60),
+            "a[31mb cd"
+        );
+        let long = format!("\u{1b}{}", "x".repeat(70));
+        let out = truncate_display(&long, 60);
+        assert_eq!(out.chars().count(), 60);
+        assert!(out.starts_with("xxx") && out.ends_with("..."), "{out}");
     }
 }

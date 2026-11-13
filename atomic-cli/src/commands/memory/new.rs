@@ -117,7 +117,7 @@ impl Command for MemoryNew {
         let vault_path = bridge::normalize_memory_path(&id);
 
         // Build the frontmatter SPINE as FLAT SCALAR/array fields only (so it
-        // survives yaml_frontmatter_to_json round-trip). Do NOT write
+        // survives the legacy frontmatter parser round-trip). Do NOT write
         // attributedTo/proof/contentHash — attest fills those. createdAt is
         // STABLE (load-bearing: it is signed, so every re-lift must reproduce
         // byte-identical signing bytes).
