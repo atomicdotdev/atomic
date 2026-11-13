@@ -117,6 +117,10 @@ pub struct Summary {
 /// An intent reached by the candidate set (a "testsuite").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentReport {
+    /// Current source status. Icebox criteria are historical, not satisfied by
+    /// candidate changes merely because a task once inspected the same file.
+    #[serde(default)]
+    pub status: String,
     pub id: String,
     pub why: Option<String>,
     pub conforms: bool,

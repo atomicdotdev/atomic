@@ -5,6 +5,8 @@ pub const PROJECTION_SHAPES: &str =
     include_str!("../../atomic-core/ontology/shapes/projection-1.0.0.ttl");
 pub const PUBLICATION_SHAPES: &str =
     include_str!("../../atomic-core/ontology/shapes/publication-1.0.0.ttl");
+pub const REVIEW_SHAPES: &str = include_str!("../../atomic-core/ontology/shapes/review-1.0.0.ttl");
+pub const ENGINE_VERSION: &str = purrdf_shapes::VERSION;
 
 mod adapter;
 pub use adapter::snapshot_ntriples;
@@ -37,6 +39,7 @@ pub enum Profile {
     #[default]
     Projection,
     Publication,
+    Review,
 }
 
 #[derive(Clone, Debug)]
@@ -157,10 +160,20 @@ pub fn validate_ntriples(
         iri: "https://atomic.dev/ns/shapes/projection/1.0.0".into(),
         turtle: PROJECTION_SHAPES.into(),
     }];
+    // Review uses source-backed evidence paths, not legacy plan shortcuts.
+    if request.profile == Profile::Review {
+        bundles.clear();
+    }
     if request.profile == Profile::Publication {
         bundles.push(ShapeBundle {
             iri: "https://atomic.dev/ns/shapes/publication/1.0.0".into(),
             turtle: PUBLICATION_SHAPES.into(),
+        });
+    }
+    if request.profile == Profile::Review {
+        bundles.push(ShapeBundle {
+            iri: "https://atomic.dev/ns/shapes/review/1.0.0".into(),
+            turtle: REVIEW_SHAPES.into(),
         });
     }
     bundles.extend(request.custom.clone());

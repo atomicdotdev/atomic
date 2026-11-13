@@ -40,8 +40,10 @@ impl NodeType {
 /// Intent status value set (mirrors the doc's `IntentShape` `sh:in`).
 /// `needs-review` is the review handoff — implementation complete (every
 /// task done, every criterion met) and signed, awaiting independent review;
-/// `done` is granted by that review. `icebox` is a terminal state (an intent
-/// reviewed and set aside — not built).
+/// `done` is granted by that review. `icebox` is a terminal disposition: reviewed
+/// and set aside, not an active delivery requirement. Historical implementation
+/// and execution evidence remain history; this does not assert those goals hold
+/// in the current product.
 pub const INTENT_STATUS: &[&str] = &[
     "backlog",
     "todo",

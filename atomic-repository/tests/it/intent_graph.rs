@@ -174,6 +174,143 @@ fn authoritative_turn_path_seeds_changes_without_requiring_shortcuts() {
     assert_eq!(graph.dependency_changes, vec![dependency]);
 }
 
+fn review_fixture() -> (WorkflowSnapshot, String, String, String) {
+    let (mut snapshot, root, _, _, unrelated) = fixture();
+    let (project, _) = iri::parse_intent(&root).unwrap();
+    let reviewer_intent = iri::mint_intent(&project, "01ARZ3NDEKTSV4RRFFQ69G5FAX").unwrap();
+    let reviewed_change = iri::mint_change(&Hash::of(b"reviewed but not implemented by root"));
+    for (id, class) in [
+        (reviewer_intent.as_str(), C::ReviewIntent),
+        (reviewed_change.as_str(), C::Change),
+        ("urn:review:one", C::PublicationReview),
+        ("urn:subject:one", C::ReviewSubject),
+        ("urn:observation:one", C::IntentObservation),
+        ("urn:judgment:one", C::CriterionJudgment),
+        ("urn:verification:one", C::VerificationRecord),
+        ("urn:evaluation:one", C::ReviewEvaluation),
+        ("urn:finding:review", C::ReviewFinding),
+        ("urn:review:unrelated", C::PublicationReview),
+        ("urn:subject:unrelated", C::ReviewSubject),
+        ("urn:observation:unrelated", C::IntentObservation),
+    ] {
+        snapshot.nodes.push(KgNode::new(id, class, id, "fixture"));
+    }
+    for (from, to, p) in [
+        (reviewer_intent.as_str(), root.as_str(), P::Reviews),
+        (
+            "urn:review:one",
+            reviewer_intent.as_str(),
+            P::HasReviewIntent,
+        ),
+        ("urn:review:one", "urn:subject:one", P::ReviewsClosure),
+        ("urn:subject:one", root.as_str(), P::IncludesIntent),
+        (
+            "urn:subject:one",
+            reviewed_change.as_str(),
+            P::ReviewsChange,
+        ),
+        (
+            reviewed_change.as_str(),
+            "urn:observation:one",
+            P::HasReviewEvidence,
+        ),
+        ("urn:observation:one", root.as_str(), P::ObservedIntent),
+        ("urn:subject:one", "urn:observation:one", P::SubjectEvidence),
+        (
+            "urn:subject:unrelated",
+            "urn:observation:unrelated",
+            P::SubjectEvidence,
+        ),
+        (
+            reviewed_change.as_str(),
+            "urn:observation:unrelated",
+            P::HasReviewEvidence,
+        ),
+        // A common dependency/change must not route into another review scope.
+        (
+            "urn:subject:unrelated",
+            reviewed_change.as_str(),
+            P::ReviewsChange,
+        ),
+        (
+            "urn:observation:one",
+            "urn:provenance:one",
+            P::EvidenceSource,
+        ),
+        ("urn:observation:one", "urn:turn:one", P::EvidenceTurn),
+        ("urn:review:one", "urn:judgment:one", P::HasJudgment),
+        ("urn:judgment:one", "urn:ac:one", P::JudgesCriterion),
+        ("urn:judgment:one", "urn:verification:one", P::SupportedBy),
+        ("urn:ac:one", "urn:verification:one", P::HasVerification),
+        ("urn:evaluation:one", "urn:review:one", P::EvaluatesReview),
+        ("urn:finding:review", "urn:evaluation:one", P::AboutResource),
+        ("urn:review:one", "urn:author:shared", P::SignedBy),
+        ("urn:review:unrelated", "urn:author:shared", P::SignedBy),
+        (
+            "urn:review:unrelated",
+            "urn:subject:unrelated",
+            P::ReviewsClosure,
+        ),
+        (
+            "urn:subject:unrelated",
+            unrelated.as_str(),
+            P::ReviewsChange,
+        ),
+    ] {
+        snapshot.edges.push(KgEdge::new(from, to, p));
+    }
+    (snapshot, root, reviewer_intent, reviewed_change)
+}
+
+#[test]
+fn review_evidence_extends_intent_selection_without_shared_resource_expansion() {
+    let (snapshot, root, reviewer, reviewed_change) = review_fixture();
+    for root in [&root, &reviewer] {
+        let graph = IntentGraph::from_snapshot(&snapshot, root, 1000).unwrap();
+        for id in [
+            "urn:review:one",
+            "urn:subject:one",
+            "urn:observation:one",
+            "urn:judgment:one",
+            "urn:verification:one",
+            "urn:evaluation:one",
+            "urn:finding:review",
+        ] {
+            assert!(graph.nodes.iter().any(|node| node.id == id), "missing {id}");
+        }
+        assert_eq!(graph.reviewed_changes, vec![reviewed_change.clone()]);
+        assert!(!graph.implementing_changes.contains(&reviewed_change));
+        assert!(!graph
+            .nodes
+            .iter()
+            .any(|node| node.id == "urn:review:unrelated"
+                || node.id == "urn:subject:unrelated"
+                || node.id == "urn:turn:two"));
+        assert!(graph.missing_resources.is_empty());
+    }
+}
+
+#[test]
+fn review_selection_keeps_deterministic_caps_and_missing_evidence_diagnostics() {
+    let (mut snapshot, root, _, _) = review_fixture();
+    let graph = IntentGraph::from_snapshot(&snapshot, &root, 12).unwrap();
+    assert!(graph.truncated);
+    snapshot.nodes.reverse();
+    snapshot.edges.reverse();
+    let reverse = IntentGraph::from_snapshot(&snapshot, &root, 12).unwrap();
+    assert_eq!(
+        serde_json::to_value(graph).unwrap(),
+        serde_json::to_value(reverse).unwrap()
+    );
+    snapshot
+        .nodes
+        .retain(|node| node.id != "urn:provenance:one");
+    let graph = IntentGraph::from_snapshot(&snapshot, &root, 1000).unwrap();
+    assert!(graph
+        .missing_resources
+        .contains(&"urn:provenance:one".into()));
+}
+
 fn recording_fixture() -> (WorkflowSnapshot, String, String, String, String, String) {
     let (mut snapshot, root, change, dependency, unrelated) = fixture();
     snapshot

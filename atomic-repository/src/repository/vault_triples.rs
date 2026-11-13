@@ -170,6 +170,42 @@ impl Repository {
             .project_id()
             .map_err(|error| RepositoryError::Serialization(error.to_string()))?;
         let view_scopes = crate::workflow_usage::view_scopes(self, &txn, &project)?;
+        // Retained review documents contribute reference topology to the same
+        // snapshot. No policy pass or original-session authenticity is inferred.
+        let review_entries = txn.list_vault_entries(super::publication_review::PREFIX, None)?;
+        if review_entries.len() > 4096 {
+            return Err(super::publication_review::refused(
+                "review reference inventory exceeds 4096 artifacts",
+            ));
+        }
+        for meta in review_entries {
+            let entry = txn.get_vault_entry(&meta.path)?.ok_or_else(|| {
+                RepositoryError::InvalidOperation {
+                    message: "retained review disappeared within snapshot".into(),
+                }
+            })?;
+            let review = atomic_canonical::publication_review::PublicationReview::parse(
+                &entry.content_bytes,
+            )
+            .map_err(super::publication_review::refused)?;
+            if meta.path
+                != format!(
+                    "{}{}/review.md",
+                    super::publication_review::PREFIX,
+                    review.artifact_hash()
+                )
+            {
+                return Err(super::publication_review::refused(
+                    "stored review address mismatch",
+                ));
+            }
+            super::publication_review::references::extend(
+                &mut nodes,
+                &mut edges,
+                super::publication_review::references::project(&project, &review)?,
+                &review.artifact_hash(),
+            );
+        }
         drop(txn);
         self.hydrate_workflow_usage(&mut nodes)?;
         crate::workflow_usage::annotate_with_views(&mut nodes, &edges, Some(&view_scopes))?;

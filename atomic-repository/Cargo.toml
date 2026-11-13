@@ -17,11 +17,15 @@ rust-version.workspace = true
 adoption-test-injection = []
 # Request-local deterministic resource counters for query tests/benchmarks only.
 query-test-instrumentation = []
+# Full review policy evaluation needs the existing PurRDF engine (Rust 1.98).
+# Consumers that keep the repository's lower MSRV do not accept this exception.
+review-shacl = ["dep:atomic-shacl"]
 
 [dependencies]
 unicode-normalization = "0.1"
 atomic-core = { workspace = true }
 atomic-canonical = { workspace = true }
+atomic-shacl = { workspace = true, optional = true }
 blake3 = { workspace = true }
 atomic-config = { workspace = true }
 atomic-identity = { workspace = true }

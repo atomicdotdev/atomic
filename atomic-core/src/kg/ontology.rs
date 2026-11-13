@@ -7,7 +7,15 @@ use serde::{Deserialize, Serialize};
 
 pub const NAMESPACE: &str = "https://atomic.dev/ns/workflow#";
 pub const VERSION_IRI: &str = "https://atomic.dev/ns/workflow/1.0.0";
-pub const TTL: &str = include_str!("../../ontology/workflow-1.0.0.ttl");
+pub const WORKFLOW_TTL: &str = include_str!("../../ontology/workflow-1.0.0.ttl");
+pub const REVIEW_VERSION_IRI: &str = "https://atomic.dev/ns/review/1.0.0";
+pub const REVIEW_TTL: &str = include_str!("../../ontology/review-1.0.0.ttl");
+/// Offline bundle: imports are pinned locally, never resolved over the network.
+pub const TTL: &str = concat!(
+    include_str!("../../ontology/workflow-1.0.0.ttl"),
+    "\n",
+    include_str!("../../ontology/review-1.0.0.ttl")
+);
 pub const PREFIXES: &[(&str, &str)] = &[
     ("atomic", NAMESPACE),
     ("prov", "http://www.w3.org/ns/prov#"),
@@ -109,6 +117,10 @@ classes! {
     View => E(OwlThing), File => E(OwlThing), Identity => E(OwlThing),
     Concept => E(SkosConcept), Project => E(OwlThing), ProjectIdentity => E(OwlThing),
     VerificationStatus => E(OwlThing),
+    PublicationReview => A(Class::Attestation), ReviewSubject => E(OwlThing),
+    ReviewEvaluation => E(OwlThing), VerificationRecord => E(OwlThing), SigningKey => E(OwlThing),
+    ReviewEvidence => E(OwlThing), IntentObservation => A(Class::ReviewEvidence),
+    CriterionJudgment => E(OwlThing), ReviewFinding => A(Class::Finding),
 }
 
 macro_rules! predicates {
@@ -138,6 +150,19 @@ const fn range(class: Class) -> Option<Range> {
 use Class::*;
 use Predicate::*;
 predicates! {
+    IncludesSetAside => ("https://atomic.dev/ns/workflow#includesSetAside", "atomic:includesSetAside", domain(ReviewSubject), range(WorkIntent), None, None),
+    ObservationRole => ("https://atomic.dev/ns/workflow#observationRole", "atomic:observationRole", domain(IntentObservation), Some(Range::Datatype(Datatype::String)), None, None),
+    SubjectEvidence => ("https://atomic.dev/ns/workflow#subjectEvidence", "atomic:subjectEvidence", domain(ReviewSubject), range(ReviewEvidence), None, None),
+    SourceNode => ("https://atomic.dev/ns/workflow#sourceNode", "atomic:sourceNode", domain(ReviewEvidence), Some(Range::Datatype(Datatype::String)), None, None),
+    ObservationKind => ("https://atomic.dev/ns/workflow#observationKind", "atomic:observationKind", domain(IntentObservation), Some(Range::Datatype(Datatype::String)), None, None),
+    SourceReference => ("https://atomic.dev/ns/workflow#sourceReference", "atomic:sourceReference", domain(IntentObservation), Some(Range::Datatype(Datatype::String)), None, None),
+    HasReviewEvidence => ("https://atomic.dev/ns/workflow#hasReviewEvidence", "atomic:hasReviewEvidence", domain(Change), range(ReviewEvidence), None, None),
+    ObservedIntent => ("https://atomic.dev/ns/workflow#observedIntent", "atomic:observedIntent", domain(IntentObservation), range(WorkIntent), None, None),
+    EvidenceSource => ("https://atomic.dev/ns/workflow#evidenceSource", "atomic:evidenceSource", domain(ReviewEvidence), range(ProvenanceGraph), None, None),
+    EvidenceTurn => ("https://atomic.dev/ns/workflow#evidenceTurn", "atomic:evidenceTurn", domain(ReviewEvidence), range(SessionTurn), None, None),
+    HasJudgment => ("https://atomic.dev/ns/workflow#hasJudgment", "atomic:hasJudgment", domain(PublicationReview), range(CriterionJudgment), None, None),
+    JudgesCriterion => ("https://atomic.dev/ns/workflow#judgesCriterion", "atomic:judgesCriterion", domain(CriterionJudgment), range(AcceptanceCriterion), None, None),
+    SupportedBy => ("https://atomic.dev/ns/workflow#supportedBy", "atomic:supportedBy", domain(CriterionJudgment), None, None, None),
     HasTurn => ("https://atomic.dev/ns/workflow#hasTurn", "atomic:hasTurn", domain(Session), range(SessionTurn), Some(TurnOfSession), None),
     HasPlan => ("https://atomic.dev/ns/workflow#hasPlan", "atomic:hasPlan", domain(SessionTurn), range(WorkIntent), Some(GovernsTurn), None),
     GeneratedChange => ("https://atomic.dev/ns/workflow#generatedChange", "atomic:generatedChange", domain(SessionTurn), range(Change), Some(GeneratedBy), Some(ProvGenerated)),
@@ -162,6 +187,24 @@ predicates! {
     ScopeOutFile => ("https://atomic.dev/ns/workflow#scopeOutFile", "atomic:scopeOutFile", domain(WorkIntent), range(File), None, None),
     Remediates => ("https://atomic.dev/ns/workflow#remediates", "atomic:remediates", domain(WorkIntent), range(WorkIntent), None, None),
     Reviews => ("https://atomic.dev/ns/workflow#reviews", "atomic:reviews", domain(ReviewIntent), range(WorkIntent), Some(ReviewedBy), None),
+    ReviewsClosure => ("https://atomic.dev/ns/workflow#reviewsClosure", "atomic:reviewsClosure", None, range(ReviewSubject), None, None),
+    ReviewsChange => ("https://atomic.dev/ns/workflow#reviewsChange", "atomic:reviewsChange", None, range(Change), None, None),
+    IncludesIntent => ("https://atomic.dev/ns/workflow#includesIntent", "atomic:includesIntent", domain(ReviewSubject), range(WorkIntent), None, None),
+    EvaluatesReview => ("https://atomic.dev/ns/workflow#evaluatesReview", "atomic:evaluatesReview", domain(ReviewEvaluation), range(PublicationReview), None, None),
+    HasReviewIntent => ("https://atomic.dev/ns/workflow#reviewIntent", "atomic:reviewIntent", domain(PublicationReview), range(ReviewIntent), None, None),
+    AuthorityResult => ("https://atomic.dev/ns/workflow#authorityResult", "atomic:authorityResult", None, range(VerificationStatus), None, None),
+    FreshnessResult => ("https://atomic.dev/ns/workflow#freshnessResult", "atomic:freshnessResult", None, range(VerificationStatus), None, None),
+    CanonicalConformance => ("https://atomic.dev/ns/workflow#canonicalConformance", "atomic:canonicalConformance", None, range(VerificationStatus), None, None),
+    SigningKey => ("https://atomic.dev/ns/workflow#signingKey", "atomic:signingKey", domain(Identity), range(Class::SigningKey), None, None),
+    HasVerification => ("https://atomic.dev/ns/workflow#hasVerification", "atomic:hasVerification", domain(AcceptanceCriterion), range(VerificationRecord), None, None),
+    RequiredKind => ("https://atomic.dev/ns/workflow#requiredKind", "atomic:requiredKind", domain(AcceptanceCriterion), Some(Range::Datatype(Datatype::String)), None, None),
+    VerificationKind => ("https://atomic.dev/ns/workflow#verificationKind", "atomic:verificationKind", domain(VerificationRecord), Some(Range::Datatype(Datatype::String)), None, None),
+    ObservedState => ("https://atomic.dev/ns/workflow#observedState", "atomic:observedState", domain(VerificationRecord), Some(Range::Datatype(Datatype::String)), None, None),
+    ReviewedState => ("https://atomic.dev/ns/workflow#reviewedState", "atomic:reviewedState", domain(ReviewSubject), Some(Range::Datatype(Datatype::String)), None, None),
+    ReviewedContext => ("https://atomic.dev/ns/workflow#reviewedContext", "atomic:reviewedContext", domain(ReviewSubject), Some(Range::Datatype(Datatype::String)), None, None),
+    VerificationReference => ("https://atomic.dev/ns/workflow#verificationReference", "atomic:verificationReference", domain(VerificationRecord), Some(Range::Datatype(Datatype::String)), None, None),
+    EvidenceText => ("https://atomic.dev/ns/workflow#evidenceText", "atomic:evidenceText", domain(AcceptanceCriterion), Some(Range::Datatype(Datatype::String)), None, None),
+    VerifiedByText => ("https://atomic.dev/ns/workflow#verifiedByText", "atomic:verifiedByText", domain(AcceptanceCriterion), Some(Range::Datatype(Datatype::String)), None, None),
     DirectlyDependsOnChange => ("https://atomic.dev/ns/workflow#directlyDependsOnChange", "atomic:directlyDependsOnChange", domain(Change), range(Change), None, Some(DependsOn)),
     DependsOnIntent => ("https://atomic.dev/ns/workflow#dependsOnIntent", "atomic:dependsOnIntent", domain(WorkIntent), range(WorkIntent), None, Some(DependsOn)),
     ModifiesFile => ("https://atomic.dev/ns/workflow#modifiesFile", "atomic:modifiesFile", domain(Change), range(File), None, Some(Modifies)),

@@ -101,6 +101,7 @@ pub fn build_report(
     let mut intent_to_changes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut ac_to_changes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut reached_any_intent: HashMap<String, bool> = HashMap::new();
+    let mut set_aside_status: HashMap<String, bool> = HashMap::new();
     let mut all_modified_files: HashSet<String> = HashSet::new();
     // Raw modified paths per candidate hash (for the actionable orphan message).
     let mut change_raw_paths: HashMap<String, Vec<String>> = HashMap::new();
@@ -168,28 +169,16 @@ pub fn build_report(
             .filter(|entity| paths.contains(&entity.file))
             .map(|entity| format!("{}#{}", entity.file, entity.name))
             .collect();
-        let mut covered = false;
         for file_id in &modifies {
             let Ok(fsub) = repo.vault_kg_neighbors(file_id, 1) else {
                 continue;
             };
             for e in &fsub.edges {
                 if e.to_id == *file_id && kind_is(&e.kind, P::Touches) {
-                    covered = true;
                     touching_tasks.insert(e.from_id.clone());
                 }
             }
         }
-
-        // Coverage: no files → unknown; else covered iff some file is touched.
-        let coverage = if modifies.is_empty() {
-            "unknown"
-        } else if covered {
-            "covered"
-        } else {
-            "uncovered"
-        }
-        .to_string();
 
         // Second hop: each task's parent intent (HAS_TASK) and satisfied ACs.
         let mut reached = false;
@@ -197,7 +186,20 @@ pub fn build_report(
             let tsub = repo.vault_kg_neighbors(task, 1)?;
             for e in &tsub.edges {
                 if e.to_id == *task && kind_is(&e.kind, P::HasTask) {
-                    reached = true;
+                    let inactive =
+                        *set_aside_status
+                            .entry(e.from_id.clone())
+                            .or_insert_with(|| {
+                                iri::parse_intent(&e.from_id)
+                                    .ok()
+                                    .and_then(|(_, uid)| load_intent_node(repo, &uid).ok())
+                                    .is_some_and(|node| node.status == "icebox")
+                            });
+                    // Keep terminal intents in the report for authenticated
+                    // disposition review, but never use them as active coverage.
+                    if !inactive {
+                        reached = true;
+                    }
                     intent_to_changes
                         .entry(e.from_id.clone())
                         .or_default()
@@ -212,6 +214,14 @@ pub fn build_report(
             }
         }
         reached_any_intent.insert(full.clone(), reached);
+        let coverage = if modifies.is_empty() {
+            "unknown"
+        } else if reached {
+            "covered"
+        } else {
+            "uncovered"
+        }
+        .to_string();
 
         entities.sort();
         entities.dedup();
@@ -415,10 +425,14 @@ pub fn build_report(
                     .map_err(|e| RepositoryError::InvalidOperation {
                         message: e.to_string(),
                     })?;
-                    let satisfied_by: Vec<String> = ac_to_changes
-                        .get(&ac_kg)
-                        .map(|s| s.iter().cloned().collect())
-                        .unwrap_or_default();
+                    let satisfied_by: Vec<String> = if node.status == "icebox" {
+                        Vec::new()
+                    } else {
+                        ac_to_changes
+                            .get(&ac_kg)
+                            .map(|s| s.iter().cloned().collect())
+                            .unwrap_or_default()
+                    };
                     let is_met = ac.ac_status == "met";
                     let judgment_required = !satisfied_by.is_empty() && !is_met;
 
@@ -481,7 +495,10 @@ pub fn build_report(
                 // baseline. Among this intent's ACs, if any carries a
                 // view-scoped verification whose LATEST such record failed, the
                 // view baseline is red. Deduped to one finding per intent.
-                if let Some(kind) = failing_view_verification(&node) {
+                if let Some(kind) = (node.status != "icebox")
+                    .then(|| failing_view_verification(&node))
+                    .flatten()
+                {
                     findings.push(
                         Finding::new(
                             F_VIEW_VERIFY_FAIL,
@@ -502,7 +519,7 @@ pub fn build_report(
                 // Task facts for the walkthrough: intent iteration order is a
                 // BTreeMap key walk and tasks keep their directive order, so
                 // this collection is deterministic.
-                for t in &node.has_task {
+                for t in node.has_task.iter().filter(|_| node.status != "icebox") {
                     task_facts.push(TaskFact {
                         id: t.id.clone(),
                         text: t.text.clone(),
@@ -515,6 +532,7 @@ pub fn build_report(
                     report.results.iter().map(|v| v.message.clone()).collect();
 
                 intent_reports.push(IntentReport {
+                    status: node.status.clone(),
                     id: intent_kg_id.clone(),
                     why: node.why.clone(),
                     conforms: report.conforms,
@@ -537,6 +555,7 @@ pub fn build_report(
                     .with_remedy("ensure the intent exists in the vault and re-run"),
                 );
                 intent_reports.push(IntentReport {
+                    status: "unknown".into(),
                     id: intent_kg_id.clone(),
                     why: None,
                     conforms: false,
@@ -621,6 +640,9 @@ pub fn build_report(
     //    targets, so the overlap is a direct set intersection.
     let mut scope_breaches: HashSet<(String, String, String)> = HashSet::new();
     for intent_kg_id in intent_to_changes.keys() {
+        if set_aside_status.get(intent_kg_id).copied().unwrap_or(false) {
+            continue; // Historical scope is not an active delivery constraint.
+        }
         let Ok(isub) = repo.vault_kg_neighbors(intent_kg_id, 1) else {
             continue;
         };
@@ -718,6 +740,12 @@ pub fn build_report(
                 Some(&did_provider),
             ) {
                 Ok(verdict) => {
+                    for approval in &verdict.retrospective_reviews {
+                        findings.push(Finding::new(
+                            F_PUBLICATION_GATE, SEV_INFO, approval.change.clone(),
+                            format!("present-day retrospective review {} covers session {}; original session attestation remains absent", approval.review_hash, approval.session),
+                        ).with_remedy("inspect the signed subject with atomic triage publication-review inspect --graph; ordinary intent/review findings remain enforced"));
+                    }
                     for blocker in &verdict.blocks {
                         findings.push(
                             Finding::new(
@@ -736,7 +764,7 @@ pub fn build_report(
                 Err(error) => {
                     findings.push(Finding::new(
                         F_PUBLICATION_GATE,
-                        SEV_WARN,
+                        SEV_BLOCK,
                         "publication-gate".to_string(),
                         format!("gate evaluation failed (surface this to review): {error}"),
                     ));
@@ -757,11 +785,13 @@ pub fn build_report(
     // 9. Summary counts.
     let criteria_met = intent_reports
         .iter()
+        .filter(|i| i.status != "icebox")
         .flat_map(|i| &i.criteria)
         .filter(|c| c.status == "met")
         .count();
     let criteria_unmet = intent_reports
         .iter()
+        .filter(|i| i.status != "icebox")
         .flat_map(|i| &i.criteria)
         .filter(|c| c.status != "met")
         .count();
@@ -1997,6 +2027,13 @@ Edit bar.
     /// `a.txt`) is optionally covered by a review intent R. `review` is
     /// `(review_author, review_done)`. Target is the shared `dev` view.
     fn review_gate_report(review: Option<(&str, bool)>) -> (TriageReport, String) {
+        review_gate_report_with_status(review, "in-progress")
+    }
+
+    fn review_gate_report_with_status(
+        review: Option<(&str, bool)>,
+        status: &str,
+    ) -> (TriageReport, String) {
         let temp = TempDir::new().unwrap();
         let mut repo = Repository::init(temp.path()).unwrap();
         repo.init_vault().unwrap();
@@ -2028,7 +2065,7 @@ Edit a.txt.
             &repo,
             &a.intent_file,
             body_a,
-            &[("attributedTo", WORK_AUTHOR), ("status", "in-progress")],
+            &[("attributedTo", WORK_AUTHOR), ("status", status)],
         );
         let a_node_id = iri::mint_intent(&repo.project_id().unwrap(), &a.uid).unwrap();
 
@@ -2161,6 +2198,39 @@ Reviewed A independently.
         let f = unreviewed_findings(&report, &a_id);
         assert_eq!(f.len(), 1, "an in-flight review must not clear the gate");
         assert!(f[0].message.contains("self-authored or not yet done"));
+    }
+
+    #[test]
+    fn set_aside_history_is_not_candidate_satisfaction_or_active_coverage() {
+        let (report, id) = review_gate_report_with_status(Some(("did:atomic:bob", true)), "icebox");
+        let intent = report
+            .intents
+            .iter()
+            .find(|intent| intent.id == id)
+            .unwrap();
+        assert_eq!(intent.status, "icebox");
+        assert!(intent
+            .criteria
+            .iter()
+            .all(|ac| ac.satisfied_by.is_empty() && !ac.judgment_required));
+        assert_eq!(report.summary.criteria_unmet, 0);
+        assert!(
+            report.findings.iter().any(|f| f.code == F_ORPHAN_CHANGE),
+            "Archival decisions cannot cover actual code changes"
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.code == F_GATE_VIOLATION && f.focus == id),
+            "Missing proof is not waived for inactive documents"
+        );
+    }
+
+    #[test]
+    fn set_aside_status_alone_does_not_waive_independent_review() {
+        let (report, id) = review_gate_report_with_status(None, "icebox");
+        assert_eq!(unreviewed_findings(&report, &id).len(), 1);
     }
 
     // ── build_walkthrough (pure projection) ───────────────────────────────

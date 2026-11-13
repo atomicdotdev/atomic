@@ -167,11 +167,23 @@ async fn reindex_rpc_refreshes_signers_with_url_bound_client_credentials() {
     server.join().unwrap();
     let snapshot = service
         .get_workflow_snapshot(Request::new(GetWorkflowSnapshotRequest {
-            repository: Some(reference),
+            review_document: None,
+            repository: Some(reference.clone()),
         }))
         .await
         .unwrap()
         .into_inner();
+    assert!(snapshot.review_preview_identity.is_none());
+    assert!(
+        service
+            .get_workflow_snapshot(Request::new(GetWorkflowSnapshotRequest {
+                repository: Some(reference),
+                review_document: Some(b"{}".to_vec()),
+            }))
+            .await
+            .is_err(),
+        "unresolved review documents must not silently return ordinary snapshot success"
+    );
     assert!(snapshot.edges.iter().any(|edge| {
         edge.source == atomic_core::kg::iri::mint_attestation(&hash)
             && edge.relation == atomic_core::kg::ontology::Predicate::VerificationResult.iri()

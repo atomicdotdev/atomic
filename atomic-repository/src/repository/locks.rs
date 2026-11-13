@@ -322,6 +322,31 @@ impl Repository {
         self.try_lock_common_operation_with_reentrancy(false)
     }
 
+    /// Participate in an existing same-thread operation for evidence writes,
+    /// without turning a non-reentrant operation into a reentrant one. This is
+    /// an alias of an already-held boundary, not a new independent operation.
+    pub(super) fn review_evidence_common_lock(
+        &self,
+    ) -> Result<RepositoryCommonLockGuard, RepositoryError> {
+        let path = self.common_operation_lock_path();
+        let alias = HELD_LOCKS.with(|held| {
+            let mut held = held.borrow_mut();
+            let (count, file, reentrant) = held.get_mut(&path)?;
+            let file = file.upgrade()?;
+            *count += 1;
+            Some((file, *reentrant))
+        });
+        if let Some((file, reentrant)) = alias {
+            return Ok(RepositoryCommonLockGuard {
+                _common_lock: AdvisoryFileLock { file, path },
+                dot_dir: self.dot_dir.clone(),
+                pristine: Arc::clone(&self.pristine),
+                reentrant,
+            });
+        }
+        self.try_lock_common_operation_with_reentrancy(true)
+    }
+
     pub(super) fn try_lock_common_operation_with_reentrancy(
         &self,
         reentrant: bool,

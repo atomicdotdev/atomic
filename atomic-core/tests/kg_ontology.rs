@@ -150,6 +150,7 @@ fn ontology_uses_only_the_declared_rl_constructs() {
         "owl:propertyChainAxiom",
         "rdfs:isDefinedBy",
         "owl:versionIRI",
+        "owl:imports",
         "rdfs:label",
         "rdfs:comment",
     ];
@@ -194,4 +195,33 @@ fn legacy_inventory_is_unique_and_all_targets_exist() {
     }
     // 81 former constants, plus 20 bare node kinds.
     assert_eq!(old.len(), 101);
+}
+
+#[test]
+fn review_is_a_versioned_module_without_governing_authority_inference() {
+    let review = TurtleParser::new()
+        .for_reader(REVIEW_TTL.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(objects(
+        &review,
+        "https://atomic.dev/ns/review",
+        "http://www.w3.org/2002/07/owl#imports"
+    )
+    .contains(VERSION_IRI));
+    assert!(objects(
+        &review,
+        "https://atomic.dev/ns/review",
+        "http://www.w3.org/2002/07/owl#versionIRI"
+    )
+    .contains(REVIEW_VERSION_IRI));
+    assert!(!WORKFLOW_TTL.contains("atomic:PublicationReview a owl:Class"));
+    for predicate in [
+        Predicate::ObservedIntent,
+        Predicate::HasReviewEvidence,
+        Predicate::EvidenceSource,
+    ] {
+        assert!(predicate.property_chain().is_empty());
+        assert!(predicate.super_predicate().is_none());
+    }
 }

@@ -207,6 +207,7 @@ impl Repository {
         content: Vec<u8>,
         frontmatter_json: String,
     ) -> Result<Hash, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let now = chrono::Utc::now().to_rfc3339();
         let entry = VaultEntry::new(entry_type, content, frontmatter_json, now.clone());
@@ -221,6 +222,17 @@ impl Repository {
         let previous_entry = txn
             .get_vault_entry(path)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        if path.starts_with(super::publication_review::PREFIX)
+            && previous_entry.as_ref().is_some_and(|old| {
+                old.content_bytes != entry.content_bytes
+                    || old.frontmatter_json != entry.frontmatter_json
+                    || old.entry_type != entry.entry_type
+            })
+        {
+            return Err(super::publication_review::refused(
+                "stored reviews are immutable; use signed supersession",
+            ));
+        }
         let cascade_updates = match previous_entry.as_ref() {
             Some(previous) if previous.entry_type != entry_type => {
                 unlink_goal_from_intent_entries(&mut txn, path, previous, &now)?
@@ -277,6 +289,7 @@ impl Repository {
         path: &str,
         entry: &VaultEntry,
     ) -> Result<Hash, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let content_hash = Hash::from_bytes(entry.content_hash);
         let now = chrono::Utc::now().to_rfc3339();
@@ -290,6 +303,17 @@ impl Repository {
         let previous_entry = txn
             .get_vault_entry(path)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        if path.starts_with(super::publication_review::PREFIX)
+            && previous_entry.as_ref().is_some_and(|old| {
+                old.content_bytes != entry.content_bytes
+                    || old.frontmatter_json != entry.frontmatter_json
+                    || old.entry_type != entry.entry_type
+            })
+        {
+            return Err(super::publication_review::refused(
+                "stored reviews are immutable; use signed supersession",
+            ));
+        }
         let cascade_updates = match previous_entry.as_ref() {
             Some(previous) if previous.entry_type != entry.entry_type => {
                 unlink_goal_from_intent_entries(&mut txn, path, previous, &now)?
@@ -406,6 +430,12 @@ impl Repository {
 
     /// Delete a vault entry by path. Also updates the manifest.
     pub fn vault_delete(&self, path: &str) -> Result<bool, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
+        if path.starts_with(super::publication_review::PREFIX) {
+            return Err(super::publication_review::refused(
+                "review history is retained; use signed supersession",
+            ));
+        }
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut txn = self
             .pristine
