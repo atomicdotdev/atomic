@@ -76,13 +76,20 @@ shape:Subject a sh:NodeShape ;
       }
     """
   ] ;
+  # Scope completeness: every intent a reviewed change observed must be in the
+  # review scope, either as current work (includesIntent) or as an explicitly
+  # reviewed set-aside disposition (includesSetAside). Only includesIntent can
+  # supply managed-change coverage below; set-aside membership never does.
   sh:sparql [
-    sh:message "Include the observed work intent in the original review intent's reviews references, then re-run review. Selected-review lifecycle receipts are context, not work requiring self-review." ;
+    sh:message "Include the observed intent in the original review intent's reviews references (as current work or an explicitly reviewed set-aside disposition), then re-run review. Selected-review lifecycle receipts are context, not work requiring self-review." ;
     sh:select """
       PREFIX atomic: <https://atomic.dev/ns/workflow#>
       SELECT DISTINCT $this ?value WHERE {
         $this atomic:reviewsChange ?change . ?change atomic:hasReviewEvidence ?evidence . ?evidence atomic:observedIntent ?value ; atomic:observationRole "work" .
-        FILTER NOT EXISTS { $this atomic:includesIntent ?value . ?review atomic:reviewsClosure $this ; atomic:reviewIntent ?intent . ?intent atomic:reviews ?value }
+        FILTER NOT EXISTS {
+          { $this atomic:includesIntent ?value } UNION { $this atomic:includesSetAside ?value }
+          ?review atomic:reviewsClosure $this ; atomic:reviewIntent ?intent . ?intent atomic:reviews ?value
+        }
       }
     """
   ] ;
