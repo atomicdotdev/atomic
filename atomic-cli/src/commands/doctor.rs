@@ -101,6 +101,20 @@ pub enum DoctorCommands {
     /// Use `--dry-run` to diagnose without writing anything.
     #[command(name = "reconcile-working-copy")]
     ReconcileWorkingCopy(ReconcileWorkingCopy),
+
+    /// Migrate the repository to native span recording.
+    ///
+    /// Durably requires the `span-range-graph` version 3 capability so new
+    /// records are span-based. This is a metadata-only transition: existing
+    /// changes stay graph-origin and remain fully readable (mixed operation
+    /// is supported), and legacy span-capability version 2 repositories are
+    /// raised in place. The migration is journaled as a repository-scoped
+    /// Repair operation with a verified receipt and is idempotent — an
+    /// already-migrated repository journals nothing. The capability is
+    /// one-way once span changes exist: run this command again to re-raise
+    /// the lease if it is ever removed.
+    #[command(name = "migrate-spans")]
+    MigrateSpans(MigrateSpans),
 }
 
 /// Read-only working-copy consistency check.
@@ -119,6 +133,14 @@ pub struct ReconcileWorkingCopy {
     pub target_view: String,
 
     /// Diagnose only; write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Journaled migration of the repository to native span recording.
+#[derive(Debug, Args, Default)]
+pub struct MigrateSpans {
+    /// Report the current span-capability state without writing anything.
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -248,6 +270,7 @@ impl Command for Doctor {
             DoctorCommands::MaterializeCrdt(cmd) => cmd.run(),
             DoctorCommands::Check(cmd) => cmd.run(),
             DoctorCommands::ReconcileWorkingCopy(cmd) => cmd.run(),
+            DoctorCommands::MigrateSpans(cmd) => cmd.run(),
         }
     }
 }
@@ -397,6 +420,92 @@ impl Command for ReconcileWorkingCopy {
             }
         }
         Ok(())
+    }
+}
+
+impl Command for MigrateSpans {
+    fn run(&self) -> CliResult<()> {
+        use atomic_core::pristine::{CapabilityTxnT, SPAN_RANGE_CAPABILITY};
+        if self.dry_run {
+            let repo = require_repository_readonly(None)?;
+            let version = repo
+                .pristine()
+                .read_txn()
+                .map_err(|error| {
+                    CliError::Repository(atomic_repository::RepositoryError::Database(
+                        error.to_string(),
+                    ))
+                })?
+                .required_capability_version(SPAN_RANGE_CAPABILITY.id())
+                .map_err(|error| {
+                    CliError::Repository(atomic_repository::RepositoryError::Database(
+                        error.to_string(),
+                    ))
+                })?;
+            describe_span_capability_state(version);
+            return Ok(());
+        }
+        let repo = match require_repository_for_native_repair(None) {
+            Ok(repo) => repo,
+            Err(error) => {
+                print_warning(&format!(
+                    "The span migration is unavailable because repository authority cannot be opened: {error}"
+                ));
+                return Err(error);
+            }
+        };
+        print_info("Migrating the repository to native span recording...");
+        match repo.migrate_span_capability() {
+            Ok(outcome) => {
+                if outcome.already_migrated {
+                    print_success(
+                        "Repository already requires span-range-graph v3; nothing to do.",
+                    );
+                } else {
+                    let previous = match outcome.previous {
+                        None => "not required".to_string(),
+                        Some(version) => format!("v{version}"),
+                    };
+                    let journaled = outcome
+                        .operation
+                        .map(|operation| format!("; journaled as Repair operation {operation}"))
+                        .unwrap_or_default();
+                    print_success(&format!(
+                        "Span recording enabled (span-range-graph {previous} \u{2192} v3){journaled}."
+                    ));
+                    print_hint(
+                        "Existing changes stay graph-origin and remain fully readable; new \
+                         records are span-based. The capability is one-way once span changes \
+                         exist; run this command again to re-raise the lease if it is ever \
+                         removed.",
+                    );
+                }
+                Ok(())
+            }
+            Err(error) => {
+                print_warning(&format!(
+                    "The span migration refused before any capability row moved: {error}"
+                ));
+                Err(CliError::Repository(error))
+            }
+        }
+    }
+}
+
+fn describe_span_capability_state(version: Option<u32>) {
+    use atomic_core::pristine::SPAN_RANGE_CAPABILITY;
+    match version {
+        Some(minimum) if minimum == SPAN_RANGE_CAPABILITY.minimum_version() => print_success(
+            "Repository requires span-range-graph v3: native span recording is already enabled.",
+        ),
+        Some(version) => print_warning(&format!(
+            "Repository requires legacy span-range-graph v{version}; \
+             `atomic doctor migrate-spans` would raise the lease to v3."
+        )),
+        None => print_info(
+            "Repository has no span capability: recorded changes are graph-origin. \
+             `atomic doctor migrate-spans` would enable native span recording.",
+        ),
     }
 }
 
@@ -593,5 +702,11 @@ mod tests {
         let cmd = MaterializeCrdt::default();
         assert!(cmd.view.is_none());
         assert!(!cmd.force);
+    }
+
+    #[test]
+    fn migrate_spans_defaults_to_apply() {
+        let cmd = MigrateSpans::default();
+        assert!(!cmd.dry_run);
     }
 }
