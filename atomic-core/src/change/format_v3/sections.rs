@@ -46,10 +46,12 @@
 //!   modify the repository DAG (vertex insertions, edge updates). This is the
 //!   minimum required to apply a change. A "thin pull" downloads only these.
 //!
-//! - **SEMANTIC section**: The display/analysis layer. Contains [`FileOps`] with
+//! - **SEMANTIC section**: The human-readable semantic layer. Contains [`FileOps`] with
 //!   Trunk/Branch/Leaf operations for line-level and token-level diffs, blame,
-//!   and code review. This is optional — it can be regenerated from graph + content.
-//!   A "thin review" downloads only these + content chunks.
+//!   and code review. Span projections retain original authored fragments;
+//!   graph bytes alone cannot recover authenticated semantic names.
+//!   Historical graph-only objects remain readable, but must not be presented as
+//!   a complete semantic interpretation. Selective readers must retain context.
 //!
 //! Both sections for the same file share the same `content_range`, which indexes
 //! into the change's content chunks. This enables the reader to correlate

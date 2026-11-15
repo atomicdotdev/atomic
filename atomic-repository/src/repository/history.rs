@@ -9,7 +9,7 @@ use atomic_core::operation::{
 };
 
 impl Repository {
-    fn authoritative_working_copy_view_name(&self) -> Result<String, RepositoryError> {
+    pub(super) fn authoritative_working_copy_view_name(&self) -> Result<String, RepositoryError> {
         let working_copy = self.require_working_copy_id()?;
         self.desired_view_name(working_copy)
     }

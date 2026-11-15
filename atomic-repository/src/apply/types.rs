@@ -154,6 +154,9 @@ pub struct InsertOptions {
     /// inserting its first dependency does not invalidate its own review pin.
     /// Default: `false`
     pub(crate) skip_publication_gate: bool,
+    #[cfg(feature = "prototype-context-completion")]
+    pub(crate) prototype_context:
+        Option<std::sync::Arc<crate::repository::prototype_context::Projection>>,
 }
 
 impl Default for InsertOptions {
@@ -166,6 +169,8 @@ impl Default for InsertOptions {
             track_conflicts: true,
             skip_validation: false,
             skip_publication_gate: false,
+            #[cfg(feature = "prototype-context-completion")]
+            prototype_context: None,
         }
     }
 }

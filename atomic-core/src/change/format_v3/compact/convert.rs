@@ -30,6 +30,10 @@ impl<'t> Compactor<'t> {
                 reason,
             })?;
         match op {
+            #[cfg(feature = "prototype-context-completion")]
+            GraphOp::PrototypeContext { effect } => Ok(CompactGraphOp::PrototypeContext {
+                effect: effect.clone(),
+            }),
             GraphOp::FileAdd {
                 add_name,
                 add_inode,
@@ -235,6 +239,10 @@ impl<'t> Compactor<'t> {
                 reason,
             })?;
         let expanded: FormatResult<GraphOp<Option<Hash>>> = match op {
+            #[cfg(feature = "prototype-context-completion")]
+            CompactGraphOp::PrototypeContext { effect } => Ok(GraphOp::PrototypeContext {
+                effect: effect.clone(),
+            }),
             CompactGraphOp::FileAdd {
                 add_name,
                 add_inode,

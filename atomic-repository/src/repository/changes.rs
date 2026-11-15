@@ -22,6 +22,24 @@ fn atom_change_file_version(bytes: &[u8]) -> Result<u32, RepositoryError> {
 }
 
 impl Repository {
+    pub(super) fn fence_legacy_span_storage(&self, change: &Change) -> Result<(), RepositoryError> {
+        if change
+            .hashed
+            .span
+            .as_ref()
+            .is_some_and(|p| p.version == atomic_core::change::span_patch::LEGACY_SOURCE_VERSION)
+        {
+            change
+                .validate_v2()
+                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+            self.pristine.require_repository_capabilities(&[
+                atomic_core::pristine::SPAN_RANGE_CAPABILITY,
+                atomic_core::pristine::SPAN_LEGACY_CONTEXT_CAPABILITY,
+                atomic_core::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY,
+            ])?;
+        }
+        Ok(())
+    }
     fn require_projected_semantic_storage_capability(
         &self,
         change: &Change,
@@ -163,6 +181,7 @@ impl Repository {
     /// println!("Saved change: {}", hash.to_base32());
     /// ```
     pub fn save_change(&self, change: &Change) -> Result<Hash, RepositoryError> {
+        self.fence_legacy_span_storage(change)?;
         self.require_projected_semantic_storage_capability(change)?;
         if change.file_ops().iter().any(|ops| {
             matches!(
@@ -202,6 +221,7 @@ impl Repository {
                 computed.to_base32()
             )));
         }
+        self.fence_legacy_span_storage(&change)?;
         let projected = change.file_ops().iter().any(|ops| {
             matches!(
                 ops.trunk_op(),
@@ -274,6 +294,24 @@ impl Repository {
         change: &Change,
     ) -> Result<Hash, RepositoryError> {
         let version = atom_change_file_version(change_bytes)?;
+        if change
+            .hashed
+            .span
+            .as_ref()
+            .is_some_and(|p| p.version == atomic_core::change::span_patch::LEGACY_SOURCE_VERSION)
+        {
+            let verified = atomic_core::change::VerifiedChange::from_bytes(change_bytes)
+                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+            if verified.hash() != *hash
+                || verified.change().hashed != change.hashed
+                || verified.change().contents != change.contents
+            {
+                return Err(RepositoryError::Serialization(
+                    "legacy span bytes differ from supplied identity".into(),
+                ));
+            }
+            self.fence_legacy_span_storage(change)?;
+        }
         self.require_projected_semantic_storage_capability(change)?;
         if version == ATOM_CHANGE_FILE_VERSION_SPAN {
             let (decoded, actual_hash) =

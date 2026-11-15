@@ -1847,7 +1847,11 @@ impl Repository {
     /// records them (the same fold the foreign record and the staged replay
     /// use), so positional Delete/Modify ops bind the branches the view's
     /// lines actually are.
-    fn view_alive_branches_in_order<T: atomic_core::pristine::GraphTxnT>(
+    fn view_alive_branches_in_order<
+        T: atomic_core::pristine::GraphTxnT
+            + atomic_core::pristine::TreeTxnT
+            + atomic_core::pristine::CrdtTxnT,
+    >(
         &self,
         txn: &T,
         view_name: &str,
@@ -1866,7 +1870,11 @@ impl Repository {
     /// visible change through the repository's semantic closure memo (see
     /// `semantic_closure`): every deleted path of one commit, and every
     /// later commit, reuses the changes folded before.
-    fn semantic_closure_trunk_state<T: atomic_core::pristine::GraphTxnT>(
+    fn semantic_closure_trunk_state<
+        T: atomic_core::pristine::GraphTxnT
+            + atomic_core::pristine::TreeTxnT
+            + atomic_core::pristine::CrdtTxnT,
+    >(
         &self,
         txn: &T,
         view_name: &str,
@@ -1874,6 +1882,40 @@ impl Repository {
         visibility: &atomic_core::pristine::GraphVisibilityClosure,
         trunk: atomic_core::crdt::TrunkId,
     ) -> Result<super::semantic_closure::TrunkBranchState, String> {
+        #[cfg(feature = "prototype-context-completion")]
+        let (completion, completed_order) = {
+            let roots = visibility
+                .iter_dependency_first()
+                .filter(|id| !id.is_root())
+                .map(|id| {
+                    txn.get_external(*id)
+                        .map_err(|e| e.to_string())?
+                        .ok_or_else(|| "visible patch has no hash".to_string())
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let projection = self
+                .prototype_projection_for_hashes(&roots)
+                .map_err(|e| e.to_string())?;
+            projection.require_complete()?;
+            let hashes = if projection.effects.is_empty() {
+                roots
+            } else {
+                self.prototype_ordered_scope(&projection, &roots)
+                    .map_err(|e| e.to_string())?
+            };
+            let order = hashes
+                .into_iter()
+                .map(|hash| {
+                    txn.get_internal(&hash)
+                        .map_err(|e| e.to_string())?
+                        .filter(|id| visibility.contains(id))
+                        .ok_or_else(|| {
+                            "completed semantic context is outside selected visibility".to_string()
+                        })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            (projection, order)
+        };
         // The memo is a pure cache: a fold that panicked leaves nothing worth
         // keeping, so a poisoned lock starts over instead of failing every
         // later record in this process.
@@ -1885,12 +1927,17 @@ impl Repository {
                 *memo = Default::default();
                 memo
             });
+        #[cfg(feature = "prototype-context-completion")]
+        memo.align_context(completion.digest);
         memo.align(view_name, excluded, visibility);
-        for change_id in visibility
+        #[cfg(not(feature = "prototype-context-completion"))]
+        let fold_order = visibility
             .iter_dependency_first()
             .copied()
-            .filter(|id| !id.is_root())
-        {
+            .filter(|id| !id.is_root());
+        #[cfg(feature = "prototype-context-completion")]
+        let fold_order = completed_order;
+        for change_id in fold_order {
             if memo.is_folded(change_id) {
                 continue;
             }
@@ -1903,6 +1950,16 @@ impl Repository {
                 change.hashed.file_ops =
                     atomic_core::change::span_patch::localize_file_ops(txn, &change)
                         .map_err(|e| e.to_string())?;
+            }
+            #[cfg(feature = "prototype-inode-transport")]
+            if change.hashed.span.is_none() {
+                change.hashed.file_ops = crate::apply::inode_transport_prototype::localize(
+                    txn,
+                    change_id,
+                    &change,
+                    #[cfg(feature = "prototype-context-completion")]
+                    Some(&completion),
+                )?;
             }
             memo.fold(change_id, &change);
         }
@@ -2204,7 +2261,13 @@ impl Repository {
 
         let shared_cached_txn =
             CachedGraphTxn::new(&shared_txn).map_err(|e| RecordError::Database(e.to_string()))?;
-        let span_context = if span_recording {
+        let span_context = if span_recording
+            || status.entries().iter().any(|entry| {
+                matches!(
+                    entry.status(),
+                    FileStatus::Modified | FileStatus::Conflicted
+                )
+            }) {
             Some(
                 atomic_core::pristine::span_patch_storage::SpanRenderContext::new(
                     &shared_cached_txn,
@@ -3232,7 +3295,7 @@ impl Repository {
                 // state, so a positional diff against it can corrupt the file.
                 // We propagate the flag to `record_modified_file` via
                 // `force_whole_file_replace` below instead of diffing against it.
-                let span_state = match &span_context {
+                let mut span_state = match &span_context {
                     Some(context) => match context.record_state(file_inode) {
                         Ok(content) => content,
                         Err(error) => return ModifiedResult::Fatal(RecordError::Database(error.to_string())),
@@ -3244,6 +3307,12 @@ impl Repository {
                         Ok(None) => {}
                         Ok(Some(_)) => return ModifiedResult::Fatal(RecordError::Database(format!("span baseline changed while recording '{path}'"))),
                         Err(error) => return ModifiedResult::Fatal(RecordError::Database(error.to_string())),
+                    }
+                    if let Some(context)=&span_context {
+                        span_state=match context.legacy_record_state(file_inode) {
+                            Ok(state)=>state,
+                            Err(error)=>return ModifiedResult::Fatal(RecordError::Database(error.to_string())),
+                        };
                     }
                 }
                 let (old_content, had_fork_structure) = if let Some(state) = &span_state {
@@ -3277,27 +3346,53 @@ impl Repository {
                 // and a record indexing its old lines by the global alive rows
                 // bound its deletes to the wrong branches, which the next Git
                 // commit's staged replay then refused.
-                let existing_trunk_id = match self.canonical_semantic_trunk(&shared_txn, path, file_inode) {
-                    Ok(trunk) => trunk,
-                    Err(error) => return ModifiedResult::Error(path.clone(), error),
-                };
-                let existing_branches = match existing_trunk_id {
-                    Some(trunk_id) => match self.view_alive_branches_in_order(
-                        &shared_txn,
-                        &effective_view,
-                        &shared_graph_visibility,
-                        trunk_id,
-                    ) {
-                        Ok(alive) => alive,
-                        Err(error) => {
-                            return ModifiedResult::Error(
-                                path.clone(),
-                                format!("semantic state of '{path}' on the view: {error}"),
-                            )
+                let semantic: Result<_,String> = if span_state.as_ref().is_some_and(|state|state.legacy_graph || state.projected_semantics) {
+                    Ok((None,Vec::new()))
+                } else { (|| {
+                    let trunk=self.canonical_semantic_trunk(&shared_txn,path,file_inode)?;
+                    let branches=match trunk {
+                        Some(trunk)=>self.view_alive_branches_in_order(&shared_txn,&effective_view,&shared_graph_visibility,trunk)?,
+                        None=>Vec::new(),
+                    };
+                    Ok((trunk,branches))
+                })() };
+                let (mut existing_trunk_id,mut existing_branches)=match semantic {
+                    Ok(state)=>state,
+                    Err(error) if span_state.is_none()=>{
+                        let Some(context)=&span_context else{return ModifiedResult::Error(path.clone(),error);};
+                        match context.legacy_record_state(file_inode) {
+                            Ok(Some(state))=>{span_state=Some(state);(None,Vec::new())},
+                            Ok(None)=>return ModifiedResult::Error(path.clone(),error),
+                            Err(proof)=>return ModifiedResult::Error(path.clone(),format!("{error}; legacy range proof: {proof}")),
                         }
                     },
-                    None => Vec::new(),
+                    // The checked span baseline is authoritative. Retain old
+                    // numeric metadata, but do not invent a historical owner
+                    // or let an unusable CRDT cache prevent a range edit.
+                    Err(_) if span_state.is_some()=>(None,Vec::new()),
+                    Err(error)=>return ModifiedResult::Error(path.clone(),error),
                 };
+
+                // A syntactically valid legacy fold can still be bound to the
+                // wrong receiver-local trunk. Never derive new operations from
+                // that cache when it disagrees with the actual byte graph.
+                let unportable_trunk=match &span_context {
+                    Some(context)=>match context.has_unportable_legacy_trunk(file_inode) {Ok(value)=>value,Err(error)=>return ModifiedResult::Error(path.clone(),error.to_string())},
+                    None=>false,
+                };
+                let legacy_mismatch=unportable_trunk
+                    || (!existing_branches.is_empty() && existing_branches.len()!=atomic_core::diff::Line::from_bytes(&old_content).len());
+                if span_state.is_none() && !had_fork_structure && legacy_mismatch {
+                    if let Some(context)=&span_context {
+                        match context.legacy_record_state(file_inode) {
+                            Ok(Some(state)) if state.content==old_content=>{
+                                span_state=Some(state);existing_trunk_id=None;existing_branches.clear();
+                            },
+                            Ok(_)=>return ModifiedResult::Error(path.clone(),"legacy semantic cache has no matching authored baseline".into()),
+                            Err(error)=>return ModifiedResult::Error(path.clone(),error.to_string()),
+                        }
+                    }
+                }
 
                 // Reuse the CRDT-materialized baseline only when every existing
                 // branch belongs to a change visible on this view. That keeps
@@ -3768,6 +3863,66 @@ impl Repository {
             crate::record::merge_move_evidence(&mut change, &move_evidence)
                 .map_err(|error| RecordError::ChangeStore(error.to_string()))?;
         }
+        #[cfg(feature = "prototype-context-completion")]
+        if !span_recording {
+            use atomic_core::pristine::{CapabilityTxnT, PROTOTYPE_CONTEXT_CAPABILITY};
+            // Sandbox-only compatibility experiment; product integration must
+            // preserve the existing compact span recording path.
+            if shared_txn
+                .required_capability_version(PROTOTYPE_CONTEXT_CAPABILITY.id())
+                .map_err(|e| RecordError::Database(e.to_string()))?
+                .is_some()
+            {
+                let ids: std::collections::BTreeSet<_> = change
+                    .file_ops()
+                    .iter()
+                    .flat_map(|ops| ops.referenced_node_ids())
+                    .collect();
+                let mut owners = Vec::new();
+                for id in ids {
+                    if !shared_graph_visibility.contains(id) {
+                        return Err(RecordError::Database(
+                            "semantic owner is outside recording context".into(),
+                        ));
+                    }
+                    let owner = shared_txn
+                        .get_external(id)
+                        .map_err(|e| RecordError::Database(e.to_string()))?
+                        .ok_or_else(|| {
+                            RecordError::Database("semantic owner has no hash".into())
+                        })?;
+                    owners.push((id.get(), owner));
+                    change.hashed.dependencies.push(owner);
+                }
+                if !owners.is_empty() {
+                    change.hashed.hunks.push(GraphOp::PrototypeContext {
+                    effect: atomic_core::change::prototype_context::PrototypeContextEffect::DeclareOwnNames { owners },
+                });
+                    change.hashed.dependencies.sort();
+                    change.hashed.dependencies.dedup();
+                }
+            }
+        }
+        #[cfg(feature = "prototype-context-completion")]
+        {
+            let roots = shared_graph_visibility
+                .iter_dependency_first()
+                .filter(|id| !id.is_root())
+                .map(|id| {
+                    shared_txn
+                        .get_external(*id)
+                        .map_err(|e| RecordError::Database(e.to_string()))?
+                        .ok_or_else(|| RecordError::Database("visible context has no hash".into()))
+                })
+                .collect::<Result<Vec<_>, RecordError>>()?;
+            let completion = self.prototype_projection_for_hashes(&roots)?;
+            change
+                .hashed
+                .dependencies
+                .extend(completion.required_effects_for(self, &change)?);
+            change.hashed.dependencies.sort();
+            change.hashed.dependencies.dedup();
+        }
         // Application metadata (e.g. the CB-7B adoption attribution marker)
         // is part of the hashed change content: it is set before
         // serialization so the marker is content-addressed with the change
@@ -3776,7 +3931,7 @@ impl Repository {
         if !application_metadata.is_empty() {
             change.hashed.metadata = application_metadata.to_vec();
         }
-        if span_recording {
+        if span_recording || change.hashed.span.is_some() {
             lower_new_files_to_spans(&mut change)?;
             // Semantic IDs are repository-local. Carry their content-addressed
             // owners in the hashed span section so another repository can
@@ -3812,6 +3967,31 @@ impl Repository {
                 atomic_core::change::span_patch::SpanPatch::new(Vec::new(), Vec::new())
             });
             patch.semantic_owners = owners;
+            for op in &patch.ops {
+                if let atomic_core::change::span_patch::SpanOp::Edit { file, .. } = op {
+                    let origin = self.load_change(&file.owner)?;
+                    let root_path = origin.hashed.span.as_ref().and_then(|p| {
+                        p.ops.iter().find_map(|op| match op {
+                            atomic_core::change::span_patch::SpanOp::Root {
+                                ordinal, path, ..
+                            } if *ordinal == file.ordinal => Some(path),
+                            _ => None,
+                        })
+                    });
+                    let projected=change.hashed.file_ops.iter().any(|ops|matches!(ops.trunk_op(),Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit {file: bound,..}) if bound==file));
+                    if root_path.is_none()
+                        || (projected
+                            && root_path.is_some_and(|path| {
+                                origin
+                                    .file_ops()
+                                    .iter()
+                                    .any(|ops| ops.path() == path && ops.is_create())
+                            }))
+                    {
+                        patch.version = atomic_core::change::span_patch::LEGACY_SOURCE_VERSION;
+                    }
+                }
+            }
         }
         lifecycle.verify_promotion_content(&change, self)?;
         change = lifecycle.classify(change)?;
@@ -3995,6 +4175,36 @@ impl Repository {
                 }
                 let mut transitions = Vec::new();
                 let mut operation_changes = vec![computed_hash];
+                if outcome.change().hashed.span.as_ref().is_some_and(|p| {
+                    p.version == atomic_core::change::span_patch::LEGACY_SOURCE_VERSION
+                }) {
+                    use atomic_core::pristine::{
+                        CapabilityTxnT, SPAN_LEGACY_CONTEXT_CAPABILITY, SPAN_RANGE_CAPABILITY,
+                    };
+                    for cap in [SPAN_RANGE_CAPABILITY, SPAN_LEGACY_CONTEXT_CAPABILITY] {
+                        let old = txn
+                            .required_capability_version(cap.id())
+                            .map_err(|e| RecordError::Database(e.to_string()))?;
+                        if old != Some(cap.minimum_version()) {
+                            if old.is_some_and(|v| v > cap.minimum_version()) {
+                                return Err(RecordError::Database(
+                                    "unsupported span capability".into(),
+                                ));
+                            }
+                            transitions.push(MetadataTransition {
+                                target: MetadataTarget::Capability {
+                                    id: cap.id().into(),
+                                },
+                                expected_old: old
+                                    .map(|v| MetadataValue::Sequence(u64::from(v)))
+                                    .unwrap_or(MetadataValue::Absent),
+                                expected_new: MetadataValue::Sequence(u64::from(
+                                    cap.minimum_version(),
+                                )),
+                            });
+                        }
+                    }
+                }
                 if outcome.change().file_ops().iter().any(|ops| {
                     matches!(
                         ops.trunk_op(),
@@ -4209,7 +4419,16 @@ impl Repository {
         // for the file to be recognized as tracked with graph content.
         let mut apply_error = None;
         if options.get_apply_after_record() && outcome.was_saved() {
-            let apply_opts = InsertOptions::default().view(&target_view);
+            #[allow(unused_mut)]
+            let mut apply_opts = InsertOptions::default().view(&target_view);
+            #[cfg(feature = "prototype-context-completion")]
+            {
+                apply_opts.prototype_context = Some(self.prototype_projection_for_txn(
+                    &txn,
+                    &target_view,
+                    &[*outcome.hash()],
+                )?);
+            }
             let apply_t0 = std::time::Instant::now();
             #[cfg(test)]
             let inject_apply_failure = RECORD_APPLY_FAULT.with(|fault| fault.replace(false));

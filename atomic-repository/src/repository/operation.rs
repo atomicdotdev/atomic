@@ -970,7 +970,7 @@ impl Repository {
                 .get(&metadata_target)
                 .cloned()
                 .unwrap_or(MetadataValue::Absent);
-            if is_projected_semantic_capability(&metadata_target)
+            if is_permanent_span_context_capability(&metadata_target)
                 && matches!(observed, MetadataValue::Sequence(_))
                 && matches!(expected_new, MetadataValue::Absent)
             {
@@ -1026,7 +1026,7 @@ impl Repository {
                 .iter()
                 // Once a projected change is stored or indexed, older clients
                 // must remain fenced even after its view reference is undone.
-                .filter(|transition| !is_projected_semantic_capability(&transition.target))
+                .filter(|transition| !is_permanent_span_context_capability(&transition.target))
                 .map(|transition| MetadataTransition {
                     target: transition.target.clone(),
                     expected_old: transition.expected_new.clone(),
@@ -3520,7 +3520,7 @@ impl Repository {
             ) {
                 LeaseClassification::Apply => {}
                 LeaseClassification::AlreadyApplied => {
-                    if !is_projected_semantic_capability(&transition.target) {
+                    if !is_permanent_span_context_capability(&transition.target) {
                         metadata.push(MetadataTransition {
                             target: transition.target.clone(),
                             expected_old: transition.expected_new.clone(),
@@ -4054,7 +4054,9 @@ fn validate_capability_lease(
                     ),
                 });
             }
-            if is_projected_semantic_capability(target) && requested < supported.minimum_version() {
+            if is_permanent_span_context_capability(target)
+                && requested < supported.minimum_version()
+            {
                 return Err(RepositoryError::InvalidOperation {
                     message: "projected span semantic capability cannot be lowered".into(),
                 });
@@ -4062,7 +4064,7 @@ fn validate_capability_lease(
             Ok(())
         }
         MetadataValue::Absent => {
-            if is_projected_semantic_capability(target) {
+            if is_permanent_span_context_capability(target) {
                 return Err(RepositoryError::InvalidOperation {
                     message: "projected span semantic capability is permanent once installed"
                         .into(),
@@ -4085,8 +4087,10 @@ fn validate_capability_lease(
     }
 }
 
-fn is_projected_semantic_capability(target: &MetadataTarget) -> bool {
-    matches!(target, MetadataTarget::Capability { id } if id == atomic_core::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())
+fn is_permanent_span_context_capability(target: &MetadataTarget) -> bool {
+    matches!(target, MetadataTarget::Capability { id }
+        if id == atomic_core::pristine::SPAN_PROJECTED_SEMANTICS_CAPABILITY.id()
+        || id == atomic_core::pristine::SPAN_LEGACY_CONTEXT_CAPABILITY.id())
 }
 
 fn apply_metadata_value_in_write(

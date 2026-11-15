@@ -2284,6 +2284,28 @@ impl<'a> MutTxnT for WriteTxn<'a> {
 // txns and avoids needing a write_txn just to inspect CRDT state.
 
 impl crate::pristine::traits::CrdtTxnT for WriteTxn<'_> {
+    fn crdt_span_edit_authors(&self, trunk: crate::crdt::TrunkId) -> PristineResult<Vec<NodeId>> {
+        use crate::pristine::span_patch_storage::SpanPatchReadTxn;
+        let table = self.txn.open_table(INODE_TRUNK)?;
+        let mut authors = std::collections::BTreeSet::new();
+        for row in table.iter()? {
+            let (inode, stored) = row?;
+            if *stored.value() == trunk.to_bytes() {
+                let inode = crate::Inode::new(inode.value());
+                for (_, edit) in
+                    self.span_edits_for_inode(inode)
+                        .map_err(|e| PristineError::Inconsistent {
+                            message: e.to_string(),
+                        })?
+                {
+                    authors.insert(NodeId::new(u64::from_be_bytes(
+                        edit[16..24].try_into().unwrap(),
+                    )));
+                }
+            }
+        }
+        Ok(authors.into_iter().collect())
+    }
     fn get_crdt_trunk(&self, key: &[u8; 12]) -> PristineResult<Option<SerializedTrunk>> {
         let table = self.txn.open_table(TRUNKS)?;
         let result = match table.get(key)? {

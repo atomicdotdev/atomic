@@ -102,8 +102,11 @@ mod graph_op;
 mod header;
 mod local;
 pub mod ops;
+#[cfg(feature = "prototype-context-completion")]
+pub mod prototype_context;
 mod provenance;
 pub mod provenance_graph;
+pub mod semantic_context;
 pub mod session;
 pub mod signing;
 pub mod span_patch;

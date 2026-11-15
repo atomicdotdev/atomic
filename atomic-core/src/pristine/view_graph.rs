@@ -415,6 +415,12 @@ impl<'a, T: TreeTxnT> TreeTxnT for ViewGraph<'a, T> {
 // ─────────────────────────────────────────────────────────────────────────
 
 impl<'a, T: crate::pristine::CrdtTxnT> crate::pristine::CrdtTxnT for ViewGraph<'a, T> {
+    fn crdt_span_edit_authors(
+        &self,
+        trunk: crate::crdt::TrunkId,
+    ) -> Result<Vec<NodeId>, PristineError> {
+        self.inner.crdt_span_edit_authors(trunk)
+    }
     fn get_crdt_trunk(
         &self,
         key: &[u8; 12],

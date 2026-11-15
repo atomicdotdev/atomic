@@ -1083,8 +1083,7 @@ where
         return Ok(None);
     }
     atomic_core::pristine::span_patch_storage::SpanRenderContext::new(txn, store, visibility)
-        .and_then(|context| context.render(inode))
-        .map(Some)
+        .and_then(|context| context.render_if_visible(inode))
         .map_err(|error| RepositoryError::Database(error.to_string()))
 }
 
@@ -1141,8 +1140,7 @@ where
             return Ok(None);
         }
         self.context()?
-            .render(inode)
-            .map(Some)
+            .render_if_visible(inode)
             .map_err(|error| RepositoryError::Database(error.to_string()))
     }
 
@@ -1209,9 +1207,17 @@ where
     if !has_visible_span_root(txn, store, inode, visibility)? {
         return Ok(None);
     }
-    let rendered = SpanRenderContext::new(txn, store, visibility)
-        .and_then(|context| context.render_bounded(inode, max_bytes))
-        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+    let context = SpanRenderContext::new(txn, store, visibility)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+    if !context
+        .has_visible_content(inode)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?
+    {
+        return Ok(None);
+    }
+    let rendered = context
+        .render_bounded(inode, max_bytes)
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
     Ok(Some(match rendered {
         BoundedSpanContent::Complete(bytes) => BoundedContent::Complete(bytes),
         BoundedSpanContent::Oversized { retained_bytes } => {
@@ -1262,7 +1268,28 @@ where
                 }
             }
         }
-        return Ok(false);
+        use atomic_core::pristine::SPAN_LEGACY_CONTEXT_CAPABILITY;
+        return match txn
+            .required_capability_version(SPAN_LEGACY_CONTEXT_CAPABILITY.id())
+            .map_err(|e| RepositoryError::Database(e.to_string()))?
+        {
+            None => {
+                if !txn
+                    .span_edits_for_inode(inode)
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?
+                    .is_empty()
+                {
+                    return Err(RepositoryError::Database(
+                        "legacy span index has no matching repository capability".into(),
+                    ));
+                }
+                Ok(false)
+            }
+            Some(1) => Ok(true),
+            Some(_) => Err(RepositoryError::Database(
+                "unsupported legacy span context capability".into(),
+            )),
+        };
     };
     if !matches!(capability, Some(2) | Some(3)) {
         return Err(RepositoryError::Database(

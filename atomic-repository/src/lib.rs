@@ -167,6 +167,9 @@ pub use manifest::{ManifestError, ViewManifest};
 // Repository exports
 pub use repository::*;
 
+#[cfg(feature = "prototype-context-completion")]
+mod context_witness_prototype;
+
 // Vault name generation
 pub use repository::generate_goal_name;
 

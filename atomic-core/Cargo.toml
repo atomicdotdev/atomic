@@ -65,5 +65,6 @@ syn = "2"
 
 [features]
 default = []
+prototype-context-completion = []
 # Enable additional debug assertions
 debug-checks = []
