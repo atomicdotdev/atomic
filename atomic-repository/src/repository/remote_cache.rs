@@ -665,11 +665,6 @@ impl Repository {
                 Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
             )
         }) {
-            if cfg!(not(unix)) {
-                return Ok(Err(SubmitRejection::Malformed(
-                    "projected semantic submission is not supported on this platform".into(),
-                )));
-            }
             if change.hashed.span.is_none() {
                 return Ok(Err(SubmitRejection::Malformed(
                     "projected semantic edit requires a span change".into(),

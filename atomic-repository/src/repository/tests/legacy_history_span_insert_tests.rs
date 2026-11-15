@@ -175,3 +175,59 @@ fn span_insert_still_refuses_a_dependency_stored_under_the_wrong_hash() {
         .insert_change_rec(&span_edit, InsertOptions::default())
         .is_err());
 }
+
+/// A span edit of a file from pre-0.20 history may land together with a mode
+/// change of that file. The file still has a CRDT trunk, but the projected
+/// edit must stay the path's only semantic operation, with the mode recorded
+/// on the graph inode. Windows always takes this path: it observes a writable
+/// file as 0o666, which differs from the default mode of a file whose history
+/// carries no mode attribute.
+#[cfg(unix)]
+#[test]
+fn span_edit_of_pre_0_20_file_records_together_with_a_mode_change() {
+    use atomic_core::change::{GraphOp, InodeAttr};
+    use std::os::unix::fs::PermissionsExt;
+
+    let (sender_dir, sender, legacy) = repo_with_legacy_history();
+    enable_spans(&sender);
+    let path = sender_dir.path().join("a.txt");
+    std::fs::write(&path, EDITED_CONTENT).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let span_edit = record_all(&sender, "span edit and mode change");
+
+    let change = sender.load_change(&span_edit).unwrap();
+    assert!(
+        change.hashed.span.is_some(),
+        "the edit must be a span change"
+    );
+    assert!(change.dependencies().contains(&legacy));
+    assert_eq!(
+        change
+            .file_ops()
+            .iter()
+            .filter(|ops| ops.path() == "a.txt")
+            .count(),
+        1,
+        "the projected edit is the path's only semantic operation"
+    );
+    assert!(
+        change.hunks().iter().any(|hunk| matches!(
+            hunk,
+            GraphOp::SetAttr {
+                value: InodeAttr::Mode(0o755),
+                ..
+            }
+        )),
+        "the mode change is recorded on the graph inode"
+    );
+    assert_eq!(content(&sender, "dev"), EDITED_CONTENT);
+
+    let (_receiver_dir, receiver, _) = repo_with_legacy_history();
+    receiver
+        .import_change_bytes(&span_edit, &span_edit_bytes(&sender, &span_edit))
+        .unwrap();
+    receiver
+        .insert_change_rec(&span_edit, InsertOptions::default())
+        .unwrap();
+    assert_eq!(content(&receiver, "dev"), EDITED_CONTENT);
+}

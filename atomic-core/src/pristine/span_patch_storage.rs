@@ -18,6 +18,8 @@ use redb::{MultimapTableDefinition, ReadableMultimapTable, ReadableTable, TableD
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+mod legacy;
+pub use legacy::LegacySpanGraph;
 
 pub(super) const FILES: TableDefinition<&[u8; 36], u64> =
     TableDefinition::new("span_patch_files_v1");
@@ -50,6 +52,70 @@ fn span_key(inode: Inode, owner: NodeId, start: u64, end: u64) -> [u8; 32] {
         .expect("fixed span key size")
 }
 
+/// Bind only the canonical legacy FileAdd identity needed by a version-3 span
+/// edit. This is a small derived index, never content or a numeric-name alias.
+/// The caller must abort the transaction if subsequent validation refuses.
+pub fn prepare_legacy_files<S: ChangeStore>(
+    txn: &mut WriteTxn<'_>,
+    store: &S,
+    change: &Change,
+) -> Result<()> {
+    let Some(patch) = &change.hashed.span else {
+        return Ok(());
+    };
+    if patch.version != crate::change::span_patch::LEGACY_SOURCE_VERSION {
+        return Ok(());
+    }
+    ensure!(
+        txn.legacy_span_enabled()?,
+        "legacy span context capability missing"
+    );
+    let ids = change
+        .dependencies()
+        .iter()
+        .map(|hash| {
+            txn.get_internal(hash)?
+                .context("legacy span dependency missing")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let deps = EffectiveProjectionClosure::try_from_membership(
+        txn,
+        &ViewMembershipSet::from_ordered(ids),
+    )?;
+    for op in &patch.ops {
+        if let SpanOp::Edit { file, .. } = op {
+            if txn.span_file_inode(file)?.is_none() {
+                let source = store.get_verified_change(&file.owner)?;
+                source.check_hash(&file.owner)?;
+                let meta = legacy::metadata(file.owner, source.change());
+                let pos = meta
+                    .file_position(file.ordinal)
+                    .context("legacy file ordinal has no FileAdd")?;
+                ensure!(
+                    source.change().hashed.span.is_none(),
+                    "typed span file index is missing; legacy identity cannot replace it"
+                );
+                let owner = txn
+                    .get_internal(&file.owner)?
+                    .context("legacy file owner missing")?;
+                ensure!(
+                    deps.contains(owner),
+                    "legacy file owner outside dependency closure"
+                );
+                let inode = super::TreeTxnT::position_inode(
+                    txn,
+                    crate::Position::new(owner, crate::ChangePosition::new(pos)),
+                )?
+                .context("legacy canonical inode missing")?;
+                txn.txn
+                    .open_table(FILES)?
+                    .insert(&file_key(file), inode.get())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Index a registered change under the same transaction as its namespace and
 /// view publication. Root inode bindings must come from the namespace writer.
 /// The caller must abort the transaction if this function returns an error.
@@ -61,7 +127,12 @@ pub fn index_change<S: ChangeStore>(
     change: &Change,
     root_inodes: &BTreeMap<u32, Inode>,
 ) -> Result<()> {
-    ensure!(change.hash()? == hash, "change/hash mismatch");
+    let verified = store.get_verified_change(&hash)?;
+    verified.check_hash(&hash)?;
+    ensure!(
+        verified.change().hashed == change.hashed && verified.change().contents == change.contents,
+        "change differs from its verified original encoding"
+    );
     let patch = change
         .hashed
         .span
@@ -88,6 +159,7 @@ pub fn index_change<S: ChangeStore>(
         txn,
         &ViewMembershipSet::from_ordered(dep_ids),
     )?;
+    prepare_legacy_files(txn, store, change)?;
     validate_projected_semantics(txn, store, change, &dependencies)?;
     let already = txn.txn.open_table(APPLIED)?.get(id.get())?.is_some();
     if already {
@@ -121,7 +193,13 @@ pub fn index_change<S: ChangeStore>(
                     "file identity already exists"
                 );
             }
-            SpanOp::Edit { file, target, .. } => {
+            SpanOp::Edit {
+                file,
+                target,
+                start: edit_start,
+                end: edit_end,
+                ..
+            } => {
                 let file_owner = txn
                     .get_internal(&file.owner)?
                     .context("file owner missing")?;
@@ -135,17 +213,43 @@ pub fn index_change<S: ChangeStore>(
                 let inode = txn
                     .span_file_inode(file)?
                     .context("file identity missing")?;
+                let verified = store.get_verified_change(&target.owner)?;
+                verified.check_hash(&target.owner)?;
+                let source = verified.change();
+                source
+                    .contents
+                    .get(usize::try_from(target.start)?..usize::try_from(target.end)?)
+                    .context("authored target is outside original content")?;
+                if txn.span_root(inode)?.is_none() {
+                    ensure!(
+                        patch.version == crate::change::span_patch::LEGACY_SOURCE_VERSION,
+                        "legacy range requires span payload version 3"
+                    );
+                    use crate::crdt::TrunkOp;
+                    ensure!(change.file_ops().iter().any(|ops| matches!(ops.trunk_op(),Some(TrunkOp::ProjectedSpanEdit {file: bound,..}) if bound==file)),"legacy span edit requires a checked semantic baseline");
+                    let context = SpanRenderContext::new(txn, store, &dependencies)?;
+                    let state = context
+                        .legacy_record_state(inode)?
+                        .context("legacy dependency baseline missing")?;
+                    ensure!(
+                        state.file == *file
+                            && legacy::covers(&state, target, *edit_start, *edit_end),
+                        "legacy span edit addresses bytes outside its dependency baseline"
+                    );
+                    let position = txn
+                        .legacy_span_position(inode)?
+                        .context("legacy inode position missing")?;
+                    let root_hash = txn
+                        .get_external(position.change)?
+                        .context("legacy creator hash missing")?;
+                    let meta = legacy::metadata(target.owner, source);
+                    if meta.contains(root_hash, position.pos.get(), target.start, target.end) {
+                        continue;
+                    }
+                }
                 ensure!(
-                    txn.txn
-                        .open_table(SPANS)?
-                        .get(&span_key(inode, target_owner, target.start, target.end))?
-                        .is_some(),
+                    txn.span_exists(&span_key(inode, target_owner, target.start, target.end))?,
                     "target span missing"
-                );
-                let source = store.get_change(&target.owner)?;
-                ensure!(
-                    source.hash()? == target.owner,
-                    "target change hash mismatch"
                 );
                 let source_patch = source
                     .hashed
@@ -318,9 +422,13 @@ pub fn validate_projected_semantics<S: ChangeStore, T: SpanPatchReadTxn + super:
         let inode = txn
             .span_file_inode(file)?
             .context("projected semantic file missing")?;
-        let state = context
-            .record_state(inode)?
-            .context("projected semantic file is outside the dependency closure")?;
+        let state = match context.record_state(inode)? {
+            Some(state) => state,
+            None if patch.version == crate::change::span_patch::LEGACY_SOURCE_VERSION => context
+                .legacy_record_state(inode)?
+                .context("legacy projected baseline missing")?,
+            None => bail!("projected semantic file is outside the dependency closure"),
+        };
         ensure!(
             state.file == *file,
             "projected semantic file identity differs from span root"
@@ -335,6 +443,24 @@ pub fn validate_projected_semantics<S: ChangeStore, T: SpanPatchReadTxn + super:
 
 /// Span index reads bound to the transaction used for visibility.
 pub trait SpanPatchReadTxn: GraphTxnT {
+    fn projected_span_enabled(&self) -> Result<bool> {
+        Ok(false)
+    }
+    fn legacy_span_position(&self, _inode: Inode) -> Result<Option<crate::Position<NodeId>>> {
+        Ok(None)
+    }
+    fn legacy_span_enabled(&self) -> Result<bool> {
+        Ok(false)
+    }
+    /// A checked, unambiguous legacy byte graph. Native implementations use
+    /// canonical inode positions; no CRDT numeric identities are interpreted.
+    fn legacy_span_graph(
+        &self,
+        _inode: Inode,
+        _visible: &EffectiveProjectionClosure,
+    ) -> Result<Option<LegacySpanGraph>> {
+        Ok(None)
+    }
     /// Whether the change's span operations were indexed transactionally.
     fn span_change_indexed(&self, change: NodeId) -> Result<bool>;
     /// The file's initial authored span, if indexed.
@@ -352,6 +478,39 @@ pub trait SpanPatchReadTxn: GraphTxnT {
 macro_rules! impl_span_read {
     ($txn:ty) => {
         impl SpanPatchReadTxn for $txn {
+            fn projected_span_enabled(&self) -> Result<bool> {
+                use super::CapabilityTxnT;
+                match self
+                    .required_capability_version(super::SPAN_PROJECTED_SEMANTICS_CAPABILITY.id())?
+                {
+                    None => Ok(false),
+                    Some(1) => Ok(true),
+                    Some(_) => bail!("unsupported projected span semantic capability"),
+                }
+            }
+            fn legacy_span_position(
+                &self,
+                inode: Inode,
+            ) -> Result<Option<crate::Position<NodeId>>> {
+                Ok(super::TreeTxnT::inode_position(self, inode)?)
+            }
+            fn legacy_span_enabled(&self) -> Result<bool> {
+                use super::CapabilityTxnT;
+                match self
+                    .required_capability_version(super::SPAN_LEGACY_CONTEXT_CAPABILITY.id())?
+                {
+                    None => Ok(false),
+                    Some(1) => Ok(true),
+                    Some(_) => bail!("unsupported legacy span context capability"),
+                }
+            }
+            fn legacy_span_graph(
+                &self,
+                inode: Inode,
+                visible: &EffectiveProjectionClosure,
+            ) -> Result<Option<LegacySpanGraph>> {
+                legacy::retrieve(self, inode, visible)
+            }
             fn span_change_indexed(&self, change: NodeId) -> Result<bool> {
                 let table = match self.txn.open_table(APPLIED) {
                     Ok(table) => table,
@@ -428,6 +587,22 @@ impl_span_read!(ReadTxn);
 impl_span_read!(WriteTxn<'_>);
 
 impl SpanPatchReadTxn for CachedGraphTxn<'_> {
+    fn projected_span_enabled(&self) -> Result<bool> {
+        self.txn.projected_span_enabled()
+    }
+    fn legacy_span_position(&self, inode: Inode) -> Result<Option<crate::Position<NodeId>>> {
+        self.txn.legacy_span_position(inode)
+    }
+    fn legacy_span_enabled(&self) -> Result<bool> {
+        self.txn.legacy_span_enabled()
+    }
+    fn legacy_span_graph(
+        &self,
+        inode: Inode,
+        visible: &EffectiveProjectionClosure,
+    ) -> Result<Option<LegacySpanGraph>> {
+        self.txn.legacy_span_graph(inode, visible)
+    }
     fn span_change_indexed(&self, change: NodeId) -> Result<bool> {
         self.txn.span_change_indexed(change)
     }
@@ -458,6 +633,7 @@ struct RenderChange {
     contents: Vec<u8>,
     dependencies: Vec<Hash>,
     span: Option<SpanPatch>,
+    legacy: legacy::LegacyMetadata,
 }
 
 type ExpectedEdits = HashMap<u64, BTreeSet<([u8; 32], [u8; 40])>>;
@@ -638,6 +814,7 @@ pub struct SpanRenderContext<'a, T: SpanPatchReadTxn> {
     expected: ExpectedEdits,
     proof: Option<CausalProof>,
     metrics: SpanContextBuildMetrics,
+    projected_files: BTreeSet<[u8; 36]>,
 }
 
 /// A bounded render never retains more than the requested number of bytes.
@@ -660,6 +837,10 @@ pub struct VisibleSpan {
 
 /// A verified recording baseline and its visible authored ranges.
 pub struct SpanRecordState {
+    /// The baseline is the original legacy byte graph, not fabricated CRDT rows.
+    pub legacy_graph: bool,
+    /// A selected authored change already uses range-derived semantics.
+    pub projected_semantics: bool,
     /// Portable file identity.
     pub file: ExternalFile,
     /// Original authored span, including for an empty file.
@@ -1048,6 +1229,7 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
             ..Default::default()
         };
         let mut changes = HashMap::new();
+        let mut projected_files = BTreeSet::new();
         let mut expected = ExpectedEdits::new();
         let ids: Vec<_> = visible.iter_dependency_first().copied().collect();
         metrics.changes = ids.len();
@@ -1088,6 +1270,7 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
                             contents: change.contents.clone(),
                             dependencies: change.hashed.dependencies.clone(),
                             span: change.hashed.span.clone(),
+                            legacy: legacy::metadata(hash, change),
                         }),
                     ))
                 })
@@ -1095,6 +1278,11 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
             metrics.verify_hashes += phase.elapsed();
             for (id, loaded) in batch.iter().zip(loaded) {
                 let (hash, change) = loaded?;
+                ensure!(
+                    change.legacy.projected_files.is_empty() || txn.projected_span_enabled()?,
+                    "projected span semantic capability missing"
+                );
+                projected_files.extend(change.legacy.projected_files.iter().map(file_key));
                 let phase = Instant::now();
                 let mut indexed = txn.get_change_deps(*id)?;
                 metrics.dependency_reads += 1;
@@ -1126,6 +1314,11 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
                 changes.insert(hash, Arc::clone(&change));
                 let phase = Instant::now();
                 if let Some(patch) = &change.span {
+                    ensure!(
+                        patch.version != crate::change::span_patch::LEGACY_SOURCE_VERSION
+                            || txn.legacy_span_enabled()?,
+                        "legacy span context capability missing"
+                    );
                     for op in &patch.ops {
                         if let SpanOp::Edit {
                             file,
@@ -1179,6 +1372,7 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
             expected,
             proof,
             metrics,
+            projected_files,
         })
     }
 
@@ -1187,9 +1381,28 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
         &self.metrics
     }
 
+    /// Detect an inconsistent old numeric trunk against its actual graph inode.
+    /// Equality alone is not a provider proof and never supplies a substitution.
+    pub fn has_unportable_legacy_trunk(&self, inode: Inode) -> Result<bool> {
+        let Some(pos) = self.txn.legacy_span_position(inode)? else {
+            return Ok(false);
+        };
+        let owner = self
+            .txn
+            .get_external(pos.change)?
+            .context("legacy inode owner missing")?;
+        Ok(self
+            .changes
+            .values()
+            .any(|c| c.legacy.mismatched_trunk(owner, pos.pos.get(), pos.change)))
+    }
+
     /// Render an indexed root when its creating change is visible.
     pub fn render_if_visible(&self, inode: Inode) -> Result<Option<Vec<u8>>> {
         let Some(root) = self.txn.span_root(inode)? else {
+            if self.txn.legacy_span_enabled()? && self.expected.contains_key(&inode.get()) {
+                return Ok(self.legacy_record_state(inode)?.map(|state| state.content));
+            }
             return Ok(None);
         };
         if !self.visible.contains(NodeId::new(root[0])) {
@@ -1198,9 +1411,21 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
         self.render(inode).map(Some)
     }
 
+    /// Whether this closure contains a typed root or range edits over a legacy
+    /// graph. Unrelated legacy files keep their existing graph interpretation.
+    pub fn has_visible_content(&self, inode: Inode) -> Result<bool> {
+        if let Some(root) = self.txn.span_root(inode)? {
+            return Ok(self.visible.contains(NodeId::new(root[0])));
+        }
+        Ok(self.txn.legacy_span_enabled()? && self.expected.contains_key(&inode.get()))
+    }
+
     /// Obtain byte-to-span mappings under this exact view closure.
     pub fn record_state(&self, inode: Inode) -> Result<Option<SpanRecordState>> {
         let Some(root) = self.txn.span_root(inode)? else {
+            if self.txn.legacy_span_enabled()? && self.expected.contains_key(&inode.get()) {
+                return self.legacy_record_state(inode);
+            }
             return Ok(None);
         };
         if !self.visible.contains(NodeId::new(root[0])) {
@@ -1256,7 +1481,10 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
                 );
             }
         }
+        let projected_semantics = self.projected_files.contains(&file_key(&file));
         Ok(Some(SpanRecordState {
+            legacy_graph: false,
+            projected_semantics,
             file,
             root: ExternalSpan {
                 owner,
@@ -1269,8 +1497,24 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
         }))
     }
 
+    /// Read an old graph as authored ranges without trusting sender-local CRDT
+    /// names or copying its content into another persisted representation.
+    pub fn legacy_record_state(&self, inode: Inode) -> Result<Option<SpanRecordState>> {
+        let Some(base) = legacy::record_state(self, inode)? else {
+            return Ok(None);
+        };
+        self.render_legacy_state(inode, base, usize::MAX)
+            .map(|(state, _)| Some(state))
+    }
+
     /// Render the visible span tree for an inode.
     pub fn render(&self, inode: Inode) -> Result<Vec<u8>> {
+        if self.txn.span_root(inode)?.is_none() && self.txn.legacy_span_enabled()? {
+            return Ok(self
+                .legacy_record_state(inode)?
+                .context("legacy span baseline missing")?
+                .content);
+        }
         let (content, oversized) = self.render_internal(inode, None, usize::MAX)?;
         ensure!(!oversized, "span render exceeds addressable memory");
         Ok(content)
@@ -1279,6 +1523,18 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
     /// Render at most `max_bytes`, validating the complete span tree even when
     /// the visible file is too large to retain.
     pub fn render_bounded(&self, inode: Inode, max_bytes: usize) -> Result<BoundedSpanContent> {
+        if self.txn.span_root(inode)?.is_none() && self.txn.legacy_span_enabled()? {
+            let base =
+                legacy::layout(self, inode, false)?.context("legacy bounded baseline missing")?;
+            let (state, oversized) = self.render_legacy_state(inode, base, max_bytes)?;
+            return Ok(if oversized {
+                BoundedSpanContent::Oversized {
+                    retained_bytes: state.content.len(),
+                }
+            } else {
+                BoundedSpanContent::Complete(state.content)
+            });
+        }
         let (content, oversized) = self.render_internal(inode, None, max_bytes)?;
         if oversized {
             Ok(BoundedSpanContent::Oversized {
@@ -1349,6 +1605,7 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
             limit: max_bytes,
             oversized: false,
             segments,
+            applied: BTreeSet::new(),
         };
         self.render_spans(inode, root, &mut out)?;
         Ok((out.bytes, out.oversized))
@@ -1380,13 +1637,34 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
         let owner = NodeId::new(owner);
         ensure!(self.visible.contains(owner), "span outside view");
         let key = span_key(inode, owner, start, end);
-        ensure!(self.txn.span_exists(&key)?, "span index row missing");
+        let indexed = self.txn.span_exists(&key)?;
         let hash = self.txn.get_external(owner)?.context("span hash missing")?;
         let change = Arc::clone(
             self.changes
                 .get(&hash)
                 .context("span change outside closure")?,
         );
+        if !indexed {
+            ensure!(self.txn.legacy_span_enabled()?, "span index row missing");
+            ensure!(
+                self.txn.span_root(inode)?.is_none(),
+                "typed span index row missing"
+            );
+            let position = self
+                .txn
+                .legacy_span_position(inode)?
+                .context("legacy span inode missing")?;
+            let file_owner = self
+                .txn
+                .get_external(position.change)?
+                .context("legacy file owner missing")?;
+            ensure!(
+                change
+                    .legacy
+                    .contains(file_owner, position.pos.get(), start, end),
+                "legacy span has no authored graph declaration"
+            );
+        }
         let (start, end) = (usize::try_from(start)?, usize::try_from(end)?);
         change
             .contents
@@ -1438,21 +1716,69 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
             cursor: 0,
             previous: None,
             covered: None,
+            limit: end - start,
         })
     }
 
     fn render_spans(&self, inode: Inode, root: [u64; 3], out: &mut RenderOutput<'_>) -> Result<()> {
+        self.render_span_slice(inode, root, None, out)
+    }
+
+    fn render_span_slice(
+        &self,
+        inode: Inode,
+        root: [u64; 3],
+        bounds: Option<(usize, usize)>,
+        out: &mut RenderOutput<'_>,
+    ) -> Result<()> {
         let mut active = BTreeSet::new();
         active.insert(root);
-        let mut stack = vec![self.frame(inode, root)?];
+        let mut frame = self.frame(inode, root)?;
+        if let Some((start, end)) = bounds {
+            ensure!(
+                start <= end && end <= frame.end - frame.start,
+                "invalid visible legacy range"
+            );
+            let mut edits = Vec::new();
+            for row in frame.edits {
+                let (lo, hi) = (usize::try_from(row[0])?, usize::try_from(row[1])?);
+                let relevant = if lo == hi {
+                    start <= lo && lo <= end
+                } else {
+                    lo < end && start < hi
+                };
+                if relevant {
+                    ensure!(
+                        start <= lo && hi <= end,
+                        "span edit overlaps an unavailable legacy range"
+                    );
+                    edits.push(row);
+                }
+            }
+            frame.edits = edits;
+            frame.cursor = start;
+            frame.limit = end;
+        }
+        let mut stack = vec![frame];
         while let Some(frame) = stack.last_mut() {
             if frame.next == frame.edits.len() {
-                append_visible(frame, frame.cursor, frame.end - frame.start, out);
+                append_visible(frame, frame.cursor, frame.limit, out);
                 active.remove(&frame.span);
                 stack.pop();
                 continue;
             }
             let [lo, hi, author, insert_start, insert_end] = frame.edits[frame.next];
+            out.applied.insert((
+                span_key(
+                    inode,
+                    NodeId::new(frame.span[0]),
+                    frame.span[1],
+                    frame.span[2],
+                ),
+                words([lo, hi, author, insert_start, insert_end])
+                    .try_into()
+                    .unwrap(),
+            ));
             frame.next += 1;
             let (lo, hi) = (usize::try_from(lo)?, usize::try_from(hi)?);
             ensure!(
@@ -1505,6 +1831,85 @@ impl<'a, T: SpanPatchReadTxn> SpanRenderContext<'a, T> {
         }
         Ok(())
     }
+
+    fn render_legacy_state(
+        &self,
+        inode: Inode,
+        mut base: SpanRecordState,
+        max_bytes: usize,
+    ) -> Result<(SpanRecordState, bool)> {
+        let expected = self.expected.get(&inode.get()).cloned().unwrap_or_default();
+        let observed = self
+            .txn
+            .span_edits_for_inode(inode)?
+            .into_iter()
+            .filter(|(_, row)| {
+                self.visible
+                    .contains(NodeId::new(decode_words::<5>(row)[2]))
+            })
+            .collect::<BTreeSet<_>>();
+        ensure!(
+            expected == observed,
+            "visible legacy span index differs from hashed changes"
+        );
+        if expected.is_empty()
+            && base.content.len() == base.spans.last().map(|s| s.output.end).unwrap_or(0)
+            && base.content.len() <= max_bytes
+        {
+            return Ok((base, false));
+        }
+        let mut spans = Vec::new();
+        let mut out = RenderOutput {
+            bytes: Vec::new(),
+            limit: max_bytes,
+            oversized: false,
+            segments: Some(&mut spans),
+            applied: BTreeSet::new(),
+        };
+        let root_owner = self
+            .txn
+            .get_internal(&base.root.owner)?
+            .context("legacy root owner missing")?;
+        self.render_spans(
+            inode,
+            [root_owner.get(), base.root.start, base.root.end],
+            &mut out,
+        )?;
+        for span in &base.spans {
+            let owner = self
+                .txn
+                .get_internal(&span.target.owner)?
+                .context("legacy range owner missing")?;
+            let start = usize::try_from(span.target_start)?;
+            let end = start + span.output.len();
+            self.render_span_slice(
+                inode,
+                [owner.get(), span.target.start, span.target.end],
+                Some((start, end)),
+                &mut out,
+            )?;
+        }
+        ensure!(
+            out.applied == expected,
+            "span edit target is no longer reachable in the legacy graph"
+        );
+        let oversized = out.oversized;
+        let content = std::mem::take(&mut out.bytes);
+        drop(out);
+        base.content = content;
+        base.spans = spans;
+        for (_, row) in expected {
+            let author = NodeId::new(decode_words::<5>(&row)[2]);
+            base.dependencies.push(
+                self.txn
+                    .get_external(author)?
+                    .context("legacy span edit owner missing")?,
+            );
+        }
+        base.dependencies.sort();
+        base.dependencies.dedup();
+        Ok((base, oversized))
+    }
 }
 
 struct RenderFrame {
@@ -1518,6 +1923,7 @@ struct RenderFrame {
     cursor: usize,
     previous: Option<(usize, usize, u64)>,
     covered: Option<(usize, usize, u64)>,
+    limit: usize,
 }
 
 struct RenderOutput<'a> {
@@ -1525,6 +1931,7 @@ struct RenderOutput<'a> {
     limit: usize,
     oversized: bool,
     segments: Option<&'a mut Vec<VisibleSpan>>,
+    applied: BTreeSet<([u8; 32], [u8; 40])>,
 }
 
 fn append_visible(frame: &RenderFrame, start: usize, end: usize, out: &mut RenderOutput<'_>) {
@@ -1570,6 +1977,8 @@ mod tests {
             end: 20,
         };
         SpanRecordState {
+            legacy_graph: false,
+            projected_semantics: false,
             file: ExternalFile {
                 owner: first,
                 ordinal: 0,
@@ -1702,6 +2111,8 @@ mod tests {
             end: content.len() as u64,
         };
         let state = SpanRecordState {
+            legacy_graph: false,
+            projected_semantics: false,
             file: ExternalFile { owner, ordinal: 7 },
             root: root.clone(),
             spans: vec![VisibleSpan {
@@ -1787,6 +2198,8 @@ mod tests {
             end: content.len() as u64,
         };
         let state = SpanRecordState {
+            legacy_graph: false,
+            projected_semantics: false,
             file: ExternalFile { owner, ordinal: 0 },
             root: root.clone(),
             spans: (0..content.len())
@@ -1830,6 +2243,8 @@ mod tests {
         let first = Hash::of(b"first newline author");
         let second = Hash::of(b"second newline author");
         let mut state = SpanRecordState {
+            legacy_graph: false,
+            projected_semantics: false,
             file: ExternalFile {
                 owner: first,
                 ordinal: 0,
@@ -1966,15 +2381,16 @@ mod tests {
 
     #[test]
     fn independent_span_edits_render_in_both_insert_orders() -> Result<()> {
+        type ProjectionIds = (
+            SpanProjectionId,
+            Vec<(SpanProjectionId, Vec<SpanProjectionId>)>,
+        );
         fn projection_ids(
             repo: &Pristine,
             store: &MemoryChangeStore,
             view_name: &str,
             inode: Inode,
-        ) -> Result<(
-            SpanProjectionId,
-            Vec<(SpanProjectionId, Vec<SpanProjectionId>)>,
-        )> {
+        ) -> Result<ProjectionIds> {
             let txn = repo.read_txn()?;
             let view = txn.get_view(view_name)?.context("view missing")?;
             let visible = EffectiveProjectionClosure::try_from_membership(

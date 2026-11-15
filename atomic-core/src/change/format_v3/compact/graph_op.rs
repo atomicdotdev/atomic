@@ -195,6 +195,11 @@ pub enum CompactGraphOp {
         /// Canonical attribute value.
         value: InodeAttr,
     },
+    /// Private experimental sandbox operation; not a production discriminant.
+    #[cfg(feature = "prototype-context-completion")]
+    PrototypeContext {
+        effect: crate::change::prototype_context::PrototypeContextEffect,
+    },
 }
 
 impl CompactGraphOp {
@@ -273,6 +278,8 @@ impl CompactGraphOp {
             | CompactGraphOp::ResurrectZombies { local, .. } => Some(&local.path),
             CompactGraphOp::SetAttr { path, .. } => Some(path),
             CompactGraphOp::AddRoot { .. } | CompactGraphOp::DelRoot { .. } => None,
+            #[cfg(feature = "prototype-context-completion")]
+            CompactGraphOp::PrototypeContext { .. } => None,
         }
     }
 
@@ -296,6 +303,8 @@ impl CompactGraphOp {
             CompactGraphOp::AddRoot { .. } => "AddRoot",
             CompactGraphOp::DelRoot { .. } => "DelRoot",
             CompactGraphOp::SetAttr { .. } => "SetAttr",
+            #[cfg(feature = "prototype-context-completion")]
+            CompactGraphOp::PrototypeContext { .. } => "PrototypeContext",
         }
     }
 }

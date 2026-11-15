@@ -18,6 +18,16 @@ use crate::pristine::error::PristineError;
 /// hold the txn behind a shared borrow while iterating CRDT state, which is
 /// the natural fit for output walkers and record-side lookups.
 pub trait CrdtTxnT {
+    /// Authors of indexed span edits for an ambient trunk. Raw output checks
+    /// their immutable semantic declarations before trusting retained cache rows.
+    /// Backends without span storage return an empty list.
+    fn crdt_span_edit_authors(
+        &self,
+        _trunk: crate::crdt::TrunkId,
+    ) -> Result<Vec<crate::NodeId>, PristineError> {
+        Ok(Vec::new())
+    }
+
     /// Get a trunk (file) entry from the CRDT tables.
     fn get_crdt_trunk(
         &self,

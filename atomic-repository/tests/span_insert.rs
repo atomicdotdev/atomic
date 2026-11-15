@@ -472,6 +472,13 @@ fn importing_spans_into_legacy_repository_preserves_legacy_edits() {
         ("new.txt", b"new span\n"),
     ] {
         let txn = target.pristine().read_txn().unwrap();
+        if name == "legacy.txt" {
+            assert!(matches!(
+                atomic_core::output::crdt::output_file_via_crdt(&txn, target.change_store(), name),
+                Err(atomic_core::output::crdt::CrdtOutputError::SpanContextRequired(_))
+            ));
+            continue;
+        }
         assert_eq!(
             atomic_core::output::crdt::output_file_via_crdt(&txn, target.change_store(), name)
                 .unwrap(),

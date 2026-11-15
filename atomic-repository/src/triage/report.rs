@@ -1203,6 +1203,8 @@ pub fn count_hunk_atoms<H>(hunks: &[GraphOp<H>]) -> (usize, usize) {
             | GraphOp::ResurrectZombies { .. }
             | GraphOp::DelRoot { .. } => edges += 1,
             GraphOp::SetAttr { .. } => {}
+            #[cfg(feature = "prototype-context-completion")]
+            GraphOp::PrototypeContext { .. } => {}
         }
     }
     (vertices, edges)
@@ -1273,6 +1275,8 @@ fn hunk_symbol_and_path<H>(graph_op: &GraphOp<H>) -> (&'static str, String) {
         GraphOp::AddRoot { .. } => ("◉", "(root)".to_string()),
         GraphOp::DelRoot { .. } => ("⊘", "(root)".to_string()),
         GraphOp::SetAttr { path, .. } => ("@", path.clone()),
+        #[cfg(feature = "prototype-context-completion")]
+        GraphOp::PrototypeContext { .. } => ("@", "(experimental context)".into()),
     }
 }
 
@@ -1302,6 +1306,8 @@ fn hunk_atom_info<H>(graph_op: &GraphOp<H>) -> String {
         GraphOp::AddRoot { .. } => "(+1 span: root)".to_string(),
         GraphOp::DelRoot { .. } => "(~edges: delete root)".to_string(),
         GraphOp::SetAttr { value, .. } => format!("(attribute: {value:?})"),
+        #[cfg(feature = "prototype-context-completion")]
+        GraphOp::PrototypeContext { effect } => format!("(experimental context: {effect:?})"),
     }
 }
 

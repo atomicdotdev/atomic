@@ -96,6 +96,9 @@ mod cross_view;
 mod queries;
 mod types;
 
+#[cfg(feature = "prototype-inode-transport")]
+pub(crate) mod inode_transport_prototype;
+
 #[cfg(test)]
 mod tests;
 
@@ -295,6 +298,19 @@ fn write_change_to_graph_inner(
         .open_or_create_view(view_name)
         .map_err(|e| InsertError::Database(e.to_string()))?;
 
+    #[cfg(feature = "prototype-context-completion")]
+    if change
+        .hunks()
+        .iter()
+        .any(|op| matches!(op, GraphOp::PrototypeContext { .. }))
+        && (options.prototype_context.is_none() || !view.kind.is_draft())
+    {
+        return Err(InsertError::InvalidChange {
+            message: "experimental context carriers require atomic draft sandbox composition"
+                .into(),
+        });
+    }
+
     // Validate we can apply (unless caller explicitly skipped validation,
     // e.g. rebuild_change_graph re-applying an existing change with new hunks).
     let verified_frontier = if options.skip_validation {
@@ -429,6 +445,34 @@ fn apply_change_hunks_locked(
     let trace_record = std::env::var_os("ATOMIC_TRACE_RECORD").is_some()
         || std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
 
+    #[cfg(feature = "prototype-context-completion")]
+    for (ordinal, op) in change.hunks().iter().enumerate() {
+        if let GraphOp::PrototypeContext { effect } = op {
+            use atomic_core::change::prototype_context::ContextEffectRef;
+            let hash = txn
+                .get_external(change_id)
+                .map_err(|e| InsertError::Database(e.to_string()))?
+                .ok_or_else(|| InsertError::InvalidChange {
+                    message: "context carrier has no hash".into(),
+                })?;
+            let valid = options
+                .prototype_context
+                .as_ref()
+                .is_some_and(|projection| {
+                    projection.effects.get(&ContextEffectRef {
+                        change: hash,
+                        ordinal: ordinal as u32,
+                    }) == Some(effect)
+                });
+            if !valid {
+                return Err(InsertError::InvalidChange {
+                    message: "context operation requires validated atomic sandbox composition"
+                        .into(),
+                });
+            }
+        }
+    }
+
     let hunks = change.hunks();
     let total_hunks = hunks.len();
     let hunk_phase_start = std::time::Instant::now();
@@ -479,7 +523,13 @@ fn apply_change_hunks_locked(
 
     // Apply FileOps to CRDT tables (semantic layer)
     // This enables human-readable diffs and token-level blame
-    if change.has_file_ops() {
+    let preserve_legacy_as_ranges = change.hashed.span.is_none() && {
+        use atomic_core::pristine::{CapabilityTxnT, SPAN_LEGACY_CONTEXT_CAPABILITY};
+        txn.required_capability_version(SPAN_LEGACY_CONTEXT_CAPABILITY.id())
+            .map_err(|e| InsertError::Database(e.to_string()))?
+            .is_some()
+    };
+    if change.has_file_ops() && !preserve_legacy_as_ranges {
         let mut localized = None;
         if change.hashed.span.is_some() {
             localized = Some(
@@ -488,6 +538,19 @@ fn apply_change_hunks_locked(
                         message: error.to_string(),
                     },
                 )?,
+            );
+        }
+        #[cfg(feature = "prototype-inode-transport")]
+        if change.hashed.span.is_none() {
+            localized = Some(
+                inode_transport_prototype::localize(
+                    txn,
+                    change_id,
+                    change,
+                    #[cfg(feature = "prototype-context-completion")]
+                    options.prototype_context.as_deref(),
+                )
+                .map_err(|message| InsertError::InvalidChange { message })?,
             );
         }
         let file_ops = localized.as_deref().unwrap_or_else(|| change.file_ops());

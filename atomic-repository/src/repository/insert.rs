@@ -284,7 +284,7 @@ impl Repository {
     }
 }
 
-fn write_recorded_graph_and_spans(
+pub(super) fn write_recorded_graph_and_spans(
     repository: &Repository,
     txn: &mut atomic_core::pristine::WriteTxn<'_>,
     view_name: &str,
@@ -308,6 +308,12 @@ fn write_recorded_graph_and_spans(
     }
     use atomic_core::change::span_patch::SpanOp;
     use atomic_core::pristine::{span_patch_storage::SpanPatchReadTxn, CrdtTxnT};
+    atomic_core::pristine::span_patch_storage::prepare_legacy_files(
+        txn,
+        &repository.change_store,
+        change,
+    )
+    .map_err(|e| RepositoryError::Apply(e.to_string()))?;
     let semantic = atomic_core::change::span_patch::localize_file_ops(txn, change)
         .map_err(|error| RepositoryError::Apply(error.to_string()))?;
     let graph_only_git = is_graph_only_git_span(change);
@@ -334,7 +340,9 @@ fn write_recorded_graph_and_spans(
                 .ok_or_else(|| {
                     RepositoryError::Apply("projected semantic file mapping missing".into())
                 })?;
-            if txn.get_crdt_inode_trunk(inode.get())?.is_some() {
+            if txn.get_crdt_inode_trunk(inode.get())?.is_some()
+                && patch.version != atomic_core::change::span_patch::LEGACY_SOURCE_VERSION
+            {
                 return Err(RepositoryError::Apply(
                     "projected semantic edit cannot replace an existing CRDT trunk".into(),
                 ));
@@ -2424,6 +2432,7 @@ impl Repository {
     ) -> Result<InsertOutcome, RepositoryError> {
         let _review_boundary = self.review_evidence_lock()?;
         let change = self.load_change(hash)?;
+        self.fence_legacy_span_storage(&change)?;
         let view_name = options
             .view
             .as_deref()
@@ -2860,6 +2869,17 @@ impl Repository {
         mut options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
         let _review_boundary = self.review_evidence_lock()?;
+        self.fence_legacy_span_storage(&self.load_change(hash)?)?;
+        #[cfg(feature = "prototype-context-completion")]
+        if !self
+            .prototype_projection_for_hashes(&[*hash])?
+            .effects
+            .is_empty()
+        {
+            return Err(RepositoryError::InvalidOperation {
+                message: "experimental context closure requires prototype_insert_composed before any membership mutation".into(),
+            });
+        }
         let _span_lock = if self.span_in_closure(std::slice::from_ref(hash))? {
             let lock = self.try_lock_workspace_operation(self.require_working_copy_id()?)?;
             self.preflight_span_references(
@@ -2874,7 +2894,7 @@ impl Repository {
         let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
         let t0 = std::time::Instant::now();
 
-        // Load the target change to get its dependencies
+        // Load the target change to get its dependencies.
         let _change = self.load_change(hash)?;
 
         // Get the view name

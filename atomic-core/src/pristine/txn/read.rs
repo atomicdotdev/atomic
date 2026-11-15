@@ -1743,6 +1743,32 @@ macro_rules! crdt_multimap_opt {
 }
 
 impl crate::pristine::traits::CrdtTxnT for ReadTxn {
+    fn crdt_span_edit_authors(&self, trunk: crate::crdt::TrunkId) -> PristineResult<Vec<NodeId>> {
+        use crate::pristine::span_patch_storage::SpanPatchReadTxn;
+        let table = match self.txn.open_table(crate::crdt::tables::INODE_TRUNK) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut authors = std::collections::BTreeSet::new();
+        for row in table.iter()? {
+            let (inode, stored) = row?;
+            if *stored.value() == trunk.to_bytes() {
+                let inode = crate::Inode::new(inode.value());
+                for (_, edit) in
+                    self.span_edits_for_inode(inode)
+                        .map_err(|e| PristineError::Inconsistent {
+                            message: e.to_string(),
+                        })?
+                {
+                    authors.insert(NodeId::new(u64::from_be_bytes(
+                        edit[16..24].try_into().unwrap(),
+                    )));
+                }
+            }
+        }
+        Ok(authors.into_iter().collect())
+    }
     fn get_crdt_trunk(
         &self,
         key: &[u8; 12],
@@ -2227,6 +2253,9 @@ impl<'txn> TreeTxnT for CachedGraphTxn<'txn> {
 // ─────────────────────────────────────────────────────────────────────────
 
 impl<'txn> crate::pristine::CrdtTxnT for CachedGraphTxn<'txn> {
+    fn crdt_span_edit_authors(&self, trunk: crate::crdt::TrunkId) -> PristineResult<Vec<NodeId>> {
+        self.txn.crdt_span_edit_authors(trunk)
+    }
     fn get_crdt_trunk(
         &self,
         key: &[u8; 12],

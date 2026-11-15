@@ -125,6 +125,8 @@ pub use remote_cache::{
     SandboxSlice, SpanBytes, SubmitRejection, Submitted, SubmittedOutcome,
     SANDBOX_GRAPH_SLICE_SCHEMA, SANDBOX_SKELETON_SCHEMA,
 };
+#[cfg(feature = "prototype-context-completion")]
+pub(crate) mod prototype_context;
 mod revise;
 mod sandbox;
 mod semantic_closure;

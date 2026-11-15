@@ -1044,6 +1044,10 @@ impl Change {
                     collect_edge_update_hashes(inode, table)?;
                 }
                 GraphOp::SetAttr { inode, .. } => collect_position_hash(inode, table)?,
+                // Experimental context endpoints are encoded as full hashes,
+                // not repository IDs or compact graph-position indices.
+                #[cfg(feature = "prototype-context-completion")]
+                GraphOp::PrototypeContext { .. } => {}
             }
         }
 

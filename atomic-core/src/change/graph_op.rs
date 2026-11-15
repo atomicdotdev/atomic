@@ -340,6 +340,11 @@ pub enum GraphOp<H> {
         /// Canonical attribute value.
         value: InodeAttr,
     },
+    /// Private experimental context relation; requires the sandbox capability.
+    #[cfg(feature = "prototype-context-completion")]
+    PrototypeContext {
+        effect: super::prototype_context::PrototypeContextEffect,
+    },
 }
 
 impl<H: PartialEq> GraphOp<H> {
@@ -551,6 +556,8 @@ impl<H> GraphOp<H> {
             | GraphOp::ResurrectZombies { local, .. } => Some(&local.path),
 
             GraphOp::AddRoot { .. } | GraphOp::DelRoot { .. } => None,
+            #[cfg(feature = "prototype-context-completion")]
+            GraphOp::PrototypeContext { .. } => None,
         }
     }
 
@@ -659,6 +666,8 @@ impl<H> GraphOp<H> {
             GraphOp::AddRoot { .. } => "AddRoot",
             GraphOp::DelRoot { .. } => "DelRoot",
             GraphOp::SetAttr { .. } => "SetAttr",
+            #[cfg(feature = "prototype-context-completion")]
+            GraphOp::PrototypeContext { .. } => "PrototypeContext",
         }
     }
 }
@@ -691,6 +700,8 @@ impl<H: fmt::Debug> fmt::Display for GraphOp<H> {
             GraphOp::AddRoot { .. } => write!(f, "AddRoot"),
             GraphOp::DelRoot { .. } => write!(f, "DelRoot"),
             GraphOp::SetAttr { path, value, .. } => write!(f, "SetAttr: {path} {value:?}"),
+            #[cfg(feature = "prototype-context-completion")]
+            GraphOp::PrototypeContext { effect } => write!(f, "PrototypeContext: {effect:?}"),
         }
     }
 }
@@ -799,6 +810,8 @@ impl<'a, H> Iterator for HunkAtomIter<'a, H> {
 
             // Attribute events are applied outside the edge graph.
             (GraphOp::SetAttr { .. }, _) => None,
+            #[cfg(feature = "prototype-context-completion")]
+            (GraphOp::PrototypeContext { .. }, _) => None,
         };
 
         if result.is_some() {
@@ -858,6 +871,8 @@ impl<H> GraphOp<H> {
             GraphOp::DirDel { .. } => 1,
             GraphOp::DirUndel { .. } => 1,
             GraphOp::SetAttr { .. } => 0,
+            #[cfg(feature = "prototype-context-completion")]
+            GraphOp::PrototypeContext { .. } => 0,
         }
     }
 }

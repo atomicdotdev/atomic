@@ -8,15 +8,13 @@ use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 4] = b"ATSP";
 const VERSION: u8 = 2;
+/// Existing span algebra, additionally permitting verified legacy graph ranges
+/// as authored sources. Requires the span-legacy-context reader fence.
+pub const LEGACY_SOURCE_VERSION: u8 = 3;
 
-/// Maps an authored repository-local semantic ID to its portable change hash.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SemanticOwner {
-    /// Non-root NodeId used in this change's semantic operations.
-    pub authored_id: u64,
-    /// Content identity of the change that created that semantic ID.
-    pub owner: Hash,
-}
+// Preserve the public import path and encoded field order for existing callers.
+use super::semantic_context::SemanticNameFrame;
+pub use super::semantic_context::SemanticOwner;
 
 /// Portable identity of a file created by a change.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,7 +129,7 @@ impl SpanPatch {
 
     /// Encode the canonical span payload.
     pub fn encode(&self) -> Result<Vec<u8>, SpanPatchError> {
-        if self.version != 1 && self.version != VERSION {
+        if self.version != 1 && self.version != VERSION && self.version != LEGACY_SOURCE_VERSION {
             return Err(SpanPatchError::UnsupportedVersion(self.version));
         }
         let mut bytes = MAGIC.to_vec();
@@ -159,7 +157,7 @@ impl SpanPatch {
             .strip_prefix(MAGIC)
             .ok_or(SpanPatchError::WrongMagic)?;
         let version = *payload.first().ok_or(SpanPatchError::InvalidEncoding)?;
-        if version != 1 && version != VERSION {
+        if version != 1 && version != VERSION && version != LEGACY_SOURCE_VERSION {
             return Err(SpanPatchError::UnsupportedVersion(version));
         }
         let (patch, remaining) = if version == 1 {
@@ -180,7 +178,8 @@ impl SpanPatch {
         if !remaining.is_empty() {
             return Err(SpanPatchError::InvalidEncoding);
         }
-        if patch.version != 1 && patch.version != VERSION {
+        if patch.version != 1 && patch.version != VERSION && patch.version != LEGACY_SOURCE_VERSION
+        {
             return Err(SpanPatchError::UnsupportedVersion(patch.version));
         }
         Ok(patch)
@@ -189,31 +188,14 @@ impl SpanPatch {
     /// Check local byte bounds. Dependency closure, file ownership, and
     /// conflicts must additionally be checked against repository state.
     pub fn validate_content_ranges(&self, content_len: u64) -> Result<(), SpanPatchError> {
-        if self.version != 1 && self.version != VERSION {
+        if self.version != 1 && self.version != VERSION && self.version != LEGACY_SOURCE_VERSION {
             return Err(SpanPatchError::UnsupportedVersion(self.version));
         }
         if self.version == 1 && !self.semantic_owners.is_empty() {
             return Err(SpanPatchError::InvalidEncoding);
         }
-        if self
-            .semantic_owners
-            .iter()
-            .any(|entry| entry.authored_id == 0 || entry.owner == Hash::NONE)
-            || self
-                .semantic_owners
-                .windows(2)
-                .any(|pair| pair[0].authored_id >= pair[1].authored_id)
-        {
-            return Err(SpanPatchError::InvalidEncoding);
-        }
-        let mut owner_hashes = std::collections::HashSet::new();
-        if self
-            .semantic_owners
-            .iter()
-            .any(|entry| !owner_hashes.insert(entry.owner))
-        {
-            return Err(SpanPatchError::InvalidEncoding);
-        }
+        SemanticNameFrame::new(self.semantic_owners.clone())
+            .map_err(|_| SpanPatchError::InvalidEncoding)?;
         for (index, op) in self.ops.iter().enumerate() {
             let reason = match op {
                 SpanOp::Root { start, end, .. } if start > end || *end > content_len => {
@@ -256,60 +238,17 @@ pub fn localize_file_ops<T: crate::pristine::GraphTxnT>(
     txn: &T,
     change: &crate::change::Change,
 ) -> anyhow::Result<Vec<crate::change::FileOps>> {
-    use crate::pristine::{EffectiveProjectionClosure, ViewMembershipSet};
-    use crate::types::NodeId;
-    use anyhow::{ensure, Context};
     let Some(patch) = &change.hashed.span else {
         return Ok(change.file_ops().to_vec());
     };
     patch.validate_content_ranges(change.contents.len().try_into()?)?;
-    let ids: std::collections::BTreeSet<_> = change
-        .file_ops()
-        .iter()
-        .flat_map(|ops| ops.referenced_node_ids())
-        .collect();
-    let owners: std::collections::BTreeSet<_> = patch
-        .semantic_owners
-        .iter()
-        .map(|entry| NodeId::new(entry.authored_id))
-        .collect();
-    ensure!(
-        ids == owners && patch.semantic_owners.len() == owners.len(),
-        "span semantic identities lack a complete portable owner mapping"
-    );
-    let deps = change
-        .dependencies()
-        .iter()
-        .map(|hash| {
-            txn.get_internal(hash)?
-                .context("semantic dependency missing")
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let closure = EffectiveProjectionClosure::try_from_membership(
-        txn,
-        &ViewMembershipSet::from_ordered(deps),
-    )?;
-    let mut mapping = std::collections::HashMap::new();
-    for entry in &patch.semantic_owners {
-        let id = txn
-            .get_internal(&entry.owner)?
-            .context("semantic owner missing")?;
-        ensure!(
-            closure.contains(id) && txn.get_external(id)? == Some(entry.owner),
-            "span semantic owner is outside its dependency closure"
-        );
-        mapping.insert(NodeId::new(entry.authored_id), id);
-    }
-    let mut ops = change.file_ops().to_vec();
-    for file in &mut ops {
-        file.remap_referenced_node_ids(|id| {
-            mapping
-                .get(&id)
-                .copied()
-                .context("span semantic owner mapping is incomplete")
-        })?;
-    }
-    Ok(ops)
+    Ok(
+        SemanticNameFrame::new(patch.semantic_owners.clone())?.localize(
+            txn,
+            change.dependencies(),
+            change.file_ops(),
+        )?,
+    )
 }
 
 #[cfg(test)]

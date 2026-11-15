@@ -35,6 +35,15 @@ pub const SPAN_RANGE_CAPABILITY: RepositoryCapability =
 pub const SPAN_PROJECTED_SEMANTICS_CAPABILITY: RepositoryCapability =
     RepositoryCapability::new("span-projected-semantics", 1);
 
+/// Span edits may address original legacy graph ranges without copying them.
+pub const SPAN_LEGACY_CONTEXT_CAPABILITY: RepositoryCapability =
+    RepositoryCapability::new("span-legacy-context", 1);
+
+/// Private experimental artifacts; ordinary builds must refuse these sandboxes.
+#[cfg(feature = "prototype-context-completion")]
+pub const PROTOTYPE_CONTEXT_CAPABILITY: RepositoryCapability =
+    RepositoryCapability::new("prototype-semantic-context-NOT-FOR-PUBLICATION", 1);
+
 /// Capabilities supported by this Atomic build.
 pub const SUPPORTED_REPOSITORY_CAPABILITIES: &[RepositoryCapability] = &[
     CHANGE_FORMAT_VNEXT_CAPABILITY,
@@ -43,6 +52,9 @@ pub const SUPPORTED_REPOSITORY_CAPABILITIES: &[RepositoryCapability] = &[
     GIT_CLOSURE_SHARING_CAPABILITY,
     SPAN_RANGE_CAPABILITY,
     SPAN_PROJECTED_SEMANTICS_CAPABILITY,
+    SPAN_LEGACY_CONTEXT_CAPABILITY,
+    #[cfg(feature = "prototype-context-completion")]
+    PROTOTYPE_CONTEXT_CAPABILITY,
 ];
 
 /// A repository capability and the minimum version required to use it.

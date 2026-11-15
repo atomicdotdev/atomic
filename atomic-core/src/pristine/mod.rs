@@ -177,11 +177,13 @@ pub use attribute::{
     INODE_ATTR_EVENT_VERSION,
 };
 pub use bindings::{BindingMutTxnT, BindingStoreOutcome, BindingTxnT};
+#[cfg(feature = "prototype-context-completion")]
+pub use capability::PROTOTYPE_CONTEXT_CAPABILITY;
 pub use capability::{
     RepositoryCapability, RequiredRepositoryCapability, UnsupportedRepositoryCapability,
     CHANGE_FORMAT_VNEXT_CAPABILITY, GIT_CLOSURE_SHARING_CAPABILITY, REQUIRED_CAPABILITY_PREFIX,
-    SHIM_CUTOVER_CAPABILITY, SPAN_PROJECTED_SEMANTICS_CAPABILITY, SPAN_RANGE_CAPABILITY,
-    SUPPORTED_REPOSITORY_CAPABILITIES,
+    SHIM_CUTOVER_CAPABILITY, SPAN_LEGACY_CONTEXT_CAPABILITY, SPAN_PROJECTED_SEMANTICS_CAPABILITY,
+    SPAN_RANGE_CAPABILITY, SUPPORTED_REPOSITORY_CAPABILITIES,
 };
 pub use error::{PristineError, PristineResult};
 mod file_index_v2;

@@ -20,6 +20,11 @@ query-test-instrumentation = []
 # Full review policy evaluation needs the existing PurRDF engine (Rust 1.98).
 # Consumers that keep the repository's lower MSRV do not accept this exception.
 review-shacl = ["dep:atomic-shacl"]
+# Native, deliberately bounded inode/name-transport prototype. No wire-format
+# change, no new persisted operation, and no effect in default builds.
+prototype-inode-transport = []
+# Replayable sandbox-only context operations. Not a production wire contract.
+prototype-context-completion = ["prototype-inode-transport", "atomic-core/prototype-context-completion"]
 
 [dependencies]
 unicode-normalization = "0.1"

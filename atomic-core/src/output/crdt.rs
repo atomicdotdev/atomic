@@ -463,6 +463,8 @@ pub enum CrdtOutputError<E> {
     Pristine(crate::pristine::PristineError),
     /// Change store read failed.
     Store(E),
+    /// Immutable span edit metadata could not be verified.
+    VerifiedStore(String),
     /// A branch was alive but had no BRANCH_VERTEX mapping — the CRDT layer
     /// has no way to know which bytes the branch corresponds to.
     ///
@@ -470,6 +472,9 @@ pub enum CrdtOutputError<E> {
     /// missing its content reference.  This is recoverable: callers can fall
     /// back to the byte-graph walker for the affected file.
     OrphanBranch(crate::crdt::BranchId),
+    /// Use canonical view-aware retrieval; the retained CRDT cache is not the
+    /// interpretation of authored span edits.
+    SpanContextRequired(crate::crdt::TrunkId),
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for CrdtOutputError<E> {
@@ -477,8 +482,12 @@ impl<E: std::fmt::Display> std::fmt::Display for CrdtOutputError<E> {
         match self {
             CrdtOutputError::Pristine(e) => write!(f, "pristine error: {}", e),
             CrdtOutputError::Store(e) => write!(f, "change store error: {}", e),
+            CrdtOutputError::VerifiedStore(e) => write!(f, "verified change store error: {e}"),
             CrdtOutputError::OrphanBranch(b) => {
                 write!(f, "branch {} has no BRANCH_VERTEX mapping", b)
+            }
+            CrdtOutputError::SpanContextRequired(trunk) => {
+                write!(f, "trunk {trunk} requires explicit view/span context")
             }
         }
     }
@@ -517,6 +526,8 @@ impl<E> From<crate::pristine::PristineError> for CrdtOutputError<E> {
 ///
 /// # Caveats
 ///
+/// - Files with span-projected semantics return [`CrdtOutputError::SpanContextRequired`]. Use
+///   canonical view-aware retrieval rather than falling back to retained caches.
 /// - Reads `branch.state` directly — correct for single-view linear
 ///   history, *not* multi-view scenarios where the same branch may be
 ///   alive on one view and deleted on another.  Add a `change_filter`
@@ -553,6 +564,28 @@ where
     C: crate::change::ChangeStore,
 {
     use crate::types::Hash;
+
+    for author in txn.crdt_span_edit_authors(trunk_id)? {
+        let hash =
+            txn.get_external(author)?
+                .ok_or(crate::pristine::PristineError::Inconsistent {
+                    message: "span edit author has no external identity".into(),
+                })?;
+        let change = changes
+            .get_verified_change(&hash)
+            .map_err(|error| CrdtOutputError::VerifiedStore(error.to_string()))?;
+        change
+            .check_hash(&hash)
+            .map_err(|error| CrdtOutputError::VerifiedStore(error.to_string()))?;
+        if change.change().file_ops().iter().any(|ops| {
+            matches!(
+                ops.trunk_op(),
+                Some(crate::crdt::TrunkOp::ProjectedSpanEdit { .. })
+            )
+        }) {
+            return Err(CrdtOutputError::SpanContextRequired(trunk_id));
+        }
+    }
 
     let mut out: Vec<u8> = Vec::new();
 

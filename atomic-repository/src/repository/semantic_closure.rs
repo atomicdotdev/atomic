@@ -44,6 +44,8 @@ pub(super) struct TrunkBranchState {
 #[derive(Debug, Default)]
 pub(super) struct SemanticClosureMemo {
     closures: Vec<FoldedClosure>,
+    #[cfg(feature = "prototype-context-completion")]
+    context_digest: Option<Hash>,
 }
 
 /// The fold of one `(view, exclusions)` closure.
@@ -89,6 +91,13 @@ impl MemoKey {
 }
 
 impl SemanticClosureMemo {
+    #[cfg(feature = "prototype-context-completion")]
+    pub(super) fn align_context(&mut self, digest: Hash) {
+        if self.context_digest != Some(digest) {
+            self.closures.clear();
+            self.context_digest = Some(digest);
+        }
+    }
     /// Make the closure of `view` under `excluded` the current one: its
     /// folded prefix is kept when every folded change is still visible,
     /// otherwise it starts over. The closures aligned least recently are
@@ -201,5 +210,26 @@ fn resolve_branch(change_id: NodeId, raw: BranchId) -> BranchId {
         BranchId::new(change_id, raw.branch_idx())
     } else {
         raw
+    }
+}
+
+#[cfg(all(test, feature = "prototype-context-completion"))]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn changed_completion_digest_discards_previously_successful_folds() {
+        let a = Hash::of(b"bound");
+        let b = Hash::of(b"exact reversal or removal");
+        let mut memo = SemanticClosureMemo::default();
+        memo.align_context(a);
+        let mut closure = FoldedClosure::new(MemoKey::new("sandbox", &[]));
+        closure.folded.insert(NodeId::new(1));
+        memo.closures.push(closure);
+        memo.align_context(a);
+        assert!(memo.is_folded(NodeId::new(1)));
+        memo.align_context(b);
+        assert!(!memo.is_folded(NodeId::new(1)));
+        assert_eq!(memo.closure_count(), 0);
     }
 }

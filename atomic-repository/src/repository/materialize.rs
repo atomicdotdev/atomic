@@ -1577,13 +1577,16 @@ impl Repository {
                 }
                 None => {
                     // Distinguish legacy graph files from a missing span index
-                    // before any materialization operation is prepared.
-                    super::content::retrieve_span_if_present(
+                    // before any materialization operation is prepared. A
+                    // legacy-backed span edit has no typed root, but its bytes
+                    // must still be rendered through the span context below.
+                    has_visible_spans |= super::content::retrieve_span_if_present(
                         &txn,
                         &self.change_store,
                         item.inode,
                         &visibility,
-                    )?;
+                    )?
+                    .is_some();
                 }
             }
         }

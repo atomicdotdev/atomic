@@ -322,10 +322,25 @@ impl FileOps {
     }
 
     /// Translate existing semantic identities while preserving ROOT placeholders.
+    ///
+    /// Resolve each distinct external owner once, before changing any operation.
+    /// If resolution fails, `self` is unchanged. The caller supplies the owner
+    /// mapping; this does not infer names from paths, application order or local
+    /// numeric coincidences.
     pub fn remap_referenced_node_ids<E>(
         &mut self,
         mut remap: impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
     ) -> Result<(), E> {
+        let mapping: std::collections::BTreeMap<_, _> = self
+            .referenced_node_ids()
+            .into_iter()
+            .map(|id| remap(id).map(|resolved| (id, resolved)))
+            .collect::<Result<_, E>>()?;
+        let mut remap = |id| -> Result<crate::types::NodeId, E> {
+            // referenced_node_ids enumerates the same non-ROOT fields walked
+            // below. All fallible resolution finished before the first write.
+            Ok(mapping[&id])
+        };
         fn trunk<E>(
             id: &mut TrunkId,
             f: &mut impl FnMut(crate::types::NodeId) -> Result<crate::types::NodeId, E>,
@@ -1152,6 +1167,211 @@ mod tests {
 
     fn test_branch_id(idx: u32) -> BranchId {
         BranchId::new(NodeId::new(1), idx)
+    }
+
+    // These are representation laws for transport of patch names, not a claim
+    // that arbitrary overlapping patches commute or that view removal is an
+    // inverse patch. ROOT is the self-name, not an external owner to transport.
+    fn transport_fixtures() -> Vec<FileOps> {
+        let trunk = TrunkId::new(NodeId::new(2), 17);
+        let branch = |owner, index| BranchId::new(NodeId::new(owner), index);
+        let leaf = |owner, index| LeafId::new(NodeId::new(owner), index);
+        let tokens = vec![
+            LeafOp::Insert {
+                after: Some(leaf(0, 11)),
+                kind: TokenKind::Word,
+                content: b"new".to_vec(),
+            },
+            LeafOp::Insert {
+                after: Some(leaf(5, 12)),
+                kind: TokenKind::Whitespace,
+                content: b" ".to_vec(),
+            },
+            LeafOp::Delete { leaf: leaf(6, 13) },
+            LeafOp::Replace {
+                leaf: leaf(7, 14),
+                new_content: b"replacement".to_vec(),
+            },
+            LeafOp::Restore { leaf: leaf(8, 15) },
+        ];
+        let lines = vec![
+            LineOps::new(
+                branch(0, 20),
+                BranchOp::Insert {
+                    after: Some(branch(3, 21)),
+                    content: tokens.clone(),
+                },
+            )
+            .with_content_range(ChangePosition::new(100), ChangePosition::new(120)),
+            LineOps::new(
+                branch(3, 21),
+                BranchOp::Delete {
+                    branch: branch(4, 22),
+                    content: tokens.clone(),
+                },
+            ),
+            LineOps::new(
+                branch(4, 22),
+                BranchOp::Modify {
+                    branch: branch(3, 21),
+                    old_content: tokens.clone(),
+                    new_content: tokens,
+                },
+            ),
+            LineOps::new(
+                branch(0, 23),
+                BranchOp::Restore {
+                    branch: branch(4, 22),
+                },
+            ),
+            LineOps::new(
+                branch(3, 24),
+                BranchOp::Reparent {
+                    branch: branch(4, 25),
+                    new_after: Some(branch(0, 26)),
+                },
+            ),
+        ];
+        let variants = vec![
+            None,
+            Some(TrunkOp::Create {
+                path: "f".into(),
+                encoding: Some(Encoding::Utf8),
+            }),
+            Some(TrunkOp::Delete { trunk }),
+            Some(TrunkOp::Move {
+                trunk,
+                new_path: "renamed".into(),
+            }),
+            Some(TrunkOp::Undelete { trunk }),
+            Some(TrunkOp::SetMode { trunk, mode: 0o644 }),
+            Some(TrunkOp::SetKind {
+                trunk,
+                kind: crate::change::InodeKind::Regular,
+            }),
+        ];
+        let mut fixtures: Vec<_> = variants
+            .into_iter()
+            .map(|trunk_op| FileOps {
+                trunk_id: trunk,
+                path: "f".into(),
+                trunk_op,
+                line_ops: lines.clone(),
+            })
+            .collect();
+        fixtures.push(FileOps::projected_span_edit(
+            "projected".into(),
+            crate::change::span_patch::ExternalFile {
+                owner: crate::types::Hash::of(b"portable owner is not a local ID"),
+                ordinal: 7,
+            },
+            crate::change::span_patch::SpanProjectionId(crate::types::Hash::of(b"projection")),
+        ));
+        fixtures
+    }
+
+    #[test]
+    fn semantic_transport_identity_composition_and_inverse() {
+        for original in transport_fixtures() {
+            let mut identity = original.clone();
+            identity.remap_referenced_node_ids::<()>(Ok).unwrap();
+            assert_eq!(identity, original);
+
+            let mut sequential = original.clone();
+            sequential
+                .remap_referenced_node_ids::<()>(|id| Ok(NodeId::new(id.get() + 100)))
+                .unwrap();
+            sequential
+                .remap_referenced_node_ids::<()>(|id| Ok(NodeId::new(id.get() * 3)))
+                .unwrap();
+            let mut composed = original.clone();
+            composed
+                .remap_referenced_node_ids::<()>(|id| Ok(NodeId::new((id.get() + 100) * 3)))
+                .unwrap();
+            assert_eq!(
+                sequential, composed,
+                "transport must compose as name substitution"
+            );
+
+            let mut roundtrip = original.clone();
+            roundtrip
+                .remap_referenced_node_ids::<()>(|id| Ok(NodeId::new(id.get() + 100)))
+                .unwrap();
+            roundtrip
+                .remap_referenced_node_ids::<()>(|id| Ok(NodeId::new(id.get() - 100)))
+                .unwrap();
+            assert_eq!(
+                roundtrip, original,
+                "inverse renaming must preserve all non-name fields and ROOT"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_transport_disjoint_renamings_commute() {
+        let left = |id: NodeId| -> Result<NodeId, ()> {
+            Ok(if id.get() == 2 { NodeId::new(102) } else { id })
+        };
+        let right = |id: NodeId| -> Result<NodeId, ()> {
+            Ok(if id.get() == 3 { NodeId::new(103) } else { id })
+        };
+        for original in transport_fixtures() {
+            let mut left_right = original.clone();
+            left_right.remap_referenced_node_ids(left).unwrap();
+            left_right.remap_referenced_node_ids(right).unwrap();
+            let mut right_left = original;
+            right_left.remap_referenced_node_ids(right).unwrap();
+            right_left.remap_referenced_node_ids(left).unwrap();
+            assert_eq!(left_right, right_left);
+        }
+    }
+
+    #[test]
+    fn semantic_transport_resolves_each_external_owner_once() {
+        for original in transport_fixtures() {
+            let owners = original.referenced_node_ids();
+            let mut observed = std::collections::BTreeSet::new();
+            let mut transported = original;
+            transported
+                .remap_referenced_node_ids::<()>(|id| {
+                    assert!(!id.is_root(), "ROOT must retain its self-relative meaning");
+                    assert!(
+                        observed.insert(id),
+                        "one owner must not be resolved inconsistently at different occurrences"
+                    );
+                    Ok(NodeId::new(id.get() + 100))
+                })
+                .unwrap();
+            assert_eq!(observed, owners);
+            assert_eq!(
+                transported.referenced_node_ids(),
+                owners
+                    .iter()
+                    .map(|id| NodeId::new(id.get() + 100))
+                    .collect()
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_transport_failure_leaves_the_patch_unchanged() {
+        for original in transport_fixtures() {
+            for missing in original.referenced_node_ids() {
+                let mut transported = original.clone();
+                let result = transported.remap_referenced_node_ids(|id| {
+                    if id == missing {
+                        Err(id)
+                    } else {
+                        Ok(NodeId::new(id.get() + 100))
+                    }
+                });
+                assert_eq!(result, Err(missing));
+                assert_eq!(
+                    transported, original,
+                    "an undefined transport must not leave a partly renamed patch"
+                );
+            }
+        }
     }
 
     // FileOps Tests
