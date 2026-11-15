@@ -3784,6 +3784,17 @@ impl Repository {
             })
             .map(|ops| (ops.path().to_string(), ops.trunk_id()))
             .collect();
+        let projected_paths: std::collections::HashSet<String> = change
+            .file_ops()
+            .iter()
+            .filter(|ops| {
+                matches!(
+                    ops.trunk_op(),
+                    Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+                )
+            })
+            .map(|ops| ops.path().to_string())
+            .collect();
         for pending in pending_attributes {
             let target = match pending.position {
                 Some(position) => {
@@ -3818,9 +3829,17 @@ impl Repository {
                 value: pending.value,
             });
 
-            let trunk = pending
-                .trunk
-                .or_else(|| semantic_trunks.get(&pending.path).copied());
+            // A projected span edit is the only semantic operation its path may
+            // carry. A legacy file still has a CRDT trunk, but the edit does
+            // not update it, so the attribute is recorded on the graph inode
+            // alone, exactly as for a file that never had a trunk.
+            let trunk = if projected_paths.contains(pending.path.as_str()) {
+                None
+            } else {
+                pending
+                    .trunk
+                    .or_else(|| semantic_trunks.get(&pending.path).copied())
+            };
             let Some(trunk) = trunk else {
                 // Imported graph-only files have no semantic identity to
                 // update. SetAttr above targets the authoritative graph inode.
