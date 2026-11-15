@@ -3352,7 +3352,9 @@ impl Repository {
                 })() };
                 let (mut existing_trunk_id,mut existing_branches)=match semantic {
                     Ok(state)=>state,
-                    Err(error) if span_state.is_none()=>{
+                    // Span recording cannot yet express a name resolution, so a
+                    // path being resolved stays on the graph route below.
+                    Err(error) if span_state.is_none() && resolution.is_none()=>{
                         let Some(context)=&span_context else{return ModifiedResult::Error(path.clone(),error);};
                         match context.legacy_record_state(file_inode) {
                             Ok(Some(state))=>{span_state=Some(state);(None,Vec::new())},
@@ -3376,7 +3378,10 @@ impl Repository {
                 };
                 let legacy_mismatch=unportable_trunk
                     || (!existing_branches.is_empty() && existing_branches.len()!=atomic_core::diff::Line::from_bytes(&old_content).len());
-                if span_state.is_none() && !had_fork_structure && legacy_mismatch {
+                // The same holds here: moving a path that is being resolved onto
+                // the span route would only reach the refusal below, so which
+                // claimant won the name would decide whether the record succeeds.
+                if span_state.is_none() && resolution.is_none() && !had_fork_structure && legacy_mismatch {
                     if let Some(context)=&span_context {
                         match context.legacy_record_state(file_inode) {
                             Ok(Some(state)) if state.content==old_content=>{

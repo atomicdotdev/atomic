@@ -548,3 +548,70 @@ fn test_emptying_file_after_orphan_view_merge_removes_every_copy() {
         leftover_bytes
     );
 }
+
+/// `test_emptying_file_after_orphan_view_merge_removes_every_copy` with the
+/// working file at the mode Windows reports for every writable file (0o666).
+///
+/// That mode differs from the default of a path with no visible mode
+/// attribute, so the orphan view's change also records a mode for the file
+/// and depends on the change that first added it. Merging then leaves two
+/// claimants for the name, and which one wins follows the change hashes, so
+/// it varies between runs. Emptying the file has to record whichever wins.
+/// The scenario is repeated so that both outcomes are exercised.
+#[cfg(unix)]
+#[test]
+fn test_emptying_file_after_orphan_view_merge_with_windows_file_mode() {
+    use crate::apply::CrossViewInsertOptions;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write(file: &std::path::Path, bytes: &[u8]) {
+        std::fs::write(file, bytes).unwrap();
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o666)).unwrap();
+    }
+
+    for round in 0..8 {
+        let (temp_dir, mut repo) = create_temp_repo();
+        let file = temp_dir.path().join("main.go");
+
+        let initial = build_go_like_source(80);
+        write(&file, initial.as_bytes());
+        repo.add("main.go", TrackingOptions::default()).unwrap();
+        record_all(&repo, "Add main.go");
+
+        create_parentless_shared_view(&repo, "orphan-xyz");
+        repo.set_current_view("orphan-xyz").unwrap();
+        let edited = initial.replacen("return 40\n", "return 4000\n", 1);
+        write(&file, edited.as_bytes());
+        repo.record(
+            ChangeHeader::new("orphan edit"),
+            RecordOptions::new()
+                .with_all(true)
+                .view("orphan-xyz")
+                .apply_after_record(true)
+                .save_to_store(true),
+        )
+        .unwrap();
+        repo.set_current_view("dev").unwrap();
+
+        repo.insert_from_view(CrossViewInsertOptions::new("orphan-xyz", "dev"))
+            .unwrap();
+        repo.materialize().unwrap();
+
+        write(&file, b"");
+        repo.record(
+            ChangeHeader::new("empty main.go"),
+            RecordOptions::new()
+                .with_all(true)
+                .apply_after_record(true)
+                .save_to_store(true),
+        )
+        .unwrap_or_else(|error| panic!("round {round}: emptying the file must record: {error}"));
+
+        let content = repo.get_file_content_on_view("main.go", "dev").unwrap();
+        assert_eq!(
+            content.as_ref().map(|c| c.len()).unwrap_or(0),
+            0,
+            "round {round}: a duplicate copy from the orphan-view merge survived"
+        );
+    }
+}
