@@ -189,9 +189,6 @@ fn record_span_edit(
         .position
         .ok_or_else(|| "span edit has no position".to_string())?;
     let old = state.content.as_slice();
-    if trunk.is_none() && cfg!(not(unix)) {
-        return Err("projected semantic recording is not supported on this platform".into());
-    }
     if atomic_core::record::workflow::compare::detect_encoding(old)
         == atomic_core::change::Encoding::Binary
         || atomic_core::record::workflow::compare::detect_encoding(new)
@@ -609,9 +606,6 @@ fn record_binary_span_edit(
     use atomic_core::record::workflow::recipes::{Recipe, RecipeContext};
     use atomic_core::record::workflow::{DetectionKind, RecordedFile};
     use atomic_core::types::ChangePosition;
-    if trunk.is_none() && cfg!(not(unix)) {
-        return Err("projected semantic recording is not supported on this platform".into());
-    }
     let inode = detected
         .inode
         .ok_or_else(|| "span edit has no inode".to_string())?;

@@ -67,6 +67,44 @@ fn empty_legacy_file_and_repeated_projected_edits_replay_after_reopen() {
 }
 
 #[test]
+fn legacy_projected_binary_edits_and_text_transitions_replay() {
+    let (dir, source, root) = fixture(b"before\0\xff");
+    let mut changes = vec![root];
+    for bytes in [
+        b"after\0\xfe".as_slice(),
+        b"plain text\n",
+        b"binary again\0\xff",
+    ] {
+        std::fs::write(dir.path().join("f"), bytes).unwrap();
+        let edit = record(&source);
+        let change = source.load_change(&edit).unwrap();
+        assert!(change.file_ops().iter().any(|ops| matches!(
+            ops.trunk_op(),
+            Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
+        )));
+        assert_eq!(source.get_file_content("f").unwrap().unwrap(), bytes);
+        changes.push(edit);
+
+        // Check each transition independently from immutable objects, without
+        // inheriting the author's CRDT caches or filesystem state.
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let receiver = Repository::init(receiver_dir.path()).unwrap();
+        for hash in &changes {
+            let original = std::fs::read(source.change_store().change_path(hash)).unwrap();
+            receiver.import_change_bytes(hash, &original).unwrap();
+        }
+        receiver
+            .insert_change_rec(&edit, Default::default())
+            .unwrap();
+        assert_eq!(receiver.get_file_content("f").unwrap().unwrap(), bytes);
+        receiver
+            .materialize(receiver.require_working_copy_id().unwrap())
+            .unwrap();
+        assert_eq!(std::fs::read(receiver_dir.path().join("f")).unwrap(), bytes);
+    }
+}
+
+#[test]
 fn materialize_legacy_span_edits_without_a_typed_root() {
     let (dir, source, root) = fixture(b"before\n");
     std::fs::write(dir.path().join("f"), b"after\n").unwrap();
