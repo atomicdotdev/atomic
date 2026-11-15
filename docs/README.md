@@ -16,6 +16,7 @@ Welcome to the Atomic VCS documentation. This directory contains comprehensive d
 | [Software Supply Chain Checks](./software-supply-chain.md) | The standards behind canonical bytes, proofs and signatures, and the CI jobs that hold them | Developers, Contributors |
 | [Intent Identity](./intent-identity.md) | ULID + `PROJECT::author::seq` intent identity and reference resolution | Users, Contributors |
 | [Intent Knowledge Graph](./intent-graph.md) | How intents become a queryable graph and the `atomic vault query` commands | Users, Contributors |
+| [Per-change Workflow Knowledge Graph](./per-change-knowledge-graph.md) | Canonical goal → intent → change → review paths, reverse traversal, real per-change results and inspection commands | Users, Reviewers, Contributors |
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | System architecture, data model, and design decisions | Developers, Contributors |
 | [THEORY.md](./THEORY.md) | Mathematical foundations of patch theory | Researchers, Core developers |
 | [IMPLEMENTATION.md](./IMPLEMENTATION.md) | Implementation details and code organization | Contributors |

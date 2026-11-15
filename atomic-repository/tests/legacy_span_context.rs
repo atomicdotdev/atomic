@@ -67,6 +67,36 @@ fn empty_legacy_file_and_repeated_projected_edits_replay_after_reopen() {
 }
 
 #[test]
+fn materialize_legacy_span_edits_without_a_typed_root() {
+    let (dir, source, root) = fixture(b"before\n");
+    std::fs::write(dir.path().join("f"), b"after\n").unwrap();
+    let edit = record(&source);
+    for sequential in [false, true] {
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let receiver = Repository::init(receiver_dir.path()).unwrap();
+        for hash in [root, edit] {
+            let bytes = std::fs::read(source.change_store().change_path(&hash)).unwrap();
+            receiver.import_change_bytes(&hash, &bytes).unwrap();
+        }
+        receiver
+            .insert_change_rec(&edit, Default::default())
+            .unwrap();
+        assert_eq!(receiver.get_file_content("f").unwrap().unwrap(), b"after\n");
+        let wc = receiver.require_working_copy_id().unwrap();
+        if sequential {
+            receiver.materialize_sequential(wc).unwrap();
+        } else {
+            receiver.materialize(wc).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(receiver_dir.path().join("f")).unwrap(),
+            b"after\n"
+        );
+        assert_eq!(receiver.materialize(wc).unwrap().files_written, 0);
+    }
+}
+
+#[test]
 fn malformed_legacy_context_refuses_before_publishing_dependencies() {
     let (dir, source, root) = fixture(b"one\ntwo\n");
     std::fs::write(dir.path().join("f"), b"ONE\ntwo\n").unwrap();
@@ -252,6 +282,11 @@ fn missing_legacy_indexes_or_capabilities_never_return_stale_graph_bytes() {
         assert!(
             repo.get_file_content("f").is_err(),
             "returned stale bytes after corruption {mode}"
+        );
+        assert!(
+            repo.materialize(repo.require_working_copy_id().unwrap())
+                .is_err(),
+            "materialized stale bytes after corruption {mode}"
         );
         assert_eq!(std::fs::read(dir.path().join("f")).unwrap(), b"after\n");
     }
