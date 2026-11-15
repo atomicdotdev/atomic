@@ -38,11 +38,20 @@ pub struct IntentGraph {
     /// Write output to this file (HTML also opens it unless --no-open is set).
     #[arg(short, long)]
     pub output: Option<std::path::PathBuf>,
+    /// Include an unsigned/signed prepared review as diagnostic intent-graph
+    /// context. Evidence is resolved by the repository service; never approval.
+    #[arg(long)]
+    pub review_file: Option<std::path::PathBuf>,
 }
 
 impl Command for IntentGraph {
     fn run(&self) -> CliResult<()> {
-        let graph = crate::commands::rpc::intent_graph(&self.id, self.max_nodes as usize)
+        let review = self
+            .review_file
+            .as_deref()
+            .map(crate::commands::triage::read_publication_review)
+            .transpose()?;
+        let graph = crate::commands::rpc::intent_graph(&self.id, self.max_nodes as usize, review.as_ref())
             .map_err(|error| {
                 if error.to_string().contains("KgNeedsRebuild") {
                     CliError::InvalidArgument {
@@ -158,6 +167,8 @@ fn annotate(graph: &Graph, nodes: &mut [atomic_core::KgNode]) {
             "selected intent's recorded artifact (matched by stored vault_path)"
         } else if graph.dependency_changes.contains(&node.id) {
             "dependency-only change"
+        } else if graph.reviewed_changes.contains(&node.id) {
+            "reviewed change; not inferred implementation"
         } else {
             "context"
         };
@@ -230,6 +241,11 @@ fn render_tree(graph: &Graph, details: bool) -> String {
             (1, "Intent recording evidence (not implementation)".into())
         } else if graph.dependency_changes.contains(&node.id) {
             (2, "Dependency-only changes".into())
+        } else if graph.reviewed_changes.contains(&node.id) {
+            (
+                2,
+                "Review scope and evidence (not implementation attribution)".into(),
+            )
         } else if graph.intent_artifact.as_ref() == Some(&node.id) {
             (3, "Intent artifact".into())
         } else if node.has_type(Class::Task) {
@@ -464,6 +480,7 @@ mod tests {
             intent_artifact: None,
             recording_changes: vec!["urn:change:RECORD".into()],
             dependency_changes: vec!["urn:change:DEPEND".into()],
+            reviewed_changes: vec![],
             truncated: false,
             missing_resources: vec![],
             diagnostics: vec![],
@@ -490,6 +507,40 @@ mod tests {
                 "\nGrouped tree; use --details for full labels, canonical IDs and relationships.\n",
             )
         );
+    }
+
+    #[test]
+    fn review_context_uses_existing_exports_and_distinct_change_role() {
+        for export in ["--json", "--dot", "--html", "--details"] {
+            assert!(IntentGraph::try_parse_from([
+                "graph",
+                "ATOM::test::1",
+                "--review-file",
+                "prepared.json",
+                export
+            ])
+            .is_ok());
+        }
+        let mut graph = fixture();
+        graph.nodes.push(atomic_core::KgNode::new(
+            "urn:change:REVIEWED",
+            Class::Change,
+            "Inspect retained work",
+            "test",
+        ));
+        graph.reviewed_changes.push("urn:change:REVIEWED".into());
+        let text = render_text(&graph);
+        assert!(text.contains("Review scope and evidence (not implementation attribution)"));
+        let mut nodes = graph.nodes.clone();
+        annotate(&graph, &mut nodes);
+        assert!(nodes
+            .iter()
+            .find(|node| node.id == "urn:change:REVIEWED")
+            .unwrap()
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("not inferred implementation"));
     }
 
     #[test]

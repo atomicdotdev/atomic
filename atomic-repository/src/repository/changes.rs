@@ -484,6 +484,7 @@ impl Repository {
         &self,
         attestation: &atomic_core::change::Attestation,
     ) -> Result<Hash, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         use atomic_core::pristine::MutTxnT;
 
@@ -613,6 +614,7 @@ impl Repository {
         &self,
         manifest: &atomic_core::change::session::SessionManifest,
     ) -> Result<Hash, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut txn = self
             .pristine
@@ -633,6 +635,7 @@ impl Repository {
     /// files are reported in the result rather than aborting the rebuild.
     /// Returns `(indexed_count, skipped_existing, corrupt_count)`.
     pub fn rebuild_session_index(&self) -> Result<(usize, usize, usize), RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let mut indexed = 0usize;
         let mut skipped = 0usize;
@@ -826,6 +829,7 @@ impl Repository {
         parent_view: Option<String>,
         ended_at: Option<i64>,
     ) -> Result<(), RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let json_path = self
             .dot_dir
@@ -855,6 +859,7 @@ impl Repository {
         parent_view: Option<String>,
         incomplete: &atomic_core::change::session::IncompleteSession,
     ) -> Result<atomic_core::change::session::IncompleteSession, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         let json_path = self
             .dot_dir
@@ -1439,6 +1444,7 @@ impl Repository {
         &self,
         graph: &atomic_core::change::ProvenanceGraph,
     ) -> Result<Hash, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
         use atomic_core::pristine::MutTxnT;
 

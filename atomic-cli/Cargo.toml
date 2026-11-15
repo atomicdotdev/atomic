@@ -36,7 +36,7 @@ atomic-config = { workspace = true }
 atomic-identity = { workspace = true }
 atomic-objects = { workspace = true }
 atomic-remote = { workspace = true }
-atomic-repository = { workspace = true }
+atomic-repository = { workspace = true, features = ["review-shacl"] }
 libatomic = { workspace = true }
 atomic-client = { workspace = true }
 tonic = { workspace = true }

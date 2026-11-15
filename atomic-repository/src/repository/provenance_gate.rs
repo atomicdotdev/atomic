@@ -291,6 +291,15 @@ pub struct GateVerdict {
     /// Honest statement of what this verdict does NOT prove (CB-12A open
     /// findings, policy-dependent gaps). Never empty for a managed gate run.
     pub limitations: Vec<String>,
+    /// Present-day exact-change approvals; never original-session attestations.
+    pub retrospective_reviews: Vec<RetrospectiveApproval>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RetrospectiveApproval {
+    pub change: String,
+    pub session: String,
+    pub review_hash: String,
 }
 
 impl GateVerdict {
@@ -494,6 +503,7 @@ impl Repository {
             managed_changes: 0,
             blocks: Vec::new(),
             limitations: default_limitations(),
+            retrospective_reviews: Vec::new(),
         };
 
         // Per-session caches: ledger status and MAC keys are session-scoped;
@@ -675,7 +685,14 @@ impl Repository {
             // signature, trusted signer. EVERY same-session attestation must
             // verify: a second attestation that fails under the session key
             // is tamper/forgery evidence, never an alternative to trust.
-            let attestations = self.find_attestations_for_change(hash).unwrap_or_default();
+            let attestations = if self
+                .vault_list(super::publication_review::PREFIX, None)?
+                .is_empty()
+            {
+                self.find_attestations_for_change(hash).unwrap_or_default()
+            } else {
+                self.review_original_attestations(hash)?
+            };
             let same_session: Vec<_> = attestations
                 .iter()
                 .filter(|(_, attest)| attest.session_id == session)
@@ -775,10 +792,29 @@ impl Repository {
 
             match check {
                 None => {
-                    verdict.blocks.push(GateBlocker::MissingAttestation {
-                        change: change_b32.clone(),
-                        session: session.clone(),
-                    });
+                    match self.retrospective_review_for(
+                        &change_b32,
+                        &session,
+                        config,
+                        did_key_provider,
+                    ) {
+                        Ok(Some(review_hash)) => {
+                            verdict.retrospective_reviews.push(RetrospectiveApproval {
+                                change: change_b32.clone(),
+                                session: session.clone(),
+                                review_hash,
+                            });
+                        }
+                        outcome => {
+                            if let Err(error) = outcome {
+                                verdict.limitations.push(error.to_string());
+                            }
+                            verdict.blocks.push(GateBlocker::MissingAttestation {
+                                change: change_b32.clone(),
+                                session: session.clone(),
+                            });
+                        }
+                    }
                 }
                 Some(AttestationCheck {
                     hash: attest_b32,

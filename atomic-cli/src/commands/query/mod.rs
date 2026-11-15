@@ -675,6 +675,15 @@ fn html_node_color(kind: &str) -> String {
         Class::Project => "#adcbe7",
         Class::ProjectIdentity => "#bba2a0",
         Class::VerificationStatus => "#d4d8e3",
+        Class::PublicationReview => "#c49bff",
+        Class::ReviewSubject => "#93b4e8",
+        Class::ReviewEvaluation => "#7fdeb6",
+        Class::VerificationRecord => "#efb788",
+        Class::SigningKey => "#d0ce73",
+        Class::ReviewEvidence => "#a3dec8",
+        Class::IntentObservation => "#e6a6ce",
+        Class::CriterionJudgment => "#a7cf77",
+        Class::ReviewFinding => "#f5ba98",
     }
     .to_owned()
 }

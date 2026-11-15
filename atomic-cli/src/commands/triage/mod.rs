@@ -24,6 +24,8 @@ pub mod model {
     pub use atomic_repository::triage::model::*;
 }
 pub mod output;
+mod publication_review;
+pub(crate) use publication_review::read as read_publication_review;
 pub mod project {
     pub use atomic_repository::triage::report::{build_report, build_walkthrough, TaskFact};
 }
@@ -48,6 +50,7 @@ impl Command for Triage {
         match &self.command {
             TriageCommands::Candidates(cmd) => cmd.run(),
             TriageCommands::Review(cmd) => cmd.run(),
+            TriageCommands::PublicationReview(cmd) => cmd.run(),
         }
     }
 }
@@ -68,6 +71,8 @@ pub enum TriageCommands {
     /// gates each reached intent, and emits a bounded CLI dashboard (default)
     /// or the full JSON worklist (`--json`). See this subcommand's examples.
     Review(TriageReview),
+    /// Prepare, sign, record or inspect an exact-scope retrospective review.
+    PublicationReview(publication_review::PublicationReviewCommand),
 }
 
 /// Compute the triage candidate set for a view relative to a target.

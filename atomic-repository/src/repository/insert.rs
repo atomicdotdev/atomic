@@ -2422,6 +2422,7 @@ impl Repository {
         hash: &Hash,
         options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         let change = self.load_change(hash)?;
         let view_name = options
             .view
@@ -2858,6 +2859,7 @@ impl Repository {
         hash: &Hash,
         mut options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         let _span_lock = if self.span_in_closure(std::slice::from_ref(hash))? {
             let lock = self.try_lock_workspace_operation(self.require_working_copy_id()?)?;
             self.preflight_span_references(
@@ -2942,7 +2944,7 @@ impl Repository {
         // closure, so coverage is complete and diagnostics are exact.
         if !to_insert.is_empty() {
             let shared_target = view.kind == atomic_core::pristine::ViewScope::Shared;
-            if shared_target {
+            if shared_target && !options.skip_publication_gate {
                 let closure = super::provenance_gate::reachable_closure(self, &to_insert)?;
                 let provider = super::provenance_gate::local_session_mac_key_provider(self);
                 let did_provider = super::provenance_gate::local_did_key_provider(self);
@@ -3055,6 +3057,7 @@ impl Repository {
         mut options: InsertOptions,
         removal: Option<(&str, Hash)>,
     ) -> Result<InsertOutcome, RepositoryError> {
+        let _review_boundary = self.review_evidence_lock()?;
         if self.is_remote_sandbox() {
             return self.submit_recorded(outcome);
         }
@@ -3404,6 +3407,11 @@ impl Repository {
         &self,
         options: CrossViewInsertOptions,
     ) -> Result<CrossViewInsertOutcome, RepositoryError> {
+        let _review_boundary = if options.dry_run {
+            None
+        } else {
+            self.review_evidence_lock()?
+        };
         let trace_insert = std::env::var_os("ATOMIC_TRACE_INSERT").is_some();
         let t0 = std::time::Instant::now();
 

@@ -70,6 +70,27 @@ pub fn print_report(report: &TriageReport) {
                     .to_string()
             };
             println!("  {} [{}]", emphasis(&intent.id), conform);
+            if intent.status == "icebox" {
+                println!(
+                    "    {}",
+                    hint("set aside: historical criteria, not current implementation approval")
+                );
+                if let Some(reviewer) = &intent.reviewed_by {
+                    println!(
+                        "    {}",
+                        info(&format!("disposition reviewed by {reviewer}"))
+                    );
+                }
+                for c in &intent.criteria {
+                    println!(
+                        "    historical [{}] {} {}",
+                        c.status,
+                        hint(&c.id),
+                        first_line(&c.text)
+                    );
+                }
+                continue;
+            }
             if let Some(reviewer) = &intent.reviewed_by {
                 println!("    {}", info(&format!("reviewed by {reviewer}")));
             }
@@ -471,8 +492,13 @@ fn render_intent(intent: &IntentReport) -> String {
         html_escape(&conform)
     ));
     if let Some(reviewer) = &intent.reviewed_by {
+        let label = if intent.status == "icebox" {
+            "set-aside disposition reviewed by"
+        } else {
+            "reviewed by"
+        };
         d.push_str(&format!(
-            "<div class=\"reviewed-by\">reviewed by {}</div>\n",
+            "<div class=\"reviewed-by\">{label} {}</div>\n",
             html_escape(reviewer)
         ));
     }
@@ -487,11 +513,24 @@ fn render_intent(intent: &IntentReport) -> String {
         d.push_str("</ul>\n");
     }
     if !intent.criteria.is_empty() {
-        d.push_str("<ul class=\"criteria\">\n");
-        for c in &intent.criteria {
-            d.push_str(&render_criterion(c));
+        if intent.status == "icebox" {
+            d.push_str("<p>Historical criteria — not evaluated as current implementation approval.</p><ul>\n");
+            for c in &intent.criteria {
+                d.push_str(&format!(
+                    "<li>historical [{}] {}: {}</li>\n",
+                    html_escape(&c.status),
+                    html_escape(&c.id),
+                    html_escape(&c.text)
+                ));
+            }
+            d.push_str("</ul>\n");
+        } else {
+            d.push_str("<ul class=\"criteria\">\n");
+            for c in &intent.criteria {
+                d.push_str(&render_criterion(c));
+            }
+            d.push_str("</ul>\n");
         }
-        d.push_str("</ul>\n");
     }
     d.push_str("</details>\n");
     d
@@ -880,6 +919,7 @@ mod tests {
                 findings_info: 0,
             },
             intents: vec![IntentReport {
+                status: "needs-review".into(),
                 id: "intent:DEMO-A".to_string(),
                 why: Some("Because <it> matters & more".to_string()),
                 conforms: false,
@@ -1005,6 +1045,20 @@ mod tests {
 
     /// The HTML chapter tour: nav anchors, numbered chapters (first open),
     /// depends_on links, escaped rationale, and layer-scoped diffs.
+    #[test]
+    fn set_aside_criteria_are_history_not_green_implementation_checks() {
+        let mut report = sample_report();
+        let intent = &mut report.intents[0];
+        intent.status = "icebox".into();
+        intent.criteria[0].status = "met".into();
+        let html = render_intent(intent);
+        assert!(html.contains("Historical criteria"));
+        assert!(html.contains("disposition reviewed by"));
+        assert!(html.contains("historical [met]"));
+        assert!(!html.contains("mark met"));
+        assert!(!html.contains("<reviewer>"));
+    }
+
     #[test]
     fn render_html_walkthrough_chapter_tour() {
         let html = render_html(&sample_report());

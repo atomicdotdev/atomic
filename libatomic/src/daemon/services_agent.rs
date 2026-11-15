@@ -3839,12 +3839,20 @@ impl knowledge_service_server::KnowledgeService for KnowledgeImpl {
         let response = tokio::task::spawn_blocking(move || {
             let _gate = gate;
             let repo = handle.repository_readonly()?;
-            let snapshot = repo.workflow_snapshot().map_err(repository_error)?;
+            let (snapshot, review_preview_identity) = if let Some(bytes) = request.review_document {
+                let (snapshot, identity) = repo
+                    .workflow_snapshot_with_review(&bytes)
+                    .map_err(repository_error)?;
+                (snapshot, Some(identity))
+            } else {
+                (repo.workflow_snapshot().map_err(repository_error)?, None)
+            };
             Ok::<_, Status>(GetWorkflowSnapshotResponse {
                 api_version: 1,
                 generation: snapshot.generation,
                 ontology_version: snapshot.ontology_version.to_owned(),
                 identity: snapshot.identity,
+                review_preview_identity,
                 nodes: snapshot
                     .nodes
                     .into_iter()
