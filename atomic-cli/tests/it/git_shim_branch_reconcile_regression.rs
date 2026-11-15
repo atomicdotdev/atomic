@@ -102,6 +102,42 @@ fn assert_clean_and_verified(root: &Path, home: &Path) {
 }
 
 #[test]
+fn tracked_atomicignore_matches_git_head_after_import() {
+    for mode in ["--stream", "--no-stream"] {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let home = home.path();
+        let ignore = b"build/\n";
+        git(root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join(".atomicignore"), ignore).unwrap();
+        fs::write(root.join("tracked.txt"), b"baseline\n").unwrap();
+        git(root, &["add", ".atomicignore", "tracked.txt"]);
+        git(
+            root,
+            &["commit", "-qm", "baseline with tracked Atomic ignore"],
+        );
+        let head = git(root, &["rev-parse", "HEAD"]);
+
+        atomic_ok(root, home, &["git", "import", mode, "--no-vault"]);
+        atomic_ok(root, home, &["git", "shim", "verify"]);
+
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), head, "{mode}");
+        assert_eq!(
+            git(root, &["ls-files", "--error-unmatch", ".atomicignore"]),
+            ".atomicignore",
+            "{mode}"
+        );
+        assert_eq!(
+            fs::read(root.join(".atomicignore")).unwrap(),
+            ignore,
+            "{mode}"
+        );
+        assert!(git(root, &["status", "--porcelain"]).is_empty(), "{mode}");
+    }
+}
+
+#[test]
 fn literal_percent_path_reconciles_without_stale_checkpoint() {
     let (root, home) = shim_repo();
     fs::write(root.join("100%.txt"), b"literal percent\n").unwrap();
