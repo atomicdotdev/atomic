@@ -183,6 +183,9 @@ attest a current `icebox` disposition with an explanation and retained originals
 The completed independent review must explicitly reference that intent. The
 resolver pins it in `ReviewSubject.set_aside`, separate from `work`, and the
 ontology projects `includesSetAside`, not active `includesIntent` coverage.
+A reviewed change whose retained receipts observe that set-aside intent is
+still complete review scope; only `includesIntent` can supply managed-change
+coverage.
 SHACL requires fresh, valid, canonically conforming source, the explicit completed
 review and different authenticated signing keys for these dispositions too. It
 does **not** assert that historical implementation goals hold in today's product.
