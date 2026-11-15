@@ -228,12 +228,6 @@ impl Repository {
                 Some(atomic_core::crdt::TrunkOp::ProjectedSpanEdit { .. })
             )
         });
-        if projected && cfg!(not(unix)) {
-            return Err(RepositoryError::InvalidOperation {
-                message: "projected semantic change import is not supported on this platform"
-                    .into(),
-            });
-        }
         if projected && change.hashed.span.is_none() {
             return Err(RepositoryError::InvalidOperation {
                 message: "projected semantic edit requires a span change".into(),
@@ -1912,7 +1906,8 @@ impl Repository {
     }
 }
 
-#[cfg(unix)]
+/// Publish a projected change object exactly once: the complete bytes or
+/// nothing, and never over a different object already stored at `path`.
 fn save_projected_change_without_overwrite(
     path: &Path,
     bytes: &[u8],
@@ -1928,13 +1923,13 @@ fn save_projected_change_without_overwrite(
         // A prior process may have linked the complete object but died before
         // syncing the containing directory. Finish that durability step when
         // reusing an identical object.
-        std::fs::File::open(path)?.sync_all()?;
+        sync_projected_object(path)?;
         let parent = path
             .parent()
             .ok_or_else(|| RepositoryError::InvalidOperation {
                 message: "projected change path has no parent".into(),
             })?;
-        std::fs::File::open(parent)?.sync_all()?;
+        sync_projected_directory(parent)?;
         Ok(())
     }
     match std::fs::symlink_metadata(path) {
@@ -1950,7 +1945,7 @@ fn save_projected_change_without_overwrite(
     if let Some(ancestor) = parent.parent() {
         // The hash-prefix directory may have just been created. Persist its
         // entry before publishing an object within it.
-        std::fs::File::open(ancestor)?.sync_all()?;
+        sync_projected_directory(ancestor)?;
     }
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
@@ -1965,7 +1960,7 @@ fn save_projected_change_without_overwrite(
     }
     match temporary.persist_noclobber(path) {
         Ok(_) => {
-            std::fs::File::open(parent)?.sync_all()?;
+            sync_projected_directory(parent)?;
             Ok(())
         }
         Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1975,24 +1970,61 @@ fn save_projected_change_without_overwrite(
     }
 }
 
-#[cfg(not(unix))]
-fn save_projected_change_without_overwrite(
-    _path: &Path,
-    _bytes: &[u8],
-) -> Result<(), RepositoryError> {
-    Err(RepositoryError::InvalidOperation {
-        message: "durable projected change publication is not supported on this platform".into(),
-    })
+/// Flush an already published object's bytes to stable storage.
+fn sync_projected_object(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let file = std::fs::File::open(path)?;
+    // Windows only flushes through a handle that was opened for writing.
+    #[cfg(not(unix))]
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.sync_all()
 }
 
-#[cfg(all(test, unix))]
+/// Make a directory's entries durable. Directory fsync is only portable on
+/// Unix; elsewhere the no-clobber rename that publishes the object is still
+/// atomic, so a reader never observes a partial object.
+fn sync_projected_directory(directory: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(directory)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
+}
+
+#[cfg(test)]
 mod projected_store_tests {
     use super::save_projected_change_without_overwrite;
-    use std::io::BufRead;
-    use std::os::unix::process::ExitStatusExt;
 
     #[test]
+    fn projected_publication_is_idempotent_and_refuses_different_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        // The hash-prefix directory is created by the caller just before
+        // publication, exactly as the change store lays objects out.
+        let prefix = dir.path().join("AB");
+        std::fs::create_dir_all(&prefix).unwrap();
+        let path = prefix.join("object.change");
+        save_projected_change_without_overwrite(&path, b"complete change bytes").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete change bytes");
+        save_projected_change_without_overwrite(&path, b"complete change bytes").unwrap();
+        assert!(save_projected_change_without_overwrite(&path, b"different bytes").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete change bytes");
+        let leftovers: Vec<_> = std::fs::read_dir(&prefix)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "object.change")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging files must not outlive publication: {leftovers:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn staged_projected_change_survives_process_kill_without_partial_publication() {
+        use std::io::BufRead;
+        use std::os::unix::process::ExitStatusExt;
+
         const ROOT: &str = "ATOMIC_TEST_PROJECTED_STORE_ROOT";
         if let Some(root) = std::env::var_os(ROOT) {
             let path = std::path::PathBuf::from(root).join("object.change");
