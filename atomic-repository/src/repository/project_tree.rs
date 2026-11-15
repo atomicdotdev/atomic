@@ -244,14 +244,29 @@ pub enum ExclusionReason {
 pub enum ExclusionPolicy {
     ShimPrivate,
     IncludeVault,
+    IncludeAtomicIgnore,
+    IncludeVaultAndAtomicIgnore,
 }
 
 impl ExclusionPolicy {
+    pub fn includes_vault(self) -> bool {
+        matches!(self, Self::IncludeVault | Self::IncludeVaultAndAtomicIgnore)
+    }
+
+    pub fn includes_atomic_ignore(self) -> bool {
+        matches!(
+            self,
+            Self::IncludeAtomicIgnore | Self::IncludeVaultAndAtomicIgnore
+        )
+    }
+
     pub fn exclusion(self, path: &RepoPath) -> Option<ExclusionReason> {
-        if atomic_private_path(path.as_bytes()) {
+        if atomic_private_path(path.as_bytes())
+            && (path.as_bytes() != b".atomicignore" || !self.includes_atomic_ignore())
+        {
             Some(ExclusionReason::AtomicPrivate)
         } else if path.components().next().unwrap_or_default() == b".vault"
-            && self == Self::ShimPrivate
+            && !self.includes_vault()
         {
             Some(ExclusionReason::VaultPrivate)
         } else {
@@ -296,7 +311,7 @@ impl ExclusionPolicy {
                 // repository) — the HEAD tree decides.
                 match Repository::canonical_dot_dir(workdir) {
                     Ok(dot_dir) => dot_dir,
-                    Err(_) => return Ok(Self::from_git_head(git)),
+                    Err(_) => return Ok(Self::from_git_head(git, None)),
                 }
             };
             let config_path = dot_dir.join("config.toml");
@@ -309,30 +324,35 @@ impl ExclusionPolicy {
                         ))
                     })?;
                 if let Some(vault) = config.git.shim.vault {
-                    return Ok(match vault {
-                        atomic_config::ShimVaultPolicy::Tracked => Self::IncludeVault,
-                        atomic_config::ShimVaultPolicy::Private => Self::ShimPrivate,
-                    });
+                    return Ok(Self::from_git_head(
+                        git,
+                        Some(matches!(vault, atomic_config::ShimVaultPolicy::Tracked)),
+                    ));
                 }
             }
         }
-        Ok(Self::from_git_head(git))
+        Ok(Self::from_git_head(git, None))
     }
 
-    /// Auto-detect from the Git HEAD tree: does the tracked root tree hold
-    /// a `.vault` entry? An unborn or detached-without-commit HEAD reads
-    /// as untracked.
-    fn from_git_head(git: &git2::Repository) -> Self {
-        let tracks_vault = git
+    /// Resolve tracked root paths from Git HEAD, honoring the vault override.
+    fn from_git_head(git: &git2::Repository, vault_override: Option<bool>) -> Self {
+        let tree = git
             .head()
             .ok()
             .and_then(|head| head.peel_to_commit().ok())
-            .and_then(|commit| commit.tree().ok())
-            .is_some_and(|tree| tree.get_name(".vault").is_some());
-        if tracks_vault {
-            Self::IncludeVault
-        } else {
-            Self::ShimPrivate
+            .and_then(|commit| commit.tree().ok());
+        let tracked = |name| {
+            tree.as_ref()
+                .is_some_and(|tree| tree.get_name(name).is_some())
+        };
+        match (
+            vault_override.unwrap_or_else(|| tracked(".vault")),
+            tracked(".atomicignore"),
+        ) {
+            (false, false) => Self::ShimPrivate,
+            (true, false) => Self::IncludeVault,
+            (false, true) => Self::IncludeAtomicIgnore,
+            (true, true) => Self::IncludeVaultAndAtomicIgnore,
         }
     }
 }
@@ -584,6 +604,8 @@ impl ConversionPolicy {
         encoder.u8(match self.exclusions {
             ExclusionPolicy::ShimPrivate => 0,
             ExclusionPolicy::IncludeVault => 1,
+            ExclusionPolicy::IncludeAtomicIgnore => 2,
+            ExclusionPolicy::IncludeVaultAndAtomicIgnore => 3,
         });
         encoder.u8(match self.losses {
             LossPolicy::Refuse => 0,
