@@ -1344,7 +1344,7 @@ impl Import {
         // then the unambiguous Git HEAD-tree detection, the exact one the
         // preflight plan above used. The value is persisted immediately
         // after init so every later command reads the recorded policy.
-        let fresh_vault_tracked = if repo_exists {
+        let fresh_exclusions = if repo_exists {
             None
         } else {
             Some(
@@ -1354,7 +1354,7 @@ impl Import {
                             "cannot resolve the shim vault policy: {error}"
                         ))
                     },
-                )? == atomic_repository::ExclusionPolicy::IncludeVault,
+                )?,
             )
         };
 
@@ -1383,8 +1383,8 @@ impl Import {
         // (RFC §6.2): explicit and durable, so the conversion policy is
         // frozen for every later command instead of re-detected against a
         // moving HEAD.
-        if let Some(tracked) = fresh_vault_tracked {
-            super::parallel::record_imported_vault_policy(&repo, tracked)?;
+        if let Some(exclusions) = fresh_exclusions {
+            super::parallel::record_imported_vault_policy(&repo, exclusions.includes_vault())?;
         }
 
         // Enter the shared workspace boundary. Import is also the bootstrap
@@ -1549,6 +1549,7 @@ impl Import {
                     self.kind.as_deref(),
                     self.no_vault,
                     working_copy,
+                    fresh_exclusions.is_some_and(|policy| policy.includes_atomic_ignore()),
                 )?;
             }
 
@@ -1712,6 +1713,7 @@ impl Import {
                     self.kind.as_deref(),
                     self.no_vault,
                     working_copy,
+                    fresh_exclusions.is_some_and(|policy| policy.includes_atomic_ignore()),
                 )?;
             }
 
@@ -2031,9 +2033,10 @@ fn init_atomicignore_and_vault(
     kind: Option<&str>,
     no_vault: bool,
     working_copy: WorkingCopyId,
+    git_tracks_atomic_ignore: bool,
 ) -> CliResult<()> {
-    // Step 1: .atomicignore
-    {
+    // Git import already recorded a tracked .atomicignore.
+    if !git_tracks_atomic_ignore {
         let ignore_path = workdir.join(".atomicignore");
         if !ignore_path.exists() {
             // Use explicit --kind if provided, otherwise auto-detect from project files
