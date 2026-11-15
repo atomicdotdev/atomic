@@ -1379,10 +1379,9 @@ impl Import {
             repo
         };
 
-        // Record the detected vault policy for a freshly created repository
-        // (RFC §6.2): explicit and durable, so the conversion policy is
-        // frozen for every later command instead of re-detected against a
-        // moving HEAD.
+        // Persist the detected vault policy for a freshly created repository
+        // (RFC §6.2). The independent .atomicignore policy follows Git HEAD
+        // so the projection includes the file exactly when Git tracks it.
         if let Some(exclusions) = fresh_exclusions {
             super::parallel::record_imported_vault_policy(&repo, exclusions.includes_vault())?;
         }
