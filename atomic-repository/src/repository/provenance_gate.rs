@@ -511,6 +511,8 @@ impl Repository {
         let mut ledger_cache: BTreeMap<String, LedgerStatus> = BTreeMap::new();
         let mut mac_key_cache: BTreeMap<String, Option<String>> = BTreeMap::new();
         let mut did_key_cache: BTreeMap<String, Option<[u8; 32]>> = BTreeMap::new();
+        // Stored reviews are resolved once for the whole evaluation.
+        let mut review_cache = super::publication_review::ReviewGateCache::default();
 
         for hash in changes {
             let change_b32 = hash.to_base32();
@@ -797,6 +799,7 @@ impl Repository {
                         &session,
                         config,
                         did_key_provider,
+                        &mut review_cache,
                     ) {
                         Ok(Some(review_hash)) => {
                             verdict.retrospective_reviews.push(RetrospectiveApproval {
@@ -806,8 +809,8 @@ impl Repository {
                             });
                         }
                         outcome => {
-                            if let Err(error) = outcome {
-                                verdict.limitations.push(error.to_string());
+                            if let Err(limitation) = outcome {
+                                verdict.limitations.push(limitation);
                             }
                             verdict.blocks.push(GateBlocker::MissingAttestation {
                                 change: change_b32.clone(),
