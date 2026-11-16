@@ -161,7 +161,8 @@ fn approval_is_exact_and_does_not_clear_incomplete_sessions() {
             &Hash::of(b"another change").to_base32(),
             SESSION,
             &f.config(),
-            Some(&|did| f.keys(did))
+            Some(&|did| f.keys(did)),
+            &mut ReviewGateCache::default(),
         )
         .unwrap()
         .is_none());
@@ -171,7 +172,8 @@ fn approval_is_exact_and_does_not_clear_incomplete_sessions() {
             &f.change.to_base32(),
             "another-session",
             &f.config(),
-            Some(&|did| f.keys(did))
+            Some(&|did| f.keys(did)),
+            &mut ReviewGateCache::default(),
         )
         .unwrap()
         .is_none());
