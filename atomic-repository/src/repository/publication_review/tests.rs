@@ -15,6 +15,7 @@ use serde_json::json;
 mod boundaries;
 mod observations;
 mod snapshot;
+mod storage;
 
 const SESSION: &str = "retained-legacy-session";
 
