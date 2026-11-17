@@ -179,6 +179,7 @@ fn isolated(
             change_store,
             is_sandbox: false,
             semantic_closure_memo: Default::default(),
+            kind_registry_cache: Default::default(),
         },
         directory,
     ))
