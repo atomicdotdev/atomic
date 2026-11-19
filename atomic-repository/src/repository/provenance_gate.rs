@@ -1636,6 +1636,40 @@ mod tests {
         assert!(outcome.is_ok(), "draft insertion is not gated: {error:?}");
     }
 
+    /// Applying a view manifest rebuilds a state that was already published
+    /// somewhere else (a clone, a server read-model). The decision to publish
+    /// was made, and gated, on the machine that pushed it; the replica holds
+    /// none of that machine's session evidence and must not re-decide it.
+    /// Publishing from the replica is still gated.
+    #[test]
+    fn manifest_replay_into_a_shared_view_is_not_a_publication() {
+        use crate::manifest::ViewManifest;
+        use atomic_core::pristine::ViewScope;
+
+        let (_dir, mut repo) = create_temp_repo();
+        let published = repo
+            .save_change(&managed_change("published elsewhere"))
+            .expect("save");
+        let manifest = ViewManifest::new("main", ViewScope::Shared, None, vec![published]);
+
+        let outcome = repo
+            .apply_view_manifest(&manifest)
+            .expect("replaying a published view is not gated");
+        assert_eq!(outcome.replayed, 1);
+        assert_eq!(outcome.state, manifest.state);
+
+        let local = repo
+            .save_change(&managed_change("new local work"))
+            .expect("save");
+        let error = repo
+            .insert_change(&local, crate::InsertOptions::default().view("main"))
+            .expect_err("publishing from the replica must still refuse");
+        assert!(
+            matches!(error, RepositoryError::PublicationGateRefused { .. }),
+            "{error:?}"
+        );
+    }
+
     /// A DID signer written into the clone's repo-local identity store
     /// (`<dot>/identities`) resolves through it: name, `did:atomic`, and
     /// `did:key` forms all reach the identity's public key, and a signer
