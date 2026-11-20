@@ -744,6 +744,51 @@ impl Repository {
         self.vault_apply_changes(&changes)
     }
 
+    /// Make the vault tables hold exactly `files` — each a vault-relative
+    /// path and the file's content — and nothing else.
+    ///
+    /// This is for a read replica that mirrors one view's vault, not for a
+    /// working vault. Everything already stored is dropped and the files are
+    /// stored as given, so none of the rules that guard edits apply (a `done`
+    /// intent whose text changed is not demoted, stored reviews are not
+    /// protected), and nothing is indexed or embedded: no file's text leaves
+    /// the process, and the cost does not grow with the square of the vault.
+    /// Call [`Self::rebuild_kg`] afterwards to derive the graph once.
+    pub fn vault_mirror_files(&self, files: &[(String, String)]) -> Result<(), RepositoryError> {
+        use atomic_core::pristine::{VaultManifest, VaultMutTxnT, VaultTxnT};
+
+        let _review_boundary = self.review_evidence_lock()?;
+        self.ensure_project_identity(atomic_core::kg::project_id::MintReason::Upgrade)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let database =
+            |e: atomic_core::pristine::PristineError| RepositoryError::Database(e.to_string());
+
+        let mut txn = self.pristine.write_txn().map_err(database)?;
+        txn.init_vault().map_err(database)?;
+        for stored in txn.list_vault_entries("", None).map_err(database)? {
+            txn.del_vault_entry(&stored.path).map_err(database)?;
+        }
+        let mut manifest = VaultManifest::default();
+        for (path, content) in files {
+            let (frontmatter_json, body) = parse_markdown_frontmatter(content);
+            let entry = VaultEntry::new(
+                infer_entry_type(path),
+                body.into_bytes(),
+                frontmatter_json,
+                now.clone(),
+            );
+            txn.put_vault_entry(path, &entry).map_err(database)?;
+            update_manifest_for_store(&mut manifest, path, &entry, None, &now);
+        }
+        txn.put_vault_manifest(&manifest).map_err(database)?;
+        txn.commit().map_err(database)?;
+
+        // Intent summaries are kept by the higher-level intent methods; fill
+        // them in from the stored entries.
+        self.vault_reconcile_intent_manifest()?;
+        Ok(())
+    }
+
     /// Deflate changed vault files from disk into redb.
     ///
     /// Scans the vault working copy, detects changes, and updates the
@@ -970,6 +1015,132 @@ impl Repository {
         txn.commit()
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use crate::{IntentCreateOptions, Repository};
+    use tempfile::tempdir;
+
+    /// The vault files of a small project, as a checkout would hold them:
+    /// one intent written by the intent API, a goal and a memory.
+    fn sample_files() -> Vec<(String, String)> {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.init_vault().unwrap();
+        let intent = repo
+            .vault_intent_create(IntentCreateOptions {
+                title: "Ship billing export".into(),
+                priority: Some("high".into()),
+                assignee: Some("dana".into()),
+                labels: vec!["billing".into()],
+                session_id: None,
+                turn_id: None,
+                kind: None,
+            })
+            .unwrap();
+        let path = format!("intents/{}/intent.md", intent.uid);
+        let content = std::fs::read_to_string(repo.vault_dir().join(&path)).unwrap();
+        vec![
+            (path, content),
+            (
+                "goals/growth/_goal.md".to_string(),
+                "---\ngoal_id: growth\nstatus: active\n---\n# Goal: Grow\n".to_string(),
+            ),
+            (
+                "memory/pricing.md".to_string(),
+                "---\ntitle: Pricing\n---\nPrices are per seat.\n".to_string(),
+            ),
+        ]
+    }
+
+    fn fresh() -> (tempfile::TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        (dir, repo)
+    }
+
+    fn intent_nodes(repo: &Repository) -> usize {
+        repo.workflow_snapshot()
+            .unwrap()
+            .nodes
+            .iter()
+            .filter(|node| node.types.iter().any(|class| class.ends_with("Intent")))
+            .count()
+    }
+
+    #[test]
+    fn a_mirror_stores_what_recording_the_same_files_stores() {
+        let files = sample_files();
+        let (_a, recorded) = fresh();
+        recorded.init_vault().unwrap();
+        let incoming: Vec<(String, Option<String>)> = files
+            .iter()
+            .map(|(path, content)| (path.clone(), Some(content.clone())))
+            .collect();
+        recorded.vault_record_files(&incoming).unwrap();
+
+        let (_b, mirrored) = fresh();
+        mirrored.vault_mirror_files(&files).unwrap();
+
+        for (path, _) in &files {
+            let expected = recorded.vault_retrieve(path).unwrap().unwrap();
+            let stored = mirrored.vault_retrieve(path).unwrap().unwrap();
+            assert_eq!(stored.entry_type, expected.entry_type, "{path}");
+            assert_eq!(stored.content_bytes, expected.content_bytes, "{path}");
+            assert_eq!(stored.frontmatter_json, expected.frontmatter_json, "{path}");
+        }
+        // The intent is listed, with the status its file states.
+        let listed = |repo: &Repository| -> Vec<(String, String)> {
+            let mut intents: Vec<(String, String)> = repo
+                .vault_manifest()
+                .unwrap()
+                .intents
+                .values()
+                .map(|summary| (summary.vault_path.clone(), summary.status.clone()))
+                .collect();
+            intents.sort();
+            intents
+        };
+        assert_eq!(listed(&mirrored), listed(&recorded));
+        assert_eq!(listed(&mirrored).len(), 1);
+    }
+
+    #[test]
+    fn a_mirror_holds_exactly_the_files_it_was_last_given() {
+        let files = sample_files();
+        let (_dir, repo) = fresh();
+        repo.vault_mirror_files(&files).unwrap();
+
+        let only_memory = vec![(
+            "memory/pricing.md".to_string(),
+            "---\ntitle: Pricing\n---\nPrices are per team.\n".to_string(),
+        )];
+        repo.vault_mirror_files(&only_memory).unwrap();
+
+        let paths: Vec<String> = repo
+            .vault_list("", None)
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.path)
+            .collect();
+        assert_eq!(paths, ["memory/pricing.md"]);
+        let stored = repo.vault_retrieve("memory/pricing.md").unwrap().unwrap();
+        assert_eq!(stored.content_bytes, b"Prices are per team.\n");
+        assert!(repo.vault_manifest().unwrap().intents.is_empty());
+    }
+
+    /// Mirroring only stores: the graph is derived by the one rebuild the
+    /// caller asks for, not once per file.
+    #[test]
+    fn a_mirror_leaves_the_graph_to_one_rebuild() {
+        let (_dir, repo) = fresh();
+        repo.vault_mirror_files(&sample_files()).unwrap();
+        assert_eq!(intent_nodes(&repo), 0);
+
+        repo.rebuild_kg(true).unwrap();
+        assert_eq!(intent_nodes(&repo), 1);
     }
 }
 
