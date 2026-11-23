@@ -8,6 +8,7 @@ rust-version = "1.98"
 
 [dependencies]
 atomic-core.workspace = true
+atomic-canonical.workspace = true
 purrdf-shapes = "=3.0.1"
 oxrdf = "=0.2.4"
 oxttl = "=0.1.8"

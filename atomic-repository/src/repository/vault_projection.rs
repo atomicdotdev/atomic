@@ -51,6 +51,16 @@ pub(super) fn kind_instance_name(kind: &str, uid: &str) -> String {
     format!("{kind}.{uid}")
 }
 
+/// The project-scoped extension class of a kind's instances:
+/// `urn:atomic:project:<pid>:kind:<k>`.
+///
+/// This is the only non-`Class` IRI the SHACL adapter accepts. It lives in the
+/// project namespace so two repositories cannot collide, and it is not part of
+/// the closed workflow ontology (see `docs/adr/0001-kind-kg-conformance.md`).
+pub(super) fn kind_class_iri(project: &ProjectId, kind: &str) -> String {
+    format!("{}:kind:{kind}", iri::mint_project(project))
+}
+
 /// Whether a stored instance row has anything trustworthy to project.
 ///
 /// Frontmatter under `kinds/` that fails strict parsing is stored as `{}`, so a
@@ -695,6 +705,19 @@ impl VaultProjection {
             node = node.with_summary(title);
         }
         graph.nodes.push(node);
+        if self.labels.contains(&kind_hub_name(kind)) {
+            self.finding(
+                graph,
+                subject,
+                "KindLabelCollision",
+                &format!(
+                    "label {:?} collides with kind hub {}",
+                    kind_hub_name(kind),
+                    kind
+                ),
+                path,
+            );
+        }
         if spec.is_none() {
             self.finding(
                 graph,
@@ -721,15 +744,23 @@ impl VaultProjection {
         let report = validate_instance(spec, uid, &fm, &body, &ProjectionRefs(self));
 
         // Field values stay application data: the `field.` prefix keeps every
-        // declared name off the keys the SHACL adapter and vault GC read.
+        // declared name off the keys the SHACL adapter and vault GC read. The
+        // `kind_*` keys are the projection contract the adapter reads to emit
+        // extension-namespace triples (ADR 0001).
+        let kind_class = kind_class_iri(&self.project, &spec.name);
         let mut metadata = serde_json::json!({
             "kind_name": spec.name,
+            "kind_class": kind_class,
+            "kind_uid": uid,
             "uid": uid,
             "vault_path": path,
             "derived_from_vault_path": path,
             "created_at": entry.created_at,
             "updated_at": entry.updated_at,
         });
+        if !body.trim().is_empty() {
+            metadata["kind_body"] = serde_json::json!(body.as_ref());
+        }
         for (name, field) in &spec.fields {
             if field.field_type.base == BaseType::Ref {
                 continue;
@@ -747,17 +778,28 @@ impl VaultProjection {
             .get("title")
             .and_then(serde_json::Value::as_str)
             .filter(|title| !title.trim().is_empty());
-        let mut node =
-            KgNode::new(subject, C::Concept, title.unwrap_or(uid), "vault").with_metadata(metadata);
+        let mut node = KgNode::new(subject, C::Concept, title.unwrap_or(uid), "vault")
+            .with_metadata(metadata);
+        node.types.push(kind_class);
         if let Some(title) = title {
             node = node.with_summary(title);
         }
 
+        // The hub's label is the definition's title when the definition is in
+        // this projection, so the label does not depend on which row was stored
+        // last. See ADR 0001 decision 3.
+        let hub_label = self
+            .kinds
+            .get(&spec.name)
+            .and_then(KindDefinition::spec)
+            .and_then(|definition| definition.title.as_deref())
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or(spec.name.as_str());
         let hub = iri::mint_concept(&self.project, &kind_hub_name(&spec.name));
         graph.nodes.push(KgNode::new(
             &hub,
             C::Concept,
-            spec.name.as_str(),
+            hub_label,
             "vault_reference",
         ));
         graph.edges.push(
@@ -777,9 +819,29 @@ impl VaultProjection {
                 "vault_reference",
             ));
             graph.edges.push(
-                KgEdge::new(subject, target, P::References).with_metadata(
-                    serde_json::json!({"fields": [resolved.field], "edges": [edge]}),
+                KgEdge::new(subject, target, P::References).with_metadata(serde_json::json!({
+                    "fields": [resolved.field],
+                    "edges": [edge],
+                    "kind_edge": edge,
+                    "kind_field": resolved.field,
+                })),
+            );
+        }
+
+        // A label that spells the instance's concept IRI collides with the
+        // instance's own node. Record it rather than silently letting the label
+        // and the instance share an identity. See ADR 0001 decision 3.
+        if self.labels.contains(&kind_instance_name(&spec.name, uid)) {
+            self.finding(
+                graph,
+                subject,
+                "KindLabelCollision",
+                &format!(
+                    "label {:?} collides with kind instance {}",
+                    kind_instance_name(&spec.name, uid),
+                    uid
                 ),
+                path,
             );
         }
 

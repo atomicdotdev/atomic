@@ -3,7 +3,7 @@ use atomic_core::{
     KgEdge, KgNode,
 };
 use oxrdf::{Literal, NamedNode};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ValidationError;
 
@@ -37,7 +37,7 @@ pub fn snapshot_ntriples(nodes: &[KgNode], edges: &[KgEdge]) -> Result<String, V
     for node in nodes {
         let subject = named(&node.id)?;
         for class in &node.types {
-            if Class::from_iri(class).is_none() {
+            if Class::from_iri(class).is_none() && !is_extension_class(class) {
                 return Err(ValidationError::Snapshot(format!(
                     "unknown asserted class: {class}"
                 )));
@@ -155,8 +155,44 @@ pub fn snapshot_ntriples(nodes: &[KgNode], edges: &[KgEdge]) -> Result<String, V
                     )?;
                 }
             }
+            // Custom kind fields and relations project into the project-scoped
+            // extension namespace. See docs/adr/0001-kind-kg-conformance.md.
+            if let Some(kind_class) = metadata.get("kind_class").and_then(|v| v.as_str()) {
+                for (key, value) in metadata.as_object().into_iter().flatten() {
+                    if let Some(field) = key.strip_prefix("field.") {
+                        emit_kind_values(
+                            &mut triples,
+                            &subject,
+                            &format!("{kind_class}#{field}"),
+                            value,
+                        )?;
+                    }
+                }
+                for key in ["kind_uid", "kind_body"] {
+                    if let Some(value) = metadata.get(key).filter(|v| !v.is_null()) {
+                        emit_kind_values(
+                            &mut triples,
+                            &subject,
+                            &format!("{kind_class}#{}", key.trim_start_matches("kind_")),
+                            value,
+                        )?;
+                    }
+                }
+            }
         }
     }
+    // Map a kind instance's IRI to its extension class so its relation edges can
+    // be emitted with the kind's own predicate as well as atomic:references.
+    let kind_classes: BTreeMap<&str, &str> = nodes
+        .iter()
+        .filter_map(|node| {
+            node.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("kind_class"))
+                .and_then(|value| value.as_str())
+                .map(|class| (node.id.as_str(), class))
+        })
+        .collect();
     for edge in edges {
         triples.insert(format!(
             "{} <{}> {} .\n",
@@ -164,6 +200,78 @@ pub fn snapshot_ntriples(nodes: &[KgNode], edges: &[KgEdge]) -> Result<String, V
             edge.kind.iri(),
             named(&edge.to_id)?
         ));
+        if let Some(kind_edge) = edge
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("kind_edge"))
+            .and_then(|value| value.as_str())
+        {
+            if let Some(kind_class) = kind_classes.get(edge.from_id.as_str()) {
+                triples.insert(format!(
+                    "{} <{}#{kind_edge}> {} .\n",
+                    named(&edge.from_id)?,
+                    kind_class,
+                    named(&edge.to_id)?
+                ));
+            }
+        }
     }
     Ok(triples.into_iter().collect())
+}
+
+/// A project-scoped extension class: `urn:atomic:project:<pid>:kind:<kind>`.
+fn is_extension_class(iri: &str) -> bool {
+    iri.starts_with("urn:atomic:project:") && iri.contains(":kind:")
+}
+
+/// Emit one triple per scalar value. Arrays fan out; objects and nulls are not
+/// projectable kind values and are skipped.
+fn emit_kind_values(
+    triples: &mut BTreeSet<String>,
+    subject: &str,
+    predicate: &str,
+    value: &serde_json::Value,
+) -> Result<(), ValidationError> {
+    match value {
+        serde_json::Value::Null => Ok(()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                emit_kind_values(triples, subject, predicate, item)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(_) => Ok(()),
+        serde_json::Value::String(text) => {
+            triples.insert(format!(
+                "{subject} <{predicate}> {} .\n",
+                Literal::new_simple_literal(text)
+            ));
+            Ok(())
+        }
+        serde_json::Value::Bool(flag) => {
+            triples.insert(format!(
+                "{subject} <{predicate}> {} .\n",
+                Literal::new_typed_literal(
+                    flag.to_string(),
+                    NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#boolean")
+                )
+            ));
+            Ok(())
+        }
+        serde_json::Value::Number(number) => {
+            let datatype = if number.is_i64() || number.is_u64() {
+                "http://www.w3.org/2001/XMLSchema#integer"
+            } else {
+                "http://www.w3.org/2001/XMLSchema#double"
+            };
+            triples.insert(format!(
+                "{subject} <{predicate}> {} .\n",
+                Literal::new_typed_literal(
+                    number.to_string(),
+                    NamedNode::new_unchecked(datatype)
+                )
+            ));
+            Ok(())
+        }
+    }
 }
