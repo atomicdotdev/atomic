@@ -31,6 +31,7 @@ mod schema_guard_test;
 mod staging_cb11a_test;
 mod stash_attributes_test;
 mod state_based_diff_test;
+mod switch_untracked_dir_removal_test;
 mod unrecord_safety_test;
 mod view_delete_test;
 mod view_manifest_test;
