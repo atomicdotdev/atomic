@@ -2074,33 +2074,79 @@ mod tests {
         assert!(!dot.join("bridge.lock").exists());
     }
 
-    /// Copy a repository while it is still open: the copy is what a killed
-    /// process leaves behind, a database redb must repair before reading.
-    fn copy_of_open_repository(source: &std::path::Path) -> tempfile::TempDir {
-        fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
-            std::fs::create_dir_all(to).unwrap();
-            for entry in std::fs::read_dir(from).unwrap() {
-                let entry = entry.unwrap();
-                let target = to.join(entry.file_name());
-                if entry.file_type().unwrap().is_dir() {
-                    copy_dir(&entry.path(), &target);
-                } else {
-                    std::fs::copy(entry.path(), &target).unwrap();
-                }
+    /// Hold a repository database open in a child process, then kill the
+    /// child: the leftover database is what a killed process leaves
+    /// behind, one redb must repair before reading.
+    ///
+    /// This replaces a Unix fixture that copied the repository while it
+    /// was still open. Windows cannot reproduce that copy — redb holds a
+    /// byte-range lock over the open database, so every second-handle read
+    /// fails with a sharing violation (OS error 33) — but killing a real
+    /// holder produces the same unclosed state on every platform.
+    fn kill_a_database_holder(root: &std::path::Path) {
+        const HOLD_ENV: &str = "ATOMIC_TEST_HOLD_OPEN_DB";
+        if let Some(held) = std::env::var_os(HOLD_ENV) {
+            let _repo = Repository::open(std::path::PathBuf::from(held)).unwrap();
+            println!("ATOMIC_TEST_DB_HELD");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
             }
         }
-        let copy = tempfile::tempdir().unwrap();
-        copy_dir(source, copy.path());
-        copy
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "repository::git_stream::tests::git_import_preflight_repairs_a_database_left_by_a_killed_process",
+                "--nocapture",
+            ])
+            .env(HOLD_ENV, root)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) if line.contains("ATOMIC_TEST_DB_HELD") => {
+                        let _ = send.send(Ok(()));
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = send.send(Err(error.to_string()));
+                        return;
+                    }
+                }
+            }
+            let _ = send.send(Err("child exited before holding the database".to_string()));
+        });
+        let ready = receive.recv_timeout(std::time::Duration::from_secs(60));
+        let killed = child.kill();
+        let _ = child.wait();
+        if ready.is_ok() {
+            reader.join().unwrap();
+        }
+        ready
+            .expect("child timed out")
+            .expect("child did not hold the database open");
+        killed.expect("child must be killed while the database is open");
     }
 
     #[test]
     fn git_import_preflight_repairs_a_database_left_by_a_killed_process() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path()).unwrap();
-        let killed = copy_of_open_repository(dir.path());
-        let dry_run = copy_of_open_repository(dir.path());
-        drop(repo);
+        let killed = tempfile::tempdir().unwrap();
+        let dry_run = tempfile::tempdir().unwrap();
+        {
+            let repo = Repository::init(killed.path()).unwrap();
+            drop(repo);
+        }
+        {
+            let repo = Repository::init(dry_run.path()).unwrap();
+            drop(repo);
+        }
+        kill_a_database_holder(killed.path());
+        kill_a_database_holder(dry_run.path());
         let database =
             |root: &std::path::Path| root.join(".atomic").join(super::super::DATABASE_FILE);
         assert!(

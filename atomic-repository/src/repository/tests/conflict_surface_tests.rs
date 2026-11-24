@@ -23,6 +23,21 @@ fn record_all(repo: &Repository, message: &str) -> Result<RecordOutcome, RecordE
     repo.record(repo.require_working_copy_id().unwrap(), header, options)
 }
 
+/// The required clean filter must be a byte-exact pass-through. Unix
+/// pipes the bytes through `cat`. Windows has no stdin pass-through that
+/// preserves bytes (`find` rewrites line endings), so `type` is pointed
+/// at the working file's absolute path instead — the test process's
+/// working directory is not the repository, and the `%f` placeholder
+/// would substitute the repo-relative name. A TOML literal string takes
+/// the Windows path verbatim, quotes intact.
+fn clean_pass_through(file: &std::path::Path) -> String {
+    if cfg!(windows) {
+        format!("'type \"{}\"'", file.display())
+    } else {
+        "'cat'".to_string()
+    }
+}
+
 /// Build a repo where feature and dev insert different lines at the same
 /// position, then insert feature → dev and materialize on dev. Returns the
 /// on-disk path of the conflicted file.
@@ -61,7 +76,10 @@ fn make_conflicted_repo() -> (TempDir, TestRepository, std::path::PathBuf) {
     .unwrap();
     std::fs::write(
         temp_dir.path().join(".atomic/config.toml"),
-        "[view]\ndefault = \"dev\"\n\n[filters.drivers.reject-conflict]\nclean = \"cat\"\nsmudge = \"exit 19\"\nrequired = true\n",
+        format!(
+            "[view]\ndefault = \"dev\"\n\n[filters.drivers.reject-conflict]\nclean = {}\nsmudge = \"exit 19\"\nrequired = true\n",
+            clean_pass_through(&file)
+        ),
     )
     .unwrap();
     repo.insert_from_view(CrossViewInsertOptions::new("feature", "dev"))
