@@ -431,9 +431,17 @@ fn neighbors_show_kind_instances_and_their_relations() {
         "{graph:#}"
     );
 
-    // One class for every kind node; membership is metadata and a real triple.
+    // The hub carries the workflow Concept class; an instance also carries its
+    // project-scoped custom-kind class in `types`.
     for node in graph["nodes"].as_array().unwrap() {
-        assert_eq!(node["types"], serde_json::json!([CONCEPT]), "{node:#}");
+        match node["metadata"]["kind_class"].as_str() {
+            Some(kind_class) => assert_eq!(
+                node["types"],
+                serde_json::json!([CONCEPT, kind_class]),
+                "{node:#}"
+            ),
+            None => assert_eq!(node["types"], serde_json::json!([CONCEPT]), "{node:#}"),
+        }
         assert_eq!(node["source"], "vault", "{node:#}");
     }
     let node = node_named(&graph, second_id);

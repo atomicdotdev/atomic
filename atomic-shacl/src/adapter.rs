@@ -158,9 +158,9 @@ pub fn snapshot_ntriples(nodes: &[KgNode], edges: &[KgEdge]) -> Result<String, V
             // Custom kind fields and relations project into the project-scoped
             // extension namespace. See docs/adr/0001-kind-kg-conformance.md.
             if let Some(kind_class) = metadata.get("kind_class").and_then(|v| v.as_str()) {
-                // The storage layer only allows canonical workflow classes in
-                // `KgNode.types`, so the extension class is carried in metadata
-                // and asserted here as a real `rdf:type`.
+                // The projection also carries the extension class in
+                // `KgNode.types`; `triples` is a set, so this assertion is
+                // idempotent and keeps metadata-only fixtures valid.
                 triples.insert(format!("{subject} <{TYPE}> {} .\n", named(kind_class)?));
                 for (key, value) in metadata.as_object().into_iter().flatten() {
                     if let Some(field) = key.strip_prefix("field.") {
@@ -225,7 +225,7 @@ pub fn snapshot_ntriples(nodes: &[KgNode], edges: &[KgEdge]) -> Result<String, V
 
 /// A project-scoped extension class: `urn:atomic:project:<pid>:kind:<kind>`.
 fn is_extension_class(iri: &str) -> bool {
-    iri.starts_with("urn:atomic:project:") && iri.contains(":kind:")
+    atomic_core::kg::iri::is_kind_class(iri)
 }
 
 /// Emit one triple per scalar value. Arrays fan out; objects and nulls are not

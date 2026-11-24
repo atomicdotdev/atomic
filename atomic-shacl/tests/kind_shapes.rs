@@ -126,9 +126,9 @@ impl Fixture {
                 "field.archived": false,
                 "field.status": "accepted"
             }));
-        // The extension class is carried in metadata, not `types`: the storage
-        // layer rejects non-canonical classes. The adapter asserts it from
-        // `metadata.kind_class`.
+        // The projection carries the extension class in `types`; this fixture
+        // exercises the adapter's metadata path only, so the class is asserted
+        // from `metadata.kind_class`.
 
         let rfc = KgNode::new(&self.rfc, C::Concept, "RFC 1", "test").with_metadata(json!({
             "kind_class": self.rfc_class

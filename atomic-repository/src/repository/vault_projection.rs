@@ -58,7 +58,7 @@ pub(super) fn kind_instance_name(kind: &str, uid: &str) -> String {
 /// project namespace so two repositories cannot collide, and it is not part of
 /// the closed workflow ontology (see `docs/adr/0001-kind-kg-conformance.md`).
 pub(super) fn kind_class_iri(project: &ProjectId, kind: &str) -> String {
-    format!("{}:kind:{kind}", iri::mint_project(project))
+    iri::mint_kind_class(project, kind)
 }
 
 /// Whether a stored instance row has anything trustworthy to project.
@@ -789,7 +789,7 @@ impl VaultProjection {
         let kind_class = kind_class_iri(&self.project, &spec.name);
         let mut metadata = serde_json::json!({
             "kind_name": spec.name,
-            "kind_class": kind_class,
+            "kind_class": kind_class.clone(),
             "kind_uid": uid,
             "uid": uid,
             "vault_path": path,
@@ -819,9 +819,11 @@ impl VaultProjection {
             .filter(|title| !title.trim().is_empty());
         let mut node =
             KgNode::new(subject, C::Concept, title.unwrap_or(uid), "vault").with_metadata(metadata);
-        // The extension class stays in metadata: `KgNode.types` is restricted to
-        // canonical workflow classes by the storage layer. The RDF adapter emits
-        // `rdf:type <kind_class>` from `metadata.kind_class`. See ADR 0001.
+        // The extension class is asserted in `types` so queries and the intent
+        // graph report the custom kind; the RDF adapter also emits it from
+        // `metadata.kind_class`. See ADR 0001.
+        node.types.push(kind_class);
+        node.types.sort();
         if let Some(title) = title {
             node = node.with_summary(title);
         }

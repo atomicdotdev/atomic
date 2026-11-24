@@ -669,7 +669,11 @@ fn a_conforming_instance_projects_its_node_and_edges() {
     let path = instance_path("adr", K1);
 
     let instance = node(&repo, &id).expect("the instance");
-    assert_eq!(instance.types, [Class::Concept.iri()]);
+    let kind_class = iri::mint_kind_class(&project, "adr");
+    assert_eq!(
+        instance.types,
+        [Class::Concept.iri(), kind_class.as_str()]
+    );
     assert_eq!(instance.label, "Use redb storage");
     assert_eq!(instance.summary.as_deref(), Some("Use redb storage"));
     assert_eq!(instance.source, "vault");

@@ -35,6 +35,13 @@ relation pred.  urn:atomic:project:<pid>:kind:<kind>#<edge>
 non-`Class` IRIs the adapter accepts; every other asserted class must still be
 a `Class` in `atomic-core::kg::ontology`.
 
+The extension class is carried in `KgNode.types` as well as emitted as
+`rdf:type` by the adapter. The storage layer admits extension class IRIs in
+`types` (and rejects every other non-`Class` IRI), so the query and intent-graph
+JSON surfaces report the custom kind's asserted type instead of typing the
+instance as `atomic:Concept` alone. See the closure RFC's "no metadata-only
+typing" requirement.
+
 A kind instance carries:
 
 - `rdf:type urn:atomic:project:<pid>:kind:<kind>`
