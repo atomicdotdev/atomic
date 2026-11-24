@@ -4,8 +4,10 @@
 //! vault. The vault families (`atomic vault`, `atomic intent`, `atomic memory`)
 //! must create it themselves instead of failing with
 //! "Vault not initialized. Run `atomic vault init` first."
-#![cfg(not(windows))]
-
+//!
+//! The global config (identity store included) is isolated with
+//! `ATOMIC_CONFIG_DIR` — the relocation that works on every platform —
+//! with `HOME` kept for any non-atomic reader on Unix.
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -18,6 +20,7 @@ fn atomic(repo_dir: &Path, home_dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(repo_dir)
         .env("HOME", home_dir)
+        .env("ATOMIC_CONFIG_DIR", home_dir.join(".atomic"))
         .env_remove("ATOMIC_SERVICE")
         .env_remove("ATOMIC_RPC")
         .output()

@@ -6,7 +6,10 @@
 //! listing, the own/inherited view classification, the KG node fields,
 //! the composed intent update, the deps opt-out, the revise surgery, the
 //! record dry-run, and the provenance summary.
-#![cfg(not(windows))]
+//!
+//! The global config (identity store included) is isolated with
+//! `ATOMIC_CONFIG_DIR`, the relocation every platform honors; `HOME`
+//! stays for any non-atomic reader on Unix.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -21,6 +24,7 @@ fn atomic(repo_dir: &Path, home_dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(repo_dir)
         .env("HOME", home_dir)
+        .env("ATOMIC_CONFIG_DIR", home_dir.join(".atomic"))
         .output()
         .expect("run atomic")
 }
@@ -1415,6 +1419,7 @@ fn vault_materialize_and_summaries_route() {
         .args(["memory", "write", "mat"])
         .current_dir(repo_dir)
         .env("HOME", home_dir)
+        .env("ATOMIC_CONFIG_DIR", home_dir.join(".atomic"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -1534,6 +1539,7 @@ fn memory_write_routes_over_the_wire() {
         .args(["memory", "write", "design", "--type", "reference"])
         .current_dir(repo_dir)
         .env("HOME", home_dir)
+        .env("ATOMIC_CONFIG_DIR", home_dir.join(".atomic"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

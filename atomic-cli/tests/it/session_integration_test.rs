@@ -7,9 +7,8 @@
 //!   4. cross-repository session sync: manifest ingest + provenance-driven
 //!      ledger rebuild in a repository that never saw the original JSON.
 //!
-//! Windows is excluded for the same identity-store redirection reason as the
-//! provenance integration tests.
-#![cfg(not(windows))]
+//! The global config (identity store included) is isolated with
+//! `ATOMIC_CONFIG_DIR` — the relocation that works on every platform.
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -34,6 +33,7 @@ fn atomic(repo_dir: &Path, home_dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(repo_dir)
         .env("HOME", home_dir)
+        .env("ATOMIC_CONFIG_DIR", home_dir.join(".atomic"))
         .output()
         .expect("run atomic")
 }

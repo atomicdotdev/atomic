@@ -17,11 +17,9 @@
 //! the content-addressed store without pristine registration is invisible to
 //! REV_DEPS, and the disk-scan fallback still finds it.
 //!
-//! Windows is excluded: the tests isolate the identity store by pointing `HOME`
-//! at a temp dir, but on Windows `dirs::home_dir()` resolves via the system API
-//! (FOLDERID_Profile) and ignores the env var, so the store cannot be redirected
-//! from a test. An explicit identity-store override (env/flag) would lift this.
-#![cfg(not(windows))]
+//! Windows used to be excluded because `dirs::home_dir()` ignores `HOME`
+//! there; the identity store now relocates with `ATOMIC_CONFIG_DIR`, which
+//! every platform honors, so the suite runs everywhere.
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -196,13 +194,16 @@ fn dsse_export_round_trip_uses_pinned_key_and_writes_nothing() {
     assert_eq!(snapshot_files(repo_tmp.path()), before);
 }
 
-/// Run `atomic <args>` inside `repo_dir` with `HOME` pointed at `home_dir` so the
-/// identity store resolves to a test-owned location.
+/// Run `atomic <args>` inside `repo_dir` with the global config pointed at
+/// `home_dir/.atomic` via `ATOMIC_CONFIG_DIR` (the relocation every platform
+/// honors; `HOME` stays for any non-atomic reader on Unix), so the identity
+/// store resolves to a test-owned location.
 fn atomic(repo_dir: &Path, home_dir: &Path, args: &[&str]) -> Output {
     Command::new(ATOMIC_BIN)
         .args(args)
         .current_dir(repo_dir)
         .env("HOME", home_dir)
+        .env("ATOMIC_CONFIG_DIR", home_dir.join(".atomic"))
         .output()
         .expect("run atomic")
 }
