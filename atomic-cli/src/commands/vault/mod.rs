@@ -14,6 +14,8 @@
 //!   materialize   Materialize vault entries to markdown on disk
 //!   sync          Sync vault markdown files back to the database
 //!   goal          Manage vault goals
+//!   new           Create an instance of a user-defined kind
+//!   kind          Define and validate user-defined kinds
 //!   intent        Manage vault intents (tasks)
 //!   memory        Manage vault memory (shared knowledge)
 //!   context       Retrieve memories relevant to a task
@@ -38,6 +40,12 @@
 //! # Create a new intent
 //! $ atomic vault intent create --title "Fix auth"
 //!
+//! # Create an instance of a user-defined kind
+//! $ atomic vault new adr --title "Sign changes with Ed25519"
+//!
+//! # Define a kind (rare: one definition per repository and kind)
+//! $ atomic vault kind init adr
+//!
 //! # Sync markdown files back to the database
 //! $ atomic vault sync
 //! ```
@@ -45,8 +53,10 @@
 pub mod context;
 pub mod goal;
 pub mod init;
+pub mod kind;
 pub mod list;
 pub mod materialize;
+pub mod new;
 pub mod removed;
 pub mod show;
 pub mod summaries;
@@ -60,8 +70,10 @@ use atomic_core::types::{Base32, Hasher};
 pub use context::Context;
 pub use goal::Goal;
 pub use init::Init;
+pub use kind::Kind;
 pub use list::List;
 pub use materialize::Materialize;
+pub use new::New;
 pub use removed::{RemovedVaultIntent, RemovedVaultMemory};
 pub use show::Show;
 pub use summaries::Summaries;
@@ -177,6 +189,39 @@ pub enum VaultCommands {
     /// ```
     Goal(Goal),
 
+    /// Create an instance of a user-defined kind.
+    ///
+    /// A kind is a repository-defined vault node type (an ADR, an RFC, a
+    /// runbook); see `atomic vault kind`. The instance is written to
+    /// `.vault/kinds/<k>/<ULID>.md` only if it conforms to the kind's
+    /// definition, and is not recorded.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// atomic vault new adr --title "Sign changes with Ed25519"
+    /// atomic vault new adr --title "Use redb" --set status=accepted --body-file adr.md
+    /// ```
+    New(New),
+
+    /// Define and validate user-defined kinds.
+    ///
+    /// A kind's definition at `.vault/kinds/<k>/_kind.md` carries the schema
+    /// in its frontmatter and guidance prose in its body. Defining one is
+    /// rare; creating instances is `atomic vault new`.
+    ///
+    /// # Examples
+    ///
+    /// ```text
+    /// # Write a starter definition, then check it
+    /// atomic vault kind init adr
+    /// atomic vault kind validate adr
+    ///
+    /// # List instances, with the kind's guidance for authors
+    /// atomic vault kind list adr --guidance
+    /// ```
+    Kind(Kind),
+
     /// Research Vault memories relevant to a task.
     ///
     /// Ranks vault memories against free-text terms, an intent, or
@@ -243,6 +288,8 @@ impl Command for Vault {
             VaultCommands::Materialize(cmd) => cmd.run(),
             VaultCommands::Sync(cmd) => cmd.run(),
             VaultCommands::Goal(cmd) => cmd.run(),
+            VaultCommands::New(cmd) => cmd.run(),
+            VaultCommands::Kind(cmd) => cmd.run(),
             VaultCommands::Intent(cmd) => cmd.run(),
             VaultCommands::Memory(cmd) => cmd.run(),
             VaultCommands::Context(cmd) => cmd.run(),
@@ -269,6 +316,8 @@ mod tests {
                 VaultCommands::Materialize(_) => "materialize",
                 VaultCommands::Sync(_) => "sync",
                 VaultCommands::Goal(_) => "goal",
+                VaultCommands::New(_) => "new",
+                VaultCommands::Kind(_) => "kind",
                 VaultCommands::Intent(_) => "intent",
                 VaultCommands::Memory(_) => "memory",
                 VaultCommands::Context(_) => "context",
@@ -285,12 +334,14 @@ mod tests {
             "materialize",
             "sync",
             "goal",
+            "new",
+            "kind",
             "context",
             "summaries",
             "query",
             "intent",
             "memory",
         ];
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 13);
     }
 }

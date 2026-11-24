@@ -6,10 +6,11 @@
 //! in [`atomic_canonical::kind_spec`]). Paths in this module are
 //! vault-relative, as redb stores them: `kinds/<k>/_kind.md`.
 //!
-//! The per-view gate (`kind validate`, `kind new`, the registry) resolves
-//! kind definitions from **files**, never from redb's `VAULT_ENTRIES`: those
-//! rows are repository-global and are not refreshed by switch, insert or
-//! unrecord, so they cannot say which kinds a given view declares. A
+//! The per-view gate (`vault kind validate`, `vault new`, the registry)
+//! resolves kind definitions from **files**, never from redb's
+//! `VAULT_ENTRIES`: those rows are repository-global and are not refreshed by
+//! switch, insert or unrecord, so they cannot say which kinds a given view
+//! declares. A
 //! [`KindSource`] names the files to read — the working copy on disk, or the
 //! tracked content of a view — and [`KindFiles`] reads them.
 //!
@@ -397,7 +398,7 @@ impl Repository {
     /// must come from the same layer, not from whatever the working copy holds
     /// (which a sandbox deflating a view's files may not even have, and which
     /// a case-insensitive filesystem would let `kinds/adr/_KIND.md` stand in
-    /// for). The per-view gate (`kind validate`, `kind new`) still reads
+    /// for). The per-view gate (`vault kind validate`, `vault new`) still reads
     /// files through [`Repository::kind_files`].
     pub fn stored_kind_definition(
         &self,

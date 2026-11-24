@@ -1,4 +1,4 @@
-//! `atomic kind list [<k>]` — the declared kinds, or one kind's instances.
+//! `atomic vault kind list [<k>]` — the declared kinds, or one kind's instances.
 
 use clap::Parser;
 use serde_json::{Map, Value};
@@ -17,7 +17,7 @@ use crate::commands::Command;
 use crate::error::{CliError, CliResult};
 use crate::output::{warning, Column, Table};
 
-/// The most field columns `kind list <k>` shows, after UID and TITLE.
+/// The most field columns `vault kind list <k>` shows, after UID and TITLE.
 const MAX_FIELD_COLUMNS: usize = 4;
 /// The widest a field column may grow.
 const FIELD_COLUMN_WIDTH: usize = 24;
@@ -91,7 +91,7 @@ impl KindList {
         }
 
         if registry.is_empty() {
-            println!("No kinds defined. Create one with `atomic kind init <name>`.");
+            println!("No kinds defined. Create one with `atomic vault kind init <name>`.");
             return Ok(());
         }
 
@@ -134,7 +134,7 @@ impl KindList {
             println!(
                 "{}",
                 warning(format!(
-                    "{} stray file(s) under .vault/kinds/; see `atomic kind validate`",
+                    "{} stray file(s) under .vault/kinds/; see `atomic vault kind validate`",
                     registry.stray().len()
                 ))
             );
@@ -175,10 +175,10 @@ impl KindList {
                 fields: Map::new(),
             };
             // One unreadable instance is one row that does not conform, as a
-            // symlink is, and `kind validate` says why.
+            // symlink is, and `vault kind validate` says why.
             let bytes = files.read(path).unwrap_or_else(|e| {
                 eprintln!(
-                    "{} {}: {}; see `atomic kind validate {}`",
+                    "{} {}: {}; see `atomic vault kind validate {}`",
                     warning("⚠"),
                     display_path(path),
                     display_text(&e.to_string()),
@@ -236,7 +236,7 @@ impl KindList {
         }
         if rows.is_empty() {
             println!(
-                "No {} instances. Create one with `atomic kind new {}`.",
+                "No {} instances. Create one with `atomic vault new {}`.",
                 def.name, def.name
             );
         } else {

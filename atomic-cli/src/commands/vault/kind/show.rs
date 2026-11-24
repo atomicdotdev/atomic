@@ -1,4 +1,4 @@
-//! `atomic kind show <k>` — a kind's schema and status.
+//! `atomic vault kind show <k>` — a kind's schema and status.
 
 use clap::Parser;
 use serde_json::Value;

@@ -2143,7 +2143,7 @@ fn deflate_does_not_block_on_what_is_not_a_file_under_kinds() {
         .is_none());
 }
 
-/// One bad file is `kind validate`'s to report: every other row still deflates,
+/// One bad file is `vault kind validate`'s to report: every other row still deflates,
 /// and a file that is there is not taken for deleted.
 #[test]
 fn a_kind_file_that_cannot_be_read_does_not_stop_the_deflate() {

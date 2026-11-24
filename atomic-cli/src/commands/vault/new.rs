@@ -1,4 +1,4 @@
-//! `atomic kind new <k>` — create an instance of a registered kind.
+//! `atomic vault new <k>` — create an instance of a registered kind.
 //!
 //! The instance is validated against the kind's spec (field types, enum
 //! values, required fields, refs that must resolve) before anything is
@@ -18,23 +18,23 @@ use atomic_repository::{
     render_frontmatter_document, InstanceCheck, KindRefResolver, KindSource, KindStatus,
 };
 
-use super::init::{ingest, write_new_file};
-use super::{
+use super::kind::init::{ingest, write_new_file};
+use super::kind::{
     display_path, display_text, kind_not_found, open_for_write, record_hint, validation_failed,
 };
 use crate::commands::{ensure_vault_exists, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{error, success, warning};
 
-/// Create an instance of a registered kind.
+/// Create an instance of a user-defined kind.
 ///
 /// Field values are checked against the kind's definition before the file
 /// is written; on any violation nothing is written. The file is ingested
 /// into the vault index but not recorded.
 #[derive(Parser, Debug)]
 #[command(name = "new")]
-pub struct KindNew {
-    /// The kind to create an instance of.
+pub struct New {
+    /// The kind to create an instance of, as listed by `atomic vault kind list`.
     pub kind: String,
 
     /// The instance title.
@@ -85,7 +85,7 @@ struct Rejection {
     message: String,
 }
 
-impl KindNew {
+impl New {
     fn read_body(&self) -> CliResult<String> {
         let mut body = if let Some(path) = &self.body_file {
             std::fs::read_to_string(path).map_err(|e| match e.kind() {
@@ -137,7 +137,7 @@ impl KindNew {
     }
 }
 
-impl Command for KindNew {
+impl Command for New {
     fn run(&self) -> CliResult<()> {
         let result = self.create();
         if let Err(e) = &result {
@@ -161,7 +161,7 @@ impl Command for KindNew {
     }
 }
 
-impl KindNew {
+impl New {
     fn create(&self) -> CliResult<()> {
         let repo = open_for_write()?;
         let registry = repo
@@ -218,7 +218,7 @@ impl KindNew {
             let Some(field) = spec.field(name) else {
                 let message = match name {
                     "title" => "set the title with --title".to_string(),
-                    "uid" => "the uid is minted by `atomic kind new`".to_string(),
+                    "uid" => "the uid is minted by `atomic vault new`".to_string(),
                     _ => format!(
                         "not a field of {} (declared: {})",
                         self.kind,

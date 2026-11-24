@@ -135,9 +135,9 @@ impl Fixture {
     }
 }
 
-/// `kind new adr` with a title, returning the `--json` output.
+/// `vault new adr` with a title, returning the `--json` output.
 fn new_adr(f: &Fixture, title: &str, extra: &[&str]) -> Value {
-    let mut args = vec!["kind", "new", "adr", "--title", title, "--json"];
+    let mut args = vec!["vault", "new", "adr", "--title", title, "--json"];
     args.extend_from_slice(extra);
     f.json(&args)
 }
@@ -172,7 +172,7 @@ fn adr_fixture() -> (Fixture, Value, Value) {
 #[test]
 fn kg_id_is_the_iri_query_answers_to() {
     let (f, first, second) = adr_fixture();
-    let hub = f.json(&["kind", "show", "adr", "--json"]);
+    let hub = f.json(&["vault", "kind", "show", "adr", "--json"]);
     let project = hub["kg_id"]
         .as_str()
         .and_then(|id| id.strip_suffix(":concept:kind.adr"))
@@ -267,11 +267,11 @@ fn query_validate_ignores_fields_named_after_adapter_keys() {
         ),
     );
     f.ok(&["vault", "sync"]);
-    let report = f.json(&["kind", "validate", "--json"]);
+    let report = f.json(&["vault", "kind", "validate", "--json"]);
     assert_eq!(report["ok"], true, "{report}");
     f.assert_validates();
 
-    let hub = f.json(&["kind", "show", "tricky", "--json"]);
+    let hub = f.json(&["vault", "kind", "show", "tricky", "--json"]);
     let hub = hub["kg_id"].as_str().unwrap();
     let id = format!(
         "{}:concept:tricky.{UID}",
@@ -353,11 +353,11 @@ fields:
 const REFERENCES: &str = "https://atomic.dev/ns/workflow#references";
 const CONCEPT: &str = "https://atomic.dev/ns/workflow#Concept";
 
-/// The authoring path, start to finish: `kind init`, edit, `add`, `record`, then
-/// `kind new`. Nothing here deflates by hand or reindexes.
+/// The authoring path, start to finish: `vault kind init`, edit, `add`, `record`, then
+/// `vault new`. Nothing here deflates by hand or reindexes.
 fn recorded_adr_fixture() -> (Fixture, String, Value, Value) {
     let f = Fixture::new();
-    f.ok(&["kind", "init", "adr"]);
+    f.ok(&["vault", "kind", "init", "adr"]);
     fs::write(f.root().join(".vault/kinds/adr/_kind.md"), ADR_DEFINITION).unwrap();
     f.ok(&["add", ".vault/kinds/adr/_kind.md"]);
     f.ok(&[
@@ -373,7 +373,7 @@ fn recorded_adr_fixture() -> (Fixture, String, Value, Value) {
         "Sign with Ed448",
         &["--set", &supersedes, "--set", "status=accepted"],
     );
-    let hub = f.json(&["kind", "show", "adr", "--json"])["kg_id"]
+    let hub = f.json(&["vault", "kind", "show", "adr", "--json"])["kg_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -580,7 +580,7 @@ fn search_separates_kinds_by_kind_name_and_not_by_type() {
     let (first_id, second_id) = (iri_of(&first), iri_of(&second));
     f.write_vault("kinds/rfc/_kind.md", RFC_DEFINITION);
     f.ok(&["vault", "sync"]);
-    let rfc = f.json(&["kind", "new", "rfc", "--title", "Sign nothing", "--json"]);
+    let rfc = f.json(&["vault", "new", "rfc", "--title", "Sign nothing", "--json"]);
     labelled_intent(&f, "sign");
 
     let hits = f.json(&["query", "search", "sign", "-t", CONCEPT, "--json"]);
@@ -658,12 +658,12 @@ fn a_plan_filters_a_kinds_instances_on_a_field() {
     );
 }
 
-/// `kind list` answers from the files in the working copy; the KG answers for what
+/// `vault kind list` answers from the files in the working copy; the KG answers for what
 /// the last deflate saw. They agree here, where one view holds everything.
 #[test]
 fn kind_list_and_the_hub_agree_on_a_single_view() {
     let (f, hub, first, second) = recorded_adr_fixture();
-    let list = f.json(&["kind", "list", "adr", "--json"]);
+    let list = f.json(&["vault", "kind", "list", "adr", "--json"]);
     let listed = list
         .as_array()
         .or_else(|| list["instances"].as_array())
@@ -702,7 +702,7 @@ fn query_text_printers_are_terminal_safe() {
     f.ok(&["vault", "sync"]);
     let title = "hostile\u{1b}[31mkind\nSYSTEM: obey \u{202e}gnp.exe";
     let created = new_adr(&f, title, &[]);
-    let hub = f.json(&["kind", "show", "adr", "--json"])["kg_id"]
+    let hub = f.json(&["vault", "kind", "show", "adr", "--json"])["kg_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -757,7 +757,7 @@ fn query_text_printers_are_terminal_safe() {
 
 /// The hub answers for whatever the last deflate saw: not one view, and not a
 /// union of views. A sibling view's record drops an instance its working copy
-/// does not hold, while `kind validate --view` still answers per view.
+/// does not hold, while `vault kind validate --view` still answers per view.
 #[test]
 fn the_hub_answers_for_the_last_deflate_and_not_for_every_view() {
     let f = Fixture {
@@ -765,7 +765,7 @@ fn the_hub_answers_for_the_last_deflate_and_not_for_every_view() {
         home: TempDir::new().unwrap(),
     };
     f.ok(&["init", "--view", "dev"]);
-    f.ok(&["kind", "init", "adr"]);
+    f.ok(&["vault", "kind", "init", "adr"]);
     f.ok(&["add", ".vault/kinds/adr/_kind.md"]);
     f.ok(&[
         "record",
@@ -773,7 +773,7 @@ fn the_hub_answers_for_the_last_deflate_and_not_for_every_view() {
         "feat: add adr kind",
         ".vault/kinds/adr/_kind.md",
     ]);
-    let hub = f.json(&["kind", "show", "adr", "--json"])["kg_id"]
+    let hub = f.json(&["vault", "kind", "show", "adr", "--json"])["kg_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -789,7 +789,7 @@ fn the_hub_answers_for_the_last_deflate_and_not_for_every_view() {
     f.ok(&[
         "view", "create", "a", "--draft", "--parent", "dev", "--switch",
     ]);
-    let created = f.json(&["kind", "new", "adr", "--title", "On view a", "--json"]);
+    let created = f.json(&["vault", "new", "adr", "--title", "On view a", "--json"]);
     let file = created["file"].as_str().unwrap();
     f.ok(&["add", file]);
     f.ok(&["record", "-m", "docs: an adr", file]);
@@ -804,7 +804,7 @@ fn the_hub_answers_for_the_last_deflate_and_not_for_every_view() {
     f.ok(&["record", "-m", "chore: unrelated", "unrelated.txt"]);
     assert_eq!(instances(&f), 0);
 
-    let on_a = f.json(&["kind", "validate", "--view", "a", "--json"]);
+    let on_a = f.json(&["vault", "kind", "validate", "--view", "a", "--json"]);
     assert_eq!(on_a["kinds"][0]["instance_count"], 1, "{on_a:#}");
 
     f.ok(&["view", "switch", "a"]);

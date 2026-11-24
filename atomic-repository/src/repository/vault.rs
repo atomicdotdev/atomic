@@ -657,9 +657,9 @@ impl Repository {
     /// Under `kinds/` the rules of [`KindFiles`] hold
     /// here too: anything but a regular file is skipped unread (a symlink is
     /// never followed), and a file that cannot be read is logged and skipped
-    /// rather than failing the scan. `atomic kind validate` reports both. A
-    /// skipped link has no row, and a file that is there but unreadable keeps
-    /// the row it has.
+    /// rather than failing the scan. `atomic vault kind validate` reports
+    /// both. A skipped link has no row, and a file that is there but
+    /// unreadable keeps the row it has.
     pub fn vault_scan_working_copy(&self) -> Result<Vec<VaultFileChange>, RepositoryError> {
         let vault_dir = self.vault_dir();
         if !vault_dir.exists() {
@@ -711,7 +711,7 @@ impl Repository {
                 Ok(content) => content,
                 Err(e) if is_kind_file => {
                     log::warn!(
-                        "vault: skipping {rel_path_str}: {e}; `atomic kind validate` reports it"
+                        "vault: skipping {rel_path_str}: {e}; `atomic vault kind validate` reports it"
                     );
                     continue;
                 }

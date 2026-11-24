@@ -1,4 +1,4 @@
-//! `atomic kind validate [<k>] [--view V]` — check kind definitions and
+//! `atomic vault kind validate [<k>] [--view V]` — check kind definitions and
 //! every instance against its kind's spec.
 
 use clap::Parser;
@@ -176,7 +176,7 @@ fn print_report(report: &KindValidationReport) {
 
     let source = &report.source;
     if report.kinds.is_empty() && report.problems.is_empty() {
-        println!("No kinds in the {source}. Create one with `atomic kind init <name>`.");
+        println!("No kinds in the {source}. Create one with `atomic vault kind init <name>`.");
         return;
     }
     let registered = report

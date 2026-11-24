@@ -55,7 +55,7 @@ pub(super) fn kind_instance_name(kind: &str, uid: &str) -> String {
 ///
 /// Frontmatter under `kinds/` that fails strict parsing is stored as `{}`, so a
 /// missing `uid` means there is none. A row that fails this stays inert, for
-/// `atomic kind validate` to report.
+/// `atomic vault kind validate` to report.
 fn instance_is_projectable(entry: &VaultEntry, fm: &serde_json::Value) -> bool {
     fm.as_object().is_some_and(|map| map.contains_key("uid"))
         && std::str::from_utf8(&entry.content_bytes).is_ok_and(|body| !has_conflict_markers(body))

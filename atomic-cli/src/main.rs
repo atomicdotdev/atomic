@@ -83,7 +83,6 @@ use commands::{
     Init,
     Insert,
     Intent,
-    Kind,
     Log,
     Memory,
     Move,
@@ -876,31 +875,6 @@ enum Commands {
     #[command(name = "memory")]
     Memory(Memory),
 
-    /// Define, create and validate user-defined vault kinds.
-    ///
-    /// A kind is a repository-defined vault node type (an ADR, an RFC, a
-    /// runbook): its definition at `.vault/kinds/<k>/_kind.md` carries the
-    /// schema in its frontmatter and guidance prose in its body, and its
-    /// instances live at `.vault/kinds/<k>/<ULID>.md`. This is the
-    /// "user-defined vault kinds" concept from the atomicdotdev/atomic#276
-    /// discussion.
-    ///
-    /// # Examples
-    ///
-    /// ```text
-    /// # Write a starter definition, then check it
-    /// atomic kind init adr
-    /// atomic kind validate adr
-    ///
-    /// # Create a validated instance
-    /// atomic kind new adr --title "Sign changes with Ed25519" --set status=accepted
-    ///
-    /// # List instances, with the kind's guidance for authors
-    /// atomic kind list adr --guidance
-    /// ```
-    #[command(name = "kind")]
-    Kind(Kind),
-
     /// Project & trace W3C PROV over the provenance atomic already captures.
     ///
     /// Read-only, compute-on-demand: projects the per-turn `ProvenanceGraph`
@@ -1032,11 +1006,19 @@ fn main() {
     remote_sandbox::install_link();
     if let Some((root, pointer)) = remote_sandbox::current() {
         let name = matches.subcommand_name().unwrap_or_default();
-        if !remote_sandbox::command_allowed(name) {
+        let subcommand = matches
+            .subcommand()
+            .and_then(|(_, sub)| sub.subcommand_name());
+        if !remote_sandbox::command_allowed(name, subcommand) {
+            // Name the subcommand too when it alone is what is refused.
+            let verb = match subcommand {
+                Some(sub) if remote_sandbox::command_allowed(name, None) => format!("{name} {sub}"),
+                _ => name.to_string(),
+            };
             let err = remote_sandbox::refusal(
                 &root,
                 &format!(
-                    "`atomic {name}` needs the repository itself; this sandbox reaches only \
+                    "`atomic {verb}` needs the repository itself; this sandbox reaches only \
                      view '{}' through its grant",
                     pointer.view
                 ),
@@ -1136,8 +1118,6 @@ fn main() {
         Commands::Intent(intent) => intent.run(),
 
         Commands::Memory(memory) => memory.run(),
-
-        Commands::Kind(kind) => kind.run(),
 
         Commands::Provenance(provenance) => provenance.run(),
 

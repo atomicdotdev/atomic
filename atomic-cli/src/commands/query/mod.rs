@@ -9,7 +9,7 @@ use atomic_core::pristine::vault::{KgEdge, KgNode};
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::Repository;
 
-use crate::commands::kind::display_text;
+use crate::commands::vault::kind::display_text;
 use crate::commands::{find_repository_root, Command};
 use crate::error::{CliError, CliResult};
 use crate::output::{create_spinner, finish_error, finish_success};
@@ -1387,8 +1387,8 @@ impl Command for QueryNeighbors {
 }
 
 /// An edge's relation for the text printers: its predicate, then the labels of
-/// the custom relations it stands for. Every `atomic kind` relation shares one
-/// predicate, so the labels are what tell them apart. No other edge has any.
+/// the custom relations it stands for. Every user-defined kind's relation shares
+/// one predicate, so the labels are what tell them apart. No other edge has any.
 pub(crate) fn edge_relation(edge: &atomic_core::KgEdge) -> String {
     let labels: Vec<String> = edge
         .metadata

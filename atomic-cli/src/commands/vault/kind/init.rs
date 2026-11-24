@@ -1,4 +1,4 @@
-//! `atomic kind init <k>` — write a starter definition for a new kind.
+//! `atomic vault kind init <k>` — write a starter definition for a new kind.
 
 use clap::Parser;
 
@@ -13,7 +13,7 @@ use crate::output::{hint, success};
 /// Write a starter definition at `.vault/kinds/<k>/_kind.md`.
 ///
 /// The starter declares one `status` enum with a default, so it registers
-/// as written. Edit its fields, check it with `atomic kind validate <k>`,
+/// as written. Edit its fields, check it with `atomic vault kind validate <k>`,
 /// then record it as its own change before creating instances.
 #[derive(Parser, Debug)]
 #[command(name = "init")]
@@ -69,7 +69,7 @@ impl Command for KindInit {
         println!("{} {}", success("Created"), display_path(&rel));
         println!();
         println!("{}", hint("Edit the fields, then check the definition:"));
-        println!("  atomic kind validate {kind}");
+        println!("  atomic vault kind validate {kind}");
         println!(
             "{}",
             hint("Record it as its own change before creating instances:")
@@ -151,8 +151,8 @@ context: false\n\
 \n\
 This body is guidance for the people and agents who write `{kind}` entries:\n\
 when to create one, what a good one contains, and how it relates to other\n\
-vault nodes. It is shown by `atomic kind show {kind} --guidance` and is never\n\
-validated.\n\
+vault nodes. It is shown by `atomic vault kind show {kind} --guidance` and is\n\
+never validated. Create an entry with `atomic vault new {kind}`.\n\
 \n\
 The frontmatter above is the schema. Each field has a `type` (`string`,\n\
 `integer`, `boolean`, `enum` or `ref`, each with a `[]` suffix for a list)\n\
@@ -177,7 +177,8 @@ mod tests {
             assert_eq!(spec.name, kind);
             let status = spec.field("status").expect("status field");
             assert_eq!(status.default, Some(serde_json::json!("draft")));
-            assert!(def.guidance.contains("is never\nvalidated"));
+            assert!(def.guidance.contains("is\nnever validated"));
+            assert!(def.guidance.contains(&format!("`atomic vault new {kind}`")));
         }
     }
 

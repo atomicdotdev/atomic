@@ -160,10 +160,10 @@ struct KindThenInstance {
 fn kind_then_instance() -> KindThenInstance {
     let f = Fixture::new();
     f.draft("a");
-    f.ok(&["kind", "init", "adr"]);
+    f.ok(&["vault", "kind", "init", "adr"]);
     let definition = f.record_path("feat: add adr kind", DEF_PATH);
 
-    let created = f.json(&["kind", "new", "adr", "--title", "First", "--json"]);
+    let created = f.json(&["vault", "new", "adr", "--title", "First", "--json"]);
     let instance_path = created["file"].as_str().unwrap().to_string();
     let instance = f.record_path("docs: first adr", &instance_path);
     KindThenInstance {
@@ -207,13 +207,13 @@ fn insert_of_instance_brings_definition() {
     assert!(f.path(DEF_PATH).is_file());
     assert!(f.path(&s.instance_path).is_file());
 
-    let report = f.json(&["kind", "validate", "--view", "b", "--json"]);
+    let report = f.json(&["vault", "kind", "validate", "--view", "b", "--json"]);
     assert_eq!(report["ok"], true, "{report}");
     assert_eq!(report["kinds"][0]["name"], "adr");
     assert_eq!(report["kinds"][0]["status"], "registered");
     assert_eq!(report["kinds"][0]["instance_count"], 1);
     assert_eq!(report["kinds"][0]["instances"][0]["conforms"], true);
-    f.ok(&["kind", "validate", "--view", "b"]);
+    f.ok(&["vault", "kind", "validate", "--view", "b"]);
 }
 
 /// Scenario 3. Unrecording the definition while an instance depends on it is
@@ -244,7 +244,7 @@ fn unrecord_of_definition_is_refused_while_instance_depends_on_it() {
     assert!(f.path(&s.instance_path).is_file());
     let log = f.log_hashes("a");
     assert!(log.contains(&s.definition) && log.contains(&s.instance));
-    f.ok(&["kind", "validate", "--view", "a"]);
+    f.ok(&["vault", "kind", "validate", "--view", "a"]);
 }
 
 /// Scenario 5. The registry is per view: a definition recorded only on `a`
@@ -254,16 +254,16 @@ fn registry_is_per_view() {
     let s = kind_then_instance();
     let f = &s.f;
 
-    let a = f.json(&["kind", "validate", "--view", "a", "--json"]);
+    let a = f.json(&["vault", "kind", "validate", "--view", "a", "--json"]);
     assert_eq!(a["source"], serde_json::json!({"view": "a"}));
     assert_eq!(a["kinds"][0]["name"], "adr", "{a}");
     assert_eq!(a["kinds"][0]["instance_count"], 1, "{a}");
 
-    let dev = f.json(&["kind", "validate", "--view", "dev", "--json"]);
+    let dev = f.json(&["vault", "kind", "validate", "--view", "dev", "--json"]);
     assert_eq!(dev["ok"], true, "{dev}");
     assert_eq!(dev["kinds"], serde_json::json!([]), "{dev}");
     assert_eq!(dev["problems"], serde_json::json!([]), "{dev}");
-    let human = f.ok(&["kind", "validate", "--view", "dev"]);
+    let human = f.ok(&["vault", "kind", "validate", "--view", "dev"]);
     assert!(human.contains("No kinds in the view dev"), "{human}");
 }
 
@@ -290,10 +290,10 @@ fn divergent_definitions() -> (Fixture, String) {
 /// but each view created its own inodes for `.vault/kinds`, `.vault/kinds/adr`
 /// and `_kind.md`, so all three paths become *name conflicts* (two claimants
 /// for one path), not a content merge. The materialized `_kind.md` holds both
-/// versions between name-conflict markers, and `kind validate` on the working
+/// versions between name-conflict markers, and `vault kind validate` on the working
 /// copy fails closed: the kind stays unregistered because of the markers.
 ///
-/// `kind validate --view d` fails closed too; see
+/// `vault kind validate --view d` fails closed too; see
 /// `view_validate_reports_name_conflicted_definition`.
 #[test]
 fn same_definition_path_on_two_views_becomes_a_name_conflict() {
@@ -330,7 +330,7 @@ fn same_definition_path_on_two_views_becomes_a_name_conflict() {
         );
     }
 
-    let out = f.run(&["kind", "validate"]);
+    let out = f.run(&["vault", "kind", "validate"]);
     let msg = text(&out);
     assert_eq!(out.status.code(), Some(2), "{msg}");
     assert!(
@@ -341,19 +341,19 @@ fn same_definition_path_on_two_views_becomes_a_name_conflict() {
     );
     assert!(msg.contains("adr stays unregistered"), "{msg}");
 
-    let out = f.run(&["kind", "validate", "--json"]);
+    let out = f.run(&["vault", "kind", "validate", "--json"]);
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["ok"], false, "{report}");
     assert_eq!(report["kinds"][0]["name"], "adr", "{report}");
     assert_ne!(report["kinds"][0]["status"], "registered", "{report}");
 
     // `c` itself is untouched.
-    let c = f.json(&["kind", "validate", "--view", "c", "--json"]);
+    let c = f.json(&["vault", "kind", "validate", "--view", "c", "--json"]);
     assert_eq!(c["ok"], true, "{c}");
     assert_eq!(c["kinds"][0]["status"], "registered", "{c}");
 }
 
-/// After scenario 4, `kind validate --view d` fails closed, as the
+/// After scenario 4, `vault kind validate --view d` fails closed, as the
 /// working-copy check does. The view renders neither claimant of a
 /// name-conflicted path (`visible_file_paths` omits it and
 /// `get_file_content_on_view` refuses it), so the view source reports the
@@ -363,7 +363,7 @@ fn view_validate_reports_name_conflicted_definition() {
     let (f, on_c) = divergent_definitions();
     f.ok(&["insert", &on_c]);
 
-    let out = f.run(&["kind", "validate", "--view", "d"]);
+    let out = f.run(&["vault", "kind", "validate", "--view", "d"]);
     let msg = text(&out);
     assert_eq!(out.status.code(), Some(2), "{msg}");
     assert!(
@@ -374,7 +374,7 @@ fn view_validate_reports_name_conflicted_definition() {
     );
     assert!(msg.contains("adr stays unregistered"), "{msg}");
 
-    let out = f.run(&["kind", "validate", "--view", "d", "--json"]);
+    let out = f.run(&["vault", "kind", "validate", "--view", "d", "--json"]);
     assert_eq!(out.status.code(), Some(2));
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["ok"], false, "{report}");
@@ -404,7 +404,7 @@ fn view_validate_reports_name_conflicted_definition() {
 fn view_validate_reports_name_conflicted_instance() {
     const UID: &str = "01JD8ZK3M6W2Q4V7X9B5N1C3TR";
     let f = Fixture::new();
-    f.ok(&["kind", "init", "adr"]);
+    f.ok(&["vault", "kind", "init", "adr"]);
     f.record_path("feat: add adr kind", DEF_PATH);
     let instance = format!(".vault/kinds/adr/{UID}.md");
     let write = |title: &str| {
@@ -415,14 +415,14 @@ fn view_validate_reports_name_conflicted_instance() {
     f.draft("c");
     write("From c");
     let on_c = f.record_path("docs: adr on c", &instance);
-    f.ok(&["kind", "validate", "--view", "c"]);
+    f.ok(&["vault", "kind", "validate", "--view", "c"]);
     f.ok(&["view", "switch", "dev"]);
     f.draft("d");
     write("From d");
     f.record_path("docs: adr on d", &instance);
     f.ok(&["insert", &on_c]);
 
-    let out = f.run(&["kind", "validate", "--view", "d", "--json"]);
+    let out = f.run(&["vault", "kind", "validate", "--view", "d", "--json"]);
     assert_eq!(out.status.code(), Some(2));
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(report["kinds"][0]["status"], "registered", "{report}");

@@ -487,10 +487,16 @@ fn a_remote_sandbox_records_through_the_socket_and_nothing_else() {
         &["push"][..],
         &["insert", "from-view", "dev"][..],
         &["sandbox", "open", "dev"][..],
+        // `vault` runs, but its kind verbs open the repository directly.
+        &["vault", "new", "adr", "--title", "x"][..],
+        &["vault", "kind", "list"][..],
     ] {
         let refused = failure(env.run(&vm, args), &format!("{args:?} in a sandbox"));
         assert!(refused.contains("remote sandbox"), "{args:?}: {refused}");
     }
+    let refused = failure(env.run(&vm, &["vault", "new", "adr"]), "vault new");
+    assert!(refused.contains("`atomic vault new`"), "{refused}");
+    assert!(!vm.join(".vault/kinds").exists());
     assert_only_the_cache(&vm);
 
     // The view moves underneath: the next record is refused as stale, and

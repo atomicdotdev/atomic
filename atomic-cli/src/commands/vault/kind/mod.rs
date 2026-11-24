@@ -1,4 +1,4 @@
-//! `atomic kind` — user-defined vault kinds.
+//! `atomic vault kind` — user-defined vault kinds.
 //!
 //! A repository declares its own vault node types (an ADR, an RFC, a
 //! runbook) by committing a definition at `.vault/kinds/<k>/_kind.md`. The
@@ -11,13 +11,18 @@
 //!
 //! # Verbs
 //!
+//! Defining a kind is rare, so its verbs sit one level down; creating an
+//! instance is the everyday verb, so it sits on `vault` itself:
+//!
 //! ```text
-//! atomic kind list [<k>]                  Kinds, or one kind's instances
-//! atomic kind show <k>                    A kind's schema and status
-//! atomic kind init <k>                    Write a starter definition
-//! atomic kind new <k> [--set f=v]...      Create a validated instance
-//! atomic kind validate [<k>] [--view V]   Check definitions and instances
+//! atomic vault kind list [<k>]                  Kinds, or one kind's instances
+//! atomic vault kind show <k>                    A kind's schema and status
+//! atomic vault kind init <k>                    Write a starter definition
+//! atomic vault kind validate [<k>] [--view V]   Check definitions and instances
+//! atomic vault new <k> [--set f=v]...           Create a validated instance
 //! ```
+//!
+//! `vault new` lives in [`super::new`] and shares this module's helpers.
 //!
 //! Nothing here records. `init` and `new` write a file and ingest it into
 //! the vault index, creating the vault on first use; recording it is a
@@ -28,7 +33,7 @@
 
 use clap::Subcommand;
 
-use atomic_canonical::kind_spec::is_unsafe_text_char;
+use atomic_canonical::kind_spec::{is_reserved_kind_name, is_unsafe_text_char};
 use atomic_repository::{KindDefinition, KindStatus, Repository};
 
 use crate::commands::{find_repository_root, open_readonly_repository, Command};
@@ -36,17 +41,15 @@ use crate::error::{CliError, CliResult};
 
 pub mod init;
 pub mod list;
-pub mod new;
 pub mod show;
 pub mod validate;
 
 pub use init::KindInit;
 pub use list::KindList;
-pub use new::KindNew;
 pub use show::KindShow;
 pub use validate::KindValidate;
 
-/// Subcommands for user-defined vault kinds.
+/// Subcommands for defining user-defined vault kinds.
 #[derive(Subcommand, Debug)]
 pub enum KindCommands {
     /// List the declared kinds, or one kind's instances.
@@ -58,20 +61,18 @@ pub enum KindCommands {
     /// Write a starter definition at `.vault/kinds/<k>/_kind.md`.
     Init(KindInit),
 
-    /// Create an instance of a registered kind (validated before writing).
-    New(KindNew),
-
     /// Validate kind definitions and their instances.
     Validate(KindValidate),
 }
 
-/// Define, create and validate user-defined vault kinds.
+/// Define and validate user-defined vault kinds.
 ///
 /// A kind is a repository-defined vault node type: its definition at
 /// `.vault/kinds/<k>/_kind.md` carries the schema in its frontmatter and
 /// guidance prose in its body; instances live at `.vault/kinds/<k>/<ULID>.md`
-/// and are referred to as `<k>:<ULID>`. This is the "user-defined vault kinds"
-/// concept from the atomicdotdev/atomic#276 discussion.
+/// and are referred to as `<k>:<ULID>`. Create an instance with
+/// `atomic vault new <k>`. This is the "user-defined vault kinds" concept from
+/// the atomicdotdev/atomic#276 discussion.
 #[derive(Debug, clap::Args)]
 #[command(name = "kind")]
 pub struct Kind {
@@ -85,7 +86,6 @@ impl Command for Kind {
             KindCommands::List(cmd) => cmd.run(),
             KindCommands::Show(cmd) => cmd.run(),
             KindCommands::Init(cmd) => cmd.run(),
-            KindCommands::New(cmd) => cmd.run(),
             KindCommands::Validate(cmd) => cmd.run(),
         }
     }
@@ -114,11 +114,21 @@ pub(crate) fn validation_failed(message: impl Into<String>) -> CliError {
 }
 
 /// The error for a kind with no definition in the source.
+///
+/// A built-in name can never be defined, so it gets no `init` hint: `intent`
+/// and `memory` point at their own commands, which `atomic vault new intent`
+/// reads as if it should reach.
 pub(crate) fn kind_not_found(kind: &str) -> CliError {
+    let hint = match kind {
+        "intent" => "built in, not a user-defined kind: use `atomic intent new`".into(),
+        "memory" => "built in, not a user-defined kind: use `atomic memory new`".into(),
+        _ if is_reserved_kind_name(kind) => "a built-in vault name, not a user-defined kind".into(),
+        _ => format!("create it with `atomic vault kind init {kind}`"),
+    };
     CliError::VaultEntityNotFound {
         kind: "kind",
         id: kind.to_string(),
-        hint: Some(format!("create it with `atomic kind init {kind}`")),
+        hint: Some(hint),
     }
 }
 

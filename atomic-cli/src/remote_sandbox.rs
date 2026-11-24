@@ -449,7 +449,14 @@ pub fn materialize(root: &Path, prefix: Option<&str>) -> CliResult<(u64, String)
 /// The commands a remote sandbox runs: those that work off its cache and
 /// reach the serving repository only through its grant. Anything else
 /// would act on a repository the sandbox does not have.
-pub fn command_allowed(name: &str) -> bool {
+///
+/// `subcommand` is the verb under `name`. `vault kind` and `vault new` are
+/// refused although `vault` runs: they open the repository directly and have
+/// no wire path, so in a sandbox they would act on the cache alone.
+pub fn command_allowed(name: &str, subcommand: Option<&str>) -> bool {
+    if name == "vault" && matches!(subcommand, Some("kind" | "new")) {
+        return false;
+    }
     matches!(
         name,
         "agent"

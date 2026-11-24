@@ -81,7 +81,6 @@ pub mod doctor;
 pub mod init;
 pub mod insert;
 pub mod intent;
-pub mod kind;
 pub mod log;
 pub mod memory;
 pub mod mv;
@@ -157,7 +156,6 @@ pub use identity::Identity;
 pub use init::Init;
 pub use insert::Insert;
 pub use intent::Intent;
-pub use kind::Kind;
 pub use log::Log;
 pub use memory::Memory;
 pub use mv::Move;
@@ -423,8 +421,8 @@ pub(crate) fn open_readonly_repository(
 /// `intent new/update/delete/link/attest`, `memory new/write/attest` — open
 /// through this helper so a repository created without a vault
 /// (`atomic init --no-vault`, or one that never ran `atomic vault init`) works
-/// on first use instead of failing with "Vault not initialized". `kind init/new`
-/// call [`ensure_vault_exists`] themselves, once they are past their checks.
+/// on first use instead of failing with "Vault not initialized". `vault kind init`
+/// and `vault new` call [`ensure_vault_exists`] themselves, once past their checks.
 ///
 /// Read-only commands deliberately do NOT use this helper: they open with
 /// [`open_readonly_repository`], so a read never mutates a checkout — an
