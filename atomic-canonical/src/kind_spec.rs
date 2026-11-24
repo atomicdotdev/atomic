@@ -79,6 +79,15 @@ pub const RESERVED_KIND_NAMES: &[&str] = &[
     "project",
     "projectidentity",
     "verificationstatus",
+    "publicationreview",
+    "reviewsubject",
+    "reviewevaluation",
+    "verificationrecord",
+    "signingkey",
+    "reviewevidence",
+    "intentobservation",
+    "criterionjudgment",
+    "reviewfinding",
     // `intent` is the built-in ref target, though no class has that local name.
     "intent",
     // The word for a kind definition and the directory they live in.
@@ -2375,7 +2384,7 @@ mod tests {
         }
         let unique: BTreeSet<_> = RESERVED_KIND_NAMES.iter().collect();
         assert_eq!(unique.len(), RESERVED_KIND_NAMES.len(), "duplicates");
-        assert_eq!(RESERVED_KIND_NAMES.len(), 33);
+        assert_eq!(RESERVED_KIND_NAMES.len(), 42);
     }
 
     #[test]
