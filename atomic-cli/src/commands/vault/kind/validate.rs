@@ -8,12 +8,10 @@
 //! normative authority; the field report is the human-readable oracle. See
 //! `docs/adr/0001-kind-kg-conformance.md`.
 
-use std::collections::BTreeSet;
-
 use clap::Parser;
 
 use atomic_repository::{
-    KindPath, KindProblemCode, KindReportStatus, KindSource, KindValidationReport, Repository,
+    KindProblemCode, KindReportStatus, KindSource, KindValidationReport, Repository,
     RepositoryError,
 };
 
@@ -60,16 +58,15 @@ impl Command for KindValidate {
         let shacl = run_shacl(&repo, &source, self.kind.as_deref())?;
 
         if self.json {
-            let mut value = serde_json::to_value(&report)
-                .map_err(|e| CliError::Internal(e.into()))?;
+            let mut value =
+                serde_json::to_value(&report).map_err(|e| CliError::Internal(e.into()))?;
             if let Some(shacl) = &shacl {
-                value["shacl"] = serde_json::to_value(shacl)
-                    .map_err(|e| CliError::Internal(e.into()))?;
+                value["shacl"] =
+                    serde_json::to_value(shacl).map_err(|e| CliError::Internal(e.into()))?;
             }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&value)
-                    .map_err(|e| CliError::Internal(e.into()))?
+                serde_json::to_string_pretty(&value).map_err(|e| CliError::Internal(e.into()))?
             );
         } else {
             print_report(&report, shacl.as_ref());
@@ -85,7 +82,11 @@ impl Command for KindValidate {
             Err(validation_failed(format!(
                 "kind validation failed in the {source} ({} problem(s){})",
                 problem_count(&report),
-                if shacl_failed { ", SHACL violations" } else { "" }
+                if shacl_failed {
+                    ", SHACL violations"
+                } else {
+                    ""
+                }
             )))
         }
     }
@@ -105,88 +106,52 @@ pub struct ShaclResult {
 ///
 /// The dataset is the ambient knowledge-graph projection filtered to the
 /// selected kind instances and their one-hop neighbourhood. That keeps the
-/// SHACL focus set aligned with the rows the field-level gate validated.
+/// SHACL focus set aligned with the rows the field-level gate validated. An
+/// instance the registry tracks but the projection does not hold fails the
+/// gate rather than passing vacuously.
 fn run_shacl(
     repo: &Repository,
     source: &KindSource,
     kind: Option<&str>,
 ) -> CliResult<Option<ShaclResult>> {
-    let registry = repo
-        .kind_registry(source)
-        .map_err(CliError::Repository)?;
-    let project = atomic_core::kg::iri::mint_project(
-        &repo.project_id().map_err(CliError::Repository)?,
-    );
-
-    let mut bundles = Vec::new();
-    let mut selected: Vec<(String, String)> = Vec::new();
-    for entry in registry.kinds() {
-        if kind.is_some_and(|only| only != entry.name()) {
-            continue;
-        }
-        let Some(spec) = entry.spec() else {
-            continue;
-        };
-        let turtle = atomic_shacl::kind_shapes::shape_for(spec, &project)
-            .map_err(|e| CliError::ShaclError(e.to_string()))?;
-        bundles.push(atomic_shacl::ShapeBundle {
-            iri: format!("{project}:kind:{}#Shape", spec.name),
-            turtle,
-        });
-        for path in &entry.instances {
-            if let Some(KindPath::Instance { uid, .. }) = KindPath::classify(path) {
-                selected.push((spec.name.clone(), uid));
-            }
-        }
-    }
-
-    if bundles.is_empty() {
+    // Without a project identity there are no IRIs to project, so the RDF
+    // gate has nothing to say. The field-level oracle remains the authority
+    // for that repository. See ADR 0001 decision 2.
+    if repo
+        .project_identity()
+        .map_err(CliError::Repository)?
+        .is_none()
+    {
         return Ok(None);
     }
-
-    let snapshot = repo.workflow_snapshot().map_err(CliError::Repository)?;
-
-    let mut keep: BTreeSet<String> = BTreeSet::new();
-    for (kind, uid) in &selected {
-        if let Some(iri) = repo.kind_instance_iri(kind, uid).map_err(CliError::Repository)? {
-            keep.insert(iri);
-        }
-        if let Some(iri) = repo.kind_hub_iri(kind).map_err(CliError::Repository)? {
-            keep.insert(iri);
-        }
+    let shapes = super::shapes::kind_shapes(repo, source, kind)?;
+    if shapes.bundles.is_empty() {
+        return Ok(None);
     }
-
-    let mut nodes = Vec::new();
-    let mut edges = Vec::new();
-    for edge in &snapshot.edges {
-        if keep.contains(&edge.from_id) || keep.contains(&edge.to_id) {
-            keep.insert(edge.from_id.clone());
-            keep.insert(edge.to_id.clone());
-            edges.push(edge.clone());
-        }
-    }
-    for node in &snapshot.nodes {
-        if keep.contains(&node.id) {
-            nodes.push(node.clone());
-        }
-    }
-
-    let data = atomic_shacl::snapshot_ntriples(&nodes, &edges)
-        .map_err(|e| CliError::ShaclError(e.to_string()))?;
+    let dataset = super::shapes::kind_dataset(repo, &shapes)?;
     let request = atomic_shacl::ValidationRequest {
         profile: atomic_shacl::Profile::Kind,
         shape: None,
         node: None,
-        custom: bundles,
+        custom: shapes.bundles,
     };
-    let output = atomic_shacl::validate_ntriples(&data, &snapshot.identity, &request)
-        .map_err(|e| CliError::ShaclError(e.to_string()))?;
+    let output =
+        atomic_shacl::validate_ntriples(&dataset.ntriples, &dataset.snapshot_identity, &request)
+            .map_err(|e| CliError::ShaclError(e.to_string()))?;
 
+    let mut diagnostics = output.diagnostics;
+    if !dataset.missing.is_empty() {
+        diagnostics.push(format!(
+            "{} kind instance(s) have no projected knowledge-graph node: {}",
+            dataset.missing.len(),
+            dataset.missing.join(", ")
+        ));
+    }
     Ok(Some(ShaclResult {
-        conforms: output.conforms,
+        conforms: output.conforms && dataset.missing.is_empty(),
         profile: "kind".into(),
         snapshot_identity: output.snapshot_identity,
-        diagnostics: output.diagnostics,
+        diagnostics,
         results: output.results,
     }))
 }
@@ -215,7 +180,12 @@ fn problem_count(report: &KindValidationReport) -> usize {
         .iter()
         .flat_map(|kind| &kind.instances)
         .filter(|instance| instance.problem.is_none())
-        .map(|instance| instance.violations.len().max(usize::from(!instance.conforms)))
+        .map(|instance| {
+            instance
+                .violations
+                .len()
+                .max(usize::from(!instance.conforms))
+        })
         .sum();
     report.problems.len() - definition_problems + spec_problems + violations
 }
@@ -277,13 +247,13 @@ fn print_report(report: &KindValidationReport, shacl: Option<&ShaclResult>) {
                 let bad = kind.instances.iter().filter(|i| !i.conforms).count();
                 let instances = match (kind.instance_count, bad) {
                     (0, _) => "no instances".to_string(),
-                    (n, 0) => format!("{n} conform"),
-                    (n, b) => format!("{b} of {n} do not conform"),
+                    (n, 0) => format!("{} conform", plural(n, "instance", "instances")),
+                    (n, bad) => format!("{} of {}", bad, plural(n, "instance", "instances")),
                 };
+                let fields = plural(kind.field_count, "field", "fields");
                 println!(
-                    "{mark_ok} {}: {} field(s), {edges}; {instances}",
-                    display_text(&kind.name),
-                    kind.field_count
+                    "{mark_ok} {}: {fields}, {edges}; {instances}",
+                    display_text(&kind.name)
                 );
                 for instance in &kind.instances {
                     for v in &instance.violations {

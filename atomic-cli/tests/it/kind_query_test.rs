@@ -812,3 +812,40 @@ fn the_hub_answers_for_the_last_deflate_and_not_for_every_view() {
     f.ok(&["vault", "sync"]);
     assert_eq!(instances(&f), 1);
 }
+
+/// `query validate --profile kind` runs the same generated-shape gate as
+/// `kind validate`, so a server-side caller can validate kinds without the
+/// CLI-only command. See ADR 0001 decision 5.
+#[test]
+fn query_validate_kind_profile_runs_the_generated_shapes() {
+    let (f, _first, _second) = adr_fixture();
+    let report = f.json(&["query", "validate", "--profile", "kind", "--format", "json"]);
+    assert_eq!(report["profile"], "kind", "{report:#}");
+    assert_eq!(report["conforms"], true, "{report:#}");
+    assert!(
+        report["target_coverage"]
+            .as_array()
+            .is_some_and(|coverage| !coverage.is_empty()),
+        "{report:#}"
+    );
+}
+
+/// The kind profile is the same closed gate as `kind validate`: an instance
+/// with an undeclared field and an out-of-enum status does not conform.
+#[test]
+fn query_validate_kind_profile_rejects_a_broken_instance() {
+    let (f, _first, _second) = adr_fixture();
+    let broken = f
+        .root()
+        .join(".vault/kinds/adr/01M85C09EPAVHNW5WW5A56K0CD.md");
+    fs::write(
+        &broken,
+        "---\nuid: 01M85C09EPAVHNW5WW5A56K0CD\ntitle: Broken\nstatus: draft\nbogus: x\n---\n",
+    )
+    .unwrap();
+    let out = f.run(&["query", "validate", "--profile", "kind", "--format", "json"]);
+    assert!(!out.status.success(), "a broken kind must fail the gate");
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["profile"], "kind", "{report:#}");
+    assert_eq!(report["conforms"], false, "{report:#}");
+}

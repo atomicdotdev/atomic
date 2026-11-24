@@ -1,11 +1,14 @@
 use super::*;
 use clap::ValueEnum;
 
-#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum Profile {
     #[default]
     Projection,
     Publication,
+    Review,
+    /// Validate user-defined vault kinds against their generated shapes.
+    Kind,
 }
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 pub enum Format {
@@ -34,12 +37,53 @@ impl Command for Validate {
         let snapshot = crate::commands::rpc::workflow_snapshot(&root)?;
         let dot_dir = Repository::canonical_dot_dir(&root).map_err(CliError::Repository)?;
         let error = |error: atomic_shacl::ValidationError| CliError::ShaclError(error.to_string());
+
+        // The kind profile is generated from the recorded kind registry, not
+        // from `.atomic/shapes`. It shares the gate with `kind validate`.
+        if self.profile == Profile::Kind {
+            let repo = crate::commands::vault::kind::open_for_read()?;
+            let shapes = crate::commands::vault::kind::shapes::kind_shapes(
+                &repo,
+                &atomic_repository::KindSource::WorkingCopy,
+                None,
+            )?;
+            if shapes.bundles.is_empty() {
+                return Err(CliError::InvalidArgument {
+                    message: "no registered kinds to validate".into(),
+                });
+            }
+            let dataset = crate::commands::vault::kind::shapes::kind_dataset(&repo, &shapes)?;
+            let request = atomic_shacl::ValidationRequest {
+                profile: atomic_shacl::Profile::Kind,
+                shape: self.shape.clone(),
+                node: self.node.clone(),
+                custom: shapes.bundles,
+            };
+            let mut report = atomic_shacl::validate_ntriples(
+                &dataset.ntriples,
+                &dataset.snapshot_identity,
+                &request,
+            )
+            .map_err(error)?;
+            if !dataset.missing.is_empty() {
+                report.conforms = false;
+                report.diagnostics.push(format!(
+                    "{} kind instance(s) have no projected knowledge-graph node: {}",
+                    dataset.missing.len(),
+                    dataset.missing.join(", ")
+                ));
+            }
+            return self.print(report);
+        }
+
         let data =
             atomic_shacl::snapshot_ntriples(&snapshot.nodes, &snapshot.edges).map_err(error)?;
         let request = atomic_shacl::ValidationRequest {
             profile: match self.profile {
                 Profile::Projection => atomic_shacl::Profile::Projection,
                 Profile::Publication => atomic_shacl::Profile::Publication,
+                Profile::Review => atomic_shacl::Profile::Review,
+                Profile::Kind => unreachable!("handled above"),
             },
             shape: self.shape.clone(),
             node: self.node.clone(),
@@ -47,6 +91,12 @@ impl Command for Validate {
         };
         let report =
             atomic_shacl::validate_ntriples(&data, &snapshot.identity, &request).map_err(error)?;
+        self.print(report)
+    }
+}
+
+impl Validate {
+    fn print(&self, report: atomic_shacl::ValidationOutput) -> CliResult<()> {
         match self.format {
             Format::Json => println!(
                 "{}",

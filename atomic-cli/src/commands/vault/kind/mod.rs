@@ -41,6 +41,7 @@ use crate::error::{CliError, CliResult};
 
 pub mod init;
 pub mod list;
+pub mod shapes;
 pub mod show;
 pub mod validate;
 

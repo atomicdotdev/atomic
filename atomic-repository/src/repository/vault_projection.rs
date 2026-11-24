@@ -17,7 +17,7 @@ use atomic_core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) struct VaultProjection {
+pub(crate) struct VaultProjection {
     project: ProjectId,
     // Canonical IRIs are exact identities. Only historical aliases may fold
     // case, and a collision must stay unresolved rather than pick a winner.
@@ -247,6 +247,45 @@ impl VaultProjection {
             }
         }
         Ok(context)
+    }
+
+    /// Add kind rows read from the validation source, so a row that has not
+    /// been ingested into the index yet still projects. The index projection
+    /// already covers ingested rows; this only fills the gaps a working-copy
+    /// or view read can have. See ADR 0001 decision 2.
+    pub(super) fn add_rows(&mut self, rows: &[(String, VaultEntry)]) {
+        // Definitions first, so an instance can resolve its spec in the same
+        // pass. A row that is not a kind definition or instance is ignored.
+        for (path, entry) in rows {
+            if let Some(KindPath::Definition { kind }) = KindPath::classify(path) {
+                self.kinds
+                    .insert(kind.clone(), KindDefinition::from_stored(&kind, entry));
+            }
+        }
+        for (path, entry) in rows {
+            let fm: serde_json::Value =
+                serde_json::from_str(&entry.frontmatter_json).unwrap_or_default();
+            let subject = match KindPath::classify(path) {
+                Some(KindPath::Definition { kind }) => {
+                    Some(iri::mint_concept(&self.project, &kind_hub_name(&kind)))
+                }
+                Some(KindPath::Instance { kind, uid })
+                    if self.kinds.get(&kind).is_some_and(|d| d.spec().is_some())
+                        && instance_is_projectable(entry, &fm) =>
+                {
+                    Some(iri::mint_concept(
+                        &self.project,
+                        &kind_instance_name(&kind, &uid),
+                    ))
+                }
+                _ => None,
+            };
+            let Some(subject) = subject else {
+                continue;
+            };
+            self.paths.insert(path.clone(), subject.clone());
+            self.subjects.insert(subject.clone(), (subject, C::Concept));
+        }
     }
 
     fn add_alias(&mut self, alias: String, target: (String, C)) {
@@ -778,9 +817,11 @@ impl VaultProjection {
             .get("title")
             .and_then(serde_json::Value::as_str)
             .filter(|title| !title.trim().is_empty());
-        let mut node = KgNode::new(subject, C::Concept, title.unwrap_or(uid), "vault")
-            .with_metadata(metadata);
-        node.types.push(kind_class);
+        let mut node =
+            KgNode::new(subject, C::Concept, title.unwrap_or(uid), "vault").with_metadata(metadata);
+        // The extension class stays in metadata: `KgNode.types` is restricted to
+        // canonical workflow classes by the storage layer. The RDF adapter emits
+        // `rdf:type <kind_class>` from `metadata.kind_class`. See ADR 0001.
         if let Some(title) = title {
             node = node.with_summary(title);
         }
@@ -796,36 +837,37 @@ impl VaultProjection {
             .filter(|title| !title.trim().is_empty())
             .unwrap_or(spec.name.as_str());
         let hub = iri::mint_concept(&self.project, &kind_hub_name(&spec.name));
-        graph.nodes.push(KgNode::new(
-            &hub,
-            C::Concept,
-            hub_label,
-            "vault_reference",
-        ));
+        graph
+            .nodes
+            .push(KgNode::new(&hub, C::Concept, hub_label, "vault_reference"));
         graph.edges.push(
             KgEdge::new(subject, hub, P::References)
                 .with_metadata(serde_json::json!({"edges": ["@kind"]})),
         );
         for resolved in &report.resolved_refs {
-            let (Some(edge), Some((target, class))) =
-                (&resolved.edge, self.subjects.get(&resolved.target_id))
-            else {
+            let Some((target, class)) = self.subjects.get(&resolved.target_id) else {
                 continue;
             };
+            // A ref field without an `edge` label is still a relation: the
+            // field name is the predicate the SHACL shape declares for it. The
+            // label only renames the KG edge. See ADR 0001 decision 1.
+            let edge = resolved.edge.as_deref().unwrap_or(&resolved.field);
             graph.nodes.push(KgNode::new(
                 target,
                 *class,
                 target.as_str(),
                 "vault_reference",
             ));
-            graph.edges.push(
-                KgEdge::new(subject, target, P::References).with_metadata(serde_json::json!({
-                    "fields": [resolved.field],
-                    "edges": [edge],
-                    "kind_edge": edge,
-                    "kind_field": resolved.field,
-                })),
-            );
+            graph
+                .edges
+                .push(KgEdge::new(subject, target, P::References).with_metadata(
+                    serde_json::json!({
+                        "fields": [resolved.field],
+                        "edges": [edge],
+                        "kind_edge": edge,
+                        "kind_field": resolved.field,
+                    }),
+                ));
         }
 
         // A label that spells the instance's concept IRI collides with the

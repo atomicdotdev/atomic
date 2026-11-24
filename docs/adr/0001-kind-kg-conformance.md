@@ -111,9 +111,11 @@ ref targets. Instead:
 - `kind validate --view` fails closed when a ref target is not in the view's
   filter, with `UNRESOLVED_REF`.
 - The KG projects the dangling ref as a `KindViolation` Finding.
-- `kind new --record` (the default for `kind new`) records the instance so the
-  KG and the view see it immediately. `--no-record` keeps the current
-  write-only behaviour for callers that want to stage a definition first.
+- `kind new` writes and ingests the instance but does not record it; the
+  operator records it like any other vault file. The command warns when the
+  definition is not yet recorded, because an instance's change only depends on
+  the definition once the definition is recorded. Recording the instance is
+  what makes the view (and the view-closure gate) see it.
 
 M3's `extra_dependencies` frontier remains the long-term fix; it is out of
 scope for this branch and tracked in the ADR's follow-ups.
@@ -142,3 +144,18 @@ per-path projection is the recommended fix and is not implemented here.
 - Extension IRIs are project-scoped; two repositories cannot collide.
 - The ambient KG remains repository-wide for vault rows. This is a known
   limitation of dev's vault projection, not a kind-specific one.
+
+## Follow-ups
+
+- **Refs as patch dependencies (M3).** The `extra_dependencies` frontier would
+  make an instance's change depend on its ref targets. Until then, a dangling
+  ref is a visible gate failure and a KG Finding, never a silent pass.
+- **Targeted projection (N2).** Whole-vault re-projection stays dev's
+  behaviour. A per-path projection keyed by the changed row is the recommended
+  fix; the branch records the cost and does not add a second pass.
+- **`kind` RPC.** A dedicated daemon verb for kind commands; `query validate
+  --profile kind` is the server-side path in this branch.
+- **`kind new --record`.** An opt-in convenience that records the instance
+  immediately. It is not the default because the definition must be recorded
+  first and the operator may want to stage the definition and instance
+  together.

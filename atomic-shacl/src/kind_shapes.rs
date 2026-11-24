@@ -37,11 +37,7 @@ pub fn shape_for(spec: &KindSpec, project: &str) -> Result<String, ValidationErr
     let class = kind_class(project, &spec.name);
     let mut out = String::new();
     writeln!(out, "@prefix sh: <http://www.w3.org/ns/shacl#> .").unwrap();
-    writeln!(
-        out,
-        "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> ."
-    )
-    .unwrap();
+    writeln!(out, "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .").unwrap();
     writeln!(
         out,
         "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ."
@@ -51,7 +47,14 @@ pub fn shape_for(spec: &KindSpec, project: &str) -> Result<String, ValidationErr
     writeln!(out, "<{class}> a sh:NodeShape ;").unwrap();
     writeln!(out, "  sh:targetClass <{class}> ;").unwrap();
     writeln!(out, "  sh:closed true ;").unwrap();
-    writeln!(out, "  sh:ignoredProperties ( rdf:type ) ;").unwrap();
+    // The adapter also emits the label, the title summary, the vault
+    // timestamps, and the `atomic:references` traversal edge. Those are not spec
+    // fields, so the closed shape must ignore them. See ADR 0001 decision 2.
+    writeln!(
+        out,
+        "  sh:ignoredProperties ( <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2000/01/rdf-schema#label> <http://purl.org/dc/terms/description> <http://purl.org/dc/terms/created> <http://purl.org/dc/terms/modified> <https://atomic.dev/ns/workflow#references> ) ;"
+    )
+    .unwrap();
 
     // uid: required, single-valued, ULID-shaped.
     writeln!(
@@ -76,7 +79,9 @@ pub fn shape_for(spec: &KindSpec, project: &str) -> Result<String, ValidationErr
     }
 
     for (name, field) in &spec.fields {
-        let predicate = format!("{class}#{name}");
+        // A ref's edge label is the predicate the projection emits; without one
+        // the field name is the predicate. See ADR 0001 decision 1.
+        let predicate = format!("{class}#{}", field.edge.as_deref().unwrap_or(name.as_str()));
         write_property(&mut out, &predicate, field, project)?;
     }
 
@@ -100,11 +105,7 @@ pub fn shape_for(spec: &KindSpec, project: &str) -> Result<String, ValidationErr
     // A conflict marker at column 0 is not representable as a SHACL Core string
     // constraint; keep it as a SPARQL constraint over the body.
     writeln!(out, "  sh:sparql [").unwrap();
-    writeln!(
-        out,
-        "    sh:message \"body contains a conflict marker\" ;"
-    )
-    .unwrap();
+    writeln!(out, "    sh:message \"body contains a conflict marker\" ;").unwrap();
     writeln!(out, "    sh:select \"\"\"").unwrap();
     writeln!(
         out,

@@ -790,14 +790,15 @@ fields:
     let intent = edges_between(&repo, &id, &intent_iri(&repo));
     assert_eq!(intent.len(), 1, "{intent:?}");
     let metadata = intent[0].metadata.as_ref().unwrap();
-    // `mentioned` declares no edge: it is existence-checked and nothing more.
+    // `mentioned` declares no edge: the field name is its relation label, so
+    // the ref still projects as an edge the RDF adapter can see.
     assert_eq!(
         metadata["fields"],
-        serde_json::json!(["implementsIntent", "tracks"])
+        serde_json::json!(["implementsIntent", "mentioned", "tracks"])
     );
     assert_eq!(
         metadata["edges"],
-        serde_json::json!(["implements", "tracks"])
+        serde_json::json!(["implements", "mentioned", "tracks"])
     );
 
     let memory = iri::mint_memory(&repo.project_id().unwrap(), "notes");

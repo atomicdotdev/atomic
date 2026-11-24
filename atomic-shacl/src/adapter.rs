@@ -158,6 +158,10 @@ pub fn snapshot_ntriples(nodes: &[KgNode], edges: &[KgEdge]) -> Result<String, V
             // Custom kind fields and relations project into the project-scoped
             // extension namespace. See docs/adr/0001-kind-kg-conformance.md.
             if let Some(kind_class) = metadata.get("kind_class").and_then(|v| v.as_str()) {
+                // The storage layer only allows canonical workflow classes in
+                // `KgNode.types`, so the extension class is carried in metadata
+                // and asserted here as a real `rdf:type`.
+                triples.insert(format!("{subject} <{TYPE}> {} .\n", named(kind_class)?));
                 for (key, value) in metadata.as_object().into_iter().flatten() {
                     if let Some(field) = key.strip_prefix("field.") {
                         emit_kind_values(
@@ -266,10 +270,7 @@ fn emit_kind_values(
             };
             triples.insert(format!(
                 "{subject} <{predicate}> {} .\n",
-                Literal::new_typed_literal(
-                    number.to_string(),
-                    NamedNode::new_unchecked(datatype)
-                )
+                Literal::new_typed_literal(number.to_string(), NamedNode::new_unchecked(datatype))
             ));
             Ok(())
         }
