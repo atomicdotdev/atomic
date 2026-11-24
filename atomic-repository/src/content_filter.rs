@@ -587,13 +587,24 @@ fn run_bounded_command(
         .spawn()
         .map_err(|error| error.to_string())?;
     #[cfg(windows)]
-    let mut child = Command::new("cmd")
-        .args(["/C", &command])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
+    let mut child = {
+        use std::os::windows::process::CommandExt;
+        let mut shell = Command::new("cmd");
+        shell.arg("/C");
+        // The driver command reaches cmd.exe verbatim. Rust's standard
+        // argument escaping writes `\"` for every quote, which cmd.exe
+        // does not understand, so a driver command that quotes an
+        // argument — a path with spaces, or any `%f` substitution that
+        // needs them — fails with "The filename, directory name, or
+        // volume label syntax is incorrect".
+        shell.raw_arg(command);
+        shell
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| error.to_string())?
+    };
 
     let mut stdin = child.stdin.take().expect("piped stdin");
     let owned_input = input.to_vec();
