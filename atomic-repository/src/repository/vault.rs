@@ -1628,6 +1628,19 @@ fn infer_entry_type(path: &str) -> VaultEntryType {
     }
 }
 
+/// The entry the vault tables hold for a vault file: its type from `path`
+/// (vault-relative), its frontmatter as JSON and its body, stamped `at`.
+/// What recording the file stores, without a repository.
+pub fn vault_entry_for_file(path: &str, content: &str, at: &str) -> VaultEntry {
+    let (frontmatter_json, body) = parse_markdown_frontmatter(content);
+    VaultEntry::new(
+        infer_entry_type(path),
+        body.into_bytes(),
+        frontmatter_json,
+        at.to_owned(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
