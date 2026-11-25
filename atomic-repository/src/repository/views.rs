@@ -1000,10 +1000,17 @@ impl Repository {
             .iter()
             .filter(|hash| present.contains(hash))
             .count();
+        // The publication gate is skipped for the same reason as in
+        // `apply_view_manifest`: what the remote's manifest adds was already
+        // published there, and this repository holds none of the publisher's
+        // session evidence. Local membership is untouched, and publishing
+        // from this repository stays gated at its own boundaries.
         let mut replayed = 0usize;
         for hash in &manifest.changes {
             if present.insert(*hash) {
-                self.insert_change(hash, InsertOptions::default().view(&manifest.name))?;
+                let mut options = InsertOptions::default().view(&manifest.name);
+                options.skip_publication_gate = true;
+                self.insert_change(hash, options)?;
                 replayed += 1;
             }
         }

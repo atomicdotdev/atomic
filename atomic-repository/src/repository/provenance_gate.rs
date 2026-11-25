@@ -1670,6 +1670,53 @@ mod tests {
         );
     }
 
+    /// A pull reconciles the remote's manifest into a view that already
+    /// exists here. What it adds was published, and gated, on the machine
+    /// that pushed it, so adding it to the local view is not a publication
+    /// either. Publishing from this repository is still gated.
+    #[test]
+    fn manifest_reconciliation_into_a_shared_view_is_not_a_publication() {
+        use crate::manifest::ViewManifest;
+        use atomic_core::pristine::ViewScope;
+
+        let (_dir, mut repo) = create_temp_repo();
+        let cloned = repo
+            .save_change(&managed_change("published before the clone"))
+            .expect("save");
+        repo.apply_view_manifest(&ViewManifest::new(
+            "main",
+            ViewScope::Shared,
+            None,
+            vec![cloned],
+        ))
+        .expect("clone");
+
+        let pulled = repo
+            .save_change(&managed_change("published after the clone"))
+            .expect("save");
+        let remote = ViewManifest::new("main", ViewScope::Shared, None, vec![cloned, pulled]);
+        let outcome = repo
+            .reconcile_view_manifest(&remote)
+            .expect("reconciling a published view is not gated");
+        assert_eq!(outcome.already_present, 1);
+        assert_eq!(outcome.replayed, 1);
+        assert_eq!(
+            repo.view_manifest("main").expect("manifest").changes,
+            vec![cloned, pulled]
+        );
+
+        let local = repo
+            .save_change(&managed_change("new local work"))
+            .expect("save");
+        let error = repo
+            .insert_change(&local, crate::InsertOptions::default().view("main"))
+            .expect_err("publishing after a pull must still refuse");
+        assert!(
+            matches!(error, RepositoryError::PublicationGateRefused { .. }),
+            "{error:?}"
+        );
+    }
+
     /// A DID signer written into the clone's repo-local identity store
     /// (`<dot>/identities`) resolves through it: name, `did:atomic`, and
     /// `did:key` forms all reach the identity's public key, and a signer
