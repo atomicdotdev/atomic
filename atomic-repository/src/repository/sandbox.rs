@@ -440,12 +440,14 @@ impl Repository {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let dest = parent.canonicalize()?.join(name);
-        let mut builder = std::fs::DirBuilder::new();
+        let builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         builder.create(&dest)?;
         let snapshot = self.materialize_view_entries(view, |entry| {
             write_recorded_snapshot_entry(&dest, &entry)
@@ -905,6 +907,14 @@ mod tests {
         let dest = dir.path().join("review");
 
         let snapshot = repo.provision_recorded_sandbox(&dest, "dev").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&dest).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
         assert_eq!(snapshot.view, "dev");
         assert_eq!(snapshot.change_count, 1);
         let expected = repo

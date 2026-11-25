@@ -102,6 +102,8 @@ impl CrossViewInsertOptions {
 /// Result of a cross-view insert operation.
 #[derive(Debug, Clone)]
 pub struct CrossViewInsertOutcome {
+    /// Attested native review used at the insertion boundary, when one exists.
+    pub review_decision: Option<crate::repository::ReviewDecisionEvidence>,
     /// Number of changes inserted.
     pub changes_applied: usize,
 
@@ -131,6 +133,7 @@ impl CrossViewInsertOutcome {
     /// Create a new outcome.
     pub fn new() -> Self {
         Self {
+            review_decision: None,
             changes_applied: 0,
             applied_hashes: Vec::new(),
             skipped_hashes: Vec::new(),

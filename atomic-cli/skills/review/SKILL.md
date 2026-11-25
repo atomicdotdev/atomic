@@ -1,6 +1,6 @@
 ---
 name: Review
-description: Review recorded work through anti-slop, intent conformance and blast-radius/risk passes, returning a graph of numbered evidence-backed findings and criterion assessments; or publish an independent view review through Atomic.
+description: Review recorded work through native anti-slop, conformance and blast-radius passes, or explicitly attest evaluated readiness and accepted degradation for a source-to-target insertion.
 ---
 
 # Review
@@ -32,8 +32,8 @@ atomic review --change <hash> --html
 atomic review --change <hash> --html --no-open --output review.html
 atomic review --view <name> --html
 atomic review --view <name> --json
-atomic review --from <before-view> --to <after-view> --html
-atomic review --from <before-view> --to <after-view> --json
+atomic review --from <draft-source> --to <shared-target> --html
+atomic review --from <draft-source> --to <shared-target> --json
 ```
 
 `--view NAME` explicitly audits the current recorded snapshot of that named view,
@@ -50,18 +50,20 @@ criteria, independently of change-plan links; this scope context is not inferred
 governing-change attribution or acceptance approval. Change-regression risk still
 has no baseline in snapshot mode.
 
-`--from BEFORE --to AFTER` compares two complete recorded view states without a
+`--from SOURCE --to TARGET` compares two complete recorded view states without a
 working-copy switch. Both options are required; they conflict with the other
-selectors and change-specific finding/risk inputs. From is before; To is after.
+selectors and change-specific finding/risk inputs. From is the proposed source;
+To is the destination/base, like a pull request. Measurements use target-before
+and source-after. This is not a simulated merge result.
 Metrics are extracted independently over each whole supplied corpus and matched
 by canonical file inode and qualified subject. The report shows actual numeric
 deltas only when both measurements and identities are comparable. Missing data
 is unavailable, not an inferred zero. Audit observations are new, existing,
 resolved, changed or unknown; changed/unknown are deliberately uncertain rather
 than guessed resolutions. Renames use recorded identity, not content similarity.
-The v4 `view_comparison.files[*].analysis` units use domain-separated source URIs,
+The v5 `view_comparison.files[*].analysis` units use domain-separated source URIs,
 not authored change hashes. All three passes are populated: conformance includes
-intents explicitly assigned to the **To** view even without a change-plan link,
+intents explicitly assigned to the **From/source** view even without a change-plan link,
 plus separately identified membership-delta governing context, pinned recorded
 criterion declarations and task/file evidence. Current-vault context is labelled
 and source/scope-hashed; unrelated and inherited parent-view assignments are not
@@ -233,57 +235,54 @@ certainty needs substantial work, report the risk, confidence and coverage gap
 instead. Stop after the three bounded passes (or explicit blockers), with a
 concise graph/findings summary and observed verification. No automatic fix phase.
 
-## A view argument means independent publication
+## Native publication: evaluation and accountable accepted degradation
 
-For `@review --view a` or `@review --view a,b`, invoke:
-
-```sh
-atomic review publish --view a
-atomic review publish --view a,b
-```
-
-There is one `--view` option, not a separate `--views` spelling. The CLI freezes
-the recorded scope, preflights issuer authority, asks once for bounded local
-ephemeral authorization, runs an independent OpenCode publisher in a temporary
-recorded-only working copy, dispatches genuine session_end after child completion,
-verifies native completion evidence, and retains exact-scope signed approval.
-It owns credentials, lifecycle and cleanup. Do not provision grants, launch a
-second agent, call session-end, or build a VM/transfer pipeline from this skill.
-
-Use `--yes` only when the user has already approved the displayed exact local
-scope/authority. No production enrollment or shared identity-default mutation is
-part of this command. `--identity` selects a trusted local issuer explicitly.
-
-Other supported operations:
+A view argument alone remains a local snapshot audit. Invoke publication only
+when explicitly requested, using the same source-to-target direction:
 
 ```sh
-atomic review publish --session <session>
-atomic review publish --view a,b --dry-run --json
-atomic review publish --resume <job-id>
-atomic review publish --cancel <job-id>
+atomic review publish --from draft --to dev --dry-run --json
+atomic review publish --from draft --to dev --evaluation evaluated-review.json --identity reviewer --yes
+atomic review publish --from draft --to dev --evaluation evaluated-review.json --identity reviewer --html
 atomic review publish inspect
 ```
 
-An unknown/crashed process outcome is not guessed complete or blindly relaunched:
-preserve its job and follow the actual recovery diagnostic. Cancellation retires
-recording credentials; it is not withdrawal of a previously published approval.
-Collection publication checks combined compatible inputs, deduplicates history,
-and rejects ambiguous overlapping deltas or unsupported symlink composition
-rather than picking a winner. An explicit integration view is needed for those
-cases; the review command never creates one for the user.
+Publication is native semantic/audit evaluation plus an existing local identity's
+attestation. It does not execute an agent, model or runner, create an ephemeral
+identity/delegation, enroll a key, insert or push. It is independent of whether a
+company uses Copilot or another recording integration. `--view draft` is a
+single-source convenience, using its parent when a destination is not supplied;
+publication collections, runner/provider flags and agent-job resume are not this
+workflow. `--cancel UUID` is cleanup-only for an owned job from the former agent
+publisher; it cannot resume or create one.
 
-## Results and boundaries
+The dry-run emits the complete report, stable report/scope digests, outstanding
+issues and an unfilled `evaluation_template`. A user must evaluate each of
+`anti_slop`, `intent_conformance`, and `blast_radius_risk`, with a nonempty
+rationale and one disposition: `ready`, `accepted_degradation`, or `not_ready`.
+Outstanding findings, unmet/unknown criteria, elevated risk and grouped coverage
+gaps require explicit issue IDs and rationales under `accepted_degradations`.
+No wildcard or `--yes` acceptance exists. `--yes` only confirms retention of an
+already explicit evaluation. Do not fabricate the user's evaluation or consent.
 
-Distinguish inspection, independent review, native session completion and retained
-publication approval. Report the CLI's actual blocker and job ID when blocked.
-Do not revoke a still-resumable job merely because one step failed, silently renew
-its authorization, weaken policy, infer intent ownership from shared filenames,
-or fabricate historical session capture. Native work-session capture and a
-present-day retrospective approval remain different evidence.
+The evaluation file can be the edited dry-run envelope (fill only its
+`evaluation_template`) or that template alone. Its digests must match a fresh
+native review. Accepted code-quality degradation stays visible and linked to the
+attested report; native evidence readiness remains `not_ready`, not a fabricated
+clean or independent approval. `not_ready` decisions can also be retained to
+document rejection and never authorize insertion. Signer trust, scope drift,
+original provenance/integrity failures and unknown signing keys are not waivable
+code degradation. Existing explicit retrospective `prepare/sign/record` tools
+retain their own proof and review-intent requirements.
 
-Publication means signed review finalization, **not insertion or push**. Those
-remain separately requested operations. Legacy triage and advanced external
-signing commands remain compatible; they are not extra skill-level workflows.
-Never run git, atomic add or atomic record for this workflow: normal agent hooks
-record actual work and provenance. If the installed CLI lacks `atomic review`,
-report the binary/version mismatch instead of simulating the missing command.
+Native decisions are immutable retained artifacts. An applicable decision is
+revalidated under the existing shared-insertion boundary, and its hash is linked
+from insertion operation evidence. Moving either view, changing intent context,
+an untrusted/tampered report, incomplete acceptance or a `not_ready` disposition
+refuses reuse. Replace a current evaluation only with explicit `--supersedes HASH`;
+do not rewrite historical evidence. Existing original-capture gates still apply.
+
+Never change work-intent criteria to hide code shortcomings, silently weaken
+policy, or treat a signature as proof that tests ran or code is defect-free.
+Publication remains separate from insertion and push. Normal agent hooks own
+recording actual code/provenance; no extra agent phase belongs in this skill.

@@ -44,6 +44,22 @@ struct Request {
 }
 
 pub(super) fn render(repo: &Repository, report: &IncrementalReport) -> CliResult<String> {
+    render_with_decision(repo, report, None)
+}
+
+pub(super) fn render_published(
+    repo: &Repository,
+    report: &IncrementalReport,
+    decision: &atomic_canonical::review_decision::ReviewDecision,
+) -> CliResult<String> {
+    render_with_decision(repo, report, Some(decision))
+}
+
+fn render_with_decision(
+    repo: &Repository,
+    report: &IncrementalReport,
+    decision: Option<&atomic_canonical::review_decision::ReviewDecision>,
+) -> CliResult<String> {
     super::view_snapshot::verify(repo, report)?;
     let graph = report.graph.as_ref().expect("resolved review graph");
     let regions = presentation::regions(graph);
@@ -59,8 +75,12 @@ pub(super) fn render(repo: &Repository, report: &IncrementalReport) -> CliResult
         Vec::new(),
         flate2::Compression::fast(),
     ));
-    serde_json::to_writer(&mut archive, report)
-        .map_err(|error| CliError::Internal(error.into()))?;
+    if let Some(decision) = decision {
+        serde_json::to_writer(&mut archive, decision)
+    } else {
+        serde_json::to_writer(&mut archive, report)
+    }
+    .map_err(|error| CliError::Internal(error.into()))?;
     let archive = archive
         .into_inner()
         .map_err(|error| CliError::Internal(error.into()))?
@@ -69,7 +89,7 @@ pub(super) fn render(repo: &Repository, report: &IncrementalReport) -> CliResult
     let view = json!({
         "selected_roots":report.selected_roots,"warnings":report.warnings,
         "view_snapshot":report.view_snapshot.as_ref().map(|snapshot|json!({"source_ref":snapshot.source_ref,"view":snapshot.view,"state":snapshot.state,"membership_hash":snapshot.membership_hash,"file_count":snapshot.paths.len(),"conformance":snapshot.conformance})),
-        "view_comparison":report.view_comparison.as_ref().map(|comparison|json!({"source_ref":comparison.source_ref,"from":comparison.from,"to":comparison.to,"diagnostics":comparison.diagnostics,"conformance":comparison.conformance,"files":comparison.files.iter().map(|file|json!({"source_ref":file.source_ref,"path":file.path,"before_path":file.before_path,"after_path":file.after_path,"status":file.status,"content_status":file.content_status})).collect::<Vec<_>>()})),
+        "view_comparison":report.view_comparison.as_ref().map(|comparison|json!({"source_ref":comparison.source_ref,"from":comparison.from,"to":comparison.to,"before":comparison.before,"after":comparison.after,"diagnostics":comparison.diagnostics,"conformance":comparison.conformance,"files":comparison.files.iter().map(|file|json!({"source_ref":file.source_ref,"path":file.path,"before_path":file.before_path,"after_path":file.after_path,"status":file.status,"content_status":file.content_status})).collect::<Vec<_>>()})),
         "changes":report.changes.iter().filter(|change|change.selected_root).map(|change|json!({"hash":change.hash,"diff":change.diff,"diff_status":change.diff_status})).collect::<Vec<_>>(),
         "graph":{"scope":graph.scope,"passes":graph.passes,"findings":graph.findings,"criteria":graph.criteria,"diagnostics":graph.diagnostics,"risk":graph.risk,
             "nodes":graph.nodes.iter().filter(|node|matches!(node.kind.as_str(),"metric"|"check")).collect::<Vec<_>>()}
@@ -82,7 +102,7 @@ pub(super) fn render(repo: &Repository, report: &IncrementalReport) -> CliResult
         .transpose()
         .map_err(|error| CliError::Internal(error.into()))?;
     emit(
-        json!({"schema":"atomic.review-viewer.v1","local_only":true,"view":view,"report_archive":{"encoding":"gzip+base64","data":archive},"profile_json":profile_json,"regions":regions,"sources":sources,"audit_cards":atomic_audit::AUDIT_CARDS,"metric_cards":atomic_audit::METRIC_CARDS,"patterns":patterns}),
+        json!({"schema":"atomic.review-viewer.v1","local_only":true,"view":view,"review_decision":decision.map(|decision|json!({"id":decision.artifact_hash(),"report_hash":decision.report_hash,"readiness":decision.readiness,"disposition":decision.evaluation.insertion_disposition(),"signer":decision.attributed_to,"public_key":decision.public_key,"proof":decision.proof,"issues":decision.issues,"evaluation":decision.evaluation})),"report_archive":{"encoding":"gzip+base64","data":archive},"profile_json":profile_json,"regions":regions,"sources":sources,"audit_cards":atomic_audit::AUDIT_CARDS,"metric_cards":atomic_audit::METRIC_CARDS,"patterns":patterns}),
         &super::terminal::render(graph, false),
     )
 }
@@ -228,9 +248,9 @@ fn sources(
                     );
                 }
                 let pin = if side == "before" {
-                    &comparison.from
+                    &comparison.before
                 } else {
-                    &comparison.to
+                    &comparison.after
                 };
                 let belongs = comparison.files.iter().any(|file| {
                     if side == "before" {
@@ -259,9 +279,9 @@ fn sources(
             }
             if let (Some(comparison), Some(file)) = (&report.view_comparison, comparison_file) {
                 let (actual, pin, hash) = if side == "before" {
-                    (&file.before_path, &comparison.from, &file.before_hash)
+                    (&file.before_path, &comparison.before, &file.before_hash)
                 } else {
-                    (&file.after_path, &comparison.to, &file.after_hash)
+                    (&file.after_path, &comparison.after, &file.after_hash)
                 };
                 let Some(actual) = actual else {
                     return SourceText::Absent;

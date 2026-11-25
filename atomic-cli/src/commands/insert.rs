@@ -844,6 +844,10 @@ pub(crate) fn print_cross_view_outcome(outcome: &CrossViewInsertOutcome, dry_run
         }
     }
 
+    if let Some(review) = &outcome.review_decision {
+        output::print_warning(&format!("Attested review {} · evidence readiness {:?} · user disposition {:?} · {} explicitly accepted degradation(s). Report {}. This is not a clean-code or independent-approval claim.",review.decision,review.readiness,review.disposition,review.accepted_degradations,review.report_hash));
+    }
+
     if outcome.has_conflicts {
         println!();
         output::print_warning("Conflicts detected. Run 'atomic conflicts' to see details.");

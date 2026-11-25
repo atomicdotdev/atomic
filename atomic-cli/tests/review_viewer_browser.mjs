@@ -76,7 +76,23 @@ try {
   assert(await evaluate(`document.getElementById('review-toolbar').hidden && document.getElementById('file-navigation').hidden && document.getElementById('card-inspector').hidden`));
   assert(await evaluate(`['audit-overview','conformance-overview','risk-overview'].every(id=>document.getElementById(id).closest('[role="tabpanel"]').id==='panel-summary')`),'Report-wide overviews belong only to Summary');
   assert.equal(await evaluate(`document.querySelectorAll('#summary-actions button').length`),3);
-  let image = await page('Page.captureScreenshot', { format: 'png' });
+   const published = await evaluate(`JSON.parse(document.getElementById('review-data').textContent).review_decision || null`);
+   if(published) {
+     assert.equal(await evaluate(`document.querySelectorAll('#summary-decision [data-review-issue]').length`),published.issues.length,'Every attested issue must remain accessible in the Summary ledger');
+     assert.equal(await evaluate(`document.querySelectorAll('#summary-decision [data-pass-evaluation]').length`),3);
+     for(const pass of published.evaluation.passes)assert(await evaluate(`Array.from(document.querySelectorAll('#summary-decision [data-pass-evaluation]')).some(row=>row.dataset.passEvaluation===${JSON.stringify(pass.pass)} && row.textContent.includes(${JSON.stringify(pass.rationale)}))`));
+     assert(await evaluate(`document.getElementById('summary-decision').textContent.includes('Not ready') && document.getElementById('summary-decision').textContent.includes('Accepted degradation')`),'Accepted risk must not rewrite evidence readiness');
+     for(const pass of published.evaluation.passes) for(const acceptance of pass.accepted_degradations) {
+       assert(await evaluate(`Array.from(document.querySelectorAll('#summary-decision [data-review-issue]')).some(row=>row.dataset.reviewIssue===${JSON.stringify(acceptance.issue)} && row.textContent.includes(${JSON.stringify(acceptance.rationale)}))`));
+     }
+     const archive=await evaluate(`(async()=>{let captured,ready;const prepared=new Promise(resolve=>ready=resolve),create=URL.createObjectURL,click=HTMLAnchorElement.prototype.click;URL.createObjectURL=blob=>{captured=blob;ready();return create.call(URL,blob)};HTMLAnchorElement.prototype.click=function(){};document.getElementById('download').click();await prepared;const text=await captured.text();URL.createObjectURL=create;HTMLAnchorElement.prototype.click=click;return JSON.parse(text);})()`);
+     assert.equal(archive.schema,'atomic.review-decision.v1');
+     assert.equal(archive.report_hash,published.report_hash);
+     assert.deepEqual(archive.evaluation,published.evaluation);
+     assert.deepEqual(archive.proof,published.proof);
+     assert.equal(archive.readiness,'not_ready');
+   }
+   let image = await page('Page.captureScreenshot', { format: 'png' });
   writeFileSync(join(directory,'summary-desktop.png'),Buffer.from(image.data,'base64'));
    const expected = await evaluate(`(() => { const d=JSON.parse(document.getElementById('review-data').textContent); const r=d.view; const c=r.view_comparison?.conformance || r.view_snapshot?.conformance; return { findings:r.graph.findings.filter(f=>f.passes.includes('anti_slop')).length, riskFindings:r.graph.findings.filter(f=>f.passes.includes('blast_radius_risk')).map(f=>f.number), criteria:r.graph.criteria.length, viewIntents:c?.intents || [], intentView:c?.scope?.view || null, metrics:d.metric_cards.length, observations:r.graph.nodes.filter(n=>n.kind==='metric').length, scope:r.graph.scope.selected_roots, snapshot:r.view_snapshot?.view || null, comparison:r.view_comparison || null }; })()`);
    assert(await evaluate(`(()=>{const logo=document.querySelector('.atomic-logo');return logo?.complete && logo.naturalWidth===560 && logo.src.startsWith('data:image/png;base64,') && logo.alt==='Atomic';})()`), 'Official logo must be embedded and decoded offline');
@@ -94,7 +110,7 @@ try {
    })()`);
    assert(contrasts.every(item=>item.ratio>=4.5),'Review text must meet AA contrast: '+JSON.stringify(contrasts));
    if (expected.comparison) {
-     assert(await evaluate(`document.querySelector('.comparison-direction').textContent.includes('From · before') && document.querySelector('.comparison-direction').textContent.includes('To · after')`));
+      assert(await evaluate(`document.querySelector('.comparison-direction').textContent.includes('From · source (after)') && document.querySelector('.comparison-direction').textContent.includes('To · target (before)')`));
      assert.equal(await evaluate(`document.querySelectorAll('[data-file-comparison]').length`),expected.comparison.files.length);
    }
   assert.equal(expected.metrics, 10);
@@ -230,7 +246,18 @@ try {
        const d=JSON.parse(document.getElementById('review-data').textContent),numbers=new Set(d.view.graph.findings.filter(f=>f.passes.includes('blast_radius_risk')).map(f=>f.number)),seen=new Set();
        for(const region of d.regions.filter(region=>region.findings.some(number=>numbers.has(number)))) {
          const control=Array.from(document.querySelectorAll('#files .region-button')).find(button=>button.dataset.region===region.id);if(!control)continue;control.click();
-         for(const finding of document.querySelectorAll('#risk-selection .finding'))seen.add(Number(finding.dataset.finding));
+          for(const finding of document.querySelectorAll('#risk-selection .finding')) {
+            const number=Number(finding.dataset.finding);seen.add(number);
+            if(d.review_decision) {
+              const graphFinding=d.view.graph.findings.find(item=>item.number===number);
+              const issues=d.review_decision.issues.filter(issue=>issue.reference===graphFinding.id);
+              const acceptances=d.review_decision.evaluation.passes.flatMap(pass=>pass.accepted_degradations);
+              for(const issue of issues) {
+                const acceptance=acceptances.find(item=>item.issue===issue.id);
+                if(acceptance && !finding.textContent.includes(acceptance.rationale))throw new Error('Missing per-finding acceptance rationale: '+number);
+              }
+            }
+          }
        }
        return [...seen].sort((a,b)=>a-b);
      })()`);
@@ -273,7 +300,12 @@ try {
   const pattern = /(<script\b[^>]*\bid="review-data"[^>]*>)([\s\S]*?)(<\/script>)/;
   const fixture = JSON.parse(original.match(pattern)[2]);
   const hostile = '</script><img id="audit-xss" src="https://example.invalid/never-fetch" onerror="globalThis.__audit_xss=1">';
-  fixture.view.graph.scope.view = hostile;
+   if(fixture.review_decision) {
+     fixture.review_decision.signer=hostile;
+     fixture.review_decision.issues[0].summary=hostile;
+     for(const pass of fixture.review_decision.evaluation.passes)if(pass.accepted_degradations.length)pass.accepted_degradations[0].rationale=hostile;
+   }
+   fixture.view.graph.scope.view = hostile;
    fixture.view.warnings.push(hostile);
    if(fixture.view.view_comparison) {
      fixture.view.view_comparison.from.view=hostile;

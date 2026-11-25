@@ -2359,6 +2359,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                 let cross_view_error = |error: atomic_repository::RepositoryError| -> Status {
                     domain_status(ErrorCode::ChangeRejected, error.to_string())
                 };
+                let mut review_decision = None;
                 let report = match request.source {
                     // A resolved single change: the direct domain calls the
                     // local single-insert body makes (the --deps=false
@@ -2418,6 +2419,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                             .allow_conflicts(request.allow_conflicts)
                             .dry_run(dry_run);
                         let outcome = repo.insert_from_view(options).map_err(cross_view_error)?;
+                        review_decision = outcome.review_decision.clone();
                         ArmReport {
                             applied: outcome.applied_hashes.clone(),
                             affected_paths: outcome.affected_paths.clone(),
@@ -2445,6 +2447,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                             .allow_conflicts(request.allow_conflicts)
                             .dry_run(dry_run);
                         let outcome = repo.insert_from_view(options).map_err(cross_view_error)?;
+                        review_decision = outcome.review_decision.clone();
                         ArmReport {
                             applied: outcome.applied_hashes.clone(),
                             affected_paths: outcome.affected_paths.clone(),
@@ -2529,6 +2532,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                                 .allow_conflicts(request.allow_conflicts);
                             let outcome =
                                 repo.insert_from_view(options).map_err(cross_view_error)?;
+                            review_decision = outcome.review_decision.clone();
                             ArmReport {
                                 applied: outcome.applied_hashes.clone(),
                                 affected_paths: outcome.affected_paths.clone(),
@@ -2563,6 +2567,7 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                             repo.cherry_pick(&hashes, "", Some(&target))
                                 .map_err(cross_view_error)?
                         };
+                        review_decision = outcome.review_decision.clone();
                         ArmReport {
                             applied: outcome.applied_hashes.clone(),
                             affected_paths: outcome.affected_paths.clone(),
@@ -2657,6 +2662,14 @@ impl repository_mutation_service_server::RepositoryMutationService for MutationI
                     files_updated,
                     directories_created,
                     has_conflicts: report.has_conflicts,
+                    review_decision: review_decision.map(|review| NativeReviewDecisionEvidence {
+                        decision: review.decision,
+                        report_hash: review.report_hash,
+                        readiness: review.readiness.as_str().into(),
+                        disposition: review.disposition.as_str().into(),
+                        accepted_degradations: review.accepted_degradations as u64,
+                        signer: review.signer,
+                    }),
                     meta: None,
                 })
             })

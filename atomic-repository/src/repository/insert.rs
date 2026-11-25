@@ -2428,7 +2428,7 @@ impl Repository {
     pub fn insert_change(
         &self,
         hash: &Hash,
-        options: InsertOptions,
+        mut options: InsertOptions,
     ) -> Result<InsertOutcome, RepositoryError> {
         let _review_boundary = self.review_evidence_lock()?;
         let change = self.load_change(hash)?;
@@ -2467,6 +2467,12 @@ impl Repository {
                     .unwrap_or(false)
             };
             if shared_target {
+                options.review_decision = self
+                    .review_decision_for_direct_insert(&view_name, std::slice::from_ref(hash))?
+                    .map(|review| {
+                        Hash::from_base32(review.decision.as_bytes())
+                            .expect("verified review decision")
+                    });
                 let closure =
                     super::provenance_gate::reachable_closure(self, std::slice::from_ref(hash))?;
                 let provider = super::provenance_gate::local_session_mac_key_provider(self);
@@ -2558,7 +2564,9 @@ impl Repository {
                     expected_old: MetadataValue::Absent,
                     expected_new: MetadataValue::Sequence(sequence),
                 }],
-                vec![*hash],
+                std::iter::once(*hash)
+                    .chain(options.review_decision)
+                    .collect(),
                 ActorRef::System {
                     name: "repository-insert".to_string(),
                 },
@@ -2974,6 +2982,12 @@ impl Repository {
                     Some(&provider),
                     Some(&did_provider),
                 )?;
+                options.review_decision = self
+                    .review_decision_for_direct_insert(view_name, std::slice::from_ref(hash))?
+                    .map(|review| {
+                        Hash::from_base32(review.decision.as_bytes())
+                            .expect("verified review decision")
+                    });
                 options.skip_publication_gate = true;
             }
         }
@@ -3542,6 +3556,17 @@ impl Repository {
         // not just the selected changes) and fails closed before any
         // VIEW_CHANGES metadata movement.
         if target_is_shared {
+            outcome.review_decision = match self.review_decision_for_insert(
+                &options.from_view,
+                &options.to_view,
+                &missing,
+            )? {
+                Some(review) => Some(review),
+                // Hash-set/cherry-pick callers have no source label. A
+                // different unreviewed label must not bypass a known
+                // decision over the same incoming changes either.
+                None => self.review_decision_for_direct_insert(&options.to_view, &missing)?,
+            };
             let closure = super::provenance_gate::reachable_closure(self, &source_changes)?;
             let provider = super::provenance_gate::local_session_mac_key_provider(self);
             let did_provider = super::provenance_gate::local_did_key_provider(self);
@@ -3576,6 +3601,9 @@ impl Repository {
         // The closure-level gate above already covered every change this
         // loop is about to insert; skip the redundant per-change gate.
         apply_opts.skip_publication_gate = target_is_shared;
+        apply_opts.review_decision = outcome.review_decision.as_ref().map(|review| {
+            Hash::from_base32(review.decision.as_bytes()).expect("verified review decision hash")
+        });
 
         let total_missing = missing.len();
         for (i, hash) in missing.iter().enumerate() {

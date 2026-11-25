@@ -935,7 +935,7 @@ enum Commands {
     /// with no arguments asks whether the current view is ready to promote.
     Triage(Triage),
 
-    /// Inspect a recorded turn/intent/change, or independently publish view reviews.
+    /// Review recorded work, or attest native source-to-target readiness and accepted risk.
     Review(Review),
 
     /// Generate a shell completion script.

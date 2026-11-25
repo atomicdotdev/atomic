@@ -105,45 +105,22 @@ struct CurrentScope {
     diagnostics: Vec<String>,
 }
 
-fn vault_path(path: &str) -> String {
-    if path.starts_with(".vault/") {
-        path.into()
-    } else {
-        format!(".vault/{path}")
-    }
-}
-
 fn current_scope(repo: &Repository, view: &str) -> CliResult<CurrentScope> {
-    let manifest = if repo.has_vault().map_err(CliError::Repository)? {
-        repo.vault_manifest().map_err(CliError::Repository)?
-    } else {
-        Default::default()
-    };
+    let bridge::ViewIntentSources {
+        entries,
+        hash,
+        mut diagnostics,
+    } = bridge::view_intent_sources(repo, view).map_err(CliError::Repository)?;
     let mut intents = Vec::new();
-    let mut inventory = BTreeMap::new();
-    let mut diagnostics = Vec::new();
-    for (key, summary) in manifest.intents {
-        let inputs = if summary.vault_path.is_empty() {
-            bridge::read_intent(repo, &key).map_err(CliError::Repository)?
-        } else {
-            let Some(entry) = repo
-                .vault_retrieve(summary.vault_path.trim_start_matches(".vault/"))
-                .map_err(CliError::Repository)?
-            else {
-                inventory.insert(key.clone(), "missing_definition".into());
-                diagnostics.push(format!(
-                    "{key}: vault definition missing; view assignment unavailable"
-                ));
-                continue;
-            };
-            bridge::inputs_from_entry(&entry).map_err(CliError::Repository)?
-        };
-        if inputs.frontmatter.get("view").and_then(Value::as_str) != Some(view) {
-            continue;
-        }
-        let hash = bridge::source_content_hash(&inputs);
-        inventory.insert(key.clone(), hash.clone());
-        let path = vault_path(&summary.vault_path);
+    for source in entries {
+        let bridge::ViewIntentSource {
+            key,
+            path,
+            inputs,
+            hash,
+            fallback_title,
+            fallback_status,
+        } = source;
         let lifted = bridge::lift(&inputs);
         let (node, error) = match lifted {
             Ok(node) => (Some(node), None),
@@ -168,13 +145,13 @@ fn current_scope(repo: &Repository, view: &str) -> CliResult<CurrentScope> {
                 .frontmatter
                 .get("title")
                 .and_then(Value::as_str)
-                .unwrap_or(&summary.title)
+                .unwrap_or(&fallback_title)
                 .into(),
             status: inputs
                 .frontmatter
                 .get("status")
                 .and_then(Value::as_str)
-                .unwrap_or(&summary.status)
+                .unwrap_or(&fallback_status)
                 .into(),
             view: view.into(),
             source_kind: "current_vault_context".into(),
@@ -191,10 +168,6 @@ fn current_scope(repo: &Repository, view: &str) -> CliResult<CurrentScope> {
         });
         intents.push(CurrentIntent { row, definition });
     }
-    let hash = Hash::of(
-        &serde_json::to_vec(&inventory).map_err(|error| CliError::Internal(error.into()))?,
-    )
-    .to_base32();
     Ok(CurrentScope {
         intents,
         hash,
@@ -291,8 +264,8 @@ pub(super) fn collect(
         }
     }
     let sources = Sources {
-        before: Some(&comparison.from.view),
-        after: &comparison.to.view,
+        before: Some(&comparison.before.view),
+        after: &comparison.after.view,
         paths: files.keys().cloned().collect(),
         files,
     };

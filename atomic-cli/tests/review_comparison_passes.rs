@@ -175,10 +175,10 @@ fn command(root: &Path, args: &[&str]) -> String {
     );
     String::from_utf8(output.stdout).unwrap()
 }
-fn review(root: &Path, from: &str, to: &str) -> Value {
+fn review(root: &Path, before: &str, after: &str) -> Value {
     serde_json::from_str(&command(
         root,
-        &["review", "--from", from, "--to", to, "--json"],
+        &["review", "--from", after, "--to", before, "--json"],
     ))
     .unwrap()
 }
@@ -306,9 +306,9 @@ fn unlinked_view_intents_are_scoped_to_the_requested_view_not_the_active_view() 
             vec![
                 "review",
                 "--from",
-                base.as_str(),
-                "--to",
                 "target",
+                "--to",
+                base.as_str(),
                 "--html",
                 "--no-open",
             ],
@@ -401,9 +401,9 @@ fn recorded_view_assignment_survives_dirty_or_missing_current_vault_definitions(
             &[
                 "review",
                 "--from",
-                &base,
-                "--to",
                 "target",
+                "--to",
+                &base,
                 "--html",
                 "--no-open",
             ],
@@ -565,9 +565,9 @@ fn pinned_conformance_and_semantic_blast_radius_export_every_contract_finding() 
         &[
             "review",
             "--from",
-            &from,
-            "--to",
             "after",
+            "--to",
+            &from,
             "--html",
             "--no-open",
         ],
@@ -607,7 +607,7 @@ fn pinned_conformance_and_semantic_blast_radius_export_every_contract_finding() 
     let archive: Value =
         serde_json::from_reader(flate2::read::GzDecoder::new(compressed.as_slice())).unwrap();
     assert_eq!(archive, report);
-    let terminal = command(dir.path(), &["review", "--from", &from, "--to", "after"]);
+    let terminal = command(dir.path(), &["review", "--from", "after", "--to", &from]);
     assert!(
         terminal.contains("RECORDED_CONTRACT_CRITERION")
             && terminal.contains("137 current bound caller(s)")

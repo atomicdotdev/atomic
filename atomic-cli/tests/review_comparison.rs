@@ -42,8 +42,8 @@ fn command(root: &Path, args: &[&str]) -> std::process::Output {
         .output()
         .unwrap()
 }
-fn review(root: &Path, from: &str, to: &str) -> Value {
-    let output = command(root, &["review", "--from", from, "--to", to, "--json"]);
+fn review(root: &Path, before: &str, after: &str) -> Value {
+    let output = command(root, &["review", "--from", after, "--to", before, "--json"]);
     assert!(
         output.status.success(),
         "{}",
@@ -159,10 +159,12 @@ fn compare_recorded_views_in_both_directions_without_touching_the_working_copy()
     let db_bytes = std::fs::read(&database).unwrap();
 
     let report = review(directory.path(), &from, "after");
-    assert_eq!(report["schema_version"], 4);
+    assert_eq!(report["schema_version"], 5);
     assert_eq!(report["selection"]["kind"], "view_comparison");
-    assert_eq!(report["view_comparison"]["from"]["view"], from);
-    assert_eq!(report["view_comparison"]["to"]["state"], expected_after);
+    assert_eq!(report["view_comparison"]["from"]["view"], "after");
+    assert_eq!(report["view_comparison"]["to"]["view"], from);
+    assert_eq!(report["view_comparison"]["after"]["state"], expected_after);
+    assert_eq!(report["view_comparison"]["before"]["view"], from);
     assert!(report["changes"].as_array().unwrap().is_empty());
     assert!(report["selected_roots"].as_array().unwrap().is_empty());
     assert!(report.get("view_snapshot").is_none());
@@ -292,9 +294,9 @@ fn compare_recorded_views_in_both_directions_without_touching_the_working_copy()
         &[
             "review",
             "--from",
-            &from,
-            "--to",
             "after",
+            "--to",
+            &from,
             "--html",
             "--no-open",
         ],
@@ -339,7 +341,7 @@ fn compare_recorded_views_in_both_directions_without_touching_the_working_copy()
     assert_eq!(restored, report);
     let terminal = command(
         directory.path(),
-        &["review", "--from", &from, "--to", "after"],
+        &["review", "--from", "after", "--to", &from],
     );
     assert!(terminal.status.success());
     assert!(String::from_utf8_lossy(&terminal.stdout)

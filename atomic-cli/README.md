@@ -49,13 +49,14 @@ atomic review --turn <session>:<turn>
 atomic review --intent <intent-id>
 atomic review --change <change-hash>
 atomic review --view dev --html
-atomic review --from release --to dev --html
-atomic review --from release --to dev --json
+atomic review --from feature-shipping --to dev --html
+atomic review --from feature-shipping --to dev --json
 ```
 
 Ordinary review is local-only: `atomic-semantic` / `atomic-audit`, no model or
-credentials. `--view` audits one recorded snapshot. `--from BEFORE --to AFTER`
-compares two recorded views without switching the working copy, showing measured
+credentials. `--view` audits one recorded snapshot. `--from SOURCE --to TARGET`
+uses pull-request direction: draft/source to shared/destination. Measurements
+compare target-before with source-after without switching the working copy, showing measured
 deltas and new/existing/resolved or uncertain local observations. The offline
 HTML embeds Atomic's real logo and colors; no remote assets or analytics load.
 Unsupported/missing analysis stays explicit, not a fabricated pass or zero.
@@ -65,51 +66,35 @@ risk estimate over the two actual view states. Every JSON finding is available
 in HTML; contract findings are not truncated at 100. These remain local review
 observations, not independent acceptance approval or runtime proof.
 
-Publish an independent review using one comma-separated view option:
+Publish an attested native evaluation of the same source-to-target scope:
 
 ```sh
-atomic review publish --view feature-a
-atomic review publish --view feature-a,feature-b
-atomic review publish --session <session-id>
-atomic review publish --view feature-a,feature-b --dry-run --json
+atomic review publish --from feature-shipping --to dev --dry-run --json > review-plan.json
+# Inspect the complete report; fill evaluation_template for all three passes,
+# naming every accepted issue and its rationale, or retain a not_ready decision.
+atomic review publish --from feature-shipping --to dev \
+  --evaluation review-plan.json --identity reviewer --yes
+atomic review publish inspect
 ```
 
-The local publisher preflights a trusted issuer, requests one bounded approval,
-creates purpose-bound ephemeral credentials without remote enrollment or global
-signer rebinding, runs a separate OpenCode process over recorded-only inputs on
-the existing logical view, and finalizes through real native `session_end`.
-The final signed receipt binds the recorded subject, review, publisher manifest,
-native attestations and retained publication artifacts. Source conversations may
-continue; publication concerns the frozen recorded snapshot, not future edits.
+No agent, model, runner, ephemeral identity, delegation or provider configuration
+is used. An existing local identity signs the evaluation under repository trust
+policy. `--yes` only confirms the supplied evaluation; it cannot accept issues or
+manufacture a passing review. All slop, unknown/unmet conformance, risk and coverage
+gaps remain in the full report. Accepted degradation is explicitly linked to that
+attestation and does not rewrite evidence readiness to clean/ready.
 
-The issuer must already be trusted by the repository. A generic read/record grant
-is not publication authority: the CLI issues a separate signed, exact-subject
-authorization from that trusted issuer. It does not alter the signer allowlist.
-Recording credentials are revoked and their secret retired only after successful
-finalization or explicit cancellation; public verification material is retained.
-`--yes` approves that exact local operation noninteractively; it never grants push.
+Applicable decisions are revalidated at shared insertion and linked from immutable
+operation evidence. A stale, tampered, untrusted, incomplete or explicitly not-ready
+decision refuses insertion; original provenance/integrity gates are not waived.
+Native publication never inserts or pushes automatically. Use `--supersedes HASH`
+to explicitly replace a current evaluation without deleting its history.
+`--html` can export the attested decision and its per-finding acceptance links.
+`--cancel UUID` only cleans up a retained job from the former agent publisher;
+there is no agent-job resume or runner in native publishing.
 
-Blocked jobs retain diagnostics under `.atomic/review-jobs/<id>`:
-
-```sh
-atomic review publish --resume <job-id>
-atomic review publish --cancel <job-id>
-```
-
-Completed jobs are revalidated, not re-executed. Partial signing may resume without
-duplicating retained artifacts. An unknown/crashed process outcome is not guessed
-successful or blindly relaunched; inspect the retained run or cancel it. Expired
-authority is not silently renewed. Retained temporary evidence is not auto-deleted.
-
-View collections deduplicate shared history and test compatible combined inputs.
-Unequal overlapping path deltas, unresolved conflicts and symlink composition
-are conservatively refused; prepare an explicit integration view for those cases.
-No logical review view is created. Current canonical limits (64 independent roots,
-4096 closure changes) fail explicitly rather than truncating coverage.
-
-Publication means retained signed review approval, **not insertion or push**.
-Legacy `atomic triage review` and `atomic triage publication-review` remain valid;
-advanced prepare/sign/record/inspect are also under `atomic review publish`.
+Advanced retrospective `prepare/sign/record` remain available under
+`atomic review publish` with their existing independent-review-intent requirements.
 The single agent-facing wrapper is [`skills/review/SKILL.md`](skills/review/SKILL.md).
 
 ## Global Options

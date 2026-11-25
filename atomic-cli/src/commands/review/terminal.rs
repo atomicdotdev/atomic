@@ -16,7 +16,7 @@ pub(super) fn render(graph: &ReviewGraph, details: bool) -> String {
         graph.scope.view,
         graph.scope.view_state,
         graph.findings.len(),
-        if let Some(comparison)=comparison {format!("View comparison: BEFORE {} -> AFTER {}",comparison.properties["from"]["view"].as_str().unwrap_or("?"),comparison.properties["to"]["view"].as_str().unwrap_or("?"))} else if snapshot.is_some(){format!("Selected view snapshot: {}",graph.scope.view)}else{format!("Selected changes: {}",graph.scope.selected_roots.join(", "))}
+        if let Some(comparison)=comparison {format!("Review source {} -> target {}\nMeasurements: BEFORE {} -> AFTER {}",comparison.properties["from"]["view"].as_str().unwrap_or("?"),comparison.properties["to"]["view"].as_str().unwrap_or("?"),comparison.properties["before"]["view"].as_str().unwrap_or("?"),comparison.properties["after"]["view"].as_str().unwrap_or("?"))} else if snapshot.is_some(){format!("Selected view snapshot: {}",graph.scope.view)}else{format!("Selected changes: {}",graph.scope.selected_roots.join(", "))}
     );
     if let Some(snapshot) = snapshot {
         writeln!(

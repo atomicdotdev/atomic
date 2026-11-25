@@ -265,6 +265,8 @@ mod project_identity;
 pub mod provenance_gate;
 mod provenance_summary;
 pub mod publication_review;
+pub mod review_decision;
+pub use review_decision::ReviewDecisionEvidence;
 pub mod review_authorization;
 pub use project_identity::{
     build_project_identity, project_identity_hash, verify_project_identity, IdentityAdoption,

@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 use super::ViewComparison;
 
 pub(in super::super) fn changed_paths(comparison: &ViewComparison) -> Vec<String> {
-    if comparison.from.state == comparison.to.state
-        && comparison.from.membership_hash == comparison.to.membership_hash
+    if comparison.before.state == comparison.after.state
+        && comparison.before.membership_hash == comparison.after.membership_hash
     {
         return vec![];
     }
@@ -55,8 +55,8 @@ pub(in super::super) fn inspect(
         result.gaps.push("Changed paths have no supported semantic source; configuration/non-code runtime effects are not inferred".into());
     } else {
         match (
-            repo.semantic_view_on_view(&comparison.from.view),
-            repo.semantic_view_on_view(&comparison.to.view),
+            repo.semantic_view_on_view(&comparison.before.view),
+            repo.semantic_view_on_view(&comparison.after.view),
         ) {
             (Ok(before), Ok(after)) => {
                 result = super::super::impact::inspect_views(

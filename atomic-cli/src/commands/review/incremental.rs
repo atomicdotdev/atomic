@@ -30,10 +30,10 @@ pub struct IncrementalArgs {
     /// Audit every live recorded file in this view, including inherited files.
     #[arg(long, value_name = "NAME", conflicts_with_all = ["turn", "intent", "change", "findings", "risk_profile"])]
     pub view: Option<String>,
-    /// Before view for a local recorded-view comparison (requires --to).
+    /// Proposed source view (for example, a draft); requires --to.
     #[arg(long, value_name="VIEW", requires="to", conflicts_with_all=["view","change","turn","intent","findings","risk_profile"])]
     pub from: Option<String>,
-    /// After view for a local recorded-view comparison (requires --from).
+    /// Destination/base view (for example, shared dev); requires --from.
     #[arg(long, value_name="VIEW", requires="from", conflicts_with_all=["view","change","turn","intent","findings","risk_profile"])]
     pub to: Option<String>,
     #[arg(long, conflicts_with = "html")]

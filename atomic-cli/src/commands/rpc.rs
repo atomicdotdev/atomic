@@ -3969,6 +3969,24 @@ fn insert_cross_view_outcome(
     response: &pb::InsertChangesResponse,
 ) -> atomic_repository::CrossViewInsertOutcome {
     atomic_repository::CrossViewInsertOutcome {
+        review_decision: response.review_decision.as_ref().map(|review| {
+            let disposition = |value: &str| match value {
+                "ready" => atomic_canonical::review_decision::Disposition::Ready,
+                "accepted_degradation" => {
+                    atomic_canonical::review_decision::Disposition::AcceptedDegradation
+                }
+                _ => atomic_canonical::review_decision::Disposition::NotReady,
+            };
+            atomic_repository::repository::ReviewDecisionEvidence {
+                decision: review.decision.clone(),
+                report_hash: review.report_hash.clone(),
+                readiness: disposition(&review.readiness),
+                disposition: disposition(&review.disposition),
+                accepted_degradations: usize::try_from(review.accepted_degradations)
+                    .unwrap_or(usize::MAX),
+                signer: review.signer.clone(),
+            }
+        }),
         changes_applied: response.inserted.len(),
         applied_hashes: insert_applied_hashes(response),
         skipped_hashes: vec![Merkle::ZERO; response.skipped_count as usize],

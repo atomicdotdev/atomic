@@ -286,12 +286,12 @@ fn native_span_queries_use_recorded_view_content() {
     repo.switch_view(wc, "feature").unwrap();
     std::fs::write(
         &source,
-        "pub fn target(secret: SiblingSecret) {}\npub fn caller() {}\n",
+        "pub fn target(secret: SiblingSecret) {}\npub fn caller() {}\nmod sibling;\n",
     )
     .unwrap();
     std::fs::write(
         dir.path().join("src/sibling.rs"),
-        "pub fn sibling_only() { target(); }\n",
+        "pub fn sibling_only() { crate::target(); }\n",
     )
     .unwrap();
     repo.add(wc, "src/sibling.rs", Default::default()).unwrap();

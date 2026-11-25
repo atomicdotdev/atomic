@@ -3,8 +3,13 @@
   const data = JSON.parse(document.getElementById('review-data').textContent);
   const report = data.view;
   const graph = report.graph;
+  const decision = data.review_decision;
+  const degradationAcceptances = new Map((decision?.evaluation.passes || []).flatMap(pass=>pass.accepted_degradations.map(entry=>[entry.issue,entry])));
+  const acceptedFor = reference => (decision?.issues || []).filter(issue=>issue.reference===reference && degradationAcceptances.has(issue.id)).map(issue=>({issue,acceptance:degradationAcceptances.get(issue.id)}));
   const viewSnapshot = report.view_snapshot;
   const viewComparison = report.view_comparison;
+  const comparisonBefore = viewComparison?.before || viewComparison?.from;
+  const comparisonAfter = viewComparison?.after || viewComparison?.to;
   const viewConformance = viewComparison?.conformance || viewSnapshot?.conformance;
   const comparedFiles = new Map((viewComparison?.files || []).map(file=>[file.source_ref,file]));
   const regions = data.regions;
@@ -151,10 +156,12 @@
     const heading = el('h3');
     heading.append(el('span', 'finding-number', 'F' + number), el('span', '', finding.summary), badge(title(finding.severity), finding.severity));
     if (item.comparison) heading.append(badge(title(item.comparison.status),item.comparison.status));
+    if(acceptedFor(item.id).length)heading.append(badge('Accepted degradation','changed'));
     host.append(heading);
     const links = el('div', 'callouts');
     links.append(cardCallout(finding.requirement_or_rule.id, 'Audit: ' + (auditCards.get(finding.requirement_or_rule.id)?.title || finding.requirement_or_rule.id)));
     host.append(links, el('p', 'region-meta', viewComparison ? `Confidence: ${title(finding.confidence)} · ${title(item.comparison?.status || 'unknown')} local observation between the selected views` : `Confidence: ${title(finding.confidence)} · Introduced by this change: ${finding.introduced_by_change.status}`));
+    const acceptance=acceptanceBlock(item.id);if(acceptance)host.append(acceptance);
     const evidence = el('div', 'evidence');
     if (item.comparison) evidence.append(el('p','',item.comparison.rationale));
     evidence.append(el('p', '', finding.introduced_by_change.rationale));
@@ -166,6 +173,18 @@
     if (!(finding.acceptance_criteria || []).length) evidence.append(el('p', 'muted', 'Engineering-rule concern; no unmet acceptance criterion was inferred.'));
     host.append(detail('Evidence, attribution & correction', evidence));
     return host;
+  }
+
+  function acceptanceBlock(reference) {
+    const entries=acceptedFor(reference);if(!entries.length)return null;
+    const host=el('div');
+    host.append(el('p','muted',`Signer ${decision.signer} explicitly accepted this degradation in attested review ${decision.id}. The finding/unknown state has not been removed or relabelled ready.`));
+    for(const {issue,acceptance} of entries) {
+      host.append(el('p','source-path',issue.id),el('p','',acceptance.rationale));
+      for(const evidence of acceptance.evidence)host.append(el('p','source-path',evidence));
+      if(acceptance.follow_up)host.append(el('p','','Follow-up: '+acceptance.follow_up));
+    }
+    return detail('Attested accepted degradation — risk remains',host);
   }
 
   function metricTable(region) {
@@ -239,7 +258,7 @@
     const diff = button('Recorded change diff', () => { side = 'diff'; update(); });
     const expand = button('Show full file', () => { full = !full; update(); });
     if (viewSnapshot) { before.hidden = true; diff.hidden = true; after.textContent = 'View snapshot'; side = 'after'; }
-    if (viewComparison) { diff.hidden=true;before.textContent='Before: '+viewComparison.from.view;after.textContent='After: '+viewComparison.to.view; }
+    if (viewComparison) { diff.hidden=true;before.textContent='Before: '+comparisonBefore.view;after.textContent='After: '+comparisonAfter.view; }
     toolbar.append(before, after, diff, expand);
     host.append(toolbar, body, caption);
     function update() {
@@ -259,7 +278,7 @@
       if (!source || source.status !== 'present') {
         body.append(el('p', 'empty', source?.status === 'absent' ? 'This file is absent in this recorded revision.' : source?.reason || 'Recorded source was not exported. No working-copy bytes are substituted.'));
         expand.hidden = true;
-        caption.textContent = viewComparison ? `${side==='before'?'Before':'After'} view ${viewComparison[side==='before'?'from':'to'].view}` : viewSnapshot ? `Recorded view ${viewSnapshot.view} @ ${viewSnapshot.state}` : `${side} snapshot · change ${region.change}`;
+        caption.textContent = viewComparison ? `${side==='before'?'Before':'After'} view ${(side==='before'?comparisonBefore:comparisonAfter).view}` : viewSnapshot ? `Recorded view ${viewSnapshot.view} @ ${viewSnapshot.state}` : `${side} snapshot · change ${region.change}`;
         return;
       }
       const range = counterpart(region, side);
@@ -275,7 +294,7 @@
       }
       body.append(code);
       expand.textContent = full ? 'Show region context' : 'Show full file';
-      const compared=comparedFiles.get(region.change), pin=viewComparison?.[side==='before'?'from':'to'];
+      const compared=comparedFiles.get(region.change), pin=side==='before'?comparisonBefore:comparisonAfter;
       caption.textContent = viewComparison ? `${side==='before'?'Before':'After'} ${pin.view}: ${compared?.[side+'_path'] || region.path}, lines ${start}–${end} of ${lines.length}. State ${pin.state}. ${range.note}.` : viewSnapshot ? `Recorded view ${viewSnapshot.view}: lines ${start}–${end} of ${lines.length}. State ${viewSnapshot.state}. No working-copy bytes or before revision.` : `Recorded ${side}: lines ${start}–${end} of ${lines.length}. ${range.note}. ${snapshot.reviewed_root ? 'Selected source file.' : 'Caller context only, not an additional reviewed root.'}`;
     }
     update();
@@ -434,7 +453,7 @@
 
   function comparisonOverview() {
     const host=el('div'), direction=el('div','comparison-direction');
-    for (const [index,[label,pin]] of [['From · before',viewComparison.from],['To · after',viewComparison.to]].entries()) {
+    for (const [index,[label,pin]] of [['From · source (after)',viewComparison.from],['To · target (before)',viewComparison.to]].entries()) {
       if (index) direction.append(el('span','direction-arrow','→'));
       const side=el('div');side.append(el('small','',label),el('strong','',pin.view),el('small','',`state ${pin.state.slice(0,12)} · filter ${pin.membership_hash.slice(0,12)}`));direction.append(side);
     }
@@ -502,7 +521,7 @@
     if (viewComparison) {
       const conformance=viewComparison.conformance;
       const changes=conformance?.changes || [];
-      host.append(el('p','',`${changes.filter(change=>change.direction==='added_to_after').length} recorded change(s) added to To · ${changes.filter(change=>change.direction==='removed_from_after').length} removed from From · ${(conformance?.criteria || []).length} criterion/criteria in scope`));
+      host.append(el('p','',`${changes.filter(change=>change.direction==='added_to_after').length} recorded change(s) only in source · ${changes.filter(change=>change.direction==='removed_from_after').length} only in target · ${(conformance?.criteria || []).length} criterion/criteria in scope`));
       const evidence=el('div');
       for(const change of changes) evidence.append(el('p','',`${title(change.direction)} · ${change.hash} · governing intent: ${change.intent_context.status}`));
       for(const note of conformance?.diagnostics || []) evidence.append(el('p','muted',note));
@@ -524,11 +543,12 @@
     if (!criterion) { host.append(el('p', 'empty', 'No scoped criterion assessment is available. File overlap and author completion claims are not acceptance evidence.')); return; }
     const article = el('article', 'criterion'), heading = el('div', 'criterion-title');
     heading.append(badge('Review: ' + title(criterion.review_assessment), criterion.review_assessment), badge('Author declared: ' + criterion.declared_status, 'declared'));
+    if(acceptedFor(criterion.id).length)heading.append(badge('Accepted degradation','changed'));
     article.append(heading, el('h2', '', criterion.text), el('small', '', `Criterion ${criterion.id}`), el('small', '', `Intent ${criterion.intent}`));
     article.append(detail('Criteria source and authentication', el('pre', '', viewConformance ? `Definition hash: ${criterion.source_hash}\nRecorded view definitions are preferred; any current-vault fallback is labelled context only. Recorded author verification claims are not independently re-executed or authenticated acceptance proof.` : `Current source hash: ${criterion.source_hash}\nCurrent intent definitions are source-hashed context, not authenticated historical criteria. A report-local judgment is not independent signed approval.`)));
     if(viewConformance) {
       const compared=viewConformance.criteria.find(item=>item.id===criterion.id);
-      for(const [label,declaration] of [['From · before',compared?.before],[viewSnapshot?'Recorded view · '+viewSnapshot.view:'To · after',compared?.after],['Current vault · context only',compared?.current_context]]) {
+      for(const [label,declaration] of [['Target · before',compared?.before],[viewSnapshot?'Recorded view · '+viewSnapshot.view:'Source · after',compared?.after],['Current vault · context only',compared?.current_context]]) {
         if(!declaration)continue;
         const section=el('section','criterion-declaration');
         section.append(el('h3','',label),el('p','',declaration.text),el('p','region-meta',`Author declared: ${declaration.status} · ${declaration.source_kind} · ${declaration.view || 'not a pinned historical view'} · ${declaration.path} · ${declaration.source_hash}`));
@@ -548,6 +568,7 @@
       }
     }
     host.append(article);
+    const acceptance=acceptanceBlock(criterion.id);if(acceptance)host.append(acceptance);
     for (const number of criterion.findings) {
       host.append(findingBlock(number));
       const links = el('div', 'callouts');
@@ -601,6 +622,26 @@
   }
 
   function renderSummary() {
+    if(decision) {
+      const host=$('summary-decision');host.className='overview';
+      host.append(el('h2','','Attested review decision'),el('p','',`Evidence readiness: ${title(decision.readiness)} · User insertion disposition: ${title(decision.disposition)}`),el('p','muted',`Accountable signer: ${decision.signer}. This records explicit evaluation and accepted risks, not a clean-code or independent-approval claim.`),el('p','source-path',`Review ${decision.id} · Report ${decision.report_hash}`));
+      for(const pass of decision.evaluation.passes) {
+        const row=el('section','criterion-declaration');row.dataset.passEvaluation=pass.pass;
+        row.append(el('h3','',title(pass.pass)+' · '+title(pass.disposition)),el('p','',pass.rationale));
+        host.append(row);
+      }
+      const issues=el('div');
+      for(const issue of decision.issues) {
+        const acceptance=degradationAcceptances.get(issue.id),row=el('article','finding');
+        row.dataset.reviewIssue=issue.id;
+        row.append(el('h3','',title(issue.pass)+' · '+issue.summary),badge(acceptance?'Accepted degradation':issue.waivable?'Not accepted':'Not waivable',acceptance?'changed':'high'),el('p','source-path',issue.id),el('p','',acceptance?.rationale || 'No acceptance of this issue was attested.'));
+        for(const entry of issue.evidence)row.append(el('p','source-path',entry));
+        for(const entry of acceptance?.evidence || [])row.append(el('p','source-path','Acceptance evidence: '+entry));
+        if(acceptance?.follow_up)row.append(el('p','','Follow-up: '+acceptance.follow_up));
+        issues.append(row);
+      }
+      host.append(detail(`Outstanding evidence and explicit dispositions (${decision.issues.length})`,issues));
+    }
     const actions = $('summary-actions');
     for (const [section, label] of [['slop', 'Review audit findings'], ['conformance', 'Review conformance'], ['risk', 'Review blast radius']]) {
       const control = button(label, () => { activate(section); $('tab-' + section).focus(); });
@@ -676,6 +717,7 @@
   $('risk-status').textContent = risk ? `${title(risk.assessment.rating)} · ${title(risk.assessment.coverage)}` : 'Unavailable';
   $('provenance').append(el('h2', '', 'Recorded review scope'), el('pre', '', JSON.stringify(graph.scope, null, 2)), el('h3', '', 'Scope notes'), el('pre', '', [...graph.diagnostics, ...report.warnings].join('\n')), el('p', '', 'Additional source snapshots are bounded exports from this recorded scope. Working-copy bytes are never substituted. Keep this artifact private if its source/evidence is sensitive.'));
   if (typeof DecompressionStream !== 'function') $('download').textContent = 'Download JSON.gz';
+  else if(decision)$('download').textContent='Download attested JSON';
   $('download').addEventListener('click', async () => {
     const control = $('download'), label = control.textContent;
     control.disabled = true; control.textContent = 'Preparing JSON…';

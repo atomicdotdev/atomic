@@ -12,6 +12,7 @@ const VAULT_DIR: &str = ".vault";
 /// evidence. Generic vault mutation must not erase or rewrite either side.
 fn retained_review_evidence(path: &str) -> bool {
     path.starts_with(super::publication_review::PREFIX)
+        || path.starts_with(super::review_decision::PREFIX)
         || path.starts_with(super::review_authorization::PREFIX)
 }
 

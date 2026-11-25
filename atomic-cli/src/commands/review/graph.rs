@@ -485,7 +485,7 @@ pub(super) fn build(
             } else {
                 PassStatus::Blocked
             };
-        graph.passes[1].detail="Intents explicitly assigned to the To view and their acceptance criteria are included independently of recorded change-plan links. Actual membership-delta governance remains separate context. Recorded definitions are preferred; current-vault fallback is labelled context only. Scope, author claims and file overlap do not establish an independent acceptance verdict.".into();
+        graph.passes[1].detail="Intents explicitly assigned to the From/source view and their acceptance criteria are included independently of recorded change-plan links. Actual membership-delta governance remains separate context. Recorded definitions are preferred; current-vault fallback is labelled context only. Scope, author claims and file overlap do not establish an independent acceptance verdict.".into();
         graph
             .diagnostics
             .extend(comparison.conformance.diagnostics.iter().cloned());
@@ -675,7 +675,7 @@ fn project(repo: &Repository, report: &IncrementalReport, graph: &mut ReviewGrap
             &comparison.source_ref,
             "view_comparison",
             "Paired recorded views",
-            json!({"from":comparison.from,"to":comparison.to,"diagnostics":comparison.diagnostics,"conformance":comparison.conformance}),
+            json!({"from":comparison.from,"to":comparison.to,"before":comparison.before,"after":comparison.after,"diagnostics":comparison.diagnostics,"conformance":comparison.conformance}),
         );
         out.edge("review", "compares_views", &comparison.source_ref);
         for file in &comparison.files {

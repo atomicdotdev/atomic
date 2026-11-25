@@ -1,4 +1,4 @@
-//! Incremental, in-session inspection and independently finalized publication.
+//! Local recorded-source inspection and accountable native review publication.
 //!
 //! The command owns execution; skills only select the scope and explain results.
 
@@ -13,7 +13,6 @@ mod progress;
 mod publish;
 mod risk;
 mod risk_facts;
-mod scope;
 mod terminal;
 mod view_comparison;
 mod view_snapshot;
@@ -34,7 +33,7 @@ pub struct Review {
 
 #[derive(Debug, Subcommand)]
 enum Action {
-    /// Run an independent ephemeral publisher and finalize at its session end.
+    /// Attest a native source-to-target review and explicit risk evaluation; no LLM.
     Publish(publish::PublishArgs),
 }
 
@@ -68,10 +67,22 @@ mod tests {
     }
 
     #[test]
-    fn publication_uses_one_comma_separated_view_option() {
-        let cli = Cli::try_parse_from(["review", "publish", "--view", "a,b", "--dry-run"]).unwrap();
+    fn publication_uses_native_source_to_target_scope_without_a_runner() {
+        let cli = Cli::try_parse_from([
+            "review",
+            "publish",
+            "--from",
+            "draft",
+            "--to",
+            "dev",
+            "--dry-run",
+        ])
+        .unwrap();
         assert!(matches!(cli.review.action, Some(Action::Publish(_))));
         assert!(Cli::try_parse_from(["review", "publish", "--views", "a,b"]).is_err());
+        assert!(Cli::try_parse_from(["review", "publish", "--runner", "opencode"]).is_err());
+        assert!(Cli::try_parse_from(["review", "publish", "--session", "session"]).is_err());
+        assert!(Cli::try_parse_from(["review", "publish", "--resume", "job"]).is_err());
     }
 
     #[test]
@@ -83,7 +94,7 @@ mod tests {
     fn bundled_skill_is_a_thin_wrapper_for_the_implemented_routes() {
         let skill = include_str!("../../../skills/review/SKILL.md");
         assert!(skill.contains("atomic review --json"));
-        assert!(skill.contains("atomic review publish --view a,b"));
+        assert!(skill.contains("atomic review publish --from draft --to dev"));
         assert!(!skill.contains("identity agent create"));
         assert!(!skill.contains("smolvm machine"));
         assert!(skill.contains("changes[].analysis"));
@@ -112,8 +123,17 @@ mod tests {
         );
         for args in [
             vec!["review", "--json"],
-            vec!["review", "publish", "--view", "a,b"],
-            vec!["review", "publish", "--view", "a,b", "--dry-run", "--json"],
+            vec!["review", "publish", "--from", "draft", "--to", "dev"],
+            vec![
+                "review",
+                "publish",
+                "--from",
+                "draft",
+                "--to",
+                "dev",
+                "--dry-run",
+                "--json",
+            ],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
         }

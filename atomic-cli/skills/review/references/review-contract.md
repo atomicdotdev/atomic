@@ -83,22 +83,24 @@ never silently passed. HTML source-text export retains its separate existing
 ## Compare two recorded views
 
 ```sh
-atomic review --from release --to dev
-atomic review --from release --to dev --json
-atomic review --from release --to dev --html --no-open --output comparison.html
+atomic review --from feature-shipping --to dev
+atomic review --from feature-shipping --to dev --json
+atomic review --from feature-shipping --to dev --html --no-open --output comparison.html
 ```
 
-Both names are exact and required. From is the before state and To is the after
-state, not an ancestor range or a sequence of patches to replay. The selectors
+Both names are exact and required. From is the proposed source; To is the
+destination/base, matching pull-request direction. Measurements are target-before
+and source-after, not an ancestor range or a sequence of patches to replay. The selectors
 conflict with `--view`, change/turn/intent selection and `--findings` /
 `--risk-profile`. Self-comparisons, inherited views and empty views are valid.
 Both effective memberships and view Merkles are checked through analysis and
 HTML export. No working-copy switch, mutation, dirty/staged/untracked source,
 model call, credential or runtime network request is involved.
 
-Comparison reports use `schema_version: 4`, `selection.kind: view_comparison`,
+Comparison reports use `schema_version: 5`, `selection.kind: view_comparison`,
 `purpose: local_view_comparison_review` and `view_comparison` with `from`/`to`
-pins, diagnostics and `files`. The authored `changes` and `selected_roots` stay
+pins, explicit `before` (target) / `after` (source) pins, diagnostics and `files`.
+The v5 direction is not the earlier v4 before/after flag convention. The authored `changes` and `selected_roots` stay
 empty; historical changes remain metadata references only. A domain-separated
 comparison URI identifies the ordered pair of pins; each file has its own
 `source_ref`, before/after path, inode and (when inspected) content hash, file and
@@ -144,7 +146,7 @@ controls alongside all twenty cards and all three review passes.
 in both directions (`added_to_after` / `removed_from_after`), path references and
 actual recorded governing-plan contexts. Common history is not swept into this
 scope. Independently, `conformance.scope.view` identifies the explicitly reviewed
-view (To for a comparison), and `conformance.intents` enumerates its explicitly
+view (From/source for a comparison), and `conformance.intents` enumerates its explicitly
 assigned intents by canonical ID, human key, title, status and source. An intent
 does not need a recorded change-plan link to appear in this view-work catalogue.
 Neither mere file visibility in an inherited view nor shared task paths assigns
@@ -154,7 +156,7 @@ diagnostics, not a reason to hide valid view-assigned work or fabricate ownershi
 The Conformance sidebar groups criteria beneath intent keys/titles, includes
 selectable intents with no available criteria, and searches intent title/key,
 criterion text/ID and related F-numbers. Any actual change-linked criteria outside
-the target's explicit assignment are separately labelled change-linked context,
+the source's explicit assignment are separately labelled change-linked context,
 not silently presented as view-assigned work. Single-view reports carry the same
 catalogue under `view_snapshot.conformance` without inventing a comparison.
 
@@ -169,7 +171,7 @@ invented historical before/after status. That context is checked for drift durin
 export. The current assignment catalogue is also source-hashed under
 `scope.current_inventory_hash`; new/reassigned/removed scoped intents and changed
 current definitions invalidate export rather than reusing stale context. Recorded
-target-view intent definitions remain available even if their current vault entry
+source-view intent definitions remain available even if their current vault entry
 is absent, and are preferred over dirty current definitions. Neither declarations nor evidence-command strings are executed or treated
 as independently authenticated approval; arbitrary semantic acceptance judgments
 stay unknown. Engineering findings in task files are related navigation evidence,
@@ -181,7 +183,7 @@ the two named effective states instead of a current-view patch prefix. Changed
 roots are selected before parsing caller context; before/after static callers,
 callees, declaration/access/argument-count checks and the rule-based risk estimate
 are populated. It does not replay intermediate changes: a break fixed before the
-To state is not presented as a current contract break. Source/path/parser/search
+source-after state is not presented as a current contract break. Source/path/parser/search
 budgets and unsupported/dynamic bindings remain explicit coverage gaps. Semantic
 callable IDs remain module/path-addressed, so a file rename can change bindings.
 Compiler-resolved types, runtime behavior and executed-test coverage are not
@@ -199,6 +201,45 @@ The viewer embeds Atomic's actual wordmark PNG and uses the verified violet/pink
 website palette. No remote fonts, website code, analytics or asset requests are
 included. See `src/commands/review/assets/README.md` for source URLs, hashes and
 the proportional downsample. Local installed font names have system fallbacks.
+
+## Attested native evaluation and accepted degradation
+
+`review publish --from draft --to dev` resolves this same native report. It never
+starts an agent/model, creates credentials, invokes a runner or requires a vendor's
+provider configuration. A trusted existing local identity attests what it evaluated.
+
+`--dry-run --json` emits full evidence, stable normalized report/scope digests,
+all outstanding issues and an unfilled `evaluation_template`. Fill that template
+or supply it alone through `--evaluation FILE`. Every pass must be explicitly
+evaluated with a rationale. `ready` requires no outstanding evidence;
+`accepted_degradation` must name every waivable issue exactly once with a nonempty
+rationale, and may attach evidence/follow-up references. `not_ready` retains a
+negative decision without authorizing insertion. `--yes` is confirmation only,
+never an opaque acceptance or waiver.
+
+The signed `atomic.review-decision.v1` retains the complete report, its digest,
+source/target state and membership, exact insertion closure, current intent-context
+pins, every issue and each pass evaluation. Evidence readiness remains `not_ready`
+when shortcomings exist even if user insertion disposition is `accepted_degradation`.
+No independent approval, test execution or clean-code claim is inferred. The
+published HTML labels these dispositions and links acceptance rationales to the
+actual finding/criterion; its JSON download contains the complete attested decision.
+
+The existing shared-insertion evidence boundary validates applicable retained
+decisions, signatures/trust, exact scope/selection, intent context and dispositions
+before mutation. A decision hash is retained in insertion operation evidence and
+the outcome reports accepted degradation. Stale scopes, bad signatures, untrusted
+signers and original provenance/integrity blockers cannot be waived as code debt.
+Known not-ready decisions refuse insertion. Current evaluations are replaced only
+by explicit signed `--supersedes HASH`, not by rewriting history; legacy insertion
+without a native decision retains its existing provenance policy.
+
+Native publication is not an automatic insert or push. `publish inspect` exposes
+retained reports and current applicability. Existing retrospective
+`prepare/sign/record` tools retain their stronger review-intent/authority contract;
+a native risk evaluation is not fabricated original session capture. Old agent
+jobs may only be explicitly cleaned up with `--cancel UUID`; no native resume,
+provider, runner, or agent-execution path is offered.
 
 ## Three-pass graph and numbered findings
 

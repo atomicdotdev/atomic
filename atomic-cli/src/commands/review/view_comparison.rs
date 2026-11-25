@@ -114,8 +114,12 @@ pub struct ComparedFile {
 #[derive(Debug, Serialize)]
 pub struct ViewComparison {
     pub source_ref: String,
+    /// Proposed source and insertion destination (CLI direction).
     pub from: ViewPin,
     pub to: ViewPin,
+    /// Destination baseline and proposed source state (measurement direction).
+    pub before: ViewPin,
+    pub after: ViewPin,
     pub files: Vec<ComparedFile>,
     pub diagnostics: Vec<String>,
     pub conformance: conformance::Conformance,
@@ -150,16 +154,16 @@ pub(super) fn resolve(repo: &Repository, args: &IncrementalArgs) -> CliResult<In
     {
         return Err(invalid("--from/--to cannot be combined with snapshot/change/turn/intent selectors, supplied change findings or a change-risk profile"));
     }
-    let mut before = super::view_snapshot::collect(repo, from)?;
-    let mut after = super::view_snapshot::collect(repo, to)?;
+    let mut before = super::view_snapshot::collect(repo, to)?;
+    let mut after = super::view_snapshot::collect(repo, from)?;
     let before_view = before.view_snapshot.take().unwrap();
     let after_view = after.view_snapshot.take().unwrap();
-    let from_pin = ViewPin::from(&before_view);
-    let to_pin = ViewPin::from(&after_view);
+    let from_pin = ViewPin::from(&after_view);
+    let to_pin = ViewPin::from(&before_view);
     let source_ref = format!(
         "urn:atomic:view-comparison:{}",
         Hash::of(
-            &serde_json::to_vec(&json!({"from":from_pin,"to":to_pin}))
+            &serde_json::to_vec(&json!({"schema":"source-target-v1","from":from_pin,"to":to_pin}))
                 .map_err(|error| CliError::Internal(error.into()))?
         )
         .to_base32()
@@ -247,18 +251,20 @@ pub(super) fn resolve(repo: &Repository, args: &IncrementalArgs) -> CliResult<In
         .metric_diagnostics
         .iter()
         .filter(|line| !line.contains(super::analysis::SNAPSHOT_BASELINE))
-        .map(|line| format!("Before {from}: {line}"))
+        .map(|line| format!("Before (target) {to}: {line}"))
         .chain(
             after_view
                 .analysis
                 .metric_diagnostics
                 .iter()
                 .filter(|line| !line.contains(super::analysis::SNAPSHOT_BASELINE))
-                .map(|line| format!("After {to}: {line}")),
+                .map(|line| format!("After (source) {from}: {line}")),
         )
         .collect();
     let mut comparison = ViewComparison {
         source_ref,
+        before: to_pin.clone(),
+        after: from_pin.clone(),
         from: from_pin,
         to: to_pin,
         files,
@@ -272,11 +278,15 @@ pub(super) fn resolve(repo: &Repository, args: &IncrementalArgs) -> CliResult<In
         &after.dependency_closure,
     )?;
     verify(repo, &comparison)?;
-    after.schema_version = 4;
+    after.schema_version = 5;
     after.purpose = "local_view_comparison_review";
-    after.selection=Selection { kind:"view_comparison".into(),value:Some(format!("{from} -> {to}")),reason:"From is the recorded before state; To is the recorded after state. Both complete view corpora are inspected locally.".into() };
+    after.selection=Selection { kind:"view_comparison".into(),value:Some(format!("{from} -> {to}")),reason:"From is the proposed source view; To is the insertion destination. Measurements compare target-before with source-after, using both complete recorded corpora.".into() };
     after.source["from_view"] = json!(from);
     after.source["from_state"] = json!(comparison.from.state);
+    after.source["to_view"] = json!(to);
+    after.source["to_state"] = json!(comparison.to.state);
+    after.source["before_view"] = json!(to);
+    after.source["after_view"] = json!(from);
     let mut refs = BTreeMap::new();
     for reference in before
         .dependency_references
@@ -294,7 +304,7 @@ pub(super) fn resolve(repo: &Repository, args: &IncrementalArgs) -> CliResult<In
     after.dependency_closure = members.into_iter().collect();
     after.dependency_only = after.dependency_closure.clone();
     after.warnings=vec![
-        format!("Local recorded-view comparison: BEFORE {from} -> AFTER {to}. No view switch, working-copy bytes, model or network calls."),
+        format!("Local review source {from} -> target {to}; measurements BEFORE {to} -> AFTER {from}. No view switch, working-copy bytes, model or network calls."),
         "Audit lifecycles compare local rule/AST observations within recorded file identities and qualified metric owners. Changed/unknown observations are not fabricated resolutions or proof of behavioral equivalence.".into(),
         "Each side uses the same explicit semantic/metric bounds as --view. Unsupported, unavailable and over-budget data stay unknown, not absent or zero.".into(),
         "Metric comparisons use the complete supplied corpus on each side. Renames are based on canonical recorded inode identity, never filename/content similarity.".into(),

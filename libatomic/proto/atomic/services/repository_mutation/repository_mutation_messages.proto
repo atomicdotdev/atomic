@@ -266,7 +266,18 @@ message InsertChangesResponse {
   optional uint64 files_updated = 10;
   optional uint64 directories_created = 11;
   bool has_conflicts = 12;  // the insert outcome's own flag
+  optional NativeReviewDecisionEvidence review_decision = 13;
   ResponseMeta meta = 100;
+}
+
+// Output evidence only; insertion authority is revalidated by the repository.
+message NativeReviewDecisionEvidence {
+  string decision = 1;
+  string report_hash = 2;
+  string readiness = 3;
+  string disposition = 4;
+  uint64 accepted_degradations = 5;
+  string signer = 6;
 }
 
 message UnrecordRequest {

@@ -312,9 +312,13 @@ mod tests {
             ),
             (
                 "tests/caller.ts".into(),
-                "function caller() { target(); }".into(),
+                "import { target } from '../src/a';\nfunction caller() { target(); }".into(),
             ),
             ("wrong.ts".into(), "function outgoing() {}".into()),
+            (
+                "unbound.ts".into(),
+                "function unbound() { target(); }".into(),
+            ),
         ]);
         let mut files = BTreeMap::from([("src/a.ts".into(), 1)]);
         let mut links = BTreeSet::new();
@@ -329,6 +333,10 @@ mod tests {
         );
         assert_eq!(files.get("tests/caller.ts"), Some(&2));
         assert!(!files.contains_key("wrong.ts"));
+        assert!(
+            !files.contains_key("unbound.ts"),
+            "An unimported name is not a bound caller"
+        );
         add_link(
             "src/a.ts",
             "tests/caller.ts",
@@ -346,7 +354,9 @@ mod tests {
         sources.extend((0..31).map(|i| {
             (
                 format!("caller{i}.ts"),
-                format!("function caller{i}() {{ target(); }}"),
+                format!(
+                    "import {{ target }} from './src/a';\nfunction caller{i}() {{ target(); }}"
+                ),
             )
         }));
         let index = SyntaxIndex::from_sources(&sources);

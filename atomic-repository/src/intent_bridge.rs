@@ -57,6 +57,79 @@ pub struct LiftInputs {
     pub body: String,
 }
 
+/// Current vault sources explicitly assigned to one view. This is context,
+/// not recorded governance, signature verification or historical approval.
+pub struct ViewIntentSources {
+    pub entries: Vec<ViewIntentSource>,
+    pub hash: String,
+    pub diagnostics: Vec<String>,
+}
+
+pub struct ViewIntentSource {
+    pub key: String,
+    pub path: String,
+    pub inputs: LiftInputs,
+    pub hash: String,
+    pub fallback_title: String,
+    pub fallback_status: String,
+}
+
+/// Shared inventory identity used by local review and insertion-time revalidation.
+pub fn view_intent_sources(repo: &Repository, view: &str) -> BridgeResult<ViewIntentSources> {
+    use atomic_core::types::{Base32, Hash};
+    let manifest = if repo.has_vault()? {
+        repo.vault_manifest()?
+    } else {
+        Default::default()
+    };
+    let mut entries = Vec::new();
+    let mut inventory = std::collections::BTreeMap::new();
+    let mut diagnostics = Vec::new();
+    for (key, summary) in manifest.intents {
+        let inputs = if summary.vault_path.is_empty() {
+            read_intent(repo, &key)?
+        } else {
+            let Some(entry) =
+                repo.vault_retrieve(summary.vault_path.trim_start_matches(".vault/"))?
+            else {
+                inventory.insert(key.clone(), "missing_definition".to_string());
+                diagnostics.push(format!(
+                    "{key}: vault definition missing; view assignment unavailable"
+                ));
+                continue;
+            };
+            inputs_from_entry(&entry)?
+        };
+        if inputs.frontmatter.get("view").and_then(Value::as_str) != Some(view) {
+            continue;
+        }
+        let hash = source_content_hash(&inputs);
+        inventory.insert(key.clone(), hash.clone());
+        let path = if summary.vault_path.starts_with(".vault/") {
+            summary.vault_path
+        } else {
+            format!(".vault/{}", summary.vault_path)
+        };
+        entries.push(ViewIntentSource {
+            key,
+            path,
+            inputs,
+            hash,
+            fallback_title: summary.title,
+            fallback_status: summary.status,
+        });
+    }
+    let bytes =
+        serde_json::to_vec(&inventory).map_err(|error| RepositoryError::InvalidOperation {
+            message: error.to_string(),
+        })?;
+    Ok(ViewIntentSources {
+        entries,
+        hash: Hash::of(&bytes).to_base32(),
+        diagnostics,
+    })
+}
+
 /// Parse a `VaultEntry` into the frontmatter map + body the lift consumes.
 ///
 /// `frontmatter_json` is parsed exactly as the repository itself parses it
