@@ -1000,10 +1000,17 @@ impl Repository {
             .iter()
             .filter(|hash| present.contains(hash))
             .count();
+        // The publication gate is skipped for the same reason as in
+        // `apply_view_manifest`: what the remote's manifest adds was already
+        // published there, and this repository holds none of the publisher's
+        // session evidence. Local membership is untouched, and publishing
+        // from this repository stays gated at its own boundaries.
         let mut replayed = 0usize;
         for hash in &manifest.changes {
             if present.insert(*hash) {
-                self.insert_change(hash, InsertOptions::default().view(&manifest.name))?;
+                let mut options = InsertOptions::default().view(&manifest.name);
+                options.skip_publication_gate = true;
+                self.insert_change(hash, options)?;
                 replayed += 1;
             }
         }
@@ -1194,9 +1201,18 @@ impl Repository {
         //    this view's log (put_change) and skips hunk application for
         //    changes already in the global graph, so replaying a draft's
         //    inherited prefix is a metadata-only operation.
+        //
+        //    The publication gate is skipped: a manifest describes a view
+        //    that was already published, so this replay reconstructs that
+        //    decision rather than making it. The publisher's session
+        //    evidence (MAC keys, identity store, trust roots) never leaves
+        //    its machine, so re-running the gate here could only refuse.
+        //    Publishing from this repository stays gated at its own
+        //    boundaries (insert, promotion, push).
         let mut replayed = 0usize;
         for hash in &manifest.changes[prefix_len..] {
-            let options = InsertOptions::default().view(&manifest.name);
+            let mut options = InsertOptions::default().view(&manifest.name);
+            options.skip_publication_gate = true;
             self.insert_change(hash, options)?;
             replayed += 1;
         }
