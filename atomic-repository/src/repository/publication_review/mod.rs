@@ -19,11 +19,26 @@ use atomic_core::types::{Base32, Hash};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PREFIX: &str = "publication-reviews/";
+/// Most review artifacts one inventory may hold.
+const MAX_REVIEWS: usize = 4096;
 
 pub(super) fn refused(error: impl std::fmt::Display) -> RepositoryError {
     RepositoryError::InvalidOperation {
         message: format!("publication review: {error}"),
     }
+}
+
+/// The bytes a review is stored as: the compact form its size bound is defined
+/// on. They are admitted here exactly as the inventory will read them back, so
+/// a review that could not be listed afterwards is never written.
+#[cfg(feature = "review-shacl")]
+fn stored_bytes(review: &PublicationReview) -> Result<Vec<u8>, RepositoryError> {
+    let mut bytes = serde_json::to_vec(review).map_err(refused)?;
+    bytes.push(b'\n');
+    if PublicationReview::parse(&bytes).map_err(refused)? != *review {
+        return Err(refused("review does not read back as it was signed"));
+    }
+    Ok(bytes)
 }
 
 /// Pin the actual executable shapes and ontology, not a caller-chosen version label.
@@ -324,17 +339,30 @@ impl Repository {
         let existing = self.publication_reviews()?;
         self.review_supersession(review, &existing, keys)?;
         let path = format!("{PREFIX}{}/review.md", review.artifact_hash());
-        let disk_path = artifact::destination(self, &review.artifact_hash())?;
-        let bytes = format!(
-            "{}\n",
-            serde_json::to_string_pretty(review).map_err(refused)?
-        )
-        .into_bytes();
-        if let Some(existing) = self.vault_retrieve(&path)? {
-            if existing.content_bytes != bytes {
-                return Err(refused("content-address collision"));
+        // Everything that can refuse the artifact itself runs before anything
+        // is created for it on disk or in the vault.
+        let bytes = stored_bytes(review)?;
+        let stored = self.vault_retrieve(&path)?;
+        match &stored {
+            // The same review may already be here in an older encoding.
+            Some(stored) => {
+                if PublicationReview::parse(&stored.content_bytes)
+                    .ok()
+                    .as_ref()
+                    != Some(review)
+                {
+                    return Err(refused("content-address collision"));
+                }
             }
-        } else {
+            None if existing.len() >= MAX_REVIEWS => {
+                return Err(refused(format!(
+                    "review inventory already holds {MAX_REVIEWS} artifacts"
+                )));
+            }
+            None => {}
+        }
+        let disk_path = artifact::destination(self, &review.artifact_hash())?;
+        if stored.is_none() {
             if std::fs::symlink_metadata(&disk_path).is_ok() {
                 return Err(refused(
                     "an unregistered working file occupies this review address",
@@ -363,8 +391,10 @@ impl Repository {
         let mut reviews = Vec::new();
         let mut addresses = Vec::new();
         for entry in self.vault_list(PREFIX, None)? {
-            if reviews.len() >= 4096 {
-                return Err(refused("review inventory exceeds 4096 artifacts"));
+            if reviews.len() >= MAX_REVIEWS {
+                return Err(refused(format!(
+                    "review inventory exceeds {MAX_REVIEWS} artifacts"
+                )));
             }
             let stored = self
                 .vault_retrieve(&entry.path)?

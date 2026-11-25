@@ -16,6 +16,7 @@ mod boundaries;
 mod gate;
 mod observations;
 mod snapshot;
+mod storage;
 
 const SESSION: &str = "retained-legacy-session";
 

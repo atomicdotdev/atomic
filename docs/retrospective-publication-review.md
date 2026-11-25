@@ -245,7 +245,10 @@ does not change.
 - Admission is bounded: 1 MiB signed documents, 64 roots, 4096 closure changes,
   256 work intents/ancestor views/supersession ancestors, and bounded strict
   sidecar inventories, with at most 4096 retained review artifacts per inventory.
-  Exceeding a budget is an error, not partial conformance.
+  Exceeding a budget is an error, not partial conformance. The document and
+  inventory bounds are checked before a review is recorded as well as when it is
+  read: the artifact is stored as the compact signed document the 1 MiB bound is
+  defined on, and a review that could not be listed afterwards is refused.
 - Signed objects require their original source revisions and public keys to be
   available. Unavailable evidence blocks validation; a signature is not proof
   that all historical execution evidence exists.
