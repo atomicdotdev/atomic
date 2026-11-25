@@ -14,14 +14,14 @@ use atomic_repository::{
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Clone, Parser)]
 pub struct PublicationReviewCommand {
     #[command(subcommand)]
-    action: Action,
+    pub(crate) action: Action,
 }
 
-#[derive(Debug, Subcommand)]
-enum Action {
+#[derive(Debug, Clone, Subcommand)]
+pub(crate) enum Action {
     /// Print the pinned review document and exact bytes for external signing.
     Prepare {
         #[arg(long)]

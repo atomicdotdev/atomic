@@ -45,6 +45,7 @@ mod hooks;
 mod identity;
 mod lifecycle;
 mod provenance_rpc;
+mod publication;
 pub(crate) mod receive;
 mod repair;
 mod status;
@@ -62,6 +63,7 @@ pub use enable::Enable;
 pub use explain::Explain;
 pub use identity::Identity;
 pub use lifecycle::Lifecycle;
+pub(crate) use publication::finish_publisher_session;
 pub use status::AgentStatus;
 
 // Agent Command

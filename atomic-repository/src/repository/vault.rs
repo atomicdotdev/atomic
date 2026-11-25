@@ -8,6 +8,13 @@ use atomic_core::types::{Hash, Merkle};
 /// Directory name for the vault at the project root.
 const VAULT_DIR: &str = ".vault";
 
+/// Signed approvals and their explicit withdrawal tombstones are retained
+/// evidence. Generic vault mutation must not erase or rewrite either side.
+fn retained_review_evidence(path: &str) -> bool {
+    path.starts_with(super::publication_review::PREFIX)
+        || path.starts_with(super::review_authorization::PREFIX)
+}
+
 impl Repository {
     /// Path to the vault directory (`.vault/` at the project root).
     pub fn vault_dir(&self) -> PathBuf {
@@ -222,7 +229,7 @@ impl Repository {
         let previous_entry = txn
             .get_vault_entry(path)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        if path.starts_with(super::publication_review::PREFIX)
+        if retained_review_evidence(path)
             && previous_entry.as_ref().is_some_and(|old| {
                 old.content_bytes != entry.content_bytes
                     || old.frontmatter_json != entry.frontmatter_json
@@ -303,7 +310,7 @@ impl Repository {
         let previous_entry = txn
             .get_vault_entry(path)
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
-        if path.starts_with(super::publication_review::PREFIX)
+        if retained_review_evidence(path)
             && previous_entry.as_ref().is_some_and(|old| {
                 old.content_bytes != entry.content_bytes
                     || old.frontmatter_json != entry.frontmatter_json
@@ -431,7 +438,7 @@ impl Repository {
     /// Delete a vault entry by path. Also updates the manifest.
     pub fn vault_delete(&self, path: &str) -> Result<bool, RepositoryError> {
         let _review_boundary = self.review_evidence_lock()?;
-        if path.starts_with(super::publication_review::PREFIX) {
+        if retained_review_evidence(path) {
             return Err(super::publication_review::refused(
                 "review history is retained; use signed supersession",
             ));

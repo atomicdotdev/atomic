@@ -241,9 +241,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-audit"
+version = "0.22.1"
+dependencies = [
+ "atomic-semantic",
+ "serde",
+ "serde_json",
+ "similar",
+]
+
+[[package]]
 name = "atomic-canonical"
 version = "0.22.1"
 dependencies = [
+ "atomic-audit",
  "atomic-identity",
  "blake3",
  "bs58",
@@ -264,6 +275,7 @@ version = "0.22.1"
 dependencies = [
  "anyhow",
  "atomic-agent",
+ "atomic-audit",
  "atomic-canonical",
  "atomic-client",
  "atomic-config",
@@ -285,6 +297,7 @@ dependencies = [
  "data-encoding",
  "dialoguer",
  "dirs",
+ "flate2",
  "fs2",
  "futures-core",
  "git2",

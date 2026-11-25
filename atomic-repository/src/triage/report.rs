@@ -679,10 +679,9 @@ pub fn build_report(
     }
 
     // 8. BLAST_UNREVIEWED (warn, best-effort): callers of modified code that
-    //    live outside the candidate change-set. For each change's defined
-    //    entities, walk incoming CALLS to caller entities, resolve each
-    //    caller's defining file, and flag any caller whose file no candidate
-    //    modifies. No CALLS/DEFINES edges (unenriched KG) → nothing emitted.
+    //    live outside the candidate change-set. Use the shared semantic source
+    //    relationships, not stored KG code edges or global simple-name joins.
+    //    Unresolved references are not asserted as callers.
     let mut emitted_blast: HashSet<String> = HashSet::new();
     for (i, entities) in change_entities.iter().enumerate() {
         let mut callers: BTreeSet<String> = BTreeSet::new();

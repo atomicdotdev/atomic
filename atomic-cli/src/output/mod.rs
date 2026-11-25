@@ -53,6 +53,7 @@
 //! ```
 
 pub mod colors;
+pub(crate) mod html;
 pub(crate) mod live;
 pub mod progress;
 pub mod table;

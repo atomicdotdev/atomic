@@ -38,6 +38,27 @@ impl TypeScriptParser {
 }
 
 impl LanguageParser for TypeScriptParser {
+    fn extract_references_from_tree(
+        &mut self,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        file_path: &str,
+    ) -> Vec<Reference> {
+        self.extractor
+            .extract_references_from_tree(tree, source, file_path)
+    }
+    fn extract_from_tree(
+        &mut self,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        file_path: &str,
+    ) -> Vec<Entity> {
+        self.extractor.extract_from_tree(tree, source, file_path)
+    }
+    fn parse_tree(&mut self, source: &str) -> Option<tree_sitter::Tree> {
+        self.extractor.parse_tree(source)
+    }
+
     fn language(&self) -> Language {
         self.language
     }

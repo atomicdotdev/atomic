@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; connect-src 'none'; img-src data:; base-uri 'none'; form-action 'none'">
+<title>Atomic review</title>
+<style nonce="{nonce}">{css}</style>
+</head>
+<body>
+<a class="skip" href="#workspace">Skip to review</a>
+<header class="report-header">
+  <div class="identity"><img class="atomic-logo" src="data:image/png;base64,{logo}" alt="Atomic" width="140" height="40"><div><h1 id="report-title">Atomic review</h1><p id="report-scope"></p></div></div>
+  <div class="report-actions"><button id="download" type="button">Download JSON</button><details class="scope-details"><summary>Scope &amp; provenance</summary><div id="provenance"></div></details></div>
+</header>
+<nav class="pass-tabs" role="tablist" aria-label="Review sections">
+  <button type="button" id="tab-summary" role="tab" aria-selected="true" aria-controls="panel-summary" data-pass="summary">Summary</button>
+  <button type="button" id="tab-slop" role="tab" aria-selected="false" aria-controls="panel-slop" tabindex="-1" data-pass="slop">Anti-slop <span id="slop-status"></span></button>
+  <button type="button" id="tab-conformance" role="tab" aria-selected="false" aria-controls="panel-conformance" tabindex="-1" data-pass="conformance">Conformance <span id="conformance-status"></span></button>
+  <button type="button" id="tab-risk" role="tab" aria-selected="false" aria-controls="panel-risk" tabindex="-1" data-pass="risk">Blast radius <span id="risk-status"></span></button>
+</nav>
+<div class="toolbar" id="review-toolbar" hidden><label class="search-label" for="search"><span id="search-title">Find a file or region</span> <input id="search" type="search" placeholder="Path, function, audit or F-number" autocomplete="off"></label><label for="region-filter">Show <select id="region-filter"><option value="concerns">Audit findings</option><option value="changed">Changed metrics</option><option value="all">All metric regions</option></select></label><span id="result-count" role="status" aria-live="polite"></span></div>
+<main id="workspace" tabindex="-1" data-summary="true">
+  <aside class="file-navigation" id="file-navigation" aria-label="Files and source regions" hidden><h2 id="navigation-title">Files &amp; regions</h2><details id="file-drawer" open><summary id="file-drawer-label">Choose a file or region</summary><div id="files"></div></details></aside>
+  <div class="review-content">
+    <section id="panel-summary" role="tabpanel" aria-labelledby="tab-summary"><h2>Review summary</h2><div class="summary-actions" id="summary-actions"></div><div id="audit-overview"></div><div id="conformance-overview"></div><div id="risk-overview"></div></section>
+    <section id="panel-slop" role="tabpanel" aria-labelledby="tab-slop" hidden><div id="slop-selection"></div></section>
+    <section id="panel-conformance" role="tabpanel" aria-labelledby="tab-conformance" hidden><div id="criteria"></div></section>
+    <section id="panel-risk" role="tabpanel" aria-labelledby="tab-risk" hidden><div id="risk-selection"></div></section>
+  </div>
+  <aside class="card-inspector" id="card-inspector" aria-label="Audit and metric card inspector" hidden><label for="card-picker">Reference card</label><select id="card-picker"><option value="">Choose an audit or metric</option></select><div id="card-content"><h2>Why this callout?</h2><p>Select a finding or metric to read its definition, evidence requirements and exceptions.</p></div></aside>
+</main>
+<footer>Local-only semantic audit and metrics. No model calls or network requests. Findings, metric observations and estimated risk are distinct. This report is not independent signed approval.</footer>
+<noscript><h2>JavaScript is disabled</h2><p>The recorded terminal review is available below. Interactive source and card navigation requires JavaScript; the report makes no network requests.</p><pre>{fallback}</pre></noscript>
+<script type="application/json" id="review-data" nonce="{nonce}">{data}</script>
+<script nonce="{nonce}">{script}</script>
+</body>
+</html>

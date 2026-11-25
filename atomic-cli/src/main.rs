@@ -97,6 +97,7 @@ use commands::{
     Remove,
     Repo,
     Restore,
+    Review,
     Revise,
     Sandbox,
     ServerCmd,
@@ -934,6 +935,9 @@ enum Commands {
     /// with no arguments asks whether the current view is ready to promote.
     Triage(Triage),
 
+    /// Inspect a recorded turn/intent/change, or independently publish view reviews.
+    Review(Review),
+
     /// Generate a shell completion script.
     ///
     /// Emits a static completion script for the given shell. For live
@@ -1114,6 +1118,7 @@ fn main() {
         Commands::Provenance(provenance) => provenance.run(),
 
         Commands::Triage(triage) => triage.run(),
+        Commands::Review(review) => review.run(),
     };
 
     // Handle errors with user-friendly output

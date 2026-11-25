@@ -40,6 +40,11 @@ impl TypeScriptExtractor {
         Self { parser }
     }
 
+    /// Parse with the same configured TypeScript/TSX grammar used for extraction.
+    pub fn parse_tree(&mut self, source: &str) -> Option<tree_sitter::Tree> {
+        self.parser.parse(source, None)
+    }
+
     /// Parse source code and extract all entities
     pub fn extract(&mut self, source: &str, file_path: &str) -> Vec<Entity> {
         let tree = match self.parser.parse(source, None) {
@@ -47,6 +52,16 @@ impl TypeScriptExtractor {
             None => return vec![],
         };
 
+        self.extract_from_tree(&tree, source, file_path)
+    }
+
+    /// Annotate the same tree used by shared semantic source analysis.
+    pub fn extract_from_tree(
+        &self,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        file_path: &str,
+    ) -> Vec<Entity> {
         let mut entities = Vec::new();
         self.walk_tree(&tree.root_node(), source, file_path, &mut entities, false);
         entities
@@ -59,6 +74,15 @@ impl TypeScriptExtractor {
             None => return vec![],
         };
 
+        self.extract_references_from_tree(&tree, source, file_path)
+    }
+
+    pub fn extract_references_from_tree(
+        &self,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        file_path: &str,
+    ) -> Vec<Reference> {
         let mut references = Vec::new();
         let mut seen = HashSet::new();
         self.walk_tree_for_references(
@@ -269,6 +293,7 @@ impl TypeScriptExtractor {
             column: Some(node.start_position().column as u32),
             context,
             confidence: Confidence::High,
+            call: None,
         })
     }
 
@@ -333,6 +358,7 @@ impl TypeScriptExtractor {
             column: Some(property.start_position().column as u32),
             context,
             confidence: Confidence::Medium,
+            call: None,
         })
     }
 
@@ -462,6 +488,7 @@ impl TypeScriptExtractor {
             column: Some(node.start_position().column as u32),
             context,
             confidence: Confidence::Low,
+            call: None,
         })
     }
 
@@ -538,6 +565,7 @@ impl TypeScriptExtractor {
             column: Some(node.start_position().column as u32),
             context,
             confidence: Confidence::High,
+            call: None,
         })
     }
 

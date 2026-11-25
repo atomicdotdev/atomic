@@ -87,6 +87,8 @@
 //! - [`unrecord`] - Undo applied changes
 
 // Core modules
+pub mod analysis_scope;
+pub use analysis_scope::is_vault_path;
 pub mod apply;
 pub mod change_source;
 pub mod changestore;

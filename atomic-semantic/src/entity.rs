@@ -267,6 +267,17 @@ pub struct Reference {
     /// Confidence level of this reference match
     #[serde(default = "default_confidence")]
     pub confidence: Confidence,
+    /// AST call spelling and owner; syntactic context is not resolved binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<CallContext>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallContext {
+    pub target: String,
+    pub receiver: Option<String>,
+    pub caller: String,
+    pub arguments: Option<usize>,
 }
 
 fn default_confidence() -> Confidence {

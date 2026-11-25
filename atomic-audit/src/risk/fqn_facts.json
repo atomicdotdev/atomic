@@ -1,0 +1,79 @@
+{
+  "available": true,
+  "production_functions": 53,
+  "existing_production_functions": 4,
+  "signature_changes": 0,
+  "test_support_functions": 23,
+  "structural_alerts": 0,
+  "production_paths": [
+    "atomic-audit/src/catalog.rs",
+    "atomic-audit/src/extract/languages.rs",
+    "atomic-audit/src/extract/mod.rs",
+    "atomic-audit/src/extract/tokens.rs",
+    "atomic-audit/src/lib.rs",
+    "atomic-audit/src/metrics.rs",
+    "atomic-canonical/src/review_finding.rs",
+    "atomic-cli/src/commands/review/analysis.rs",
+    "atomic-cli/src/commands/review/graph.rs",
+    "atomic-cli/src/commands/review/incremental.rs",
+    "atomic-semantic/src/lib.rs"
+  ],
+  "components": ["atomic-audit", "atomic-canonical", "atomic-cli", "atomic-semantic"],
+  "observed_production_callers": 31,
+  "observed_test_support_callers": 22,
+  "existing_production_callers": 2,
+  "existing_caller_files": 2,
+  "outside_change_callers": 0,
+  "public_growth": 19,
+  "added_file_public_units": 24,
+  "public_removed": 0,
+  "dependency_growth": 4,
+  "non_callable_paths": [
+    "atomic-audit/src/catalog.rs",
+    "atomic-audit/src/extract/languages.rs",
+    "atomic-audit/src/extract/mod.rs",
+    "atomic-audit/src/extract/tokens.rs",
+    "atomic-audit/src/lib.rs",
+    "atomic-audit/src/metrics.rs",
+    "atomic-canonical/src/review_finding.rs",
+    "atomic-cli/src/commands/review/analysis.rs",
+    "atomic-cli/src/commands/review/incremental.rs",
+    "atomic-semantic/src/lib.rs"
+  ],
+  "source_selection_complete": true,
+  "unresolved_references": 1328,
+  "surface_measurements_complete": true,
+  "unknowns": ["Unresolved reference expressions are excluded from observed callers"],
+  "references": {
+    "calls": [
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:atomic-cli/src/commands/review/graph.rs:332-332:atomic-cli/src/commands/review/graph.rs#build",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:atomic-cli/src/commands/review/incremental.rs:722-730:atomic-cli/src/commands/review/incremental.rs#resolve_with_session"
+    ],
+    "change": [
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:after:atomic-audit/src/extract/languages.rs:110-121",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:after:atomic-audit/src/extract/languages.rs:123-133",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:after:atomic-audit/src/extract/languages.rs:135-155",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:after:atomic-audit/src/extract/languages.rs:157-168",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:after:atomic-audit/src/extract/languages.rs:16-36",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:after:atomic-audit/src/extract/languages.rs:170-182",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:after:atomic-audit/src/extract/languages.rs:184-206",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:after:atomic-audit/src/extract/languages.rs:208-239"
+    ],
+    "dependency": [
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:dependency_fan_out:atomic-audit/src/extract/languages.rs",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:dependency_fan_out:atomic-audit/src/extract/mod.rs",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:dependency_fan_out:atomic-audit/src/extract/tokens.rs",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:dependency_fan_out:atomic-audit/src/metrics.rs",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:dependency_fan_out:atomic-cli/src/commands/review/graph.rs",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:dependency_fan_out:atomic-cli/src/commands/review/incremental.rs",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:dependency_fan_out:atomic-semantic/src/lib.rs"
+    ],
+    "surface": [
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:public_surface:atomic-audit/src/extract/mod.rs",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:public_surface:atomic-audit/src/lib.rs",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:public_surface:atomic-audit/src/metrics.rs",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:public_surface:atomic-canonical/src/review_finding.rs",
+      "FQNWHCPNXXO5SFTEKSJENKPC3KBGUVFM3O3KLEIZ56AEHW2MJQ5A:public_surface:atomic-semantic/src/lib.rs"
+    ]
+  }
+}

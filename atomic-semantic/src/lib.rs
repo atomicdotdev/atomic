@@ -19,6 +19,12 @@
 pub mod entity;
 pub mod parser;
 pub mod parsers;
+pub mod relationships;
+pub mod source;
+
+/// Shared default byte budget for bounded source inspection. Parsing callers
+/// decide when to apply it; this is not an audit rule or a grammar limitation.
+pub const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 
 /// Find the largest byte index ≤ `max_bytes` that falls on a UTF-8 char boundary.
 ///
@@ -36,6 +42,8 @@ pub(crate) fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> usize {
 }
 
 pub use entity::{
-    ChangeType, Confidence, Entity, EntityChange, EntityKind, FileSummary, Reference,
+    CallContext, ChangeType, Confidence, Entity, EntityChange, EntityKind, FileSummary, Reference,
 };
 pub use parsers::{is_supported, Language, LanguageParser, ParserRegistry, ALL_EXTENSIONS};
+/// Raw syntax-node type used by optional analysis adapters over this registry.
+pub use tree_sitter::Node as SyntaxNode;

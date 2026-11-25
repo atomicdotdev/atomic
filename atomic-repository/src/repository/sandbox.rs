@@ -411,6 +411,82 @@ impl Repository {
         Ok(count)
     }
 
+    /// Provision a new sandbox from the recorded `view`, never from working files.
+    ///
+    /// The destination must not exist and its parent must exist. The checkout
+    /// renderer supplies bytes, inode modes, symlink kinds, and conflict output.
+    /// Absolute symlinks and symlinks containing parent components are not
+    /// supported: a review snapshot must not expose files outside itself.
+    /// Entries may not traverse symlink ancestors or overwrite sandbox metadata.
+    /// On failure, the newly created directory is retained for owner inspection
+    /// and cleanup; no existing destination is overwritten or removed.
+    pub fn provision_recorded_sandbox(
+        &self,
+        dest: impl AsRef<Path>,
+        view: &str,
+    ) -> Result<super::ViewSnapshot, RepositoryError> {
+        let dest = dest.as_ref();
+        let name = dest.file_name().ok_or_else(|| unsafe_snapshot_path(dest))?;
+        if !matches!(
+            dest.components().next_back(),
+            Some(std::path::Component::Normal(_))
+        ) {
+            return Err(unsafe_snapshot_path(dest));
+        }
+        // Resolve the caller's parent once, then keep output beneath the new
+        // directory. create_dir refuses existing directories and dangling links.
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let dest = parent.canonicalize()?.join(name);
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&dest)?;
+        let snapshot = self.materialize_view_entries(view, |entry| {
+            write_recorded_snapshot_entry(&dest, &entry)
+        })??;
+
+        let pointer = SandboxPointer {
+            canonical: self
+                .dot_dir
+                .parent()
+                .ok_or_else(|| RepositoryError::InvalidOperation {
+                    message: "canonical repository directory has no parent".to_string(),
+                })?
+                .to_path_buf(),
+            view: view.to_string(),
+        };
+        use std::io::Write;
+        let bytes = serde_json::to_vec_pretty(&pointer)
+            .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dest.join(SANDBOX_POINTER))?
+            .write_all(&bytes)?;
+        let layout = working_copy::layout_for_paths(
+            dest.clone(),
+            self.dot_dir.clone(),
+            dest.join(DOT_DIR),
+            false,
+        )?;
+        let (_, registered_view) = working_copy::migrate_identity(&self.pristine, &layout, view)?;
+        if registered_view != view {
+            return Err(RepositoryError::InvalidOperation {
+                message: format!(
+                    "sandbox location is already registered on view '{registered_view}', not '{view}'; retained '{}' for inspection",
+                    dest.display()
+                ),
+            });
+        }
+        Ok(snapshot)
+    }
+
     fn materialized_view_files(
         &self,
         view_name: &str,
@@ -670,6 +746,108 @@ fn recreate_symlink(src: &Path, dest: &Path) -> std::io::Result<()> {
     std::fs::copy(src, dest).map(|_| ())
 }
 
+fn unsafe_snapshot_path(path: &Path) -> RepositoryError {
+    RepositoryError::InvalidOperation {
+        message: format!(
+            "unsafe recorded sandbox path '{}': paths must be relative, without parent components, symlink ancestors, or repository metadata; external/parent symlinks are unsupported",
+            path.display()
+        ),
+    }
+}
+
+fn validate_snapshot_relative(path: &Path) -> Result<(), RepositoryError> {
+    use std::path::Component;
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.is_empty()
+        || bytes.contains(&b'\\')
+        || bytes.contains(&b':')
+        || bytes.contains(&0)
+        || bytes.split(|b| *b == b'/').any(|part| {
+            part.is_empty()
+                || part == b"."
+                || part == b".."
+                || [DOT_DIR, ".git", SANDBOX_POINTER, SANDBOX_CACHE_DIR]
+                    .iter()
+                    .any(|reserved| part.eq_ignore_ascii_case(reserved.as_bytes()))
+        })
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(unsafe_snapshot_path(path));
+    }
+    Ok(())
+}
+
+fn ensure_snapshot_directories(root: &Path, relative: &Path) -> Result<(), RepositoryError> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => return Err(unsafe_snapshot_path(relative)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn write_recorded_snapshot_entry(
+    root: &Path,
+    entry: &super::ViewEntry,
+) -> Result<(), RepositoryError> {
+    use super::ViewEntryKind;
+    use std::io::Write;
+    let relative = Path::new(&entry.path);
+    validate_snapshot_relative(relative)?;
+    let target = root.join(relative);
+    if let Some(parent) = relative.parent() {
+        ensure_snapshot_directories(root, parent)?;
+    }
+    match entry.kind {
+        ViewEntryKind::Directory => ensure_snapshot_directories(root, relative)?,
+        ViewEntryKind::File => {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)?;
+            file.write_all(&entry.content)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(u32::from(
+                    entry.mode & 0o777,
+                )))?;
+            }
+        }
+        ViewEntryKind::Symlink => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                let link = Path::new(std::ffi::OsStr::from_bytes(&entry.content));
+                validate_snapshot_relative(link)?;
+                std::os::unix::fs::symlink(link, &target)?;
+            }
+            #[cfg(not(unix))]
+            return Err(RepositoryError::InvalidOperation {
+                message: "recorded sandbox symlinks are unsupported on this platform".to_string(),
+            });
+        }
+    }
+    #[cfg(unix)]
+    if entry.kind == ViewEntryKind::Directory {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            target,
+            std::fs::Permissions::from_mode(u32::from(entry.mode & 0o777)),
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,6 +869,11 @@ mod tests {
         }
         std::fs::write(&path, contents).unwrap();
 
+        record_path(&repo, rel);
+        repo
+    }
+
+    fn record_path(repo: &Repository, rel: &str) {
         repo.add(
             repo.require_working_copy_id().unwrap(),
             rel,
@@ -707,8 +890,219 @@ mod tests {
             .unwrap();
         repo.write_recorded(&outcome, InsertOptions::default())
             .unwrap();
+    }
 
-        repo
+    #[test]
+    fn recorded_sandbox_excludes_dirty_files_and_keeps_source_identity() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("repo");
+        let repo = repo_with_recorded_file(&source, "src/file.txt", b"recorded\0bytes\n");
+        let source_id = repo.require_working_copy_id().unwrap();
+        let source_view = std::fs::read(source.join(DOT_DIR).join("current_view")).unwrap();
+        let source_identity = std::fs::read(source.join(DOT_DIR).join("working_copy_id")).unwrap();
+        std::fs::write(source.join("src/file.txt"), b"dirty\n").unwrap();
+        std::fs::write(source.join(".env"), b"SECRET=never-copy\n").unwrap();
+        let dest = dir.path().join("review");
+
+        let snapshot = repo.provision_recorded_sandbox(&dest, "dev").unwrap();
+        assert_eq!(snapshot.view, "dev");
+        assert_eq!(snapshot.change_count, 1);
+        let expected = repo
+            .materialize_view_entries::<std::convert::Infallible>("dev", |_| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.state, expected.state);
+        assert_eq!(
+            std::fs::read(dest.join("src/file.txt")).unwrap(),
+            b"recorded\0bytes\n"
+        );
+        assert!(!dest.join(".env").exists());
+        assert_eq!(
+            std::fs::read(source.join("src/file.txt")).unwrap(),
+            b"dirty\n"
+        );
+        assert_eq!(
+            std::fs::read(source.join(".env")).unwrap(),
+            b"SECRET=never-copy\n"
+        );
+        assert_eq!(
+            std::fs::read(source.join(DOT_DIR).join("current_view")).unwrap(),
+            source_view
+        );
+        assert_eq!(
+            std::fs::read(source.join(DOT_DIR).join("working_copy_id")).unwrap(),
+            source_identity
+        );
+        assert_eq!(repo.require_working_copy_id().unwrap(), source_id);
+        drop(repo);
+
+        let sandbox = Repository::open_existing(&dest).unwrap();
+        let sandbox_id = sandbox.require_working_copy_id().unwrap();
+        assert_ne!(sandbox_id, source_id);
+        assert_eq!(sandbox.desired_view_name(sandbox_id).unwrap(), "dev");
+        assert_eq!(sandbox.current_view, "dev");
+    }
+
+    #[test]
+    fn recorded_sandbox_refuses_existing_destination_without_mutation() {
+        let dir = tempdir().unwrap();
+        let repo = repo_with_recorded_file(&dir.path().join("repo"), "file", b"recorded");
+        let dest = dir.path().join("existing");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("keep"), b"owned by someone else").unwrap();
+        assert!(repo.provision_recorded_sandbox(&dest, "dev").is_err());
+        assert_eq!(
+            std::fs::read(dest.join("keep")).unwrap(),
+            b"owned by someone else"
+        );
+        assert!(!dest.join("file").exists());
+        assert!(!dest.join(SANDBOX_POINTER).exists());
+    }
+
+    fn snapshot_entry(
+        path: &str,
+        kind: super::super::ViewEntryKind,
+        content: &[u8],
+    ) -> super::super::ViewEntry {
+        super::super::ViewEntry {
+            path: path.to_string(),
+            inode: 1,
+            kind,
+            mode: 0o755,
+            content: content.to_vec(),
+            hash: atomic_core::types::Hash::of(content),
+            conflict_marker_line: None,
+        }
+    }
+
+    #[test]
+    fn recorded_sandbox_rejects_traversal_and_metadata_paths() {
+        use super::super::ViewEntryKind;
+        let dir = tempdir().unwrap();
+        for path in [
+            "../escape",
+            "/absolute",
+            "a/../../escape",
+            "a/./file",
+            "a\\escape",
+            "C:/escape",
+            ".atomic/current_view",
+            ".atomic-sandbox",
+            ".git/config",
+        ] {
+            let entry = snapshot_entry(path, ViewEntryKind::File, b"unsafe");
+            assert!(
+                write_recorded_snapshot_entry(dir.path(), &entry).is_err(),
+                "{path}"
+            );
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_sandbox_preserves_recorded_mode_and_safe_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("repo");
+        let repo = Repository::init(&source).unwrap();
+        std::fs::write(source.join("tool"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(source.join("tool"), std::fs::Permissions::from_mode(0o751))
+            .unwrap();
+        record_path(&repo, "tool");
+        symlink("tool", source.join("link")).unwrap();
+        record_path(&repo, "link");
+        std::fs::set_permissions(source.join("tool"), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let dest = dir.path().join("review");
+
+        repo.provision_recorded_sandbox(&dest, "dev").unwrap();
+        assert_eq!(
+            std::fs::metadata(dest.join("tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+        assert!(std::fs::symlink_metadata(dest.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(dest.join("link")).unwrap(),
+            Path::new("tool")
+        );
+        assert_eq!(
+            std::fs::metadata(source.join("tool"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_link(source.join("link")).unwrap(),
+            Path::new("tool")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_sandbox_rejects_external_links_and_symlink_ancestors() {
+        use super::super::ViewEntryKind;
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        for target in ["../outside", "/etc/passwd", "dir/../../outside"] {
+            let entry = snapshot_entry("link", ViewEntryKind::Symlink, target.as_bytes());
+            assert!(write_recorded_snapshot_entry(dir.path(), &entry).is_err());
+            assert!(std::fs::symlink_metadata(dir.path().join("link")).is_err());
+        }
+        symlink(outside.path(), dir.path().join("ancestor")).unwrap();
+        let entry = snapshot_entry("ancestor/escape", ViewEntryKind::File, b"unsafe");
+        assert!(write_recorded_snapshot_entry(dir.path(), &entry).is_err());
+        assert!(!outside.path().join("escape").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_sandbox_refuses_recorded_external_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("repo");
+        let repo = Repository::init(&source).unwrap();
+        symlink("../private-secret", source.join("link")).unwrap();
+        record_path(&repo, "link");
+        let dest = dir.path().join("review");
+
+        let error = repo.provision_recorded_sandbox(&dest, "dev").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("external/parent symlinks are unsupported"));
+        assert!(
+            dest.is_dir(),
+            "partial output is retained, not recursively deleted"
+        );
+        assert!(!dest.join(SANDBOX_POINTER).exists());
+        assert_eq!(
+            std::fs::read_link(source.join("link")).unwrap(),
+            Path::new("../private-secret")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_sandbox_refuses_dangling_destination_symlink() {
+        let dir = tempdir().unwrap();
+        let repo = repo_with_recorded_file(&dir.path().join("repo"), "file", b"recorded");
+        let dest = dir.path().join("review");
+        let outside = dir.path().join("not-created");
+        std::os::unix::fs::symlink(&outside, &dest).unwrap();
+
+        assert!(repo.provision_recorded_sandbox(&dest, "dev").is_err());
+        assert_eq!(std::fs::read_link(&dest).unwrap(), outside);
+        assert!(!outside.exists());
     }
 
     #[test]

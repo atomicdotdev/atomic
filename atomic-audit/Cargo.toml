@@ -1,0 +1,21 @@
+[package]
+name = "atomic-audit"
+description = "Tool-neutral audit cards, manageability metrics and structural review checks"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+structural = ["dep:atomic-semantic", "dep:similar"]
+
+[dependencies]
+serde = { workspace = true }
+atomic-semantic = { workspace = true, optional = true }
+similar = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

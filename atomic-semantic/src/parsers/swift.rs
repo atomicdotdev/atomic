@@ -583,6 +583,7 @@ impl SwiftParser {
                             column: Some(node.start_position().column as u32),
                             context: None,
                             confidence: Confidence::High,
+                            call: None,
                         });
                     }
                 }
@@ -637,6 +638,10 @@ impl Default for SwiftParser {
 }
 
 impl LanguageParser for SwiftParser {
+    fn parse_tree(&mut self, source: &str) -> Option<tree_sitter::Tree> {
+        self.parser.parse(source, None)
+    }
+
     fn language(&self) -> Language {
         Language::Swift
     }
@@ -647,6 +652,15 @@ impl LanguageParser for SwiftParser {
             None => return vec![],
         };
 
+        self.extract_from_tree(&tree, source, file_path)
+    }
+
+    fn extract_from_tree(
+        &mut self,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        file_path: &str,
+    ) -> Vec<Entity> {
         let mut entities = Vec::new();
         self.walk_tree(&tree.root_node(), source, file_path, &mut entities, None);
         entities
@@ -657,6 +671,15 @@ impl LanguageParser for SwiftParser {
             Some(t) => t,
             None => return vec![],
         };
+        self.extract_references_from_tree(&tree, source, file_path)
+    }
+
+    fn extract_references_from_tree(
+        &mut self,
+        tree: &tree_sitter::Tree,
+        source: &str,
+        file_path: &str,
+    ) -> Vec<Reference> {
         let mut refs = Vec::new();
         self.walk_tree_for_calls(&tree.root_node(), source, file_path, &mut refs);
         refs

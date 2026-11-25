@@ -44,6 +44,8 @@ pub mod prov;
 #[cfg(feature = "dsse-export")]
 pub mod provenance_export;
 pub mod render;
+pub mod review_finding;
+pub mod review_graph;
 pub mod triage_ref;
 pub mod vocab;
 

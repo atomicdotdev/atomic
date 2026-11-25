@@ -82,15 +82,22 @@ pub(super) struct ReviewGateCache {
 }
 
 impl Repository {
-    /// Writers affecting review evidence participate in the common operation
-    /// boundary once retrospective artifacts exist. No feature means no bypass.
+    /// Writers affecting reviewable evidence participate even before the first
+    /// artifact exists. Otherwise a first publication can race a writer which
+    /// observed an empty artifact inventory and skipped the common boundary.
     pub(super) fn review_evidence_lock(
         &self,
     ) -> Result<Option<super::locks::RepositoryCommonLockGuard>, RepositoryError> {
-        if self.vault_list(PREFIX, None)?.is_empty() {
-            return Ok(None);
-        }
         self.review_evidence_common_lock().map(Some)
+    }
+
+    /// Hold the canonical evidence/operation boundary across final scope and
+    /// authority revalidation, authorization, signatures and receipt retention.
+    /// Does not lock an agent run or create a new view; contention is retryable.
+    pub fn lock_review_publication(
+        &self,
+    ) -> Result<super::locks::RepositoryCommonLockGuard, RepositoryError> {
+        self.review_evidence_common_lock()
     }
     /// Prepare a present-day review from fresh signed intents and exact original
     /// changes. This does not grant trust, sign, store, or publish anything.
@@ -337,7 +344,7 @@ impl Repository {
             )));
         }
         let existing = self.publication_reviews()?;
-        self.review_supersession(review, &existing, keys)?;
+        self.review_supersession(review, &existing, config, keys)?;
         let path = format!("{PREFIX}{}/review.md", review.artifact_hash());
         // Everything that can refuse the artifact itself runs before anything
         // is created for it on disk or in the vault.
@@ -475,9 +482,9 @@ impl Repository {
                     .ancestry
                     .entry(address.clone())
                     .or_insert_with(|| {
-                        self.verify_review_signature(review, keys)
+                        self.verify_review_signature(review, config, keys)
                             .and_then(|()| {
-                                self.review_supersession(review, &inventory.reviews, keys)
+                                self.review_supersession(review, &inventory.reviews, config, keys)
                             })
                             .map_err(|error| error.to_string())
                     })
@@ -509,11 +516,15 @@ impl Repository {
     fn verify_review_signature(
         &self,
         review: &PublicationReview,
+        config: &PublicationGateConfig,
         keys: DidKeyProvider<'_>,
     ) -> Result<(), RepositoryError> {
-        let public =
-            key(keys(&review.attributed_to)
-                .ok_or_else(|| refused("review signing key unavailable"))?)?;
+        let bytes = match keys(&review.attributed_to) {
+            Some(bytes) => bytes,
+            None => super::review_authorization::retained_public_key(self, review, config)?
+                .ok_or_else(|| refused("review signing key unavailable"))?,
+        };
+        let public = key(bytes)?;
         if !atomic_canonical::did::did_matches_public_key(&review.attributed_to, &public) {
             return Err(refused("review DID is not key-bound"));
         }
@@ -525,6 +536,7 @@ impl Repository {
         &self,
         review: &PublicationReview,
         all: &[PublicationReview],
+        config: &PublicationGateConfig,
         keys: DidKeyProvider<'_>,
     ) -> Result<std::collections::BTreeSet<String>, RepositoryError> {
         let mut visited = std::collections::BTreeSet::new();
@@ -543,7 +555,7 @@ impl Repository {
                 .iter()
                 .find(|old| old.artifact_hash() == hash)
                 .ok_or_else(|| refused("superseded review is unavailable"))?;
-            self.verify_review_signature(old, keys)?;
+            self.verify_review_signature(old, config, keys)?;
             let scope = |r: &PublicationReview| {
                 (
                     r.subject.project.clone(),

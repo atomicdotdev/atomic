@@ -131,6 +131,7 @@ mod revise;
 mod sandbox;
 mod semantic_closure;
 mod semantic_materialize;
+mod semantic_review;
 mod set_id;
 mod snapshot;
 mod snapshot_split;
@@ -139,6 +140,7 @@ mod staging;
 mod stash;
 mod switch;
 mod syntax_index;
+pub use semantic_review::RecordedSemanticView;
 mod synthesis;
 pub use syntax_index::{Caller, SyntaxIndex};
 mod tag_projection;
@@ -263,6 +265,7 @@ mod project_identity;
 pub mod provenance_gate;
 mod provenance_summary;
 pub mod publication_review;
+pub mod review_authorization;
 pub use project_identity::{
     build_project_identity, project_identity_hash, verify_project_identity, IdentityAdoption,
 };
