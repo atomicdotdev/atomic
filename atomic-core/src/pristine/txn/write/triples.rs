@@ -342,13 +342,13 @@ impl<'a> KgMutTxnT for WriteTxn<'a> {
             return Ok(());
         }
         if node.types.is_empty()
-            || node
-                .types
-                .iter()
-                .any(|iri| crate::kg::ontology::Class::from_iri(iri).is_none())
+            || node.types.iter().any(|iri| {
+                crate::kg::ontology::Class::from_iri(iri).is_none()
+                    && !crate::kg::iri::is_kind_class(iri)
+            })
         {
             return Err(PristineError::Serialization {
-                message: "node must have canonical asserted classes".into(),
+                message: "node must have canonical or extension asserted classes".into(),
             });
         }
         let old_types: Vec<String> = self

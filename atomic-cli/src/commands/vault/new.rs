@@ -322,6 +322,12 @@ impl New {
             if let Some(kg_id) = kg_id {
                 println!("  KG id: {kg_id}");
             }
+            // The instance is written and ingested but not recorded, so the
+            // view does not see it until the operator records it. See ADR 0001
+            // decision 4.
+            for line in record_hint(&rel, &format!("docs: add {} instance", self.kind)) {
+                println!("  {line}");
+            }
         }
         Ok(())
     }

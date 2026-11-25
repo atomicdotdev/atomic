@@ -638,11 +638,17 @@ fn reads_answer_on_a_repository_needing_a_kg_rebuild_and_change_nothing() {
         "feat: add adr kind",
         ".vault/kinds/adr/_kind.md",
     ]);
-    let intent = f.ok(&["intent", "new", "Sign changes"]);
-    let intent = intent
+    let intent_out = f.ok(&["intent", "new", "Sign changes"]);
+    let intent = intent_out
         .lines()
         .find_map(|line| line.strip_prefix("Created intent: "))
-        .unwrap();
+        .unwrap()
+        .to_string();
+    let intent_file = intent_out
+        .lines()
+        .find_map(|line| line.strip_prefix("  file: "))
+        .unwrap()
+        .to_string();
     fs::write(f.root().join("decision.md"), "We sign.\n").unwrap();
     let created: serde_json::Value = serde_json::from_str(&f.ok(&[
         "vault",
@@ -658,8 +664,12 @@ fn reads_answer_on_a_repository_needing_a_kg_rebuild_and_change_nothing() {
     ]))
     .unwrap();
     let instance = created["file"].as_str().unwrap();
+    // The kind's `intent` ref only resolves inside the view when the view
+    // tracks the intent it names, so the intent artifact is recorded here
+    // before the instance that references it (ADR 0001 decision 3).
+    f.ok(&["add", &intent_file]);
     f.ok(&["add", instance]);
-    f.ok(&["record", "-m", "docs: first adr", instance]);
+    f.ok(&["record", "-m", "docs: first adr", &intent_file, instance]);
 
     age_repository(f.root());
     let view = {

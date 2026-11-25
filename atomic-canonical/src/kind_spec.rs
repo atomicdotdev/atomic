@@ -70,6 +70,15 @@ pub const RESERVED_KIND_NAMES: &[&str] = &[
     "managedturn",
     "provenancegraph",
     "attestation",
+    "publicationreview",
+    "reviewevaluation",
+    "reviewevidence",
+    "reviewfinding",
+    "reviewsubject",
+    "intentobservation",
+    "criterionjudgment",
+    "verificationrecord",
+    "signingkey",
     "finding",
     "change",
     "view",
@@ -2384,6 +2393,10 @@ mod tests {
         }
         let unique: BTreeSet<_> = RESERVED_KIND_NAMES.iter().collect();
         assert_eq!(unique.len(), RESERVED_KIND_NAMES.len(), "duplicates");
+        // Every workflow ontology class's normalized local name, plus the five
+        // names no class has (`intent`, `kind`, `kinds`, `urn`, `did`). The
+        // cross-crate test in `atomic-repository/tests/it/kg_kinds.rs` keeps
+        // this list equal to the ontology as classes are added.
         assert_eq!(RESERVED_KIND_NAMES.len(), 42);
     }
 

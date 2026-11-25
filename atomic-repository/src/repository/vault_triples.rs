@@ -63,7 +63,7 @@ impl Repository {
         Ok(())
     }
 
-    fn vault_projection(&self) -> Result<VaultProjection, RepositoryError> {
+    pub(crate) fn vault_projection(&self) -> Result<VaultProjection, RepositoryError> {
         self.ensure_project_identity(MintReason::Upgrade)?;
         let hashes = self
             .change_store

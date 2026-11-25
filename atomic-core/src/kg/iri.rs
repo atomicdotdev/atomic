@@ -120,6 +120,26 @@ named!(mint_file, parse_file, "file", true);
 named!(mint_session, parse_session, "session", false);
 named!(mint_named_identity, parse_named_identity, "identity", false);
 
+/// The project-scoped extension class of a custom kind's instances:
+/// `urn:atomic:project:<pid>:kind:<kind>`.
+///
+/// Custom kinds are the only non-workflow classes the knowledge graph accepts;
+/// see `docs/adr/0001-kind-kg-conformance.md`.
+pub fn mint_kind_class(project: &ProjectId, kind: &str) -> String {
+    qualified(project, "kind", kind, false)
+}
+
+/// Parse a project-scoped extension class IRI.
+pub fn parse_kind_class(iri: &str) -> Result<(ProjectId, String), IriError> {
+    let (project, kind) = parse_qualified(iri, "kind")?;
+    Ok((project, decode(kind, false)?))
+}
+
+/// Whether `iri` is a project-scoped extension class IRI.
+pub fn is_kind_class(iri: &str) -> bool {
+    parse_kind_class(iri).is_ok()
+}
+
 pub fn mint_identity(project: &ProjectId, name_or_did: &str) -> String {
     if name_or_did.starts_with("did:atomic:") {
         name_or_did.to_owned()
@@ -254,4 +274,30 @@ pub fn parse_finding(iri: &str) -> Result<(ProjectId, String, Hash), IriError> {
         .map(crate::types::Merkle)
         .map_err(|_| IriError(iri.into()))?;
     Ok((project, decode(code, false)?, hash))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_class_round_trips_and_is_recognized() {
+        let project = ProjectId::generate();
+        let class = mint_kind_class(&project, "adr");
+        assert!(is_kind_class(&class));
+        let (parsed, kind) = parse_kind_class(&class).expect("kind class parses");
+        assert_eq!(parsed, project);
+        assert_eq!(kind, "adr");
+    }
+
+    #[test]
+    fn kind_class_rejects_non_kind_iris() {
+        let project = ProjectId::generate();
+        assert!(!is_kind_class("https://atomic.dev/ns/workflow#Concept"));
+        assert!(!is_kind_class(&mint_concept(
+            &project,
+            "adr.01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        )));
+        assert!(!is_kind_class(&mint_intent(&project, "01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap()));
+    }
 }

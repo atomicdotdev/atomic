@@ -406,6 +406,47 @@ fn recording_evidence_never_fans_out_from_shared_files_or_other_projects() {
 }
 
 #[test]
+fn custom_kind_reference_keeps_its_extension_class_in_the_graph_json() {
+    let (mut snapshot, root, _, _, _) = fixture();
+    let project = ProjectId::from_base32(&"A".repeat(52)).unwrap();
+    let kind_class = iri::mint_kind_class(&project, "adr");
+    let kind_id = iri::mint_concept(&project, "adr.01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    let mut node = KgNode::new(&kind_id, C::Concept, "Decision", "vault");
+    node.types.push(kind_class.clone());
+    node.types.sort();
+    snapshot.nodes.push(node);
+    snapshot
+        .edges
+        .push(KgEdge::new(&kind_id, &root, P::References));
+
+    let graph = IntentGraph::from_snapshot(&snapshot, &root, 100).unwrap();
+    let kind = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == kind_id)
+        .expect("custom kind node is selected");
+    assert!(
+        kind.types.iter().any(|t| t == &kind_class),
+        "custom kind class missing from the selected node"
+    );
+    let json = serde_json::to_value(&graph).unwrap();
+    let json_kind = json["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["id"].as_str() == Some(kind_id.as_str()))
+        .expect("custom kind node is serialized");
+    assert!(
+        json_kind["types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t.as_str() == Some(kind_class.as_str())),
+        "custom kind class missing from the serialized graph"
+    );
+}
+
+#[test]
 fn recording_evidence_limits_are_deterministic_and_primary_changes_are_not_dependency_only() {
     let (mut snapshot, root, change, dependency, _, artifact) = recording_fixture();
     snapshot

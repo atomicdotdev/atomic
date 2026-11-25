@@ -471,6 +471,61 @@ impl Repository {
         Ok(KindFiles { repo: self, inner })
     }
 
+    /// Project the kind rows of `source` to KG nodes and edges without reading
+    /// the ambient projection.
+    ///
+    /// The SHACL gate validates the rows the source actually has — a working
+    /// copy that has not been ingested, or a view whose rows are not the last
+    /// deflate — so it cannot rely on the ambient projection being current.
+    /// The ambient projection still supplies non-kind rows (intents, memories)
+    /// so a kind's refs resolve to the same IRIs a query would see.
+    ///
+    /// See ADR 0001 decision 2.
+    pub fn kind_kg_graph(
+        &self,
+        source: &KindSource,
+        only: Option<&str>,
+    ) -> Result<(Vec<atomic_core::KgNode>, Vec<atomic_core::KgEdge>), RepositoryError> {
+        let files = self.kind_files(source)?;
+        let registry = self.kind_registry_for(&files)?;
+        let mut projection = self.vault_projection()?;
+        let mut rows: Vec<(String, atomic_core::pristine::VaultEntry)> = Vec::new();
+        for entry in registry.kinds() {
+            if only.is_some_and(|name| name != entry.name()) {
+                continue;
+            }
+            let mut paths = Vec::with_capacity(1 + entry.instances.len());
+            paths.push(entry.definition.def_path.clone());
+            paths.extend(entry.instances.iter().cloned());
+            for path in paths {
+                let Some(bytes) = files.read(&path)? else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&bytes);
+                let (frontmatter_json, body) =
+                    super::vault_frontmatter::parse_vault_frontmatter_at(Some(&path), &text);
+                rows.push((
+                    path,
+                    atomic_core::pristine::VaultEntry::new(
+                        atomic_core::pristine::VaultEntryType::Scratch,
+                        body.into_bytes(),
+                        frontmatter_json,
+                        String::new(),
+                    ),
+                ));
+            }
+        }
+        projection.add_rows(&rows);
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for (path, entry) in &rows {
+            let graph = projection.extract(path, entry)?;
+            nodes.extend(graph.nodes);
+            edges.extend(graph.edges);
+        }
+        Ok((nodes, edges))
+    }
+
     /// The kind registry of `source`.
     ///
     /// A view's registry is cached by the view's state (its Merkle combined

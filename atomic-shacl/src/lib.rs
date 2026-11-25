@@ -11,6 +11,9 @@ pub const ENGINE_VERSION: &str = purrdf_shapes::VERSION;
 mod adapter;
 pub use adapter::snapshot_ntriples;
 
+/// Generate SHACL shapes from recorded custom-kind specs. See ADR 0001.
+pub mod kind_shapes;
+
 use purrdf_shapes::{
     engine, report::ValidationResult, shapes::Path as ShapePath, term::Term, ShapesImports,
 };
@@ -40,6 +43,8 @@ pub enum Profile {
     Projection,
     Publication,
     Review,
+    /// Validate custom vault kinds against generated shapes.
+    Kind,
 }
 
 #[derive(Clone, Debug)]

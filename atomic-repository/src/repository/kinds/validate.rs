@@ -38,10 +38,9 @@ use crate::RepositoryError;
 /// The resolved value is an opaque id: the gate only needs to know a ref
 /// resolves, and it is not a KG subject.
 ///
-/// Intent resolution always reads the redb vault index, because intents are
-/// addressed by keys only the manifest maps to paths. Against a view source
-/// an intent ref therefore resolves when the intent exists anywhere in the
-/// repository, even if the view does not track it.
+/// Intent resolution goes through the source's own file set. Against a view
+/// source an intent ref therefore resolves only when the view tracks the
+/// intent, matching the view's effective filter. See ADR 0001 decision 3.
 pub struct KindRefResolver<'a, 'r> {
     files: &'a KindFiles<'r>,
     /// Whether each custom target kind is registered, looked up once.
@@ -76,7 +75,13 @@ impl<'a, 'r> KindRefResolver<'a, 'r> {
 impl RefResolver for KindRefResolver<'_, '_> {
     fn resolve(&self, target_kind: &str, raw: &str) -> Option<String> {
         match target_kind {
-            "intent" => self.files.repository().intent_path_strict(raw),
+            "intent" => {
+                // Resolve through the source's own file set: a view may only
+                // reference an intent it actually tracks. This keeps the gate
+                // closed under the view's effective filter.
+                let path = self.files.repository().intent_path_strict(raw)?;
+                self.files.exists(&path).then_some(path)
+            }
             "memory" => {
                 let name_ok = !raw.is_empty()
                     && !raw.contains('\\')
