@@ -1006,11 +1006,19 @@ fn main() {
     remote_sandbox::install_link();
     if let Some((root, pointer)) = remote_sandbox::current() {
         let name = matches.subcommand_name().unwrap_or_default();
-        if !remote_sandbox::command_allowed(name) {
+        let subcommand = matches
+            .subcommand()
+            .and_then(|(_, sub)| sub.subcommand_name());
+        if !remote_sandbox::command_allowed(name, subcommand) {
+            // Name the subcommand too when it alone is what is refused.
+            let verb = match subcommand {
+                Some(sub) if remote_sandbox::command_allowed(name, None) => format!("{name} {sub}"),
+                _ => name.to_string(),
+            };
             let err = remote_sandbox::refusal(
                 &root,
                 &format!(
-                    "`atomic {name}` needs the repository itself; this sandbox reaches only \
+                    "`atomic {verb}` needs the repository itself; this sandbox reaches only \
                      view '{}' through its grant",
                     pointer.view
                 ),

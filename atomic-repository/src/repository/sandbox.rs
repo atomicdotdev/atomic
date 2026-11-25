@@ -351,6 +351,7 @@ impl Repository {
             change_store,
             is_sandbox: true,
             semantic_closure_memo: Default::default(),
+            kind_registry_cache: Default::default(),
         })
     }
 
