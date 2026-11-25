@@ -369,7 +369,13 @@ fn rust_import(
         }
         "use_wildcard" => {}
         _ => {
-            let argument = node.child_by_field_name("path").unwrap_or(node);
+            // A scoped_identifier's `path` is only its prefix; unwrapping it
+            // drops the imported symbol. Only an alias wraps a complete path.
+            let argument = if node.kind() == "use_as_clause" {
+                node.child_by_field_name("path").unwrap_or(node)
+            } else {
+                node
+            };
             let Some(target) = qualified_path(text(argument, source), "::") else {
                 return;
             };

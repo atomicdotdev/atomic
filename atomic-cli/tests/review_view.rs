@@ -65,6 +65,7 @@ fn document(html: &str) -> Value {
 #[test]
 fn named_view_audits_live_snapshot_once_without_switching_or_reading_dirty_bytes() {
     let directory = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
     let outside = tempfile::tempdir().unwrap();
     let mut repo = Repository::init(directory.path()).unwrap();
     repo.init_vault().unwrap();

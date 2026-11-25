@@ -1,6 +1,83 @@
 use crate::{relationships::SourceGraph, ParserRegistry, Reference};
 
 #[test]
+fn rust_module_candidates_use_repository_separators_on_every_host() {
+    use crate::relationships::module_candidates;
+    assert_eq!(
+        module_candidates("src/main.rs", &["foundation".into()]),
+        ["src/foundation.rs", "src/foundation/mod.rs",]
+    );
+    assert_eq!(
+        module_candidates("src/service.rs", &["inner".into()]),
+        ["src/service/inner.rs", "src/service/inner/mod.rs",]
+    );
+}
+
+#[test]
+fn rust_imports_keep_terminal_symbols_in_plain_grouped_and_aliased_paths() {
+    let source = "use crate::foundation::foundation;\nuse crate::foundation::foundation as aliased;\nuse crate::foundation::{foundation as grouped, helper};\nuse crate::{foundation::foundation as nested, service::service};\n";
+    let mut parser = ParserRegistry::new();
+    let file = parser.analyze_source("src/service.rs", source).unwrap();
+    let imports: Vec<_> = file
+        .imports
+        .iter()
+        .map(|import| (import.local.as_str(), import.target.join("::")))
+        .collect();
+    assert_eq!(
+        imports,
+        vec![
+            ("foundation", "crate::foundation::foundation".into()),
+            ("aliased", "crate::foundation::foundation".into()),
+            ("grouped", "crate::foundation::foundation".into()),
+            ("helper", "crate::foundation::helper".into()),
+            ("nested", "crate::foundation::foundation".into()),
+            ("service", "crate::service::service".into()),
+        ]
+    );
+}
+
+#[test]
+fn rust_imported_calls_bind_through_the_declared_module_chain() {
+    for (import, call) in [
+        ("use crate::foundation::foundation;", "foundation"),
+        ("use crate::foundation::foundation as base;", "base"),
+        ("use crate::foundation::{foundation};", "foundation"),
+        ("use crate::{foundation::foundation};", "foundation"),
+        ("use crate::foundation::{foundation as base};", "base"),
+    ] {
+        let sources = [
+            ("src/foundation.rs", "pub fn foundation() -> u32 { 1 }".to_owned()),
+            ("src/service.rs", format!("{import}\npub fn service() -> u32 {{ {call}() }}")),
+            ("src/main.rs", "mod foundation; mod service; fn main() { service::service(); crate::missing::foundation(); }".to_owned()),
+        ];
+        let mut parser = ParserRegistry::new();
+        let files = sources
+            .iter()
+            .map(|(path, source)| parser.analyze_source(path, source).unwrap())
+            .collect();
+        let graph = SourceGraph::new(
+            files,
+            sources.iter().map(|(path, _)| (*path).to_owned()),
+            true,
+        );
+        let calls = graph.bind_calls(None);
+        let bindings: std::collections::BTreeSet<_> = calls
+            .iter()
+            .map(|call| (call.call.caller.as_str(), call.symbol.id.as_str()))
+            .collect();
+        assert_eq!(
+            bindings,
+            std::collections::BTreeSet::from([
+                ("src/service.rs#service", "src/foundation.rs#foundation"),
+                ("src/main.rs#main", "src/service.rs#service"),
+            ]),
+            "{import}"
+        );
+        assert!(calls.iter().all(|call| call.present && call.accessible));
+    }
+}
+
+#[test]
 fn shared_entity_and_reference_apis_keep_qualified_targets_and_owners() {
     let source = "struct Reader; impl Reader { fn value(&self, x:i32) {} fn run(&self) { self.value(1); } } fn value(x:i32) {} fn consumer(reader:&Reader) { reader.value(2); value(3); module::value(4); }";
     let mut parser = ParserRegistry::new();

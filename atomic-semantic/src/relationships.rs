@@ -53,10 +53,14 @@ pub fn module_candidates(file: &str, scope: &[String]) -> Vec<String> {
     for name in scope {
         base.push(name);
     }
-    vec![
-        base.with_extension("rs").to_string_lossy().into_owned(),
-        base.join("mod.rs").to_string_lossy().into_owned(),
-    ]
+    // Source inventories use repository-relative '/' paths on every host.
+    [base.with_extension("rs"), base.join("mod.rs")]
+        .into_iter()
+        .map(|path| {
+            path.to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/")
+        })
+        .collect()
 }
 
 /// Standard explicit relative script import candidates. Full source inventory is
