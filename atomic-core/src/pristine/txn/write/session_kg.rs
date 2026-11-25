@@ -8,7 +8,7 @@ use crate::kg::{
     ontology::{Class, Predicate},
     project_id::ProjectId,
 };
-use crate::pristine::vault::{KgEdge, KgNode};
+use crate::pristine::vault::{KgEdge, KgNode, VaultManifest};
 use crate::pristine::{
     GraphTxnT, KgMutTxnT, KgTxnT, PristineError, PristineResult, VaultTxnT, ViewTxnT,
 };
@@ -28,14 +28,18 @@ impl WriteTxn<'_> {
     /// Resolve a plan through authoritative manifest identity; a raw label is
     /// insufficient evidence to invent a canonical intent resource.
     pub fn kg_intent_id(&self, raw: &str) -> PristineResult<Option<String>> {
+        Ok(self.kg_intent_id_in(&self.get_vault_manifest()?, raw))
+    }
+
+    /// [`Self::kg_intent_id`] against a manifest the caller holds.
+    fn kg_intent_id_in(&self, manifest: &VaultManifest, raw: &str) -> Option<String> {
         let raw = raw.strip_prefix("urn:atomic:intent:").unwrap_or(raw);
-        let manifest = self.get_vault_manifest()?;
         let summary = manifest.intents.iter().find(|(key, summary)| {
             key.eq_ignore_ascii_case(raw) || summary.uid.eq_ignore_ascii_case(raw)
         });
-        Ok(summary.and_then(|(_, summary)| {
+        summary.and_then(|(_, summary)| {
             iri::mint_intent(&self.kg_project().ok()?, &summary.uid.to_uppercase()).ok()
-        }))
+        })
     }
 
     pub fn kg_finding(&mut self, code: &str, subject: &str, message: &str) -> PristineResult<()> {
@@ -215,6 +219,7 @@ impl WriteTxn<'_> {
         record: &SessionRecord,
         turn: &SessionTurn,
         previous: Option<u32>,
+        manifest: Option<&VaultManifest>,
     ) -> PristineResult<()> {
         if !self.kg_writes_enabled()? {
             return Ok(());
@@ -286,7 +291,10 @@ impl WriteTxn<'_> {
             self.upsert_kg_edge(&edge(&id, &provenance, Predicate::TurnExplainedBy))?;
         }
         let plan = match turn.plan_id.as_deref() {
-            Some(raw) => self.kg_intent_id(raw)?,
+            Some(raw) => match manifest {
+                Some(manifest) => self.kg_intent_id_in(manifest, raw),
+                None => self.kg_intent_id(raw)?,
+            },
             None => None,
         };
         if let Some(plan) = &plan {
@@ -380,6 +388,18 @@ impl WriteTxn<'_> {
         record: &SessionRecord,
         turns: &[SessionTurn],
     ) -> PristineResult<()> {
+        self.project_session_kg_with(record, turns, None)
+    }
+
+    /// [`Self::project_session_kg`], resolving each turn's governing intent
+    /// through `manifest` instead of the stored vault manifest when one is
+    /// given.
+    pub fn project_session_kg_with(
+        &mut self,
+        record: &SessionRecord,
+        turns: &[SessionTurn],
+        manifest: Option<&VaultManifest>,
+    ) -> PristineResult<()> {
         if !self.kg_writes_enabled()? {
             return Ok(());
         }
@@ -394,6 +414,7 @@ impl WriteTxn<'_> {
                 turn,
                 turn.previous_provenance
                     .and_then(|hash| numbers.get(&hash).copied()),
+                manifest,
             )?;
         }
         let lineage = {

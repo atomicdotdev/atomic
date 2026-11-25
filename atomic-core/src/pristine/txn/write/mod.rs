@@ -493,7 +493,7 @@ impl<'a> WriteTxn<'a> {
                 .map(|existing| existing.turn_number)
                 .or_else(|| (hash == turn.provenance_hash).then_some(turn.turn_number))
         });
-        self.emit_turn_kg(&record, &turn, previous_turn_number)
+        self.emit_turn_kg(&record, &turn, previous_turn_number, None)
     }
 
     fn index_session_turn_candidate(
@@ -610,7 +610,7 @@ impl<'a> WriteTxn<'a> {
             let previous_turn_number = turn
                 .previous_provenance
                 .and_then(|hash| turn_numbers.get(&hash).copied());
-            self.emit_turn_kg(&record, turn, previous_turn_number)?;
+            self.emit_turn_kg(&record, turn, previous_turn_number, None)?;
         }
         for edge in preserved_edges {
             self.upsert_kg_edge(&edge)?;

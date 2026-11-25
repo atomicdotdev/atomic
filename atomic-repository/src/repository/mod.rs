@@ -315,6 +315,7 @@ pub use synthesis::{
 };
 pub use tags::{deserialize_tag, serialize_tag};
 pub use triage::{BaggageEntry, CandidateSet, Coverage};
+pub use vault::vault_entry_for_file;
 pub use vault_embeddings::{hash_embed, EmbedConfig, TextChunk};
 pub use vault_goal::{
     GoalInfo, GoalStartOptions, GoalStartResult, GoalStopOptions, GoalStopResult,
