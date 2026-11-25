@@ -13,6 +13,7 @@ use atomic_core::{
 use atomic_identity::{Identity, KeyPair};
 use serde_json::json;
 mod boundaries;
+mod gate;
 mod observations;
 mod snapshot;
 

@@ -15,6 +15,8 @@ use super::provenance_gate::{DidKeyProvider, PublicationGateConfig};
 use super::{Repository, RepositoryError};
 use atomic_canonical::publication_review::{PublicationReview, SCHEMA};
 use atomic_core::types::{Base32, Hash};
+#[cfg(feature = "review-shacl")]
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const PREFIX: &str = "publication-reviews/";
 
@@ -40,6 +42,28 @@ pub fn profile_hash() -> String {
     #[cfg(not(feature = "review-shacl"))]
     hash.update(b"unavailable-validator");
     hash.finalize().to_hex().to_string()
+}
+
+/// Stored reviews and, at the same index, their content addresses.
+struct ReviewInventory {
+    reviews: Vec<PublicationReview>,
+    addresses: Vec<String>,
+}
+
+/// What one gate evaluation has already resolved about the stored reviews.
+/// None of it depends on which covered change asks, so the inventory is read
+/// once and each review is authenticated and validated at most once. A failure
+/// is kept as the text the gate reports and repeated for every change it
+/// affects.
+#[derive(Default)]
+pub(super) struct ReviewGateCache {
+    inventory: Option<Result<ReviewInventory, String>>,
+    /// Per review address: its signature holds and these reviews precede it.
+    #[cfg(feature = "review-shacl")]
+    ancestry: BTreeMap<String, Result<BTreeSet<String>, String>>,
+    /// Per review address: whether it conforms, and its violation count.
+    #[cfg(feature = "review-shacl")]
+    validation: BTreeMap<String, Result<(bool, usize), String>>,
 }
 
 impl Repository {
@@ -330,7 +354,14 @@ impl Repository {
     /// Strictly inspect stored artifacts. Corruption cannot disappear behind a
     /// best-effort filter. Stale approvals are retained and refused, not erased.
     pub fn publication_reviews(&self) -> Result<Vec<PublicationReview>, RepositoryError> {
+        Ok(self.review_inventory()?.reviews)
+    }
+
+    /// The inventory together with each review's content address, which is
+    /// derived while checking where the review is stored.
+    fn review_inventory(&self) -> Result<ReviewInventory, RepositoryError> {
         let mut reviews = Vec::new();
+        let mut addresses = Vec::new();
         for entry in self.vault_list(PREFIX, None)? {
             if reviews.len() >= 4096 {
                 return Err(refused("review inventory exceeds 4096 artifacts"));
@@ -339,29 +370,40 @@ impl Repository {
                 .vault_retrieve(&entry.path)?
                 .ok_or_else(|| refused("registered review unavailable"))?;
             let review = PublicationReview::parse(&stored.content_bytes).map_err(refused)?;
-            if entry.path != format!("{PREFIX}{}/review.md", review.artifact_hash()) {
+            let address = review.artifact_hash();
+            if entry.path != format!("{PREFIX}{address}/review.md") {
                 return Err(refused(
                     "stored artifact address does not match signed bytes",
                 ));
             }
             reviews.push(review);
+            addresses.push(address);
         }
-        Ok(reviews)
+        Ok(ReviewInventory { reviews, addresses })
     }
 
+    /// The stored review that discharges this change's missing attestation,
+    /// if one does. An error is the limitation the gate reports for the change.
     pub(super) fn retrospective_review_for(
         &self,
         change: &str,
         session: &str,
         config: &PublicationGateConfig,
         keys: Option<DidKeyProvider<'_>>,
-    ) -> Result<Option<String>, RepositoryError> {
-        #[allow(unused_mut)]
-        let mut accepted = None;
-        let reviews = self.publication_reviews()?;
-        let relevant: Vec<_> = reviews
+        resolved: &mut ReviewGateCache,
+    ) -> Result<Option<String>, String> {
+        let inventory = match resolved
+            .inventory
+            .get_or_insert_with(|| self.review_inventory().map_err(|error| error.to_string()))
+        {
+            Ok(inventory) => &*inventory,
+            Err(error) => return Err(error.clone()),
+        };
+        let relevant: Vec<_> = inventory
+            .reviews
             .iter()
-            .filter(|review| {
+            .zip(&inventory.addresses)
+            .filter(|(review, _)| {
                 review
                     .subject
                     .changes
@@ -369,57 +411,68 @@ impl Repository {
                     .any(|pin| pin.hash == change && pin.session.as_deref() == Some(session))
             })
             .collect();
+        #[cfg(not(feature = "review-shacl"))]
+        {
+            let _ = (config, keys);
+            if relevant.is_empty() {
+                return Ok(None);
+            }
+            Err(
+                refused("review-shacl feature is required to evaluate retrospective evidence")
+                    .to_string(),
+            )
+        }
         #[cfg(feature = "review-shacl")]
-        let mut superseded = std::collections::BTreeSet::new();
-        #[cfg(feature = "review-shacl")]
-        for review in &relevant {
-            let keys = keys.ok_or_else(|| refused("review key resolver unavailable"))?;
-            self.verify_review_signature(review, keys)?;
-            // A renewal cannot suppress signature corruption, even in old rows.
-            let ancestors = self.review_supersession(review, &reviews, keys)?;
-            if !review.supersedes.is_empty() {
-                let report = self.validate_publication_review(review, config, keys)?;
-                if report.conforms {
-                    superseded.extend(ancestors);
+        {
+            let resolver =
+                || keys.ok_or_else(|| refused("review key resolver unavailable").to_string());
+            let mut validated = |review: &PublicationReview, address: &String, keys| {
+                resolved
+                    .validation
+                    .entry(address.clone())
+                    .or_insert_with(|| {
+                        self.validate_publication_review(review, config, keys)
+                            .map(|report| (report.conforms, report.results.len()))
+                            .map_err(|error| error.to_string())
+                    })
+                    .clone()
+            };
+            let mut superseded = BTreeSet::new();
+            for &(review, address) in &relevant {
+                let keys = resolver()?;
+                // A renewal cannot suppress signature corruption, even in old rows.
+                let ancestors = resolved
+                    .ancestry
+                    .entry(address.clone())
+                    .or_insert_with(|| {
+                        self.verify_review_signature(review, keys)
+                            .and_then(|()| {
+                                self.review_supersession(review, &inventory.reviews, keys)
+                            })
+                            .map_err(|error| error.to_string())
+                    })
+                    .as_ref()
+                    .map_err(String::clone)?;
+                if !review.supersedes.is_empty() && validated(review, address, keys)?.0 {
+                    superseded.extend(ancestors.iter().cloned());
                 }
             }
-        }
-        for review in relevant {
-            if !review
-                .subject
-                .changes
-                .iter()
-                .any(|pin| pin.hash == change && pin.session.as_deref() == Some(session))
-            {
-                continue;
-            }
-            #[cfg(not(feature = "review-shacl"))]
-            {
-                let _ = (config, keys);
-                return Err(refused(
-                    "review-shacl feature is required to evaluate retrospective evidence",
-                ));
-            }
-            #[cfg(feature = "review-shacl")]
-            {
-                if superseded.contains(&review.artifact_hash()) {
+            let mut accepted = None;
+            for (review, address) in relevant {
+                if superseded.contains(address) {
                     continue;
                 }
-                let report = self.validate_publication_review(
-                    review,
-                    config,
-                    keys.ok_or_else(|| refused("review key resolver unavailable"))?,
-                )?;
-                if !report.conforms {
+                let (conforms, violations) = validated(review, address, resolver()?)?;
+                if !conforms {
                     return Err(refused(format!(
-                        "stored review fails SHACL ({} violations)",
-                        report.results.len()
-                    )));
+                        "stored review fails SHACL ({violations} violations)"
+                    ))
+                    .to_string());
                 }
-                accepted = Some(review.artifact_hash());
+                accepted = Some(address.clone());
             }
+            Ok(accepted)
         }
-        Ok(accepted)
     }
 
     #[cfg(feature = "review-shacl")]
@@ -577,7 +630,13 @@ mod unsupported {
             trust: Default::default(),
             repository_identity: None,
         };
-        let result = repo.retrospective_review_for(&change, "legacy", &config, None);
+        let result = repo.retrospective_review_for(
+            &change,
+            "legacy",
+            &config,
+            None,
+            &mut ReviewGateCache::default(),
+        );
         assert!(repo
             .workflow_snapshot_with_review(&serde_json::to_vec(&review).unwrap())
             .unwrap_err()
@@ -585,7 +644,6 @@ mod unsupported {
             .contains("review-shacl feature is required"));
         assert!(result
             .unwrap_err()
-            .to_string()
             .contains("review-shacl feature is required"));
     }
 }
