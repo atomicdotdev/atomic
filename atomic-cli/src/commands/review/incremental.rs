@@ -1176,6 +1176,22 @@ mod tests {
         (dir, repo)
     }
 
+    // Windows enforces redb's byte-range locks on ordinary file reads too.
+    // Snapshot only while closed, then exercise the real read-only open path.
+    fn readonly_snapshot(repo: Repository) -> (Repository, Vec<u8>) {
+        let root = repo.root().to_path_buf();
+        let database = repo.dot_dir().join("atomic.redb");
+        drop(repo);
+        let before = std::fs::read(database).unwrap();
+        (Repository::open_readonly(root).unwrap(), before)
+    }
+
+    fn assert_database_unchanged(repo: Repository, before: Vec<u8>) {
+        let database = repo.dot_dir().join("atomic.redb");
+        drop(repo);
+        assert_eq!(before, std::fs::read(database).unwrap());
+    }
+
     fn record(repo: &Repository, content: &str) -> Hash {
         record_path(repo, "subject.txt", content)
     }
@@ -1353,9 +1369,9 @@ mod tests {
                 finding,
             }],
         );
-        let database_before = std::fs::read(repo.dot_dir().join("atomic.redb")).unwrap();
         let source_before =
             bridge::source_content_hash(&bridge::read_intent(&repo, &intent.id).unwrap());
+        let (repo, database_before) = readonly_snapshot(repo);
         let reviewed = inspect(
             &repo,
             IncrementalArgs {
@@ -1408,10 +1424,7 @@ mod tests {
             source_before,
             bridge::source_content_hash(&bridge::read_intent(&repo, &intent.id).unwrap())
         );
-        assert_eq!(
-            database_before,
-            std::fs::read(repo.dot_dir().join("atomic.redb")).unwrap()
-        );
+        assert_database_unchanged(repo, database_before);
     }
 
     #[test]
@@ -1697,7 +1710,7 @@ mod tests {
             "export function later() { return 0; }\n",
         );
         std::fs::write(repo.root().join("src/user.ts"), "function dirty() {}\n").unwrap();
-        let database_before = std::fs::read(repo.dot_dir().join("atomic.redb")).unwrap();
+        let (repo, database_before) = readonly_snapshot(repo);
         let report = inspect(
             &repo,
             IncrementalArgs {
@@ -1742,10 +1755,7 @@ mod tests {
         let text = super::super::graph::render(graph);
         assert!(text.contains("Risk: High") && text.contains("1 current bound caller(s)"));
         assert!(text.contains("F1") && text.contains("1 incompatible after-contract(s)"));
-        assert_eq!(
-            database_before,
-            std::fs::read(repo.dot_dir().join("atomic.redb")).unwrap()
-        );
+        assert_database_unchanged(repo, database_before);
     }
 
     #[test]
@@ -2052,7 +2062,7 @@ mod tests {
             "evidence": [{"kind": "source", "reference": "src/api.ts:1", "observation": "Selected function returns a constant; caller and export inspection found no incompatible consumers in scoped recorded context"}],
         });
         std::fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
-        let database_before = std::fs::read(repo.dot_dir().join("atomic.redb")).unwrap();
+        let (repo, database_before) = readonly_snapshot(repo);
         let reviewed = inspect(
             &repo,
             IncrementalArgs {
@@ -2073,10 +2083,6 @@ mod tests {
         );
         assert!(graph.findings.is_empty());
         assert!(super::super::graph::render(graph).contains("Risk: Low"));
-        assert_eq!(
-            database_before,
-            std::fs::read(repo.dot_dir().join("atomic.redb")).unwrap()
-        );
         input["scope"]["view_state"] = json!("stale");
         std::fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
         assert!(inspect(
@@ -2087,6 +2093,7 @@ mod tests {
             }
         )
         .is_err());
+        assert_database_unchanged(repo, database_before);
     }
 
     #[derive(Parser)]
@@ -2165,7 +2172,7 @@ mod tests {
             },
         )
         .unwrap();
-        let before = std::fs::read(repo.dot_dir().join("atomic.redb")).unwrap();
+        let (repo, before) = readonly_snapshot(repo);
         let archive_only = "selected patch archive probe ".repeat(20_000);
         report.changes[0].recorded_patch["archive_only_probe"] =
             json!({"payload":&archive_only,"id":u64::MAX});
@@ -2231,10 +2238,7 @@ mod tests {
                 .collect()
         );
         assert!(projected.iter().any(|region| region.findings.contains(&1)));
-        assert_eq!(
-            before,
-            std::fs::read(repo.dot_dir().join("atomic.redb")).unwrap()
-        );
+        assert_database_unchanged(repo, before);
     }
 
     #[test]
@@ -2299,7 +2303,7 @@ mod tests {
             "export class Dirty {}\n",
         )
         .unwrap();
-        let database_before = std::fs::read(repo.dot_dir().join("atomic.redb")).unwrap();
+        let (repo, database_before) = readonly_snapshot(repo);
         let report = inspect(
             &repo,
             IncrementalArgs {
@@ -2396,10 +2400,7 @@ mod tests {
             .subject
             .contains("Later")
             || record.observation.subject.contains("Dirty")));
-        assert_eq!(
-            database_before,
-            std::fs::read(repo.dot_dir().join("atomic.redb")).unwrap()
-        );
+        assert_database_unchanged(repo, database_before);
     }
 
     #[test]
@@ -3169,12 +3170,9 @@ fn large(x:i32) {
 
     #[test]
     fn inspection_reopened_readonly_does_not_change_database_or_create_session_store() {
-        let (dir, repo) = fixture();
+        let (_dir, repo) = fixture();
         let hash = record(&repo, "stable\n");
-        let database = repo.dot_dir().join("atomic.redb");
-        drop(repo);
-        let before = std::fs::read(&database).unwrap();
-        let repo = Repository::open_readonly(dir.path()).unwrap();
+        let (repo, before) = readonly_snapshot(repo);
         let args = IncrementalArgs {
             change: Some(hash.to_base32()),
             ..Default::default()
@@ -3182,7 +3180,7 @@ fn large(x:i32) {
         let first = encode(&inspect(&repo, args.clone()).unwrap()).unwrap();
         let second = encode(&inspect(&repo, args).unwrap()).unwrap();
         assert_eq!(first, second);
-        assert_eq!(before, std::fs::read(&database).unwrap());
         assert!(!repo.dot_dir().join("sessions").exists());
+        assert_database_unchanged(repo, before);
     }
 }
