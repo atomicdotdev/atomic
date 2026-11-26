@@ -38,6 +38,65 @@ atomic remote add origin https://api.example.com/repo
 atomic push origin
 ```
 
+## Review
+
+`atomic review` inspects the current recorded intent/change in the current agent
+session. It is a deterministic worklist, not an automatic substantive approval:
+
+```sh
+atomic review --json
+atomic review --turn <session>:<turn>
+atomic review --intent <intent-id>
+atomic review --change <change-hash>
+atomic review --view dev --html
+atomic review --from feature-shipping --to dev --html
+atomic review --from feature-shipping --to dev --json
+```
+
+Ordinary review is local-only: `atomic-semantic` / `atomic-audit`, no model or
+credentials. `--view` audits one recorded snapshot. `--from SOURCE --to TARGET`
+uses pull-request direction: draft/source to shared/destination. Measurements
+compare target-before with source-after without switching the working copy, showing measured
+deltas and new/existing/resolved or uncertain local observations. The offline
+HTML embeds Atomic's real logo and colors; no remote assets or analytics load.
+Unsupported/missing analysis stays explicit, not a fabricated pass or zero.
+Paired-view conformance includes governing-intent criteria and recorded task
+evidence. Blast radius includes static callers, contract checks and the local
+risk estimate over the two actual view states. Every JSON finding is available
+in HTML; contract findings are not truncated at 100. These remain local review
+observations, not independent acceptance approval or runtime proof.
+
+Publish an attested native evaluation of the same source-to-target scope:
+
+```sh
+atomic review publish --from feature-shipping --to dev --dry-run --json > review-plan.json
+# Inspect the complete report; fill evaluation_template for all three passes,
+# naming every accepted issue and its rationale, or retain a not_ready decision.
+atomic review publish --from feature-shipping --to dev \
+  --evaluation review-plan.json --identity reviewer --yes
+atomic review publish inspect
+```
+
+No agent, model, runner, ephemeral identity, delegation or provider configuration
+is used. An existing local identity signs the evaluation under repository trust
+policy. `--yes` only confirms the supplied evaluation; it cannot accept issues or
+manufacture a passing review. All slop, unknown/unmet conformance, risk and coverage
+gaps remain in the full report. Accepted degradation is explicitly linked to that
+attestation and does not rewrite evidence readiness to clean/ready.
+
+Applicable decisions are revalidated at shared insertion and linked from immutable
+operation evidence. A stale, tampered, untrusted, incomplete or explicitly not-ready
+decision refuses insertion; original provenance/integrity gates are not waived.
+Native publication never inserts or pushes automatically. Use `--supersedes HASH`
+to explicitly replace a current evaluation without deleting its history.
+`--html` can export the attested decision and its per-finding acceptance links.
+`--cancel UUID` only cleans up a retained job from the former agent publisher;
+there is no agent-job resume or runner in native publishing.
+
+Advanced retrospective `prepare/sign/record` remain available under
+`atomic review publish` with their existing independent-review-intent requirements.
+The single agent-facing wrapper is [`skills/review/SKILL.md`](skills/review/SKILL.md).
+
 ## Global Options
 
 | Flag | Description |

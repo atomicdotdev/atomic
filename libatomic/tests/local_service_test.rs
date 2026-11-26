@@ -646,7 +646,10 @@ async fn change_blast_radius_is_readonly_change_local_and_uses_view_syntax() {
     repo.add(wc, "src/api.ts", Default::default()).unwrap();
     std::fs::create_dir(dir.path().join("tests")).unwrap();
     for (path, source) in [
-        ("tests/api.ts", "function test() { changed(); }\n"),
+        (
+            "tests/api.ts",
+            "import { changed } from '../src/api';\nfunction test() { changed(); }\n",
+        ),
         ("src/ui.ts", "import { changed } from './api';\n"),
         ("unrelated.ts", "function unrelated() { return 1; }\n"),
     ] {
@@ -715,7 +718,23 @@ async fn change_blast_radius_is_readonly_change_local_and_uses_view_syntax() {
         .iter()
         .any(|file| file.path == "src/ui.ts" && file.hop == 2));
     assert!(!impact.files.iter().any(|file| file.path == "unrelated.ts"));
-    assert_eq!(impact.edges.len(), 2);
+    assert_eq!(impact.edges.len(), 3);
+    assert_eq!(
+        impact
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == "calls")
+            .count(),
+        1
+    );
+    assert_eq!(
+        impact
+            .edges
+            .iter()
+            .filter(|edge| edge.relation == "includes")
+            .count(),
+        2
+    );
     assert_eq!(
         before,
         std::fs::read(database).unwrap(),
@@ -739,7 +758,10 @@ async fn change_impact_and_recorded_bytes_use_the_selected_view_not_the_working_
     };
     for (path, source) in [
         ("api.ts", "function changed() { return 1; }\n"),
-        ("caller.ts", "function caller() { changed(); }\n"),
+        (
+            "caller.ts",
+            "import { changed } from './api';\nfunction caller() { changed(); }\n",
+        ),
     ] {
         std::fs::write(dir.path().join(path), source).unwrap();
         repo.add(wc, path, Default::default()).unwrap();
@@ -798,9 +820,13 @@ async fn change_impact_and_recorded_bytes_use_the_selected_view_not_the_working_
     assert_eq!(impact.mode, "structural", "{:?}", impact.warnings);
     assert!(impact.context.contains(&selected_view));
     assert_eq!(impact.files.len(), 2);
-    assert_eq!(impact.edges.len(), 1);
-    assert_eq!(impact.edges[0].from_path, "caller.ts");
-    assert_eq!(impact.edges[0].to_path, "api.ts");
+    assert_eq!(impact.edges.len(), 2);
+    assert!(impact
+        .edges
+        .iter()
+        .all(|edge| edge.from_path == "caller.ts" && edge.to_path == "api.ts"));
+    assert!(impact.edges.iter().any(|edge| edge.relation == "calls"));
+    assert!(impact.edges.iter().any(|edge| edge.relation == "includes"));
     let file = response
         .file_contents
         .iter()

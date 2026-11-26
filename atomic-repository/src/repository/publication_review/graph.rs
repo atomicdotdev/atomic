@@ -164,8 +164,18 @@ pub(super) fn build(
         return Err(refused("unsupported review schema"));
     }
     chrono::DateTime::parse_from_rfc3339(&review.reviewed_at).map_err(refused)?;
-    let bytes =
-        keys(&review.attributed_to).ok_or_else(|| refused("review signing key unavailable"))?;
+    let bytes = match keys(&review.attributed_to) {
+        Some(bytes) => bytes,
+        None => super::super::review_authorization::retained_public_key(repo, review, config)?
+            .ok_or_else(|| refused("review signing key unavailable"))?,
+    };
+    // Transported exact-scope authorization retains the authenticated public
+    // reviewer key even after its local secret/identity store is unavailable.
+    // This resolves key material only; the authority result below is rechecked.
+    let supplied_keys = keys;
+    let retained_keys =
+        |did: &str| supplied_keys(did).or_else(|| (did == review.attributed_to).then_some(bytes));
+    let keys: DidKeyProvider<'_> = &retained_keys;
     let key = key(bytes)?;
     if !atomic_canonical::did::did_matches_public_key(&review.attributed_to, &key) {
         return Err(refused("review identity does not match its key"));
@@ -264,10 +274,7 @@ pub(super) fn build(
     graph.result(
         &artifact,
         P::AuthorityResult,
-        config
-            .trust
-            .evaluate(&review.attributed_to, config.repository_identity.as_deref())
-            == atomic_config::SignerTrust::Trusted,
+        super::super::review_authorization::reviewer_is_authorized(repo, review, config, keys)?,
     );
     graph.node(&review.attributed_to, C::Identity);
     if signed {

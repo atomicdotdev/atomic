@@ -59,27 +59,38 @@ pub(crate) fn capture_root(
     Ok(atomic_core::types::Hash::of(&buf))
 }
 
+fn did_signing_identity_from_store(
+    store: &atomic_identity::IdentityStore,
+    selected_name: Option<&str>,
+) -> Option<(String, atomic_identity::KeyPair)> {
+    let identity = match selected_name {
+        Some(name) => store.load_by_name(name).ok()?,
+        None => store.get_default().ok()??,
+    };
+    // Verify the secret matches this identity's public key. An unavailable
+    // explicit signer must never fall back to a different identity.
+    let keypair = store.load_keypair(&identity.id, None).ok()?;
+    Some((
+        atomic_canonical::did::did_for_public_key(&identity.public_key),
+        keypair,
+    ))
+}
+
 impl TurnOrchestrator {
     /// Load the configured agent DID identity for attestation signing
     /// (CB-12A AC3).
     ///
     /// Returns the signer DID (`did:atomic:<base32>` from
     /// `atomic_canonical::did`) plus the store-verified keypair when a
-    /// default identity with a loadable secret key exists. Any failure — no
-    /// store, no default identity, encrypted/locked key, secret/public
+    /// selected agent identity (or the default when none is selected) has a
+    /// loadable secret key. Any failure — no store, missing identity,
+    /// encrypted/locked key, secret/public
     /// mismatch — yields `None` and the attestation falls back to the
     /// session MAC, which [`atomic_core::change::attestation::TrustPolicy`]
     /// then refuses as trusted evidence.
     pub(crate) fn load_did_signing_identity(&self) -> Option<(String, atomic_identity::KeyPair)> {
         let store = atomic_identity::IdentityStore::open_default().ok()?;
-        // get_default resolves the configured default identity directly.
-        let identity = store.get_default().ok()??;
-        // load_keypair verifies the secret matches the identity's public key.
-        let keypair = store.load_keypair(&identity.id, None).ok()?;
-        Some((
-            atomic_canonical::did::did_for_public_key(&identity.public_key),
-            keypair,
-        ))
+        did_signing_identity_from_store(&store, self.agent_identity.as_deref())
     }
 
     // =========================================================================
@@ -494,5 +505,96 @@ impl TurnOrchestrator {
                 reason: format!("failed to save signed attestation: {e}"),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod signing_identity_tests {
+    use super::did_signing_identity_from_store;
+    use atomic_identity::{Identity, IdentityStore, KeyPair};
+
+    fn store_with_default() -> (tempfile::TempDir, IdentityStore, Identity) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = IdentityStore::open(temp.path()).unwrap();
+        let keypair = KeyPair::generate();
+        let human = Identity::new("human", &keypair);
+        store.save_with_keypair(&human, &keypair, None).unwrap();
+        store.set_default(&human.id).unwrap();
+        (temp, store, human)
+    }
+
+    #[test]
+    fn selected_reviewer_uses_its_own_did_and_key() {
+        let (_temp, store, human) = store_with_default();
+        let reviewer_key = KeyPair::generate();
+        let reviewer = Identity::new("reviewer", &reviewer_key);
+        store
+            .save_with_keypair(&reviewer, &reviewer_key, None)
+            .unwrap();
+
+        let (did, keypair) = did_signing_identity_from_store(&store, Some("reviewer")).unwrap();
+        assert_eq!(
+            did,
+            atomic_canonical::did::did_for_public_key(&reviewer.public_key)
+        );
+        assert_eq!(keypair.public, reviewer_key.public);
+        assert_ne!(keypair.public, human.public_key);
+    }
+
+    #[test]
+    fn no_selection_retains_default_signer() {
+        let (_temp, store, human) = store_with_default();
+
+        let (did, keypair) = did_signing_identity_from_store(&store, None).unwrap();
+        assert_eq!(
+            did,
+            atomic_canonical::did::did_for_public_key(&human.public_key)
+        );
+        assert_eq!(keypair.public, human.public_key);
+    }
+
+    #[test]
+    fn missing_selected_reviewer_does_not_use_default() {
+        let (_temp, store, _human) = store_with_default();
+        assert!(did_signing_identity_from_store(&store, Some("missing-reviewer")).is_none());
+    }
+
+    #[test]
+    fn keyless_selected_reviewer_does_not_use_default() {
+        let (_temp, store, _human) = store_with_default();
+        store.save(&Identity::generate("reviewer")).unwrap();
+        assert!(did_signing_identity_from_store(&store, Some("reviewer")).is_none());
+    }
+
+    #[test]
+    fn mismatched_selected_reviewer_key_does_not_use_default() {
+        let (_temp, store, _human) = store_with_default();
+        let reviewer = Identity::generate("reviewer");
+        store
+            .save_with_keypair(&reviewer, &KeyPair::generate(), None)
+            .unwrap();
+        assert!(did_signing_identity_from_store(&store, Some("reviewer")).is_none());
+    }
+
+    #[test]
+    fn locked_selected_reviewer_key_does_not_use_default() {
+        let (_temp, store, _human) = store_with_default();
+        let reviewer_key = KeyPair::generate();
+        let reviewer = Identity::new("reviewer", &reviewer_key);
+        store
+            .save_with_keypair(&reviewer, &reviewer_key, None)
+            .unwrap();
+        let secret_path = store
+            .root()
+            .join(format!("reviewer-{}", reviewer.id.short()))
+            .join("secret.key");
+        let secret = std::fs::read_to_string(&secret_path).unwrap();
+        std::fs::write(
+            secret_path,
+            secret.replace("encryption = \"none\"", "encryption = \"locked\""),
+        )
+        .unwrap();
+
+        assert!(did_signing_identity_from_store(&store, Some("reviewer")).is_none());
     }
 }

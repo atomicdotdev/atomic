@@ -185,6 +185,13 @@ pub trait LanguageParser: Send {
     /// The language this parser handles.
     fn language(&self) -> Language;
 
+    /// Parse a full source file for structural inspection. Error nodes remain
+    /// visible; callers must not treat a recovered syntax tree as a clean parse.
+    /// External entity-only parsers can leave this unsupported.
+    fn parse_tree(&mut self, _source: &str) -> Option<tree_sitter::Tree> {
+        None
+    }
+
     /// Extract AST entities (functions, classes, etc.) from source code.
     ///
     /// # Arguments
@@ -196,6 +203,17 @@ pub trait LanguageParser: Send {
     ///
     /// A list of entities found in the source code.
     fn extract(&mut self, source: &str, file_path: &str) -> Vec<Entity>;
+
+    /// Reuse a registered grammar's tree when enriching existing entities.
+    /// Entity-only adapters may fall back to their ordinary extraction path.
+    fn extract_from_tree(
+        &mut self,
+        _tree: &tree_sitter::Tree,
+        source: &str,
+        file_path: &str,
+    ) -> Vec<Entity> {
+        self.extract(source, file_path)
+    }
 
     /// Extract references (function calls, variable usages) from source code.
     ///
@@ -214,6 +232,17 @@ pub trait LanguageParser: Send {
         let _ = (source, file_path);
         Vec::new()
     }
+
+    /// Visit references without reparsing. The tree must use this parser's
+    /// configured grammar and correspond to `source`.
+    fn extract_references_from_tree(
+        &mut self,
+        _tree: &tree_sitter::Tree,
+        source: &str,
+        path: &str,
+    ) -> Vec<Reference> {
+        self.extract_references(source, path)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -223,7 +252,7 @@ pub trait LanguageParser: Send {
 /// Registry of language parsers.
 ///
 /// Provides a single entry point for extracting entities from any supported
-/// file. Lazily creates parsers on first use for each language.
+/// file. Registered grammar instances are reused across source requests.
 ///
 /// # Thread Safety
 ///
@@ -247,6 +276,53 @@ pub struct ParserRegistry {
 }
 
 impl ParserRegistry {
+    /// Convenience adapter for consumers supplying an in-memory source corpus.
+    pub fn analyze_sources(&mut self, sources: &[(String, String)]) -> crate::source::SourceSet {
+        let mut result = crate::source::SourceSet {
+            paths: sources.iter().map(|(path, _)| path.clone()).collect(),
+            complete: true,
+            paths_complete: true,
+            ..Default::default()
+        };
+        let unique: std::collections::BTreeSet<_> = result.paths.iter().collect();
+        if unique.len() != result.paths.len() {
+            result.complete = false;
+            result.gaps.push("Duplicate semantic source paths".into());
+            return result;
+        }
+        for (path, source) in sources {
+            match self.analyze_source(path, source) {
+                Ok(file) => result.files.push(file),
+                Err(error) => {
+                    result.complete = false;
+                    result.gaps.push(format!("{path}: {error}"));
+                }
+            }
+        }
+        result
+    }
+    /// Shared source context for search, callers and review. Qualified targets,
+    /// receivers and lexical owners are retained instead of flattened names.
+    pub fn analyze_source(
+        &mut self,
+        path: &str,
+        source: &str,
+    ) -> Result<crate::source::SourceAnalysis, String> {
+        if source.len() > crate::MAX_SOURCE_BYTES || source.contains('\0') {
+            return Err("Semantic source exceeds byte limit or is binary".into());
+        }
+        let language = Language::detect(path).ok_or("Unsupported semantic source language")?;
+        let parser = self
+            .parsers
+            .get_mut(&language)
+            .ok_or("No registered semantic parser")?;
+        let tree = parser
+            .parse_tree(source)
+            .ok_or("No registered semantic syntax tree")?;
+        crate::source::SourceAnalysis::from_tree(path, source, language, &tree, || {
+            parser.extract_from_tree(&tree, source, path)
+        })
+    }
     /// Create a new registry with all supported language parsers.
     pub fn new() -> Self {
         let mut parsers: HashMap<Language, Box<dyn LanguageParser>> = HashMap::new();
@@ -282,6 +358,13 @@ impl ParserRegistry {
         Language::detect(path)
     }
 
+    /// Parse with the existing registered language parser. `None` means an
+    /// unsupported language/parser or parsing failure, not a clean file.
+    pub fn parse_tree(&mut self, file_path: &str, source: &str) -> Option<tree_sitter::Tree> {
+        let language = Language::detect(file_path)?;
+        self.parsers.get_mut(&language)?.parse_tree(source)
+    }
+
     /// Extract entities from a source file.
     ///
     /// Automatically selects the right parser based on the file extension.
@@ -309,10 +392,39 @@ impl ParserRegistry {
             None => return Vec::new(),
         };
 
-        match self.parsers.get_mut(&language) {
-            Some(parser) => parser.extract_references(source, file_path),
-            None => Vec::new(),
+        let Some(parser) = self.parsers.get_mut(&language) else {
+            return vec![];
+        };
+        let Some(tree) = parser.parse_tree(source) else {
+            return parser.extract_references(source, file_path);
+        };
+        if source.len() > crate::MAX_SOURCE_BYTES {
+            return vec![];
         }
+        let Ok(analysis) =
+            crate::source::SourceAnalysis::from_tree(file_path, source, language, &tree, || {
+                parser.extract_from_tree(&tree, source, file_path)
+            })
+        else {
+            return vec![];
+        };
+        let mut references = parser.extract_references_from_tree(&tree, source, file_path);
+        let calls: std::collections::BTreeMap<_, _> = analysis
+            .calls
+            .iter()
+            .map(|call| ((call.location.start_line, call.column), call))
+            .collect();
+        for reference in &mut references {
+            if let Some(call) = calls.get(&(reference.line, reference.column.unwrap_or(0))) {
+                reference.call = Some(crate::entity::CallContext {
+                    target: call.expression.clone(),
+                    receiver: call.receiver.clone(),
+                    caller: call.caller.clone(),
+                    arguments: call.arguments,
+                });
+            }
+        }
+        references
     }
 
     /// Get a list of all supported languages.
@@ -343,6 +455,87 @@ impl fmt::Debug for ParserRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_and_reference_context_reuse_one_registered_tree_per_request() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Counted {
+            inner: rust::RustParser,
+            parses: Arc<AtomicUsize>,
+            entities: Arc<AtomicUsize>,
+            references: Arc<AtomicUsize>,
+        }
+        impl LanguageParser for Counted {
+            fn language(&self) -> Language {
+                Language::Rust
+            }
+            fn parse_tree(&mut self, source: &str) -> Option<tree_sitter::Tree> {
+                self.parses.fetch_add(1, Ordering::Relaxed);
+                self.inner.parse_tree(source)
+            }
+            fn extract(&mut self, _: &str, _: &str) -> Vec<Entity> {
+                panic!("shared source analysis must not reparse through extract")
+            }
+            fn extract_from_tree(
+                &mut self,
+                tree: &tree_sitter::Tree,
+                source: &str,
+                path: &str,
+            ) -> Vec<Entity> {
+                self.entities.fetch_add(1, Ordering::Relaxed);
+                self.inner.extract_from_tree(tree, source, path)
+            }
+            fn extract_references(&mut self, _: &str, _: &str) -> Vec<Reference> {
+                panic!("shared references must not reparse")
+            }
+            fn extract_references_from_tree(
+                &mut self,
+                tree: &tree_sitter::Tree,
+                source: &str,
+                path: &str,
+            ) -> Vec<Reference> {
+                self.references.fetch_add(1, Ordering::Relaxed);
+                self.inner.extract_references_from_tree(tree, source, path)
+            }
+        }
+        let (parses, entities, references) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mut registry = ParserRegistry::new();
+        registry.parsers.insert(
+            Language::Rust,
+            Box::new(Counted {
+                inner: rust::RustParser::new(),
+                parses: parses.clone(),
+                entities: entities.clone(),
+                references: references.clone(),
+            }),
+        );
+        let source = "fn target() {} fn consumer() { target(); }";
+        assert_eq!(
+            registry
+                .analyze_source("lib.rs", source)
+                .unwrap()
+                .symbols
+                .len(),
+            2
+        );
+        assert!(registry
+            .extract_references("lib.rs", source)
+            .iter()
+            .any(|reference| reference
+                .call
+                .as_ref()
+                .is_some_and(|call| call.target == "target")));
+        assert_eq!(parses.load(Ordering::Relaxed), 2);
+        assert_eq!(entities.load(Ordering::Relaxed), 2);
+        assert_eq!(references.load(Ordering::Relaxed), 1);
+    }
 
     // ── Language detection ──────────────────────────────────────────
 

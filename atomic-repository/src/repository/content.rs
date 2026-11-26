@@ -1,7 +1,7 @@
 use super::*;
 use atomic_core::pristine::{CachedGraphTxn, ViewGraph};
 
-fn graph_visibility_at_change<T: ViewTxnT>(
+pub(super) fn graph_visibility_at_change<T: ViewTxnT>(
     txn: &T,
     view: &atomic_core::pristine::ViewState,
     change_hash: &Hash,
@@ -322,6 +322,76 @@ impl Repository {
         paths: &[String],
         view_name: &str,
     ) -> Result<Vec<RecordedPresence>, RepositoryError> {
+        Ok(self
+            .recorded_identity_rows_on_view(paths, view_name)?
+            .into_iter()
+            .map(|row| row.0)
+            .collect())
+    }
+
+    /// Canonical recorded file identities in requested-path order. Absent paths
+    /// and directories have no inode; ambiguous names fail rather than guessing
+    /// a rename. This performs no content rendering or working-copy lookup.
+    pub fn recorded_file_inodes_on_view(
+        &self,
+        paths: &[String],
+        view_name: &str,
+    ) -> Result<Vec<Option<Inode>>, RepositoryError> {
+        self.recorded_identity_rows_on_view(paths, view_name)?
+            .into_iter()
+            .zip(paths)
+            .map(|((presence, inode), path)| {
+                if let RecordedPresence::NameConflict { paths, claimants } = presence {
+                    return Err(name_conflict_error(path, paths, claimants));
+                }
+                Ok(inode)
+            })
+            .collect()
+    }
+
+    /// Enumerate the canonical recorded names and file identities of a view.
+    /// Unlike recovery-oriented working-copy enumeration, this never revives a
+    /// superseded name merely because an inode still has live content. Staged
+    /// paths and directories are excluded; ambiguous recorded names fail closed.
+    pub fn recorded_file_identities_on_view(
+        &self,
+        view_name: &str,
+    ) -> Result<std::collections::BTreeMap<String, Inode>, RepositoryError> {
+        let txn = self
+            .pristine
+            .read_txn()
+            .map_err(|error| RepositoryError::Database(error.to_string()))?;
+        let view = txn
+            .get_view(view_name)
+            .map_err(|error| RepositoryError::Database(error.to_string()))?
+            .ok_or_else(|| RepositoryError::ViewNotFound {
+                name: view_name.into(),
+            })?;
+        let visibility = graph_visibility_closure(&txn, &view)?;
+        let projection = self.project_tree_for_visibility(&txn, &visibility)?;
+        if let Some((path, conflict)) = projection
+            .name_conflicts
+            .iter()
+            .min_by_key(|(path, _)| *path)
+        {
+            return Err(name_conflict_error(
+                path,
+                conflict.paths.len(),
+                conflict.sides.len(),
+            ));
+        }
+        Ok(projection
+            .present
+            .into_iter()
+            .filter_map(|(path, item)| (!item.is_directory).then_some((path, item.inode)))
+            .collect())
+    }
+
+    fn recorded_identity_rows_on_view(
+        &self,
+        paths: &[String],
+        view_name: &str,
+    ) -> Result<Vec<(RecordedPresence, Option<Inode>)>, RepositoryError> {
         let txn = self
             .pristine
             .read_txn()
@@ -344,14 +414,19 @@ impl Repository {
             .map(|path| {
                 let normalized = normalize_path(Path::new(path));
                 if let Some(conflict) = projection.name_conflicts.get(&normalized) {
-                    return RecordedPresence::NameConflict {
-                        paths: conflict.paths.len(),
-                        claimants: conflict.sides.len(),
-                    };
+                    return (
+                        RecordedPresence::NameConflict {
+                            paths: conflict.paths.len(),
+                            claimants: conflict.sides.len(),
+                        },
+                        None,
+                    );
                 }
                 match projection.present.get(&normalized) {
-                    Some(item) if !item.is_directory => RecordedPresence::Present,
-                    _ => RecordedPresence::Absent,
+                    Some(item) if !item.is_directory => {
+                        (RecordedPresence::Present, Some(item.inode))
+                    }
+                    _ => (RecordedPresence::Absent, None),
                 }
             })
             .collect())
@@ -422,6 +497,52 @@ impl Repository {
         view_name: &str,
         mut visit: impl FnMut(&str, Option<Vec<u8>>) -> Result<(), RepositoryError>,
     ) -> Result<(), RepositoryError> {
+        self.visit_recorded_files_on_view(paths, view_name, false, |path, bytes, _| {
+            visit(path, bytes)
+        })
+    }
+
+    /// Stream recorded bytes and inode kinds without consulting the working copy
+    /// or following symlinks. Directories/absent paths have no bytes or kind;
+    /// unresolved names or inode attributes fail closed.
+    /// The transaction/visitor constraints are the same as
+    /// [`Self::for_each_file_content_on_view`].
+    ///
+    /// ```no_run
+    /// # use atomic_repository::{Repository, RepositoryError};
+    /// # let repo = Repository::open_readonly(".")?;
+    /// repo.for_each_file_content_and_kind_on_view(
+    ///     &["src/lib.rs".into()], "dev", |path, bytes, kind| {
+    ///         println!("{path}: {kind:?}, {} bytes", bytes.as_ref().map_or(0, Vec::len));
+    ///         Ok(())
+    ///     },
+    /// )?;
+    /// # Ok::<(), RepositoryError>(())
+    /// ```
+    pub fn for_each_file_content_and_kind_on_view(
+        &self,
+        paths: &[String],
+        view_name: &str,
+        visit: impl FnMut(
+            &str,
+            Option<Vec<u8>>,
+            Option<atomic_core::change::InodeKind>,
+        ) -> Result<(), RepositoryError>,
+    ) -> Result<(), RepositoryError> {
+        self.visit_recorded_files_on_view(paths, view_name, true, visit)
+    }
+
+    fn visit_recorded_files_on_view(
+        &self,
+        paths: &[String],
+        view_name: &str,
+        include_kind: bool,
+        mut visit: impl FnMut(
+            &str,
+            Option<Vec<u8>>,
+            Option<atomic_core::change::InodeKind>,
+        ) -> Result<(), RepositoryError>,
+    ) -> Result<(), RepositoryError> {
         let txn = self
             .pristine
             .read_txn()
@@ -449,6 +570,31 @@ impl Repository {
                     conflict.sides.len(),
                 ));
             }
+            let kind = if include_kind {
+                match projection
+                    .present
+                    .get(&normalized)
+                    .filter(|item| !item.is_directory)
+                {
+                    Some(item) => {
+                        let attrs = atomic_core::output::project_inode_attributes(
+                            &txn,
+                            item.position,
+                            visibility.attribute_visibility(),
+                        )
+                        .map_err(|error| RepositoryError::Database(error.to_string()))?;
+                        if attrs.is_conflicted() {
+                            return Err(RepositoryError::Output(format!(
+                                "cannot inspect '{normalized}' with conflicting inode attributes"
+                            )));
+                        }
+                        Some(attrs.materialization.kind)
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
             let bytes = match projection.present.get(&normalized) {
                 Some(item) if !item.is_directory => Some(render_projected_file(
                     &txn,
@@ -459,7 +605,7 @@ impl Repository {
                 )?),
                 _ => None,
             };
-            visit(path, bytes)?;
+            visit(path, bytes, kind)?;
         }
         Ok(())
     }

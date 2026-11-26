@@ -1,6 +1,7 @@
 //! Request-scoped source relationships. Nothing here is persisted in the KG.
 
 use super::*;
+use atomic_semantic::relationships::{script_candidates, SourceGraph};
 use atomic_semantic::{Entity, EntityKind, ParserRegistry};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,6 +19,8 @@ pub struct SyntaxIndex {
     pub calls: BTreeSet<(String, String)>,
     pub file_deps: BTreeSet<(String, String)>,
     pub file_modules: BTreeMap<String, String>,
+    bound_callers: BTreeMap<String, Vec<Caller>>,
+    aliases: BTreeMap<String, BTreeSet<String>>,
 }
 
 fn selector(entity: &Entity) -> String {
@@ -27,51 +30,17 @@ fn callable(entity: &Entity) -> bool {
     matches!(entity.kind, EntityKind::Function | EntityKind::Method)
 }
 
-fn relative_script_import(importer: &str, module: &str, target: &str) -> Option<bool> {
-    let script = |path: &Path| {
-        matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("ts" | "tsx" | "js" | "jsx" | "mjs" | "mts" | "cjs" | "cts")
-        )
-    };
-    if !script(Path::new(importer)) || !module.starts_with('.') {
-        return None;
-    }
-    if !script(Path::new(target)) {
-        return Some(false);
-    }
-    let mut resolved = std::path::PathBuf::new();
-    let joined = Path::new(importer)
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join(module);
-    for component in joined.components() {
-        match component {
-            std::path::Component::Normal(name) => resolved.push(name),
-            std::path::Component::ParentDir if !resolved.pop() => return Some(false),
-            std::path::Component::ParentDir | std::path::Component::CurDir => {}
-            _ => return Some(false),
-        }
-    }
-    let target = Path::new(target);
-    let stem = target.with_extension("");
-    Some(target == resolved || stem == resolved || stem == resolved.join("index"))
-}
-
 impl SyntaxIndex {
     pub fn from_sources(sources: &[(String, String)]) -> Self {
         let mut parser = ParserRegistry::new();
         let mut index = Self::default();
         let mut parsed = Vec::new();
-        let mut names = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut paths = BTreeSet::new();
         for (path, source) in sources {
-            let entities = parser.extract(path, source);
-            for entity in entities.iter().filter(|entity| callable(entity)) {
-                names
-                    .entry(entity.name.clone())
-                    .or_default()
-                    .insert(selector(entity));
+            if crate::is_vault_path(path) {
+                continue;
             }
+            paths.insert(path.clone());
             index.file_modules.insert(
                 path.clone(),
                 Path::new(path)
@@ -80,49 +49,67 @@ impl SyntaxIndex {
                     .unwrap_or_default()
                     .to_owned(),
             );
-            index.entities.extend(entities.clone());
-            parsed.push((path, source, entities));
-        }
-        for (path, source, entities) in &parsed {
-            for reference in parser.extract_references(path, source) {
-                let Some(caller) = entities
-                    .iter()
-                    .filter(|entity| {
-                        callable(entity)
-                            && reference.line >= entity.line
-                            && reference.line <= entity.end_line
-                    })
-                    .min_by_key(|entity| entity.end_line - entity.line)
-                else {
-                    continue;
-                };
-                let caller = selector(caller);
-                if let Some(targets) = names.get(&reference.symbol) {
-                    for target in targets {
-                        if target != &caller {
-                            index.calls.insert((target.clone(), caller.clone()));
-                        }
-                    }
+            match parser.analyze_source(path, source) {
+                Ok(file) => {
+                    index.entities.extend(file.entities.clone());
+                    parsed.push(file);
                 }
+                Err(_) => index.entities.extend(parser.extract(path, source)),
             }
-            for import in entities
+        }
+        let graph = SourceGraph::new(parsed, paths, true);
+        for symbol in graph
+            .symbols
+            .values()
+            .filter(|symbol| callable(&symbol.entity))
+        {
+            for alias in [
+                symbol.id.clone(),
+                selector(&symbol.entity),
+                symbol.entity.name.clone(),
+            ] {
+                index
+                    .aliases
+                    .entry(alias)
+                    .or_default()
+                    .insert(symbol.id.clone());
+            }
+        }
+        for call in graph
+            .bind_calls(None)
+            .into_iter()
+            .filter(|call| call.present && call.accessible)
+        {
+            let caller = &graph.symbols[&call.call.caller];
+            index
+                .calls
+                .insert((call.symbol.id.clone(), caller.id.clone()));
+            index
+                .bound_callers
+                .entry(call.symbol.id.clone())
+                .or_default()
+                .push(Caller {
+                    path: caller.location.path.clone(),
+                    name: caller.entity.name.clone(),
+                    line: caller.location.start_line,
+                    summary: caller.entity.signature.clone(),
+                });
+            if caller.location.path != call.symbol.location.path {
+                index.file_deps.insert((
+                    caller.location.path.clone(),
+                    call.symbol.location.path.clone(),
+                ));
+            }
+        }
+        for file in graph.files.values() {
+            for import in file
+                .entities
                 .iter()
                 .filter(|entity| entity.kind == EntityKind::Import)
             {
-                let tokens: BTreeSet<_> = import
-                    .name
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                for (target, _) in sources {
-                    let stem = Path::new(target)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_default();
-                    let matches = relative_script_import(path, &import.name, target)
-                        .unwrap_or_else(|| tokens.contains(stem));
-                    if target != *path && matches {
-                        index.file_deps.insert(((*path).clone(), target.clone()));
+                for target in script_candidates(&file.path, &import.name, &graph.paths) {
+                    if target != file.path {
+                        index.file_deps.insert((file.path.clone(), target));
                     }
                 }
             }
@@ -131,36 +118,13 @@ impl SyntaxIndex {
     }
 
     pub fn callers(&self, target: &str) -> Vec<Caller> {
-        let (path, name) = target
-            .rsplit_once('#')
-            .map(|(path, name)| (Some(path), name))
-            .unwrap_or((None, target));
-        let targets: BTreeSet<_> = self
-            .entities
-            .iter()
-            .filter(|entity| {
-                callable(entity)
-                    && entity.name == name
-                    && path.is_none_or(|path| entity.file == path)
-            })
-            .map(selector)
-            .collect();
-        let callers: BTreeSet<_> = self
-            .calls
-            .iter()
-            .filter(|(callee, _)| targets.contains(callee))
-            .map(|(_, caller)| caller.as_str())
-            .collect();
         let mut result: Vec<_> = self
-            .entities
-            .iter()
-            .filter(|entity| callable(entity) && callers.contains(selector(entity).as_str()))
-            .map(|entity| Caller {
-                path: entity.file.clone(),
-                name: entity.name.clone(),
-                line: entity.line,
-                summary: entity.signature.clone(),
-            })
+            .aliases
+            .get(target)
+            .into_iter()
+            .flatten()
+            .flat_map(|id| self.bound_callers.get(id).into_iter().flatten())
+            .cloned()
             .collect();
         result.sort_by(|a, b| (&a.path, &a.name, a.line).cmp(&(&b.path, &b.name, b.line)));
         result.dedup_by(|a, b| a.path == b.path && a.name == b.name && a.line == b.line);
@@ -195,7 +159,7 @@ impl Repository {
         };
         let mut sources = Vec::new();
         for path in paths {
-            if !atomic_semantic::is_supported(&path) {
+            if crate::is_vault_path(&path) || !atomic_semantic::is_supported(&path) {
                 continue;
             }
             let bytes = if let Some(view) = view {
@@ -222,6 +186,58 @@ impl Repository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_queries_use_shared_qualified_bindings_not_global_name_joins() {
+        let index = SyntaxIndex::from_sources(&[
+            ("api.ts".into(), "export function value() {}".into()),
+            (
+                "noise.ts".into(),
+                "function unrelated() { table.value(); }".into(),
+            ),
+            (
+                "user.ts".into(),
+                "import {value as read} from './api'; function consumer() { read(); }".into(),
+            ),
+            ("api.rs".into(), "pub fn value() {}".into()),
+        ]);
+        let callers = index.callers("api.ts#value");
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].name, "consumer");
+        assert!(index.callers("api.rs#value").is_empty());
+    }
+
+    #[test]
+    fn static_relationships_never_treat_vault_source_as_application_code() {
+        let index = SyntaxIndex::from_sources(&[
+            ("src/api.ts".into(), "export function work() {}".into()),
+            (
+                ".vault/fake.ts".into(),
+                "import { work } from '../src/api'; export function fake() { work(); }".into(),
+            ),
+            (
+                "nested/.vault/more.ts".into(),
+                "export function another() {}".into(),
+            ),
+            (
+                ".vaultish/real.ts".into(),
+                "export function real() {}".into(),
+            ),
+        ]);
+        assert!(!index
+            .entities
+            .iter()
+            .any(|entity| crate::is_vault_path(&entity.file)));
+        assert!(index.callers("src/api.ts#work").is_empty());
+        assert!(!index
+            .file_modules
+            .keys()
+            .any(|path| crate::is_vault_path(path)));
+        assert!(index
+            .entities
+            .iter()
+            .any(|entity| entity.file == ".vaultish/real.ts"));
+    }
 
     #[test]
     fn script_imports_follow_relative_paths_instead_of_duplicate_file_stems() {

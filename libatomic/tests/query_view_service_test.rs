@@ -38,12 +38,12 @@ async fn fixture() -> (tempfile::TempDir, LocalService, pb::RepositoryRef) {
     repo.switch_view(wc, "feature").unwrap();
     std::fs::write(
         dir.path().join("src/lib.rs"),
-        "pub fn target(secret: SiblingSecret) {}\npub fn caller() {}\n// inherited_marker\n",
+        "pub fn target(secret: SiblingSecret) {}\npub fn caller() {}\nmod hidden;\n// inherited_marker\n",
     )
     .unwrap();
     std::fs::write(
         dir.path().join("src/hidden.rs"),
-        "pub fn sibling_only() { target(); }\n// sibling_marker\n",
+        "pub fn sibling_only() { crate::target(); }\n// sibling_marker\n",
     )
     .unwrap();
     repo.add(wc, "src/hidden.rs", TrackingOptions::default())

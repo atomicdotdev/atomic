@@ -24,7 +24,7 @@ pub mod model {
     pub use atomic_repository::triage::model::*;
 }
 pub mod output;
-mod publication_review;
+pub(crate) mod publication_review;
 pub(crate) use publication_review::read as read_publication_review;
 pub mod project {
     pub use atomic_repository::triage::report::{build_report, build_walkthrough, TaskFact};

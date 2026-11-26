@@ -5,6 +5,7 @@
 //! Use `--details` for complete text and canonical relationships, `--json` for
 //! machine-readable facts, or `--html` for the interactive browser graph.
 
+use crate::output::html::write_and_open_html;
 use crate::{
     commands::Command,
     error::{CliError, CliResult},
@@ -113,42 +114,6 @@ impl Command for IntentGraph {
         }
         Ok(())
     }
-}
-
-fn write_and_open_html(
-    html: &str,
-    output: Option<&std::path::Path>,
-    open_browser: impl FnOnce(&str) -> std::io::Result<()>,
-) -> CliResult<std::path::PathBuf> {
-    use std::io::Write;
-
-    let path = match output {
-        Some(path) => {
-            std::fs::write(path, html)?;
-            path.to_path_buf()
-        }
-        None => {
-            // Keep the file after the process exits so asynchronous browsers
-            // can load it. Unique names avoid replacing another open graph.
-            let path = std::env::temp_dir()
-                .join(format!("atomic-intent-graph-{}.html", uuid::Uuid::new_v4()));
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
-            file.write_all(html.as_bytes())?;
-            path
-        }
-    };
-    let path = std::fs::canonicalize(path)?;
-    let url = url::Url::from_file_path(&path).map_err(|_| CliError::InvalidArgument {
-        message: format!("cannot convert HTML path to a file URL: {}", path.display()),
-    })?;
-    println!("Wrote intent graph to {}", path.display());
-    if let Err(error) = open_browser(url.as_str()) {
-        eprintln!("Could not open a browser: {error}. Open {url} manually.");
-    }
-    Ok(path)
 }
 
 fn annotate(graph: &Graph, nodes: &mut [atomic_core::KgNode]) {

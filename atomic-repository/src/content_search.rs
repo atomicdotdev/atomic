@@ -240,7 +240,54 @@ pub(crate) struct RecordedContentSearch {
     display_limit: usize,
 }
 
+pub(crate) struct RecordedSourceMatches {
+    pub sources: Vec<(String, String)>,
+    pub searched_files: usize,
+    pub omitted_files: usize,
+}
+
 impl RecordedContentSearch {
+    /// Select matching recorded source before AST budgets. Unlike display search,
+    /// this retains one source per matching path, not the first N matching lines.
+    pub(crate) fn matching_sources<E>(
+        self,
+        max_files: usize,
+        max_bytes: usize,
+        mut retrieve: impl FnMut(&str) -> Result<Option<Vec<u8>>, E>,
+        mut accept: impl FnMut(&str, &[u8]) -> bool,
+    ) -> Result<RecordedSourceMatches, E> {
+        let mut result = RecordedSourceMatches {
+            sources: vec![],
+            searched_files: 0,
+            omitted_files: 0,
+        };
+        let mut bytes = 0;
+        for path in self.paths {
+            result.searched_files += 1;
+            let Some(content) = retrieve(&path)? else {
+                continue;
+            };
+            if syntext::index::is_binary(&content)
+                || !self.re.is_match(&content)
+                || !accept(&path, &content)
+            {
+                continue;
+            }
+            if result.sources.len() >= max_files
+                || bytes + content.len() > max_bytes
+                || content.len() > atomic_semantic::MAX_SOURCE_BYTES
+            {
+                result.omitted_files += 1;
+                continue;
+            }
+            bytes += content.len();
+            match String::from_utf8(content) {
+                Ok(source) => result.sources.push((path, source)),
+                Err(_) => result.omitted_files += 1,
+            }
+        }
+        Ok(result)
+    }
     pub(crate) fn new<'path>(
         paths: impl IntoIterator<Item = &'path str>,
         pattern: &str,
@@ -704,6 +751,45 @@ impl From<IndexError> for ContentSearchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_semantic_candidates_ignore_display_limits_and_filter_before_budgets() {
+        let files = std::collections::BTreeMap::from([
+            (
+                "a_dense.ts".to_string(),
+                "needle\n".repeat(1000).into_bytes(),
+            ),
+            ("b_outside_scope.ts".to_string(), b"needle\n".to_vec()),
+            ("z_real.ts".to_string(), b"needle\n".to_vec()),
+        ]);
+        let plan = RecordedContentSearch::new(
+            files.keys().map(String::as_str),
+            "needle",
+            ContentSearchOptions {
+                max_results: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let selected = plan
+            .matching_sources(
+                2,
+                1024 * 1024,
+                |path| Ok::<_, ()>(Some(files[path].clone())),
+                |path, _| path != "b_outside_scope.ts",
+            )
+            .unwrap();
+        assert_eq!(
+            selected
+                .sources
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["a_dense.ts", "z_real.ts"]
+        );
+        assert_eq!(selected.searched_files, 3);
+        assert_eq!(selected.omitted_files, 0);
+    }
 
     fn streaming(
         files: &std::collections::BTreeMap<String, Vec<u8>>,

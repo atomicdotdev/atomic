@@ -307,6 +307,109 @@ fn exact_signed_shacl_review_discharges_only_missing_attestation() {
 }
 
 #[test]
+fn purpose_bound_ephemeral_publication_passes_without_allowlisting_the_reviewer() {
+    let fixture = Fixture::new();
+    let config = PublicationGateConfig {
+        trust: atomic_config::GitTrustConfig {
+            signers: vec![atomic_canonical::did::did_for_public_key(
+                &fixture.author.public_key,
+            )],
+            revoked: vec![],
+        },
+        repository_identity: None,
+    };
+    let mut review = fixture
+        .repo
+        .prepare_publication_review(&fixture.review, &[fixture.change], &|did| fixture.keys(did))
+        .unwrap();
+    assert!(!fixture.conforms(&fixture.sign(review.clone()), &config));
+    super::super::review_authorization::mint_and_store(
+        &fixture.repo,
+        &review.subject,
+        &fixture.reviewer.public_key,
+        &fixture.author,
+        &fixture.author_key,
+        chrono::Utc::now() + chrono::Duration::minutes(30),
+        &config,
+    )
+    .unwrap();
+    review.reviewed_at = chrono::Utc::now().to_rfc3339();
+    assert!(super::super::review_authorization::reviewer_may_sign_now(
+        &fixture.repo,
+        &review,
+        &config,
+        &|did| fixture.keys(did),
+    )
+    .unwrap());
+    let review = fixture.sign(review);
+    assert!(fixture.conforms(&review, &config));
+    fixture
+        .repo
+        .record_publication_review(&review, &config, &|did| fixture.keys(did))
+        .unwrap();
+    let gate = fixture
+        .repo
+        .evaluate_publication_gate(
+            &[fixture.change],
+            &config,
+            None,
+            Some(&|did| fixture.keys(did)),
+        )
+        .unwrap();
+    assert!(gate.allowed(), "{}", gate.refusal_report());
+    assert_eq!(
+        config.trust.signers.len(),
+        1,
+        "reviewer was never added to raw trust"
+    );
+    let transported_keys = |did: &str| {
+        atomic_canonical::did::did_matches_public_key(did, &fixture.author.public_key)
+            .then_some(*fixture.author.public_key.as_bytes())
+    };
+    assert!(
+        fixture
+            .repo
+            .validate_publication_review(&review, &config, &transported_keys)
+            .unwrap()
+            .conforms,
+        "retained issuer-authenticated public reviewer key survives local identity-store absence"
+    );
+    assert!(fixture
+        .repo
+        .evaluate_publication_gate(&[fixture.change], &config, None, Some(&transported_keys))
+        .unwrap()
+        .allowed());
+}
+
+#[test]
+fn first_publication_boundary_fences_vault_writers_before_any_artifact_exists() {
+    let fixture = Fixture::new();
+    assert!(fixture.repo.publication_reviews().unwrap().is_empty());
+    let root = fixture.repo.root().to_path_buf();
+    let _boundary = fixture.repo.lock_review_publication().unwrap();
+    let result = std::thread::spawn(move || {
+        let repo = Repository::open_existing(root)?;
+        repo.vault_store(
+            "memory/concurrent-review-write.md",
+            VaultEntryType::Memory,
+            b"must not land".to_vec(),
+            "{}".into(),
+        )
+    })
+    .join()
+    .unwrap();
+    assert!(
+        result.is_err(),
+        "a concurrent writer must not bypass the first-publication fence"
+    );
+    assert!(fixture
+        .repo
+        .vault_retrieve("memory/concurrent-review-write.md")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn stale_wrong_scope_and_truncated_subjects_fail_even_when_resigned() {
     let f = Fixture::new();
     let original = f.signed();

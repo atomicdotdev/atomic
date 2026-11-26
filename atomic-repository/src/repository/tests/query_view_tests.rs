@@ -418,12 +418,12 @@ fn fixture() -> (TempDir, TestRepository, Hash) {
     repo.switch_view("feature").unwrap();
     std::fs::write(
         temp.path().join("src/lib.rs"),
-        "pub fn target(secret: SiblingSecret) {}\npub fn caller() {}\n// inherited_marker\n",
+        "pub fn target(secret: SiblingSecret) {}\npub fn caller() {}\npub mod sibling;\n// inherited_marker\n",
     )
     .unwrap();
     std::fs::write(
         temp.path().join("src/sibling.rs"),
-        "pub fn sibling_only() { target(); }\n// sibling_marker\n",
+        "pub fn sibling_only() { crate::target(); }\n// sibling_marker\n",
     )
     .unwrap();
     repo.add("src/sibling.rs", TrackingOptions::default())

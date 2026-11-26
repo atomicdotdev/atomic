@@ -627,6 +627,72 @@ impl IdentityStore {
         Ok(KeyPair::from_secret_key(secret))
     }
 
+    /// Remove an identity's stored signing secret without retiring its public identity.
+    ///
+    /// Public verification data, defaults, delegations, and revocations remain
+    /// available. Repeating this operation succeeds even if the secret is already
+    /// absent. The secret is removed before atomically replacing its metadata,
+    /// so retrying after an interrupted retirement completes the metadata update.
+    /// This unlinks the stored key; it does not erase backups or keys in memory.
+    ///
+    /// Returns an error if the identity is unknown or its metadata cannot be
+    /// validated, or if a filesystem operation fails.
+    pub fn retire_secret_key(&self, id: &IdentityId) -> Result<(), IdentityError> {
+        use std::io::Write;
+
+        let identity_dir = self.find_identity_dir(id)?;
+        let identity_path = identity_dir.join(Self::IDENTITY_FILE);
+        let mut stored: StoredIdentity = toml::from_str(&fs::read_to_string(&identity_path)?)?;
+        // Directory discovery uses a short suffix, not the complete identity ID.
+        if stored.to_identity()?.id != *id {
+            return Err(IdentityError::NotFound {
+                name: id.to_base32(),
+            });
+        }
+        stored.has_secret_key = false;
+        let content = toml::to_string_pretty(&stored)?;
+        match fs::remove_file(identity_dir.join(Self::SECRET_KEY_FILE)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Persist the unlink before publishing metadata claiming no secret exists.
+        #[cfg(unix)]
+        fs::File::open(&identity_dir)?.sync_all()?;
+
+        let (temporary_path, mut temporary) = loop {
+            let path =
+                identity_dir.join(format!(".retire-secret-{:016x}.tmp", rand::random::<u64>()));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => break (path, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let result = (|| -> Result<(), IdentityError> {
+            temporary.set_permissions(fs::metadata(&identity_path)?.permissions())?;
+            temporary.write_all(content.as_bytes())?;
+            temporary.sync_all()?;
+            Ok(())
+        })();
+        drop(temporary);
+        let result = result.and_then(|()| {
+            fs::rename(&temporary_path, &identity_path)?;
+            #[cfg(unix)]
+            fs::File::open(&identity_dir)?.sync_all()?;
+            Ok(())
+        });
+        if result.is_err() {
+            // Only remove the temporary file created by this call, never public data.
+            let _ = fs::remove_file(&temporary_path);
+        }
+        result
+    }
+
     /// Delete an identity from the store.
     pub fn delete(&mut self, id: &IdentityId) -> Result<(), IdentityError> {
         let identity_dir = self.find_identity_dir(id)?;
@@ -1029,6 +1095,147 @@ mod tests {
 
         store.delete(&identity.id).unwrap();
         assert!(!store.exists(&identity.id));
+    }
+
+    #[test]
+    fn retire_secret_key_preserves_public_verification_and_audit_data() {
+        let (_temp, store) = create_test_store();
+        let keypair = KeyPair::generate();
+        let identity = Identity::new("ephemeral-reviewer", &keypair);
+        store.save_with_keypair(&identity, &keypair, None).unwrap();
+        let identity_dir = store.find_identity_dir(&identity.id).unwrap();
+        let identity_path = identity_dir.join(IdentityStore::IDENTITY_FILE);
+        let mut expected: toml::Value =
+            toml::from_str(&fs::read_to_string(&identity_path).unwrap()).unwrap();
+        expected["has_secret_key"] = toml::Value::Boolean(false);
+        fs::write(identity_dir.join("certificate.json"), b"public certificate").unwrap();
+        store
+            .save_delegation("review-grant", "signed delegation")
+            .unwrap();
+        store
+            .save_revocation("review-grant", "signed revocation")
+            .unwrap();
+        let message = b"evidence signed before key retirement";
+        let signature = keypair.sign(message);
+
+        store.retire_secret_key(&identity.id).unwrap();
+
+        let public = store.load(&identity.id).unwrap();
+        assert_eq!(public.id, identity.id);
+        assert_eq!(public.name, identity.name);
+        assert_eq!(public.public_key, identity.public_key);
+        public.verify(message, &signature).unwrap();
+        assert!(store.load_keypair(&identity.id, None).is_err());
+        assert!(!identity_dir.join(IdentityStore::SECRET_KEY_FILE).exists());
+        let actual: toml::Value =
+            toml::from_str(&fs::read_to_string(identity_path).unwrap()).unwrap();
+        assert_eq!(actual, expected, "only secret-presence metadata changes");
+        assert!(store
+            .list_filtered(&IdentityFilter::all().with_secret_key())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fs::read(identity_dir.join("certificate.json")).unwrap(),
+            b"public certificate"
+        );
+        assert_eq!(
+            store.load_delegation("review-grant").unwrap(),
+            "signed delegation"
+        );
+        assert_eq!(
+            store.load_revocation("review-grant").unwrap().as_deref(),
+            Some("signed revocation")
+        );
+    }
+
+    #[test]
+    fn retire_secret_key_keeps_global_and_usage_defaults() {
+        let (_temp, mut store) = create_test_store();
+        let keypair = KeyPair::generate();
+        let identity = Identity::new("default-reviewer", &keypair);
+        store.save_with_keypair(&identity, &keypair, None).unwrap();
+        store.set_default(&identity.id).unwrap();
+        store
+            .set_default_for_usage(&IdentityUsage::Work, &identity.id)
+            .unwrap();
+        let config = fs::read(store.root().join(IdentityStore::CONFIG_FILE)).unwrap();
+
+        store.retire_secret_key(&identity.id).unwrap();
+
+        let reopened = IdentityStore::open_existing(store.root()).unwrap();
+        assert_eq!(reopened.get_default().unwrap().unwrap().id, identity.id);
+        assert_eq!(
+            reopened
+                .get_default_for_usage(&IdentityUsage::Work)
+                .unwrap()
+                .unwrap()
+                .id,
+            identity.id
+        );
+        assert_eq!(
+            fs::read(store.root().join(IdentityStore::CONFIG_FILE)).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn retire_secret_key_is_idempotent_for_retired_and_public_only_identities() {
+        let (_temp, store) = create_test_store();
+        let keypair = KeyPair::generate();
+        let identity = Identity::new("reviewer", &keypair);
+        store.save_with_keypair(&identity, &keypair, None).unwrap();
+        store.retire_secret_key(&identity.id).unwrap();
+        store.retire_secret_key(&identity.id).unwrap();
+        assert_eq!(
+            store.load(&identity.id).unwrap().public_key,
+            identity.public_key
+        );
+
+        let public_only = Identity::generate("public-only");
+        store.save(&public_only).unwrap();
+        store.retire_secret_key(&public_only.id).unwrap();
+        assert!(store.load(&public_only.id).is_ok());
+    }
+
+    #[test]
+    fn retire_secret_key_resumes_after_secret_unlink() {
+        let (_temp, store) = create_test_store();
+        let keypair = KeyPair::generate();
+        let identity = Identity::new("interrupted-reviewer", &keypair);
+        store.save_with_keypair(&identity, &keypair, None).unwrap();
+        let identity_dir = store.find_identity_dir(&identity.id).unwrap();
+        fs::remove_file(identity_dir.join(IdentityStore::SECRET_KEY_FILE)).unwrap();
+
+        store.retire_secret_key(&identity.id).unwrap();
+
+        let stored: StoredIdentity = toml::from_str(
+            &fs::read_to_string(identity_dir.join(IdentityStore::IDENTITY_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert!(!stored.has_secret_key);
+        assert_eq!(
+            store.load(&identity.id).unwrap().public_key,
+            identity.public_key
+        );
+    }
+
+    #[test]
+    fn retire_secret_key_refuses_unknown_identity() {
+        let (_temp, store) = create_test_store();
+        let keypair = KeyPair::generate();
+        let known = Identity::new("known", &keypair);
+        store.save_with_keypair(&known, &keypair, None).unwrap();
+        let unknown = Identity::generate("unknown");
+
+        assert!(matches!(
+            store.retire_secret_key(&unknown.id),
+            Err(IdentityError::NotFound { .. })
+        ));
+        assert_eq!(
+            store.load_keypair(&known.id, None).unwrap().public,
+            keypair.public
+        );
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     #[test]
