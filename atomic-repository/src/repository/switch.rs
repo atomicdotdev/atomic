@@ -791,6 +791,15 @@ impl Repository {
             .collect();
         removal_paths.extend(old_files.intersection(&new_directories).cloned());
         removal_paths.extend(old_directories.intersection(&new_files).cloned());
+        // Untracked directories beneath a removed directory carry no user
+        // bytes when they hold no files and no symlinks — `init` scaffolds
+        // like `.vault/goals`, `.vault/intents`, and `.vault/scratch` are
+        // exactly this shape. Plan their removal too, or the parent
+        // directory's `fs::remove_dir` fails with DirectoryNotEmpty and the
+        // switch fails closed. Directories that keep untracked files or
+        // symlinks are NOT swept: execution still refuses them with the
+        // untracked-children guard.
+        super::materialize::expand_removals_with_data_free_dirs(&self.root, &mut removal_paths)?;
         let switch_removal_scope = removal_paths.clone();
         let mut removal_paths: Vec<String> = removal_paths.into_iter().collect();
         removal_paths.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));

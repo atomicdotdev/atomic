@@ -850,6 +850,11 @@ impl Repository {
             .filter(|entry| entry.is_directory() && selected(entry.path()))
             .collect();
         directories.sort_by_key(|entry| std::cmp::Reverse(entry.path().matches('/').count()));
+        let planned_paths: std::collections::HashSet<&str> = entries
+            .iter()
+            .filter(|entry| selected(entry.path()))
+            .map(|entry| entry.path())
+            .collect();
         for entry in directories {
             if let Some(executor) = effect_executor.as_deref_mut() {
                 executor.remove_path(entry.path())?;
@@ -857,6 +862,15 @@ impl Repository {
                 let absolute = self.root.join(entry.path());
                 match std::fs::symlink_metadata(&absolute) {
                     Ok(metadata) if metadata.file_type().is_dir() => {
+                        // Untracked data-free scaffolds beneath the directory
+                        // would keep `remove_dir` failing closed; sweep them
+                        // first. Files and symlinks are never touched, so
+                        // any real untracked byte still blocks the removal.
+                        remove_data_free_untracked_children(
+                            &absolute,
+                            entry.path(),
+                            &planned_paths,
+                        )?;
                         std::fs::remove_dir(&absolute).map_err(|error| {
                             RepositoryError::InvalidOperation {
                                 message: format!(
@@ -2701,6 +2715,137 @@ impl Repository {
             change_count: view.change_count,
         }))
     }
+}
+
+/// Does this directory tree hold no user bytes — every entry beneath it is
+/// a directory, none holding a file, symlink, or other special entry?
+fn dir_tree_is_data_free(path: &std::path::Path) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            return Ok(false);
+        }
+        if !dir_tree_is_data_free(&entry.path())? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The bottom-up removal order for a directory subtree that holds no
+/// files and no symlinks: deepest directories first, the subtree root
+/// last.
+fn data_free_dir_tree_order(path: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut ordered = Vec::new();
+    let mut queue = vec![path.to_path_buf()];
+    while let Some(dir) = queue.pop() {
+        ordered.push(dir.clone());
+        for child in std::fs::read_dir(&dir)? {
+            let child = child?;
+            let file_type = child.file_type()?;
+            if file_type.is_dir() && !file_type.is_symlink() {
+                queue.push(child.path());
+            }
+        }
+    }
+    ordered.reverse();
+    Ok(ordered)
+}
+
+/// Remove the untracked directories beneath a directory that a direct
+/// (unjournaled) materialize is about to remove, when those directories
+/// hold no files and no symlinks. Paths with their own removal plans are
+/// left to those plans. Any untracked file or symlink keeps the parent
+/// removal failing closed — untracked children are never removed
+/// recursively.
+fn remove_data_free_untracked_children(
+    absolute: &std::path::Path,
+    path: &str,
+    planned: &std::collections::HashSet<&str>,
+) -> Result<(), RepositoryError> {
+    let children = match std::fs::read_dir(absolute) {
+        Ok(children) => children,
+        // Absent or unreadable paths contribute nothing to sweep; the
+        // planned removal below owns any real failure.
+        Err(_) => return Ok(()),
+    };
+    for child in children {
+        let child = child.map_err(RepositoryError::Io)?;
+        let file_type = child.file_type().map_err(RepositoryError::Io)?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+        let child_path = match child.file_name().into_string() {
+            Ok(name) => format!("{path}/{name}"),
+            // Non-UTF-8 names cannot be repository paths; leave them for
+            // the fail-closed guard.
+            Err(_) => continue,
+        };
+        if planned.contains(child_path.as_str()) {
+            continue;
+        }
+        if !dir_tree_is_data_free(&child.path()).map_err(RepositoryError::Io)? {
+            continue;
+        }
+        for dir in data_free_dir_tree_order(&child.path()).map_err(RepositoryError::Io)? {
+            std::fs::remove_dir(&dir).map_err(RepositoryError::Io)?;
+        }
+    }
+    Ok(())
+}
+
+/// Expand a planned removal set with the untracked directories beneath
+/// removed directories that hold no files and no symlinks.
+///
+/// Repository scaffolds like the vault's `goals/`, `intents/`, and
+/// `scratch/` directories are never recorded (only files are), so a view
+/// that stops projecting their parent directory plans the parent's
+/// removal while the empty scaffolds linger on disk. `fs::remove_dir`
+/// then fails with `DirectoryNotEmpty` and the operation fails closed
+/// ("untracked children are never removed recursively").
+///
+/// Directories with no files or symlinks anywhere beneath them carry no
+/// user bytes, so planning their removal preserves the fail-closed
+/// contract for everything that matters: an untracked file or symlink
+/// beneath a removed directory still blocks execution with the same
+/// guard.
+pub(super) fn expand_removals_with_data_free_dirs(
+    root: &std::path::Path,
+    removal_paths: &mut std::collections::HashSet<String>,
+) -> Result<(), RepositoryError> {
+    let mut queue: Vec<String> = removal_paths.iter().cloned().collect();
+    while let Some(dir) = queue.pop() {
+        let children = match std::fs::read_dir(root.join(&dir)) {
+            Ok(children) => children,
+            // Planned files, symlinks, absent paths, and unreadable
+            // entries contribute nothing to expand; their own effects and
+            // the fail-closed execution guard own any real failure.
+            Err(_) => continue,
+        };
+        for child in children {
+            let child = child.map_err(RepositoryError::Io)?;
+            let file_type = child.file_type().map_err(RepositoryError::Io)?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let child_path = match child.file_name().into_string() {
+                Ok(name) => format!("{dir}/{name}"),
+                // Non-UTF-8 names cannot be repository paths; leave them
+                // for the fail-closed guard.
+                Err(_) => continue,
+            };
+            if removal_paths.contains(&child_path) {
+                continue;
+            }
+            if !dir_tree_is_data_free(&child.path()).map_err(RepositoryError::Io)? {
+                continue;
+            }
+            removal_paths.insert(child_path.clone());
+            queue.push(child_path);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
