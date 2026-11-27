@@ -15,9 +15,10 @@
 //! graph, and one attestation — exactly the shape a real server sends after
 //! an agent-made push. It then drives the real CLI binary.
 //!
-//! Windows is excluded: the test isolates the identity store by pointing
-//! `HOME` at a temp dir, which `dirs::home_dir()` ignores on Windows.
-#![cfg(not(windows))]
+//! The test isolates the global config (identity store included) by
+//! pointing `ATOMIC_CONFIG_DIR` at a temp dir — the one home relocation
+//! that works on every platform — with `HOME` kept for any non-atomic
+//! reader on Unix.
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
@@ -38,6 +39,7 @@ fn atomic(work_dir: &Path, home_dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(work_dir)
         .env("HOME", home_dir)
+        .env("ATOMIC_CONFIG_DIR", home_dir.join(".atomic"))
         .output()
         .expect("run atomic")
 }

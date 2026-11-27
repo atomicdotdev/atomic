@@ -1,5 +1,6 @@
-//! Compatibility coverage for freeform memories.
-#![cfg(not(windows))]
+//! Compatibility coverage for freeform memories. The global config is
+//! isolated with `ATOMIC_CONFIG_DIR` (cross-platform); `HOME` stays for
+//! any non-atomic reader on Unix.
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -13,6 +14,7 @@ fn atomic(repo_dir: &Path, home_dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(repo_dir)
         .env("HOME", home_dir)
+        .env("ATOMIC_CONFIG_DIR", home_dir.join(".atomic"))
         .output()
         .expect("run atomic")
 }
@@ -35,6 +37,7 @@ fn memory_show_reads_written_and_default_freeform_memories() {
         .args(["memory", "write", "notes", "--type", "reference"])
         .current_dir(repo_dir)
         .env("HOME", home_dir)
+        .env("ATOMIC_CONFIG_DIR", home_dir.join(".atomic"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
