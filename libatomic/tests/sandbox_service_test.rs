@@ -774,6 +774,128 @@ fn a_stale_submit_is_refused_with_the_live_skeleton() {
 }
 
 #[test]
+fn schema_five_submit_and_get_changes_preserve_bytes_and_reject_codec_tampering() {
+    use atomic_core::change::{
+        format_v3::{
+            graph_fields::GraphEncoding, semantic::SemanticEncoding, FileHeader, FileHeaderFlags,
+        },
+        Change,
+    };
+    let host = host();
+    host.draft("schema-five");
+    let opened = host.open("schema-five", ALL);
+    let vm = materialize(&host, &opened);
+    let text = (0..512)
+        .map(|i| format!("pub fn generated_{i}() -> usize {{ {i} }}\n"))
+        .collect::<String>();
+    write(&vm.root, "src/lib.rs", &text);
+    let outcome = vm
+        .cache
+        .record(
+            vm.cache.require_working_copy_id().unwrap(),
+            header("schema-five"),
+            record_options(),
+        )
+        .unwrap();
+    let mut change = vm.cache.load_change(outcome.hash()).unwrap();
+    change.graph_encoding = GraphEncoding::FieldsV1;
+    change.semantic_encoding = SemanticEncoding::PredictiveV2;
+    let mut bytes = vec![];
+    let hash = change.serialize(&mut bytes).unwrap();
+    let file_header = FileHeader::from_bytes(bytes[..64].try_into().unwrap()).unwrap();
+    assert!(file_header.has_graph_fields());
+    assert!(file_header.has_predictive_semantics());
+    let base = host.with_repo(|repo| repo.sandbox_effective_state("schema-five").unwrap());
+    let submit = |bundle| {
+        host.rt
+            .block_on(host.service().submit_change(with_token(
+                SubmitChangeRequest {
+                    repository: Some(host.repository.clone()),
+                    meta: None,
+                    change: Some(bundle),
+                    expected_snapshot: Some(wire::view_snapshot("schema-five", &base, None)),
+                    target: None,
+                },
+                &opened.token,
+            )))
+            .unwrap()
+            .into_inner()
+    };
+
+    // Header flags are outside the change hash. The unchanged trailer would
+    // still verify if the hashed CODECS descriptor were not enforced.
+    for flag in [
+        FileHeaderFlags::GRAPH_FIELDS,
+        FileHeaderFlags::PREDICTIVE_SEMANTICS,
+    ] {
+        let mut tampered = bytes.clone();
+        tampered[8..12].copy_from_slice(&(file_header.flags.to_raw() ^ flag).to_le_bytes());
+        let response = submit(wire::change_bundle(&hash, tampered));
+        let Some(submit_change_response::Outcome::Refused(refused)) = response.outcome else {
+            panic!("expected malformed refusal")
+        };
+        let rejection =
+            wire::rejection_from_error_info(refused.rejection.as_ref().unwrap()).unwrap();
+        assert!(
+            matches!(rejection, SubmitRejection::Malformed(ref detail) if detail.contains("CODECS")),
+            "{rejection:?}"
+        );
+        host.with_repo(|repo| {
+            assert!(!repo.change_store().change_path(&hash).exists());
+            assert_eq!(repo.sandbox_effective_state("schema-five").unwrap(), base);
+        });
+        assert!(!host.on_view("schema-five", &hash));
+    }
+    let wrong_hash = Hash::of(b"not the submitted schema-five change");
+    let response = submit(wire::change_bundle(&wrong_hash, bytes.clone()));
+    let Some(submit_change_response::Outcome::Refused(refused)) = response.outcome else {
+        panic!("expected claimed-hash refusal")
+    };
+    assert!(matches!(
+        wire::rejection_from_error_info(refused.rejection.as_ref().unwrap()),
+        Some(SubmitRejection::HashMismatch { .. })
+    ));
+    host.with_repo(|repo| {
+        assert!(!repo.change_store().change_path(&wrong_hash).exists());
+        assert!(!repo.change_store().change_path(&hash).exists());
+        assert_eq!(repo.sandbox_effective_state("schema-five").unwrap(), base);
+    });
+    let response = submit(wire::change_bundle(&hash, bytes.clone()));
+    assert!(matches!(
+        response.outcome,
+        Some(submit_change_response::Outcome::Submitted(_))
+    ));
+    assert!(host.on_view("schema-five", &hash));
+    assert_eq!(host.tree("schema-five")["src/lib.rs"], text);
+    let response = host
+        .rt
+        .block_on(host.service().get_changes(with_token(
+            GetChangesRequest {
+                repository: Some(host.repository.clone()),
+                hashes: vec![libatomic::daemon::convert::hash_proto(&hash)],
+                target: None,
+                expected_snapshot: None,
+            },
+            &opened.token,
+        )))
+        .unwrap()
+        .into_inner();
+    let Some(get_changes_response::Outcome::Changes(changes)) = response.outcome else {
+        panic!("expected change bytes")
+    };
+    let bundle = &changes.changes[0];
+    assert_eq!(bundle.schema, wire::CHANGE_SCHEMA);
+    assert_eq!(
+        wire::change_from_bundle(bundle).unwrap(),
+        (hash, bytes.clone())
+    );
+    let (decoded, actual) = Change::deserialize(&mut bundle.payload.as_slice()).unwrap();
+    assert_eq!(actual, hash);
+    assert_eq!(decoded.hashed, change.hashed);
+    assert_eq!(decoded.contents, change.contents);
+}
+
+#[test]
 fn a_token_reaches_its_view_and_nothing_else() {
     let host = host();
     host.draft("exp-1");

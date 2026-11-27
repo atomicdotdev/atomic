@@ -100,8 +100,8 @@ pub enum SectionType {
     /// the Trunk/Branch/Leaf operations for line-level and token-level diffs,
     /// blame, and code review.
     ///
-    /// SEMANTIC sections are independently loadable — a code review UI can
-    /// read only these sections without touching GRAPH sections.
+    /// Expanded sections are independently loadable. Schema-4 compact payloads
+    /// additionally need authored CONTENT bytes, but not graph operations or redb.
     ///
     /// Payload: `zstd(postcard(SemanticSection))`
     Semantic = 0x30,
@@ -118,6 +118,8 @@ pub enum SectionType {
     /// Immutable range operations, stored as one hashed schema-3 section.
     /// Kept last so existing postcard enum ordinals remain unchanged.
     Span = 0x11,
+    /// Hashed schema-5 interpretation manifest; appended to preserve old serde ordinals.
+    Codecs = 0x05,
 }
 
 impl SectionType {
@@ -147,6 +149,7 @@ impl SectionType {
             0x04 => Ok(SectionType::Signature),
             0x10 => Ok(SectionType::Graph),
             0x11 => Ok(SectionType::Span),
+            0x05 => Ok(SectionType::Codecs),
             0x20 => Ok(SectionType::Content),
             0x30 => Ok(SectionType::Semantic),
             0xF0 => Ok(SectionType::Unhashed),
@@ -206,6 +209,7 @@ impl SectionType {
                 | SectionType::Dependencies
                 | SectionType::Provenance
                 | SectionType::Signature
+                | SectionType::Codecs
         )
     }
 
@@ -238,6 +242,7 @@ impl SectionType {
             SectionType::Signature => "SIGNATURE",
             SectionType::Graph => "GRAPH",
             SectionType::Span => "SPAN",
+            SectionType::Codecs => "CODECS",
             SectionType::Content => "CONTENT",
             SectionType::Semantic => "SEMANTIC",
             SectionType::Unhashed => "UNHASHED",
@@ -257,6 +262,7 @@ impl SectionType {
             SectionType::Dependencies => 1,
             SectionType::Provenance => 2,
             SectionType::Signature => 3,
+            SectionType::Codecs => 3,
             SectionType::Graph => 4,
             SectionType::Span => 5,
             SectionType::Semantic => 6,

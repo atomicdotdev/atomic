@@ -128,7 +128,7 @@ message SessionTurn {
 // bytes as versioned-opaque with this schema field, like the event envelope's
 // type URL (HANDOFF §10.3 recommendation).
 message VersionedBytes {
-  string schema = 1;   // e.g. "atomic.change.v3", "atomic.prov.graph.v1"
+  string schema = 1;   // e.g. "atomic.change.v5", "atomic.prov.graph.v1"
   bytes payload = 2;
 }
 
@@ -158,11 +158,15 @@ message ChangeRef {
 }
 
 // A versioned change bundle — the wire form of a change interchange object
-// (today: V3 change-file bytes; .change files remain import/export
-// interchange per the RFC's non-goals).
+// (ATOM change-file bytes; .change files remain import/export interchange).
+// Schema-5 payloads use "atomic.change.v5"; historical payloads retain
+// "atomic.change.v3". Readers also accept legacy v3/empty envelopes containing
+// schema-5 bytes, as emitted by older producers. A v5 envelope requires a v5
+// ATOM header. The label is not authentication: atomic-core validates the hashed
+// CODECS descriptor, payload and claimed hash before repository mutation.
 message ChangeBundle {
   Hash hash = 1;
-  string schema = 2;   // e.g. "atomic.change.v3"
+  string schema = 2;   // "atomic.change.v5" or legacy "atomic.change.v3"
   bytes payload = 3;
 }
 

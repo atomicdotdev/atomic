@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use atomic_core::change::format_v3::{FileHeader, FIELD_CODEC_FORMAT_VERSION};
 use atomic_core::change::session::{SessionCheckpointPublication, SessionTurn};
 use atomic_core::types::{Base32, Hash};
 use atomic_repository::{
@@ -20,8 +21,12 @@ use super::sandbox_grants::view_ref_id;
 use crate::atomic as pb;
 use crate::atomic::ErrorCode;
 
-/// V3 change bytes in a [`pb::ChangeBundle`].
-pub const CHANGE_SCHEMA: &str = "atomic.change.v3";
+/// Schema-5 ATOM bytes, with authenticated CODECS interpretation.
+pub const CHANGE_SCHEMA: &str = "atomic.change.v5";
+/// Historical envelope label, also used by earlier producers for schema 5.
+pub const LEGACY_CHANGE_SCHEMA: &str = "atomic.change.v3";
+/// GetCapabilities feature: schema-5 graph fields and predictive semantics.
+pub const CHANGE_SCHEMA5_FEATURE: &str = "change-format-schema-5";
 /// A serialized provenance graph (`ProvenanceGraph::serialize`).
 pub const PROVENANCE_GRAPH_SCHEMA: &str = "atomic.prov.graph.v1";
 /// A [`SessionTurn`] as JSON.
@@ -305,21 +310,57 @@ pub fn rejection_from_error_info(info: &pb::ErrorInfo) -> Option<SubmitRejection
     })
 }
 
+/// Envelope hint only. Core decoding still authenticates CODECS and the hash.
+/// Historical payloads keep the legacy label; they are never upgraded here.
+fn change_schema(bytes: &[u8]) -> &'static str {
+    if change_file_header(bytes).is_ok_and(|header| header.version == FIELD_CODEC_FORMAT_VERSION) {
+        CHANGE_SCHEMA
+    } else {
+        LEGACY_CHANGE_SCHEMA
+    }
+}
+
+fn change_file_header(bytes: &[u8]) -> Result<FileHeader, String> {
+    let header = bytes
+        .get(..FileHeader::SIZE)
+        .ok_or("truncated ATOM change header")?;
+    FileHeader::from_bytes(header.try_into().expect("fixed-size header slice"))
+        .map_err(|error| error.to_string())
+}
+
+/// Full change bytes for GetChange, sharing the sandbox envelope version policy.
+pub fn change_bytes(bytes: Vec<u8>) -> pb::VersionedBytes {
+    versioned(change_schema(&bytes), bytes)
+}
+
+/// Wrap already-produced change bytes without conversion or validation. The
+/// recipient must validate the payload and claimed identity before storing it.
 pub fn change_bundle(hash: &Hash, bytes: Vec<u8>) -> pb::ChangeBundle {
     pb::ChangeBundle {
         hash: Some(hash_proto(hash)),
-        schema: CHANGE_SCHEMA.to_string(),
+        schema: change_schema(&bytes).to_string(),
         payload: bytes,
     }
 }
 
-/// A bundle's hash and V3 bytes. An empty schema reads as V3.
+/// Unwrap an interchange envelope without converting its payload. Legacy v3
+/// and empty labels remain accepted, including schema-5 bytes sent by older
+/// libatomic producers. A v5 label requires a v5 header. The caller must use
+/// core/repository validation for the authenticated descriptor and claimed hash.
 pub fn change_from_bundle(bundle: &pb::ChangeBundle) -> Result<(Hash, Vec<u8>), String> {
-    if !bundle.schema.is_empty() && bundle.schema != CHANGE_SCHEMA {
+    if !bundle.schema.is_empty()
+        && bundle.schema != CHANGE_SCHEMA
+        && bundle.schema != LEGACY_CHANGE_SCHEMA
+    {
         return Err(format!(
-            "expected {CHANGE_SCHEMA} change bytes, got '{}'",
+            "expected {CHANGE_SCHEMA} or {LEGACY_CHANGE_SCHEMA} change bytes, got '{}'",
             bundle.schema
         ));
+    }
+    if bundle.schema == CHANGE_SCHEMA
+        && change_file_header(&bundle.payload)?.version != FIELD_CODEC_FORMAT_VERSION
+    {
+        return Err("atomic.change.v5 requires an ATOM schema-5 payload".into());
     }
     Ok((
         hash_from_proto(bundle.hash.as_ref())?,

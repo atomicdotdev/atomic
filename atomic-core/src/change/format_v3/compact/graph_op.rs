@@ -203,7 +203,9 @@ pub enum CompactGraphOp {
 }
 
 impl CompactGraphOp {
-    pub(super) fn validate_serialized_name_conflict(&self) -> Result<(), String> {
+    pub(in crate::change::format_v3) fn validate_serialized_name_conflict(
+        &self,
+    ) -> Result<(), String> {
         if let CompactGraphOp::SetAttr { inode, path, value } = self {
             if path.is_empty() {
                 return Err("SetAttr requires a non-empty path".to_string());

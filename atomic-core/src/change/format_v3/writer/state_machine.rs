@@ -4,7 +4,10 @@
 //! and all public methods for writing sections of a V3 change file.
 //! Private helper methods live in the sibling `helpers` module.
 
-use super::super::error::{FormatError, FormatResult, FORMAT_VERSION, SPAN_FORMAT_VERSION};
+use super::super::error::{
+    FormatError, FormatResult, COMPACT_SEMANTIC_FORMAT_VERSION, FIELD_CODEC_FORMAT_VERSION,
+    FORMAT_VERSION, SPAN_FORMAT_VERSION,
+};
 use super::super::hash_table::HashDedupTable;
 use super::super::types::{
     envelope::encode_native_change_header_v2, FileHeader, SectionHeader, SectionType, Trailer,
@@ -162,6 +165,9 @@ pub struct ChangeWriter<'w, W: Write> {
 
     pub(super) schema_version: u32,
     pub(super) wrote_span_section: bool,
+    pub(super) requires_span: bool,
+    pub(super) expected_codecs: Option<super::super::codecs::CodecDescriptor>,
+    pub(super) wrote_codecs: bool,
 
     /// The highest section ordering value written so far.
     /// Used to enforce monotonic section ordering.
@@ -199,6 +205,9 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
             wrote_signature_section: false,
             schema_version: 0,
             wrote_span_section: false,
+            requires_span: false,
+            expected_codecs: None,
+            wrote_codecs: false,
             last_section_ordering: None,
         }
     }
@@ -229,7 +238,11 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     pub fn write_file_header(&mut self, header: &FileHeader) -> FormatResult<()> {
         self.expect_state(WriterState::Created, "write_file_header")?;
         header.validate()?;
-        if header.version != FORMAT_VERSION && header.version != SPAN_FORMAT_VERSION {
+        if header.version != FORMAT_VERSION
+            && header.version != SPAN_FORMAT_VERSION
+            && header.version != COMPACT_SEMANTIC_FORMAT_VERSION
+            && header.version != FIELD_CODEC_FORMAT_VERSION
+        {
             return Err(FormatError::InvalidHeader {
                 reason: format!(
                     "schema version {} is read-only; writers emit version {}",
@@ -240,6 +253,12 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
 
         header.write_to(self.writer)?;
         self.schema_version = header.version;
+        self.requires_span = header.has_span();
+        self.expected_codecs = if header.version == FIELD_CODEC_FORMAT_VERSION {
+            Some(super::super::codecs::CodecDescriptor::from_header(header)?)
+        } else {
+            None
+        };
         self.stats.total_bytes_written += FileHeader::SIZE as u64;
         self.state = WriterState::FileHeaderWritten;
         Ok(())
@@ -514,9 +533,14 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     /// - I/O errors from writing the trailer.
     pub fn finalize(mut self) -> FormatResult<WriteOutcome> {
         self.ensure_metadata_complete()?;
-        if (self.schema_version == SPAN_FORMAT_VERSION) != self.wrote_span_section {
+        if self.expected_codecs.is_some() != self.wrote_codecs {
             return Err(FormatError::InvalidHeader {
-                reason: "schema 3 requires exactly one SPAN section; schema 2 forbids it".into(),
+                reason: "missing authenticated CODECS section".into(),
+            });
+        }
+        if self.requires_span != self.wrote_span_section {
+            return Err(FormatError::InvalidHeader {
+                reason: "SPAN sections do not match the schema and HAS_SPAN manifest".into(),
             });
         }
 
@@ -565,10 +589,25 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
         uncompressed_len: u64,
     ) -> FormatResult<()> {
         self.ensure_metadata_complete()?;
-        if section_type == SectionType::Span {
+        self.check_section_size(uncompressed_len, compressed_data.len())?;
+        if matches!(section_type, SectionType::Span | SectionType::Codecs) {
             return Err(FormatError::InvalidHeader {
-                reason: "SPAN sections must use write_span_section".into(),
+                reason: "SPAN/CODECS sections require their typed writer methods".into(),
             });
+        }
+        if matches!(
+            section_type,
+            SectionType::Graph
+                | SectionType::Semantic
+                | SectionType::Content
+                | SectionType::Unhashed
+        ) {
+            self.ensure_body_ready()?;
+        }
+        match section_type {
+            SectionType::Graph => self.transition_to_at_least(WriterState::WritingGraph)?,
+            SectionType::Semantic => self.transition_to_at_least(WriterState::WritingSemantic)?,
+            _ => {}
         }
         self.check_section_ordering(section_type)?;
 

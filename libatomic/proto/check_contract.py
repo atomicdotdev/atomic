@@ -21,6 +21,7 @@ SANDBOX_METHODS = {
     "DaemonService": {"Health", "GetCapabilities"},
     "SandboxService": {
         "Materialize", "GetFileStates", "GetChanges", "SubmitChange", "PublishProvenance",
+        "SubmitAttestation",
     },
     "ProvenanceService": {
         "ReserveTurn", "AppendEnvelopes", "PrepareCheckpoint", "LoadFrozenEnvelopes",
@@ -132,6 +133,20 @@ def main():
             if options.RPC_EFFECT_WORKSPACE_WRITE in effects:
                 check("working-copy.write" in capabilities, f"{label}: workspace write lacks workspace permission")
         check(observed_sandbox == SANDBOX_METHODS, "Sandbox method allowlist differs from reviewed contract")
+
+        # This session-owned submission is already admitted by the runtime's
+        # sandbox/scoped allowlists. Pin its narrow authority, not just membership.
+        submission = methods.get(("SandboxService", "SubmitAttestation"))
+        check(submission is not None, "SandboxService.SubmitAttestation: missing reviewed method")
+        if submission is not None:
+            opt = submission.options
+            check(set(opt.Extensions[options.required_capability]) == {"attestation.write"}, "SandboxService.SubmitAttestation: requires exactly attestation.write")
+            check(opt.Extensions[options.execution_scope] == options.EXECUTION_SCOPE_BOTH, "SandboxService.SubmitAttestation: requires BOTH scope")
+            check(set(opt.Extensions[options.allowed_caller]) == {
+                options.CALLER_CLASS_LOCAL, options.CALLER_CLASS_REMOTE_IDENTITY,
+                options.CALLER_CLASS_SANDBOX,
+            }, "SandboxService.SubmitAttestation: caller allowlist differs from reviewed contract")
+            check(set(opt.Extensions[options.effect]) == {options.RPC_EFFECT_REPOSITORY_WRITE}, "SandboxService.SubmitAttestation: requires repository-write effect only")
 
         def field(message, name, kind):
             fields = messages[f".atomic.{message}"].field

@@ -44,12 +44,20 @@ pub const MAGIC: [u8; 4] = *b"ATOM";
 /// Legacy ATOM streaming schema version accepted read-only.
 pub const LEGACY_FORMAT_VERSION: u32 = 1;
 
-/// Current ATOM streaming schema version emitted by writers.
+/// Base ATOM streaming schema for expanded semantic operations. New writers
+/// retain it for small changes where compact semantics do not save space.
 pub const FORMAT_VERSION: u32 = 2;
 
 /// Schema for changes carrying one separately hashed span section. Ordinary
 /// changes retain schema 2 and their existing identities.
 pub const SPAN_FORMAT_VERSION: u32 = 3;
+
+/// Compact semantic payloads; HAS_SPAN explicitly declares an optional span
+/// section. Earlier readers reject this schema before interpreting operations.
+pub const COMPACT_SEMANTIC_FORMAT_VERSION: u32 = 4;
+
+/// Authenticated codec descriptors, graph fields and predictive semantics.
+pub const FIELD_CODEC_FORMAT_VERSION: u32 = 5;
 
 /// Maximum number of unique hashes in the deduplication table.
 ///
@@ -76,6 +84,16 @@ pub const MAX_HASH_TABLE_ENTRIES: usize = (u16::MAX as usize) - 1;
 /// | Section | `InvalidSectionType`, `UnexpectedSection`, `SectionTruncated` | Section parsing |
 #[derive(Debug, Error)]
 pub enum FormatError {
+    /// New graph codec or raw schema-5 fallback exceeds fixed resource budgets.
+    #[error("graph-field resource limit exceeded")]
+    GraphFieldLimitExceeded,
+    /// Experimental graph operations keep their existing raw representation.
+    #[error("graph-field v1 does not support private prototype operations")]
+    UnsupportedGraphFieldOp,
+    /// Compact semantic input or expanded allocations exceed the supported
+    /// budget. New writers may choose the historical raw encoding instead.
+    #[error("compact semantic resource limit exceeded")]
+    SemanticLimitExceeded,
     // ── Format errors ──────────────────────────────────────────────
     /// File does not start with the expected `b"ATOM"` magic bytes.
     ///

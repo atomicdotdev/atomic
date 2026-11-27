@@ -20,6 +20,29 @@ The version check above verifies the local crate; it is not a registry fallback.
 
 ## Embedded service API
 
+### Change format support
+
+The Rust service, daemon handlers and optional Node addon use the shared
+schema-5 core reader/writer. `GetChange` and sandbox change responses label actual
+schema-5 ATOM payloads `atomic.change.v5`; historical encodings retain the legacy
+`atomic.change.v3` container label. Bundle inputs still accept v3 and empty labels,
+including schema-5 objects from older producers. New v5 labels require a v5
+header; core validation authenticates CODECS and hashes, not the envelope string.
+
+`DaemonService.GetCapabilities` advertises `change-format-schema-5` in `features`
+and is available through `LocalService.call` (including the Node byte boundary).
+RPC protocol revision 2, metadata projection version 1 and protobuf field numbers
+are unchanged. No client-side decoder is needed for the metadata projection; full
+bundle consumers must use a schema-5-capable decoder. Native sync import/export
+preserves ATOM bytes and signatures without protobuf wrapping or format upgrades.
+
+See [the service contract](proto/CONTRACT.md#schema-5-change-interchange) and
+[schema-5 format](../docs/CHANGE-FORMAT-SCHEMA-5.md). Rebuild consumers and the Node
+addon against this source to obtain support; existing installed binaries do not
+automatically acquire the new reader.
+
+### Calling the service
+
 `LocalService` provides a protobuf-byte boundary for language bindings. Reuse an
 instance (or its clones) so calls share routing and repository gates:
 

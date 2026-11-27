@@ -19,6 +19,162 @@ fn make_test_change(message: &str, content: &[u8]) -> Change {
     Change::new(ChangeHeader::new(message), vec![], content.to_vec(), vec![])
 }
 
+fn compact_change() -> Change {
+    use atomic_core::{
+        change::{FileOps, LineOps},
+        crdt::{BranchId, LeafOp, TrunkId},
+        diff::token::TokenKind,
+        types::NodeId,
+    };
+    let mut content = vec![];
+    let mut file = FileOps::create(TrunkId::ROOT, "f".into(), Some(Encoding::Utf8));
+    for i in 0..1024u32 {
+        let text = format!("line {i}: authored text\n");
+        let start = content.len();
+        content.extend(text.as_bytes());
+        file.add_line_op(
+            LineOps::insert_at(
+                BranchId::new(NodeId::ROOT, i),
+                i.checked_sub(1).map(|j| BranchId::new(NodeId::ROOT, j)),
+                vec![LeafOp::Insert {
+                    after: None,
+                    kind: TokenKind::Word,
+                    content: text.into_bytes(),
+                }],
+                i as usize + 1,
+            )
+            .with_content_range(
+                ChangePosition::new(start as u64),
+                ChangePosition::new(content.len() as u64),
+            ),
+        );
+    }
+    let mut change = Change::with_file_ops(
+        ChangeHeader::new("compact store round-trip"),
+        vec![],
+        vec![file],
+        content,
+        vec![],
+    );
+    change.add_provenance(atomic_core::change::Provenance::default());
+    change.unhashed = Some(serde_json::json!({"retained":"unhashed attachment"}));
+    change
+}
+
+#[test]
+fn compact_semantics_signed_provenance_survives_store_export_and_file_only_query() {
+    for span in [false, true] {
+        let mut change = compact_change();
+        if span {
+            change.hashed.span = Some(atomic_core::change::span_patch::SpanPatch::new(
+                vec![],
+                vec![atomic_core::change::span_patch::SpanOp::Root {
+                    path: "f".into(),
+                    ordinal: 0,
+                    start: 0,
+                    end: change.contents.len() as u64,
+                }],
+            ));
+        }
+        let seed = [91; 32];
+        let hash = change
+            .sign_with("did:atomic:compact-store", &seed, 123)
+            .unwrap();
+        let mut original = vec![];
+        change.serialize(&mut original).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(original[4..8].try_into().unwrap()),
+            format_v3::COMPACT_SEMANTIC_FORMAT_VERSION
+        );
+        let (dir, store) = temp_store();
+        store.import_v3_bytes(&original).unwrap();
+        drop(store);
+        let store =
+            RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+        let exported = store.export_v3_bytes(hash.as_bytes()).unwrap();
+        assert_eq!(exported, original);
+        if !span {
+            let sections = store.load_semantic_sections(hash.as_bytes()).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<Vec<atomic_core::change::FileOps>>(&sections[0].payload)
+                    .unwrap(),
+                change.file_ops()
+            );
+        }
+        drop(store);
+        drop(dir);
+        // The server has only the pushed object, with the database gone.
+        let (decoded, actual) = Change::deserialize(&mut exported.as_slice()).unwrap();
+        assert_eq!(actual, hash);
+        assert_eq!(decoded.hashed, change.hashed);
+        assert_eq!(decoded.contents, change.contents);
+        assert_eq!(decoded.unhashed, change.unhashed);
+        assert_eq!(
+            decoded.signature.as_ref().unwrap().signed_hash,
+            *hash.as_bytes()
+        );
+        let mut again = vec![];
+        assert_eq!(decoded.serialize(&mut again).unwrap(), hash);
+        assert_eq!(again, original);
+    }
+}
+
+#[test]
+fn compact_corruption_is_rejected_before_store_mutation() {
+    let change = compact_change();
+    let mut bytes = vec![];
+    let hash = change.serialize(&mut bytes).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 1;
+    let (_dir, store) = temp_store();
+    assert!(store.import_v3_bytes(&bytes).is_err());
+    assert!(!store.has_change(hash.as_bytes()).unwrap());
+}
+
+#[test]
+fn versioned_field_and_predictive_codecs_keep_signatures_provenance_and_selective_contracts() {
+    use atomic_core::change::format_v3::{
+        graph_fields::GraphEncoding, semantic::SemanticEncoding, GraphSectionPayload,
+    };
+    for graph in [GraphEncoding::Raw, GraphEncoding::FieldsV1] {
+        for semantic in [
+            SemanticEncoding::Raw,
+            SemanticEncoding::Compact,
+            SemanticEncoding::CompactMixed,
+            SemanticEncoding::PredictiveV2,
+        ] {
+            let mut change = compact_change();
+            change.hashed.hunks = make_change_with_hunk().hashed.hunks;
+            change.graph_encoding = graph;
+            change.semantic_encoding = semantic;
+            let hash = change
+                .sign_with("did:atomic:versioned-store", &[97; 32], 123)
+                .unwrap();
+            let mut bytes = vec![];
+            change.serialize(&mut bytes).unwrap();
+            let (dir, store) = temp_store();
+            assert_eq!(store.import_v3_bytes(&bytes).unwrap(), *hash.as_bytes());
+            drop(store);
+            let store =
+                RedbChangeStore::open_existing(dir.path().join("test_change_store.redb")).unwrap();
+            assert_eq!(store.export_v3_bytes(hash.as_bytes()).unwrap(), bytes);
+            for section in store.load_graph_sections(hash.as_bytes()).unwrap() {
+                GraphSectionPayload::from_postcard_bytes(&section.payload).unwrap();
+            }
+            let sections = store.load_semantic_sections(hash.as_bytes()).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<Vec<atomic_core::change::FileOps>>(&sections[0].payload)
+                    .unwrap(),
+                change.file_ops()
+            );
+            assert_eq!(
+                store.load_change(hash.as_bytes()).unwrap().hashed,
+                change.hashed
+            );
+        }
+    }
+}
+
 #[test]
 fn typed_span_survives_redb_reopen_and_export() {
     use atomic_core::change::span_patch::{SpanOp, SpanPatch};
@@ -147,7 +303,7 @@ fn altered_span_cannot_be_exported_under_its_original_hash() {
     );
     change.hashed.span = Some(patch.clone());
     let hash = store.save_change(&change).unwrap();
-    let (meta, header, _) = {
+    let (meta, extra) = {
         let txn = store.db().begin_read().unwrap();
         store.load_meta_with_header_in_txn(&txn, &hash).unwrap()
     };
@@ -158,7 +314,7 @@ fn altered_span_cannot_be_exported_under_its_original_hash() {
     let mut meta_bytes = postcard::to_allocvec(&meta).unwrap();
     meta_bytes.extend(
         postcard::to_allocvec(&StoredChangeMetaExtension::V2 {
-            header_v2: header.unwrap(),
+            header_v2: extra.header_v2.unwrap(),
             span: altered.encode().unwrap(),
         })
         .unwrap(),

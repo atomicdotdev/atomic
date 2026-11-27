@@ -52,6 +52,8 @@ Compile and descriptor-contract check (temporary output only):
 python3 -m venv "$TEMP_DIR/proto-venv"
 "$TEMP_DIR/proto-venv/bin/pip" install grpcio-tools
 "$TEMP_DIR/proto-venv/bin/python" proto/check_contract.py --temp-dir "$TEMP_DIR"
+# From libatomic/: positive and intentionally invalid descriptor fixtures.
+TMPDIR="$TEMP_DIR" "$TEMP_DIR/proto-venv/bin/python" -B -m unittest discover -s proto -p 'test_check_contract.py'
 ```
 
 The import root is `proto/`; imports read `atomic/common/common.proto`.

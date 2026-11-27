@@ -94,8 +94,14 @@ fn higher_known_requirement_is_typed_and_actionable() {
     ));
     let message = error.to_string();
     assert!(message.contains("change-format-vnext"));
-    assert!(message.contains("version 2"));
-    assert!(message.contains("supports through version 1"));
+    assert!(message.contains(&format!(
+        "version {}",
+        CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version() + 1
+    )));
+    assert!(message.contains(&format!(
+        "supports through version {}",
+        CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version()
+    )));
 }
 
 #[test]
@@ -150,7 +156,7 @@ fn save_change_declares_vnext_capability() {
         vec![
             RequiredRepositoryCapability {
                 id: "change-format-vnext".to_string(),
-                minimum_version: 1,
+                minimum_version: CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version(),
             },
             RequiredRepositoryCapability {
                 id: "kg-semweb-v1".into(),
@@ -196,7 +202,7 @@ fn v2_pre_serialized_save_marks_before_object_persistence() {
         vec![
             RequiredRepositoryCapability {
                 id: "change-format-vnext".to_string(),
-                minimum_version: 1,
+                minimum_version: CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version(),
             },
             RequiredRepositoryCapability {
                 id: "kg-semweb-v1".into(),
@@ -217,6 +223,8 @@ fn malformed_or_unsupported_pre_serialized_bytes_do_not_mutate() {
             bytes
         },
         atom_file_header(3),
+        atom_file_header(4),
+        atom_file_header(5),
     ] {
         let (temp, repo) = create_temp_repo();
         let hash = Hash::of(&bytes);

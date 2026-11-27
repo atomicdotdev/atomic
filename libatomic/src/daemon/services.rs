@@ -222,6 +222,7 @@ impl daemon_service_server::DaemonService for DaemonImpl {
                 "full-turn-slice".to_string(),
                 VAULT_MEMORY_CREATE_OPTIONS_FEATURE.to_string(),
                 RECORD_FILE_OPTIONS_FEATURE.to_string(),
+                super::sandbox_wire::CHANGE_SCHEMA5_FEATURE.to_string(),
             ],
             limits: Some(Limits {
                 max_message_bytes: 64 * 1024 * 1024,

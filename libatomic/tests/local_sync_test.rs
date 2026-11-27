@@ -7,6 +7,10 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use atomic_core::change::{
+    format_v3::{FileHeader, FileHeaderFlags, FIELD_CODEC_FORMAT_VERSION},
+    Change,
+};
 use atomic_core::types::{Base32, Hash};
 use atomic_identity::{Identity, IdentityStore, KeyPair};
 use atomic_objects::{ObjectFamily, ObjectRecord, RefRecord, SyncPack, SyncWants};
@@ -301,7 +305,10 @@ async fn native_sync_authenticates_transfers_graph_and_does_not_materialize_host
     let target_repo = Repository::init(target.path()).unwrap();
     target_repo.add_remote_default("origin", &url).unwrap();
     drop(target_repo);
-    std::fs::write(source.path().join("hello.txt"), "first native revision\n").unwrap();
+    let first_text = (0..2048)
+        .map(|i| format!("let variable_{i} = calculate({i}, input);\n"))
+        .collect::<String>();
+    std::fs::write(source.path().join("hello.txt"), &first_text).unwrap();
     std::fs::write(target.path().join("hello.txt"), "local unrecorded bytes\n").unwrap();
 
     let service = LocalService::new();
@@ -334,6 +341,13 @@ async fn native_sync_authenticates_transfers_graph_and_does_not_materialize_host
     )
     .await;
     let first = record(&service, &source_ref, "first native change").await;
+    let first_bytes = {
+        let repo = Repository::open_readonly(source.path()).unwrap();
+        std::fs::read(repo.change_store().change_path(&first)).unwrap()
+    };
+    let header = FileHeader::from_bytes(first_bytes[..64].try_into().unwrap()).unwrap();
+    assert_eq!(header.version, FIELD_CODEC_FORMAT_VERSION);
+    assert!(header.has_graph_fields());
 
     let mut push = proto::PushChangesRequest {
         repository: Some(source_ref.clone()),
@@ -384,6 +398,31 @@ async fn native_sync_authenticates_transfers_graph_and_does_not_materialize_host
         import_sidecars: true,
         ..Default::default()
     };
+    // The real sync importer must reject a changed interpretation hint without
+    // persisting the claimed object. Restore the peer bytes, then retry normally.
+    let object_key = (ObjectFamily::Change, first.to_base32());
+    {
+        let mut peer = state.lock().unwrap();
+        let object = peer.objects.get_mut(&object_key).unwrap();
+        assert_eq!(object.bytes, first_bytes);
+        object.bytes[8..12].copy_from_slice(
+            &(header.flags.to_raw() ^ FileHeaderFlags::GRAPH_FIELDS).to_le_bytes(),
+        );
+    }
+    let rejected: proto::PullChangesResponse =
+        invoke(&service, "/atomic.SyncService/PullChanges", &pull).await;
+    assert!(rejected.report.unwrap().changes_failed > 0);
+    {
+        let repo = Repository::open_readonly(target.path()).unwrap();
+        assert!(!repo.change_store().change_path(&first).exists());
+    }
+    state
+        .lock()
+        .unwrap()
+        .objects
+        .get_mut(&object_key)
+        .unwrap()
+        .bytes = first_bytes.clone();
     let pulled: proto::PullChangesResponse =
         invoke(&service, "/atomic.SyncService/PullChanges", &pull).await;
     let report = pulled.report.unwrap();
@@ -406,8 +445,13 @@ async fn native_sync_authenticates_transfers_graph_and_does_not_materialize_host
             repo.get_file_content_on_view("hello.txt", "received")
                 .unwrap()
                 .unwrap(),
-            b"first native revision\n"
+            first_text.as_bytes()
         );
+        let received = std::fs::read(repo.change_store().change_path(&first)).unwrap();
+        assert_eq!(received, first_bytes);
+        let (decoded, actual) = Change::deserialize(&mut received.as_slice()).unwrap();
+        assert_eq!(actual, first);
+        assert!(!decoded.file_ops().is_empty());
     }
 
     std::fs::write(source.path().join("hello.txt"), "second native revision\n").unwrap();
