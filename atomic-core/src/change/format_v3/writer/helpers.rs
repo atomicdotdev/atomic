@@ -10,6 +10,25 @@ use serde::Serialize;
 use std::io::Write;
 
 impl<'w, W: Write> ChangeWriter<'w, W> {
+    pub(super) fn check_section_size(&self, raw: u64, compressed: usize) -> FormatResult<()> {
+        let limit = super::super::semantic::wire_limit();
+        if (self.schema_version == super::super::COMPACT_SEMANTIC_FORMAT_VERSION
+            || self.schema_version == super::super::FIELD_CODEC_FORMAT_VERSION)
+            && (raw > limit as u64 || compressed > limit)
+        {
+            return Err(FormatError::SemanticLimitExceeded);
+        }
+        Ok(())
+    }
+    pub(super) fn ensure_body_ready(&self) -> FormatResult<()> {
+        self.ensure_metadata_complete()?;
+        if self.expected_codecs.is_some() && !self.wrote_codecs {
+            return Err(FormatError::InvalidHeader {
+                reason: "CODECS must precede graph/span/semantic/content sections".into(),
+            });
+        }
+        Ok(())
+    }
     /// Check that the writer is in the expected state.
     pub(super) fn expect_state(&self, expected: WriterState, operation: &str) -> FormatResult<()> {
         if self.state != expected {
@@ -97,10 +116,12 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     ) -> FormatResult<()> {
         // Serialize with postcard
         let serialized = postcard::to_allocvec(value)?;
+        self.check_section_size(serialized.len() as u64, 0)?;
 
         // Compress with zstd
         let compressed = zstd::encode_all(&serialized[..], self.options.compression_level())
             .map_err(|e| FormatError::Compress(e.to_string()))?;
+        self.check_section_size(serialized.len() as u64, compressed.len())?;
 
         // Write section header
         let section_header = SectionHeader::new(section_type, compressed.len() as u32);
@@ -135,9 +156,11 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
         section_type: SectionType,
         uncompressed: &[u8],
     ) -> FormatResult<()> {
+        self.check_section_size(uncompressed.len() as u64, 0)?;
         // Compress with zstd
         let compressed = zstd::encode_all(uncompressed, self.options.compression_level())
             .map_err(|e| FormatError::Compress(e.to_string()))?;
+        self.check_section_size(uncompressed.len() as u64, compressed.len())?;
 
         // Write section header
         let section_header = SectionHeader::new(section_type, compressed.len() as u32);

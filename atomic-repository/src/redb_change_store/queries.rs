@@ -12,7 +12,7 @@ use std::path::Path;
 
 use super::{
     count_table_entries, extract_path_from_payload, RedbChangeStore, RedbStoreError,
-    RedbStoreResult,
+    RedbStoreResult, StoredExtraSections,
 };
 
 use super::batch::StoredSection;
@@ -92,10 +92,16 @@ impl RedbChangeStore {
     /// A vector of decompressed graph section payloads, ordered by file index.
     pub fn load_graph_sections(&self, hash: &[u8; 32]) -> RedbStoreResult<Vec<StoredSection>> {
         let txn = self.db().begin_read()?;
-        let (meta, _, span) = self.load_meta_with_header_in_txn(&txn, hash)?;
-        if span.is_some() {
+        let (meta, extra) = self.load_meta_with_header_in_txn(&txn, hash)?;
+        if extra.span.is_some() {
             return Err(RedbStoreError::UnsupportedSpanSelectiveRead);
         }
+        let fields = extra
+            .codecs
+            .as_deref()
+            .map(atomic_core::change::format_v3::codecs::CodecDescriptor::from_bytes)
+            .transpose()?
+            .is_some_and(|c| c.graph_fields);
         let table = txn.open_table(tables::CHANGE_GRAPH)?;
 
         let mut sections = Vec::with_capacity(meta.graph_section_count as usize);
@@ -110,6 +116,12 @@ impl RedbChangeStore {
                         idx, e
                     ))
                 })?;
+                let decompressed = if fields {
+                    atomic_core::change::format_v3::graph_fields::decode(&decompressed)?
+                        .to_postcard_bytes()?
+                } else {
+                    decompressed
+                };
 
                 // Extract path from the payload (it's a postcard-encoded GraphSectionPayload)
                 let path = extract_path_from_payload(&decompressed);
@@ -137,9 +149,23 @@ impl RedbChangeStore {
     /// A vector of decompressed semantic section payloads, ordered by file index.
     pub fn load_semantic_sections(&self, hash: &[u8; 32]) -> RedbStoreResult<Vec<StoredSection>> {
         let txn = self.db().begin_read()?;
-        let (meta, _, span) = self.load_meta_with_header_in_txn(&txn, hash)?;
-        if span.is_some() {
+        let (meta, extra) = self.load_meta_with_header_in_txn(&txn, hash)?;
+        if extra.span.is_some() {
             return Err(RedbStoreError::UnsupportedSpanSelectiveRead);
+        }
+        if extra.compact {
+            // Compact semantics reference authored bytes. Preserve this API's
+            // expanded payload contract rather than returning undecodable data.
+            let bytes = self.export_v3_bytes_in_txn(&txn, hash)?;
+            let (change, _) = Change::deserialize(&mut Cursor::new(bytes))
+                .map_err(|e| RedbStoreError::Corrupt(e.to_string()))?;
+            return Ok(vec![StoredSection {
+                section_type: SectionType::Semantic,
+                payload: postcard::to_allocvec(change.file_ops())
+                    .map_err(|e| RedbStoreError::Serialization(e.to_string()))?,
+                path: String::new(),
+                file_index: 0,
+            }]);
         }
         let table = txn.open_table(tables::CHANGE_SEMANTIC)?;
 
@@ -178,8 +204,8 @@ impl RedbChangeStore {
     /// A vector of decompressed content chunks, ordered by chunk index.
     pub fn load_content_chunks(&self, hash: &[u8; 32]) -> RedbStoreResult<Vec<StoredContentChunk>> {
         let txn = self.db().begin_read()?;
-        let (meta, _, span) = self.load_meta_with_header_in_txn(&txn, hash)?;
-        if span.is_some() {
+        let (meta, extra) = self.load_meta_with_header_in_txn(&txn, hash)?;
+        if extra.span.is_some() {
             return Err(RedbStoreError::UnsupportedSpanSelectiveRead);
         }
         let manifest_table = txn.open_table(tables::CHANGE_CHUNKS)?;
@@ -403,8 +429,14 @@ impl RedbChangeStore {
         txn: &redb::ReadTransaction,
         hash: &[u8; 32],
     ) -> RedbStoreResult<Vec<u8>> {
-        let (meta, header_v2, span) = self.load_meta_with_header_in_txn(txn, hash)?;
-        let span_format = span.is_some();
+        let (meta, extra) = self.load_meta_with_header_in_txn(txn, hash)?;
+        let StoredExtraSections {
+            header_v2,
+            span,
+            compact,
+            provenance,
+            codecs,
+        } = extra;
 
         // Reconstruct the hash dedup table
         let hash_table = if meta.hash_table.is_empty() {
@@ -436,6 +468,21 @@ impl RedbChangeStore {
         if span.is_some() {
             file_header.version = atomic_core::change::format_v3::SPAN_FORMAT_VERSION;
         }
+        if compact {
+            file_header.version = atomic_core::change::format_v3::COMPACT_SEMANTIC_FORMAT_VERSION;
+            if span.is_some() {
+                file_header
+                    .flags
+                    .set(atomic_core::change::format_v3::FileHeaderFlags::HAS_SPAN);
+            }
+        }
+        let descriptor = codecs
+            .as_deref()
+            .map(atomic_core::change::format_v3::codecs::CodecDescriptor::from_bytes)
+            .transpose()?;
+        if let Some(descriptor) = descriptor {
+            descriptor.apply(&mut file_header)?;
+        }
 
         // Write V3 format
         let mut output = Vec::new();
@@ -457,6 +504,17 @@ impl RedbChangeStore {
         // Write DEPS section
         writer.write_dependencies(&meta.dependency_indices)?;
 
+        if meta.has_provenance {
+            let payload = provenance.ok_or_else(|| {
+                RedbStoreError::Corrupt("missing compact provenance section".into())
+            })?;
+            writer.write_compressed_section(
+                SectionType::Provenance,
+                &zstd::encode_all(payload.as_slice(), 3)?,
+                payload.len() as u64,
+            )?;
+        }
+
         // Write SIGNATURE section (metadata phase — before GRAPH). The
         // payload is the stored postcard ChangeSignature; decompress from
         // CHANGE_SIGNATURES and write as the SIGNATURE section.
@@ -474,6 +532,9 @@ impl RedbChangeStore {
             } else {
                 return Err(RedbStoreError::Corrupt("missing SIGNATURE payload".into()));
             }
+        }
+        if let Some(descriptor) = descriptor {
+            writer.write_codec_descriptor(descriptor)?;
         }
 
         // Write GRAPH sections
@@ -554,9 +615,9 @@ impl RedbChangeStore {
         }
 
         let outcome = writer.finalize()?;
-        if span_format && &outcome.content_hash != hash {
+        if &outcome.content_hash != hash {
             return Err(RedbStoreError::Corrupt(
-                "reconstructed span change hash does not match requested identity".into(),
+                "reconstructed change hash does not match requested identity".into(),
             ));
         }
 

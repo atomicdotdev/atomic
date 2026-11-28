@@ -229,11 +229,40 @@ pub struct StoredChangeMeta {
 /// Rows written before this extension remain valid without being rewritten.
 #[derive(serde::Serialize, serde::Deserialize)]
 enum StoredChangeMetaExtension {
-    V1 { header_v2: Vec<u8> },
-    V2 { header_v2: Vec<u8>, span: Vec<u8> },
+    V1 {
+        header_v2: Vec<u8>,
+    },
+    V2 {
+        header_v2: Vec<u8>,
+        span: Vec<u8>,
+    },
+    V3 {
+        header_v2: Vec<u8>,
+        span: Option<Vec<u8>>,
+        provenance: Option<Vec<u8>>,
+    },
+    V4 {
+        header_v2: Vec<u8>,
+        span: Option<Vec<u8>>,
+        provenance: Option<Vec<u8>>,
+        codecs: Vec<u8>,
+    },
+    V5 {
+        header_v2: Vec<u8>,
+        span: Option<Vec<u8>>,
+        provenance: Vec<u8>,
+    },
 }
 
-type StoredMetaWithSections = (StoredChangeMeta, Option<Vec<u8>>, Option<Vec<u8>>);
+#[derive(Default)]
+struct StoredExtraSections {
+    header_v2: Option<Vec<u8>>,
+    span: Option<Vec<u8>>,
+    compact: bool,
+    provenance: Option<Vec<u8>>,
+    codecs: Option<Vec<u8>>,
+}
+type StoredMetaWithSections = (StoredChangeMeta, StoredExtraSections);
 
 // ═══════════════════════════════════════════════════════════════════════
 // RedbChangeStore — the main store
@@ -383,9 +412,22 @@ impl RedbChangeStore {
         let mut reader = ChangeReader::open(&mut cursor)?;
 
         let file_header = *reader.file_header();
-        if file_header.version == format_v3::SPAN_FORMAT_VERSION {
-            Change::deserialize(&mut Cursor::new(data))
+        let compact = file_header.has_compact_semantics();
+        let fields = file_header.version == format_v3::FIELD_CODEC_FORMAT_VERSION;
+        if file_header.has_span() || compact || fields {
+            let (change, hash) = Change::deserialize(&mut Cursor::new(data))
                 .map_err(|error| RedbStoreError::Corrupt(error.to_string()))?;
+            // This store recompresses sections on export. Admit only schema-4
+            // objects whose canonical encoding it can reproduce, before any DB
+            // writes. The filesystem import path retains arbitrary source bytes.
+            if (compact || fields)
+                && change
+                    .hash()
+                    .map_err(|e| RedbStoreError::Corrupt(e.to_string()))?
+                    != hash
+            {
+                return Err(RedbStoreError::Corrupt("noncanonical compact object cannot be losslessly exported by the section store".into()));
+            }
         }
         let hash_table = reader.hash_table().clone();
 
@@ -400,17 +442,18 @@ impl RedbChangeStore {
         let mut content_chunks: Vec<(u32, [u8; 32], Vec<u8>)> = Vec::new();
         let mut unhashed_payload: Option<Vec<u8>> = None;
         let mut signature_payload: Option<Vec<u8>> = None;
+        let mut codecs_payload = None;
 
         let mut graph_idx = 0u32;
         let mut semantic_idx = 0u32;
 
         while let Some(section) = reader.next_section()? {
             match section.section_type {
+                SectionType::Codecs => {
+                    codecs_payload = Some(section.payload);
+                }
                 SectionType::Header => {
-                    meta_header = Some(
-                        postcard::from_bytes(&section.payload)
-                            .map_err(|e| RedbStoreError::Serialization(e.to_string()))?,
-                    );
+                    meta_header = Some(section.deserialize::<ChangeHeader>()?);
                     if file_header.version != format_v3::LEGACY_FORMAT_VERSION {
                         header_v2 = Some(section.payload.clone());
                     }
@@ -427,9 +470,7 @@ impl RedbChangeStore {
                     graph_idx += 1;
                 }
                 SectionType::Span => {
-                    if file_header.version != format_v3::SPAN_FORMAT_VERSION
-                        || span_payload.is_some()
-                    {
+                    if !file_header.has_span() || span_payload.is_some() {
                         return Err(RedbStoreError::Corrupt("unexpected span section".into()));
                     }
                     span_payload = Some(section.payload.clone());
@@ -479,9 +520,32 @@ impl RedbChangeStore {
         let mut meta_bytes = postcard::to_allocvec(&meta)
             .map_err(|e| RedbStoreError::Serialization(e.to_string()))?;
         if let Some(header_v2) = header_v2 {
-            let extension = match span_payload {
-                Some(span) => StoredChangeMetaExtension::V2 { header_v2, span },
-                None => StoredChangeMetaExtension::V1 { header_v2 },
+            let extension = if fields {
+                StoredChangeMetaExtension::V4 {
+                    header_v2,
+                    span: span_payload,
+                    provenance: provenance_payload,
+                    codecs: codecs_payload.ok_or_else(|| {
+                        RedbStoreError::Corrupt("missing authenticated CODECS section".into())
+                    })?,
+                }
+            } else if compact {
+                StoredChangeMetaExtension::V3 {
+                    header_v2,
+                    span: span_payload,
+                    provenance: provenance_payload,
+                }
+            } else if let Some(provenance) = provenance_payload {
+                StoredChangeMetaExtension::V5 {
+                    header_v2,
+                    span: span_payload,
+                    provenance,
+                }
+            } else {
+                match span_payload {
+                    Some(span) => StoredChangeMetaExtension::V2 { header_v2, span },
+                    None => StoredChangeMetaExtension::V1 { header_v2 },
+                }
             };
             meta_bytes.extend(
                 postcard::to_allocvec(&extension)
@@ -598,7 +662,7 @@ impl RedbChangeStore {
         hash: &[u8; 32],
     ) -> RedbStoreResult<StoredChangeMeta> {
         self.load_meta_with_header_in_txn(txn, hash)
-            .map(|(meta, _, _)| meta)
+            .map(|(meta, _)| meta)
     }
 
     fn load_meta_with_header_in_txn(
@@ -620,8 +684,8 @@ impl RedbChangeStore {
             .map_err(|e| RedbStoreError::Corrupt(format!("meta decompression failed: {}", e)))?;
         let (meta, suffix) = postcard::take_from_bytes::<StoredChangeMeta>(&decompressed)
             .map_err(|e| RedbStoreError::Corrupt(format!("meta deserialization failed: {}", e)))?;
-        let (header_v2, span) = if suffix.is_empty() {
-            (None, None)
+        let extra = if suffix.is_empty() {
+            StoredExtraSections::default()
         } else {
             let (extension, remainder) =
                 postcard::take_from_bytes::<StoredChangeMetaExtension>(suffix).map_err(|e| {
@@ -633,11 +697,61 @@ impl RedbChangeStore {
                 ));
             }
             match extension {
-                StoredChangeMetaExtension::V1 { header_v2 } => (Some(header_v2), None),
-                StoredChangeMetaExtension::V2 { header_v2, span } => (Some(header_v2), Some(span)),
+                StoredChangeMetaExtension::V1 { header_v2 } => StoredExtraSections {
+                    header_v2: Some(header_v2),
+                    ..Default::default()
+                },
+                StoredChangeMetaExtension::V2 { header_v2, span } => StoredExtraSections {
+                    header_v2: Some(header_v2),
+                    span: Some(span),
+                    ..Default::default()
+                },
+                StoredChangeMetaExtension::V3 {
+                    header_v2,
+                    span,
+                    provenance,
+                } => StoredExtraSections {
+                    header_v2: Some(header_v2),
+                    span,
+                    compact: true,
+                    provenance,
+                    ..Default::default()
+                },
+                StoredChangeMetaExtension::V4 {
+                    header_v2,
+                    span,
+                    provenance,
+                    codecs,
+                } => {
+                    let descriptor = format_v3::codecs::CodecDescriptor::from_bytes(&codecs)?;
+                    if descriptor.span != span.is_some()
+                        || meta.has_provenance != provenance.is_some()
+                    {
+                        return Err(RedbStoreError::Corrupt(
+                            "stored codec context/manifest mismatch".into(),
+                        ));
+                    }
+                    StoredExtraSections {
+                        header_v2: Some(header_v2),
+                        span,
+                        compact: descriptor.semantic > 0,
+                        provenance,
+                        codecs: Some(codecs),
+                    }
+                }
+                StoredChangeMetaExtension::V5 {
+                    header_v2,
+                    span,
+                    provenance,
+                } => StoredExtraSections {
+                    header_v2: Some(header_v2),
+                    span,
+                    provenance: Some(provenance),
+                    ..Default::default()
+                },
             }
         };
-        Ok((meta, header_v2, span))
+        Ok((meta, extra))
     }
 
     // NOTE: load_change(), export_v3_file(), export_v3_bytes(), and

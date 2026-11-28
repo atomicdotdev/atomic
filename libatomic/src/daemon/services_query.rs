@@ -399,7 +399,7 @@ pub async fn get_change_impl(
         let change = repo
             .load_change(&hash)
             .map_err(|error| domain_status(ErrorCode::NotFound, error.to_string()))?;
-        // The complete change, V3-serialized, plus the causal decision
+        // The complete change in its retained encoding, plus the causal decision
         // graph(s) explaining it — the client's full-detail renders
         // (change ledger, hunks, JSON) deserialize these with atomic-core.
         let bundle = if wants_bundle {
@@ -407,10 +407,7 @@ pub async fn get_change_impl(
             change
                 .serialize(&mut buffer)
                 .map_err(|error| domain_status(ErrorCode::Repository, error.to_string()))?;
-            Some(VersionedBytes {
-                schema: "atomic.change.v3".to_string(),
-                payload: buffer,
-            })
+            Some(super::sandbox_wire::change_bytes(buffer))
         } else {
             None
         };

@@ -219,9 +219,40 @@ Keep prepare/bind/acknowledge separate for crash-injection parity.
 ## Decoded change metadata
 
 `RepositoryQueryService.GetChange` with `includes.metadata = true` returns the
-existing `atomic.change.v3` bundle and an additive `ChangeMetadata` projection
+versioned change bundle and an additive `ChangeMetadata` projection
 (response field 11, projection schema version 1). Both derive from the same
 atomic-core-loaded change; clients do not need a second binary decoder.
+
+### Schema-5 change interchange
+
+GetChange's `VersionedBytes` and SandboxService's `ChangeBundle` share one
+version policy: actual ATOM schema-5 bytes are labeled **`atomic.change.v5`**;
+historical payloads retain **`atomic.change.v3`**. This legacy label denotes the
+older change container family, not an assertion that its ATOM header is exactly
+3. Producers preserve the object's encoding and do not upgrade historical
+payloads to manufacture a v5 label. These strings are independent of RPC protocol
+revision 2 and `ChangeMetadata.schema_version` 1; neither revision changes here.
+
+Sandbox bundle readers accept v5, legacy v3 and empty labels. For compatibility
+with previously emitted bundles, v3/empty may also carry schema-5 bytes. A v5
+label requires an actual supported schema-5 header; unknown labels and mismatches
+fail. The outer label is never authority for graph or semantic interpretation:
+atomic-core validates the hashed CODECS descriptor and content identity, while
+repository import/submission verifies the claimed hash and capability gates
+before persisting or applying the object. No lossy projection or tokenizer replay
+is substituted for full change bytes. Native sync packs retain the same raw
+ATOM object bytes; they do not use or require a protobuf envelope.
+
+`DaemonService.GetCapabilities.features` includes **`change-format-schema-5`**
+when the implementation supports graph-field v1, predictive ATSC v2 (frozen
+predictor 1), authenticated CODECS and historical reads. This is a discovery
+feature, not an authorization grant or automatic downgrade negotiation. Upgrade
+readers before exchanging new objects; do not relabel or reencode a signed
+schema-5 object to accommodate an older reader. Repository persistence still
+uses `change-format-vnext` minimum version 3, a distinct on-disk capability.
+
+See [the schema-5 wire contract](../../docs/CHANGE-FORMAT-SCHEMA-5.md) for exact
+roles, masks, byte references, limits and authenticated interpretation rules.
 
 The projection binds to `change_hash` and carries recorded AI vendor/model/tool,
 request/session identity, all six token counters, exact micro-USD cost and actual

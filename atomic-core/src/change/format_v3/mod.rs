@@ -63,8 +63,10 @@
 //! Each section is independently compressed with zstd and tagged with a
 //! [`SectionType`] byte. This enables:
 //!
-//! - **Thin pull**: Download only GRAPH + CONTENT sections to apply a change.
-//!   Skip SEMANTIC entirely — reconstruct it locally on demand.
+//! - **Layer-specific reads**: Historical non-span changes can expose GRAPH and
+//!   CONTENT independently. Exact semantic identities must be retained, not
+//!   reconstructed by retokenizing graph bytes. Compact semantic reads require
+//!   the authored content as well as their semantic section.
 //! - **Thin review**: Download only SEMANTIC + CONTENT sections for code review.
 //!   Never load graph operations.
 //! - **Streaming apply**: Start applying GRAPH sections before SEMANTIC/CONTENT
@@ -96,10 +98,11 @@
 //!
 //! # Backward Compatibility
 //!
-//! **None.** V3 is a clean break from V1/V2. There is no version detection,
-//! no migration code, and no dual codepath. Old `.change` files must be
-//! re-recorded. The `b"ATOM"` magic bytes and version field exist for
-//! forward compatibility — if V4 is ever needed, readers can detect it.
+//! The ATOM container accepts streaming schemas 1–4 (not the pre-ATOM bincode
+//! formats). Schema 4 stores lossless compact semantics with same-change content
+//! references; small new objects keep expanded schema-2/3 payloads. Existing
+//! objects are imported as original bytes, not migrated in place. See
+//! [`semantic`] and `docs/COMPACT-SEMANTIC-STORAGE.md` for the codec and fences.
 //!
 //! # Implementation Status
 //!
@@ -178,12 +181,17 @@
 //! - [zstd streaming](https://docs.rs/zstd/latest/zstd/stream/) — Per-section compression
 
 pub mod chunking;
+pub mod codecs;
+#[cfg(test)]
+mod codecs_tests;
 pub mod compact;
 mod compatibility;
 pub mod error;
+pub mod graph_fields;
 pub mod hash_table;
 pub mod reader;
 pub mod sections;
+pub mod semantic;
 pub mod types;
 pub mod writer;
 
@@ -200,8 +208,8 @@ pub mod writer;
 
 // Error types
 pub use error::{
-    FormatError, FormatResult, FORMAT_VERSION, LEGACY_FORMAT_VERSION, MAGIC,
-    MAX_HASH_TABLE_ENTRIES, SPAN_FORMAT_VERSION,
+    FormatError, FormatResult, COMPACT_SEMANTIC_FORMAT_VERSION, FIELD_CODEC_FORMAT_VERSION,
+    FORMAT_VERSION, LEGACY_FORMAT_VERSION, MAGIC, MAX_HASH_TABLE_ENTRIES, SPAN_FORMAT_VERSION,
 };
 
 // Core types

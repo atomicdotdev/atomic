@@ -6,8 +6,11 @@ use std::fmt;
 pub const REQUIRED_CAPABILITY_PREFIX: &str = "required-capability/";
 
 /// Capability required by repositories containing vNext change objects.
+/// Version 2 adds schema-4 compact semantics; version 3 adds schema-5 graph
+/// fields/predictive semantics and their hashed codec manifest. Earlier required
+/// versions remain readable and upgrade before a new-format writer stores objects.
 pub const CHANGE_FORMAT_VNEXT_CAPABILITY: RepositoryCapability =
-    RepositoryCapability::new("change-format-vnext", 1);
+    RepositoryCapability::new("change-format-vnext", 3);
 
 /// CB-13B: capability a repository requires once the transactional shadow
 /// migration has cut over to the colocated shim.

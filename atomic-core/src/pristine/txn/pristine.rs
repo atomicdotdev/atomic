@@ -840,8 +840,14 @@ mod tests {
         let error = expect_unsupported(Pristine::open_readonly(&db_path));
         let message = error.to_string();
         assert!(message.contains("change-format-vnext"));
-        assert!(message.contains("version 2"));
-        assert!(message.contains("supports through version 1"));
+        assert!(message.contains(&format!(
+            "version {}",
+            CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version() + 1
+        )));
+        assert!(message.contains(&format!(
+            "supports through version {}",
+            CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version()
+        )));
     }
 
     #[test]
@@ -877,7 +883,7 @@ mod tests {
             vec![
                 RequiredRepositoryCapability {
                     id: "change-format-vnext".to_string(),
-                    minimum_version: 1,
+                    minimum_version: CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version(),
                 },
                 RequiredRepositoryCapability {
                     id: "kg-semweb-v1".into(),
@@ -896,7 +902,10 @@ mod tests {
         {
             let mut metadata = write_txn.open_table(PRISTINE_META).unwrap();
             metadata
-                .insert("required-capability/change-format-vnext", 0)
+                .insert(
+                    "required-capability/change-format-vnext",
+                    CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version() - 1,
+                )
                 .unwrap();
         }
         write_txn.commit().unwrap();
@@ -909,7 +918,7 @@ mod tests {
             vec![
                 RequiredRepositoryCapability {
                     id: "change-format-vnext".to_string(),
-                    minimum_version: 1,
+                    minimum_version: CHANGE_FORMAT_VNEXT_CAPABILITY.minimum_version(),
                 },
                 RequiredRepositoryCapability {
                     id: "kg-semweb-v1".into(),
@@ -917,6 +926,26 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn opening_a_version_one_change_repository_does_not_upgrade_it() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("pristine");
+        let pristine = Pristine::open(&db_path).unwrap();
+        let txn = pristine.db.writable_db().unwrap().begin_write().unwrap();
+        txn.open_table(PRISTINE_META)
+            .unwrap()
+            .insert("required-capability/change-format-vnext", 1)
+            .unwrap();
+        txn.commit().unwrap();
+        drop(pristine);
+        let reopened = Pristine::open_readonly(&db_path).unwrap();
+        assert!(reopened
+            .required_repository_capabilities()
+            .unwrap()
+            .iter()
+            .any(|c| c.id == CHANGE_FORMAT_VNEXT_CAPABILITY.id() && c.minimum_version == 1));
     }
 
     #[test]

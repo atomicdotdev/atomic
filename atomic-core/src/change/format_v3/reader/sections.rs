@@ -118,6 +118,14 @@ impl<'r, R: Read> ChangeReader<'r, R> {
 
         let peeked = self.peeked.take().unwrap();
 
+        let bounded_schema = self.file_header.bounded_sections();
+        let limit = super::super::semantic::wire_limit();
+        if bounded_schema && peeked.compressed_len as usize > limit {
+            return Err(FormatError::InvalidChangeMetadata {
+                reason: "compressed schema-4 section exceeds limit".into(),
+            });
+        }
+
         // Read the compressed payload
         let mut compressed = vec![0u8; peeked.compressed_len as usize];
         self.reader.read_exact(&mut compressed)?;
@@ -131,6 +139,17 @@ impl<'r, R: Read> ChangeReader<'r, R> {
         // Decompress
         let decompressed = if peeked.compressed_len == 0 {
             Vec::new()
+        } else if bounded_schema {
+            let mut decoded = Vec::new();
+            zstd::stream::read::Decoder::new(compressed.as_slice())?
+                .take(limit as u64 + 1)
+                .read_to_end(&mut decoded)?;
+            if decoded.len() > limit {
+                return Err(FormatError::InvalidChangeMetadata {
+                    reason: "decompressed schema-4 section exceeds limit".into(),
+                });
+            }
+            decoded
         } else {
             zstd::decode_all(&compressed[..]).map_err(|e| FormatError::Decompress(e.to_string()))?
         };
@@ -393,9 +412,13 @@ impl<'r, R: Read> ChangeReader<'r, R> {
     ///
     /// Skipped sections are still fed through the hasher for verification.
     fn sections_of_type(&mut self, target: SectionType) -> FormatResult<Vec<ReadSection>> {
-        if self.file_header.version == super::super::error::SPAN_FORMAT_VERSION {
+        if self.file_header.has_span()
+            || self.file_header.version == super::super::FIELD_CODEC_FORMAT_VERSION
+            || (self.file_header.version == super::super::COMPACT_SEMANTIC_FORMAT_VERSION
+                && target == SectionType::Semantic)
+        {
             return Err(FormatError::InvalidChangeMetadata {
-                reason: "selective section reads cannot interpret span changes".into(),
+                reason: "selective section reads require authored content/context; use Change::deserialize for span or compact semantics".into(),
             });
         }
         let mut result = Vec::new();

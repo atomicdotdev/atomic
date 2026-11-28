@@ -144,6 +144,12 @@ pub struct Change {
     /// This contains the actual file content referenced by hunks.
     /// Hunks reference byte ranges within this blob.
     pub contents: Vec<u8>,
+
+    /// Wire representation policy, retained on decode so reserialization does
+    /// not silently upgrade historical objects or invalidate their signatures.
+    pub semantic_encoding: format_v3::semantic::SemanticEncoding,
+    /// Historical decode retains Raw; new objects compare field-role encoding.
+    pub graph_encoding: format_v3::graph_fields::GraphEncoding,
 }
 
 impl Change {
@@ -201,6 +207,8 @@ impl Change {
             unhashed: None,
             signature: None,
             contents,
+            semantic_encoding: format_v3::semantic::SemanticEncoding::Auto,
+            graph_encoding: format_v3::graph_fields::GraphEncoding::Auto,
         }
     }
 
@@ -227,6 +235,8 @@ impl Change {
             unhashed: None,
             signature: None,
             contents: Vec::new(),
+            semantic_encoding: format_v3::semantic::SemanticEncoding::Auto,
+            graph_encoding: format_v3::graph_fields::GraphEncoding::Auto,
         }
     }
 
@@ -435,6 +445,119 @@ impl Change {
             1
         };
         let contents_chunks_count = content_chunks.len() as u32;
+        let mut graph = if self.hashed.hunks.is_empty() {
+            None
+        } else {
+            let compactor = compact::Compactor::new(&hash_table);
+            let ops = self
+                .hashed
+                .hunks
+                .iter()
+                .map(|op| compactor.compact_graph_op(op))
+                .collect::<Result<Vec<_>, _>>()?;
+            let payload =
+                GraphSectionPayload::new(String::new(), ops, 0, self.contents.len() as u64);
+            let policy = if self.contents.len() > semantic::wire_limit()
+                && self.graph_encoding == graph_fields::GraphEncoding::Auto
+            {
+                graph_fields::GraphEncoding::Raw
+            } else {
+                self.graph_encoding
+            };
+            Some(graph_fields::select(&payload, policy)?)
+        };
+        let mut semantic = if self.hashed.file_ops.is_empty() {
+            None
+        } else {
+            Some(format_v3::semantic::select(
+                &self.hashed.file_ops,
+                &self.contents,
+                self.semantic_encoding,
+            )?)
+        };
+        // A new schema adds a hashed CODECS frame. Compare complete costs, not
+        // just payloads; small per-section wins may not pay for that manifest.
+        if graph.as_ref().is_some_and(|g| g.fields)
+            || semantic.as_ref().is_some_and(|s| s.predictive)
+        {
+            let forced = graph
+                .as_ref()
+                .is_some_and(|g| g.fields && g.fallback.is_none())
+                || semantic
+                    .as_ref()
+                    .is_some_and(|s| s.predictive && s.fallback.is_none());
+            if !forced {
+                let descriptor = codecs::CodecDescriptor {
+                    graph_fields: graph.as_ref().is_some_and(|g| g.fields),
+                    semantic: semantic.as_ref().map_or(0, |s| {
+                        if s.predictive {
+                            2
+                        } else if s.compact {
+                            1
+                        } else {
+                            0
+                        }
+                    }),
+                    span: self.hashed.span.is_some(),
+                };
+                let cost = zstd::encode_all(descriptor.to_bytes().as_slice(), 3)
+                    .map_err(|e| FormatError::Compress(e.to_string()))?
+                    .len()
+                    + SectionHeader::SIZE;
+                let gain = graph
+                    .as_ref()
+                    .and_then(|g| {
+                        g.fallback
+                            .as_ref()
+                            .map(|old| old.compressed.len() - g.compressed.len())
+                    })
+                    .unwrap_or(0)
+                    + semantic
+                        .as_ref()
+                        .and_then(|s| {
+                            s.fallback
+                                .as_ref()
+                                .map(|old| old.compressed.len() - s.compressed.len())
+                        })
+                        .unwrap_or(0);
+                if gain <= cost {
+                    if let Some(g) = &mut graph {
+                        if let Some(old) = g.fallback.take() {
+                            *g = *old;
+                        }
+                    }
+                    if let Some(s) = &mut semantic {
+                        if let Some(old) = s.fallback.take() {
+                            *s = *old;
+                        }
+                    }
+                }
+            }
+        }
+        if graph.as_ref().is_some_and(|g| !g.fields)
+            && semantic.as_ref().is_some_and(|s| s.predictive)
+        {
+            let g = graph.as_ref().unwrap();
+            let raw = zstd::decode_all(g.compressed.as_slice())
+                .map_err(|e| FormatError::Decompress(e.to_string()))?;
+            if let Err(error) = graph_fields::decode_raw(&raw) {
+                if matches!(error, FormatError::GraphFieldLimitExceeded) {
+                    if let Some(old) = semantic.as_mut().and_then(|s| s.fallback.take()) {
+                        *semantic.as_mut().unwrap() = *old;
+                    } else {
+                        return Err(error.into());
+                    }
+                } else {
+                    return Err(error.into());
+                }
+            }
+        }
+        if let Some(g) = &mut graph {
+            g.fallback = None;
+        }
+        if let Some(s) = &mut semantic {
+            s.fallback = None;
+        }
 
         // 3. Build file header
         let mut file_header_builder = FileHeader::builder()
@@ -457,6 +580,33 @@ impl Change {
         if self.hashed.span.is_some() {
             file_header.version = SPAN_FORMAT_VERSION;
         }
+        if semantic.as_ref().is_some_and(|s| s.compact) {
+            file_header.version = COMPACT_SEMANTIC_FORMAT_VERSION;
+            if self.hashed.span.is_some() {
+                file_header.flags.set(FileHeaderFlags::HAS_SPAN);
+            }
+        }
+        let descriptor = if graph.as_ref().is_some_and(|g| g.fields)
+            || semantic.as_ref().is_some_and(|s| s.predictive)
+        {
+            let descriptor = codecs::CodecDescriptor {
+                graph_fields: graph.as_ref().is_some_and(|g| g.fields),
+                semantic: semantic.as_ref().map_or(0, |s| {
+                    if s.predictive {
+                        2
+                    } else if s.compact {
+                        1
+                    } else {
+                        0
+                    }
+                }),
+                span: self.hashed.span.is_some(),
+            };
+            descriptor.apply(&mut file_header)?;
+            Some(descriptor)
+        } else {
+            None
+        };
 
         // 4. Create writer and write preamble
         let mut change_writer = ChangeWriter::new(writer, WriterOptions::default());
@@ -488,27 +638,17 @@ impl Change {
         if let Some(ref signature) = self.signature {
             change_writer.write_signature(signature)?;
         }
+        if let Some(descriptor) = descriptor {
+            change_writer.write_codec_descriptor(descriptor)?;
+        }
 
         // 6. Write GRAPH section(s) — compact graph ops
-        if !self.hashed.hunks.is_empty() {
-            let compactor = format_v3::compact::Compactor::new(&hash_table);
-
-            let compact_ops: Vec<format_v3::CompactGraphOp> = self
-                .hashed
-                .hunks
-                .iter()
-                .map(|op| compactor.compact_graph_op(op))
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let graph_payload = format_v3::GraphSectionPayload::new(
-                String::new(), // All hunks in one section for now
-                compact_ops,
-                0,
-                self.contents.len() as u64,
-            );
-
-            let payload_bytes = graph_payload.to_postcard_bytes()?;
-            change_writer.write_graph_section(&payload_bytes)?;
+        if let Some(graph) = graph {
+            change_writer.write_compressed_section(
+                SectionType::Graph,
+                &graph.compressed,
+                graph.uncompressed_len as u64,
+            )?;
         }
 
         if let Some(span) = &self.hashed.span {
@@ -519,11 +659,12 @@ impl Change {
         }
 
         // 7. Write SEMANTIC section(s)
-        if !self.hashed.file_ops.is_empty() {
-            // Serialize all file_ops together as one semantic section
-            let semantic_bytes = postcard::to_allocvec(&self.hashed.file_ops)
-                .map_err(format_v3::FormatError::from)?;
-            change_writer.write_semantic_section(&semantic_bytes)?;
+        if let Some(semantic) = semantic {
+            change_writer.write_compressed_section(
+                SectionType::Semantic,
+                &semantic.compressed,
+                semantic.uncompressed_len as u64,
+            )?;
         }
 
         // 8. Write content chunks (FastCDC splits content into variable-size chunks)
@@ -603,8 +744,18 @@ impl Change {
         let mut change_reader = ChangeReader::open(&mut combined)?;
         let file_header = *change_reader.file_header();
         let format_version = file_header.version;
+        let expected_codecs = if format_version == FIELD_CODEC_FORMAT_VERSION {
+            Some(codecs::CodecDescriptor::from_header(&file_header)?)
+        } else {
+            None
+        };
+        let graph_encoding = if file_header.has_graph_fields() {
+            graph_fields::GraphEncoding::FieldsV1
+        } else {
+            graph_fields::GraphEncoding::Raw
+        };
         let hash_table = change_reader.hash_table().clone();
-        let strict_v2 = format_version == FORMAT_VERSION || format_version == SPAN_FORMAT_VERSION;
+        let strict_v2 = format_version != LEGACY_FORMAT_VERSION;
 
         // 2. Read all sections. V2 enforces the canonical section manifest;
         // V1 keeps its historical framing and gains only semantic defaults.
@@ -615,6 +766,8 @@ impl Change {
         let mut hunks: Vec<GraphOp<Option<Hash>>> = Vec::new();
         let mut span = None;
         let mut file_ops: Vec<FileOps> = Vec::new();
+        let mut compact_semantic = None;
+        let mut semantic_encoding = format_v3::semantic::SemanticEncoding::Raw;
         let mut contents: Vec<u8> = Vec::new();
         let mut unhashed: Option<serde_json::Value> = None;
         let mut last_ordering = None;
@@ -626,8 +779,25 @@ impl Change {
         let mut content_count = 0u32;
         let mut unhashed_count = 0u32;
         let mut signature: Option<format_v3::ChangeSignature> = None;
+        let mut signature_count = 0u32;
+        let mut codecs_count = 0u32;
 
         while let Some(section) = change_reader.next_section()? {
+            if format_version == FIELD_CODEC_FORMAT_VERSION
+                && matches!(
+                    section.section_type,
+                    SectionType::Graph
+                        | SectionType::Span
+                        | SectionType::Semantic
+                        | SectionType::Content
+                        | SectionType::Unhashed
+                )
+                && codecs_count != 1
+            {
+                return Err(ChangeError::Invalid(
+                    "authenticated CODECS section must precede body".into(),
+                ));
+            }
             if strict_v2 {
                 let ordering = section.section_type.ordering();
                 if last_ordering.is_some_and(|last| ordering < last) {
@@ -640,6 +810,23 @@ impl Change {
             }
 
             match section.section_type {
+                SectionType::Codecs => {
+                    codecs_count += 1;
+                    let actual = codecs::CodecDescriptor::from_bytes(&section.payload)?;
+                    if codecs_count != 1
+                        || expected_codecs != Some(actual)
+                        || header_count != 1
+                        || deps_count != 1
+                        || provenance_count
+                            != u32::from(file_header.flags.has(FileHeaderFlags::HAS_PROVENANCE))
+                        || signature_count
+                            != u32::from(file_header.flags.has(FileHeaderFlags::HAS_SIGNATURE))
+                    {
+                        return Err(ChangeError::Invalid(
+                            "unexpected or mismatched authenticated CODECS section".into(),
+                        ));
+                    }
+                }
                 SectionType::Header => {
                     header_count += 1;
                     if strict_v2 {
@@ -694,8 +881,13 @@ impl Change {
                 }
                 SectionType::Graph => {
                     graph_count += 1;
-                    let graph_payload: GraphSectionPayload =
-                        GraphSectionPayload::from_postcard_bytes(&section.payload)?;
+                    let graph_payload: GraphSectionPayload = if file_header.has_graph_fields() {
+                        graph_fields::decode(&section.payload)?
+                    } else if format_version == FIELD_CODEC_FORMAT_VERSION {
+                        graph_fields::decode_raw(&section.payload)?
+                    } else {
+                        GraphSectionPayload::from_postcard_bytes(&section.payload)?
+                    };
                     let compactor = compact::Compactor::new(&hash_table);
                     for compact_op in graph_payload.ops() {
                         hunks.push(if strict_v2 {
@@ -706,7 +898,7 @@ impl Change {
                     }
                 }
                 SectionType::Span => {
-                    if format_version != SPAN_FORMAT_VERSION || span.is_some() {
+                    if !file_header.has_span() || span.is_some() {
                         return Err(ChangeError::Invalid(
                             "unexpected or duplicate SPAN section".into(),
                         ));
@@ -724,12 +916,38 @@ impl Change {
                 }
                 SectionType::Semantic => {
                     semantic_count += 1;
-                    let ops: Vec<FileOps> = postcard::from_bytes(&section.payload)
-                        .map_err(format_v3::FormatError::from)?;
-                    file_ops.extend(ops);
+                    if file_header.has_compact_semantics() {
+                        if compact_semantic.replace(section.payload).is_some() {
+                            return Err(ChangeError::Invalid("duplicate compact semantics".into()));
+                        }
+                    } else {
+                        let ops: Vec<FileOps> = postcard::from_bytes(&section.payload)
+                            .map_err(format_v3::FormatError::from)?;
+                        file_ops.extend(ops);
+                    }
                 }
                 SectionType::Content => {
                     content_count += 1;
+                    if file_header.bounded_sections() {
+                        let info = section.content_chunk_info.as_ref().ok_or_else(|| {
+                            ChangeError::Invalid("missing content chunk metadata".into())
+                        })?;
+                        if info.chunk_index != content_count - 1
+                            || info.uncompressed_len as usize != section.payload.len()
+                            || info.chunk_hash != *blake3::hash(&section.payload).as_bytes()
+                        {
+                            return Err(ChangeError::Invalid(
+                                "compact change content chunk integrity mismatch".into(),
+                            ));
+                        }
+                        if contents
+                            .len()
+                            .checked_add(section.payload.len())
+                            .is_none_or(|n| n > format_v3::semantic::wire_limit())
+                        {
+                            return Err(FormatError::SemanticLimitExceeded.into());
+                        }
+                    }
                     contents.extend_from_slice(&section.payload);
                 }
                 SectionType::Unhashed => {
@@ -742,6 +960,10 @@ impl Change {
                     unhashed = Some(serde_json::from_slice(&section.payload)?);
                 }
                 SectionType::Signature => {
+                    if format_version == FIELD_CODEC_FORMAT_VERSION && codecs_count != 0 {
+                        return Err(ChangeError::Invalid("SIGNATURE must precede CODECS".into()));
+                    }
+                    signature_count += 1;
                     signature = Some(postcard::from_bytes(&section.payload).map_err(|error| {
                         ChangeError::Invalid(format!(
                             "failed to deserialize SIGNATURE section: {error}"
@@ -773,10 +995,30 @@ impl Change {
                 || semantic_count != file_header.semantic_section_count
                 || content_count != file_header.contents_chunks
                 || unhashed_count != expected_unhashed
-                || (format_version == SPAN_FORMAT_VERSION) != span.is_some()
+                || signature_count
+                    != u32::from(file_header.flags.has(FileHeaderFlags::HAS_SIGNATURE))
+                || file_header.has_span() != span.is_some()
+                || codecs_count != u32::from(format_version == FIELD_CODEC_FORMAT_VERSION)
             {
                 return Err(ChangeError::Invalid(
                     "V2 section manifest does not match the file header".to_string(),
+                ));
+            }
+        }
+
+        // Content references are resolved only after authenticating the original
+        // compressed sections. No semantic identity is reconstructed by guessing.
+        if let Some(payload) = compact_semantic {
+            if file_header.has_predictive_semantics() != payload.starts_with(b"ATSC\x02") {
+                return Err(ChangeError::Invalid(
+                    "semantic payload does not match authenticated codec".into(),
+                ));
+            }
+            semantic_encoding = format_v3::semantic::payload_encoding(&payload)?;
+            file_ops = format_v3::semantic::decode(&payload, &contents)?;
+            if file_ops.is_empty() {
+                return Err(ChangeError::Invalid(
+                    "compact schema requires nonempty semantic operations".into(),
                 ));
             }
         }
@@ -834,6 +1076,8 @@ impl Change {
             unhashed,
             signature,
             contents,
+            semantic_encoding,
+            graph_encoding,
         };
         if strict_v2 {
             change.validate_v2()?;

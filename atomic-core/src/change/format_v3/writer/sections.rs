@@ -10,6 +10,25 @@ use super::state_machine::{ChangeWriter, WriterState};
 use std::io::Write;
 
 impl<'w, W: Write> ChangeWriter<'w, W> {
+    /// Write the authenticated schema-5 codec manifest before any body section.
+    pub fn write_codec_descriptor(
+        &mut self,
+        descriptor: super::super::codecs::CodecDescriptor,
+    ) -> FormatResult<()> {
+        self.ensure_metadata_complete()?;
+        if self.expected_codecs != Some(descriptor)
+            || self.wrote_codecs
+            || self.state != WriterState::WritingMetadata
+        {
+            return Err(FormatError::InvalidHeader {
+                reason: "unexpected, duplicate or mismatched CODECS section".into(),
+            });
+        }
+        self.check_section_ordering(SectionType::Codecs)?;
+        self.write_raw_section(SectionType::Codecs, &descriptor.to_bytes())?;
+        self.wrote_codecs = true;
+        Ok(())
+    }
     // ── Step 4: Per-File Graph Sections ────────────────────────────
 
     /// Write a GRAPH section for a single file.
@@ -30,7 +49,7 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     /// - Zstd compression errors.
     /// - I/O errors.
     pub fn write_graph_section(&mut self, payload: &[u8]) -> FormatResult<()> {
-        self.ensure_metadata_complete()?;
+        self.ensure_body_ready()?;
         self.transition_to_at_least(WriterState::WritingGraph)?;
 
         if self.state != WriterState::WritingGraph {
@@ -47,9 +66,8 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
 
     /// Write the single hashed span payload required by schema 3.
     pub fn write_span_section(&mut self, payload: &[u8]) -> FormatResult<()> {
-        use super::super::error::SPAN_FORMAT_VERSION;
-        self.ensure_metadata_complete()?;
-        if self.schema_version != SPAN_FORMAT_VERSION || self.wrote_span_section {
+        self.ensure_body_ready()?;
+        if !self.requires_span || self.wrote_span_section {
             return Err(FormatError::InvalidHeader {
                 reason: "SPAN requires schema 3 and may appear only once".into(),
             });
@@ -85,7 +103,7 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     /// - Zstd compression errors.
     /// - I/O errors.
     pub fn write_semantic_section(&mut self, payload: &[u8]) -> FormatResult<()> {
-        self.ensure_metadata_complete()?;
+        self.ensure_body_ready()?;
         self.transition_to_at_least(WriterState::WritingSemantic)?;
 
         if self.state != WriterState::WritingSemantic {
@@ -121,6 +139,8 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     /// - Zstd compression errors.
     /// - I/O errors.
     pub fn write_content_chunk(&mut self, chunk_index: u32, data: &[u8]) -> FormatResult<()> {
+        self.ensure_body_ready()?;
+        self.check_section_size(data.len() as u64, 0)?;
         self.ensure_metadata_complete()?;
         self.transition_to_at_least(WriterState::WritingContent)?;
 
@@ -137,6 +157,7 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
         // Compress the chunk data
         let compressed = zstd::encode_all(data, self.options.compression_level())
             .map_err(|e| FormatError::Compress(e.to_string()))?;
+        self.check_section_size(data.len() as u64, compressed.len())?;
 
         // Build the content chunk header
         let chunk_header = ContentChunkHeader::new(
@@ -191,6 +212,8 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
     /// - Zstd compression errors.
     /// - I/O errors.
     pub fn write_unhashed(&mut self, data: &[u8]) -> FormatResult<()> {
+        self.ensure_body_ready()?;
+        self.check_section_size(data.len() as u64, 0)?;
         self.ensure_metadata_complete()?;
         self.transition_to_at_least(WriterState::WritingContent)?;
 
@@ -207,6 +230,7 @@ impl<'w, W: Write> ChangeWriter<'w, W> {
         // Compress the data
         let compressed = zstd::encode_all(data, self.options.compression_level())
             .map_err(|e| FormatError::Compress(e.to_string()))?;
+        self.check_section_size(data.len() as u64, compressed.len())?;
 
         // Write section header + compressed payload
         let section_header = SectionHeader::new(SectionType::Unhashed, compressed.len() as u32);

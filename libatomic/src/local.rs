@@ -16,12 +16,12 @@ use crate::atomic::{
     repository_mutation_service_server::RepositoryMutationService,
     repository_query_service_server::RepositoryQueryService, sync_service_server::SyncService,
     vault_service_server::VaultService, view_service_server::ViewService, AddFilesRequest,
-    CreateViewRequest, DeleteViewRequest, GetChangeRequest, GetVaultContextRequest,
-    GetVaultEntryRequest, GetWorkflowSnapshotRequest, InsertChangesRequest, ListRemotesRequest,
-    ListVaultEntriesRequest, ListViewsRequest, LogRequest, ManageRemotesRequest,
-    PreviewRestoreRequest, PullChangesRequest, PushChangesRequest, QueryGraphRequest,
-    RecordRequest, ReplayVaultEvidenceRequest, ResolveRepositoryRequest, StatusRequest,
-    SwitchViewRequest, VerifyAttestationRequest,
+    CreateViewRequest, DeleteViewRequest, GetCapabilitiesRequest, GetChangeRequest,
+    GetVaultContextRequest, GetVaultEntryRequest, GetWorkflowSnapshotRequest, InsertChangesRequest,
+    ListRemotesRequest, ListVaultEntriesRequest, ListViewsRequest, LogRequest,
+    ManageRemotesRequest, PreviewRestoreRequest, PullChangesRequest, PushChangesRequest,
+    QueryGraphRequest, RecordRequest, ReplayVaultEvidenceRequest, ResolveRepositoryRequest,
+    StatusRequest, SwitchViewRequest, VerifyAttestationRequest,
 };
 use crate::daemon::{
     services::{DaemonImpl, MutationImpl, QueryImpl},
@@ -38,7 +38,7 @@ use crate::daemon::{
 /// handles. Keep one instance per application and reuse it across calls.
 /// This is not a replacement for remote authentication middleware.
 ///
-/// Supports repository resolution, basic working-copy/change/view operations,
+/// Supports capability discovery, repository resolution, basic working-copy/change/view operations,
 /// change insertion, configured remote registry management and authenticated push/pull,
 /// read-only restore previews (including recorded file bytes),
 /// read-only knowledge queries, vault get/list/context, attestation verification, and
@@ -89,6 +89,15 @@ impl LocalService {
     /// ```
     pub async fn call(&self, method: &str, request: &[u8]) -> Result<Vec<u8>, Status> {
         match method {
+            "/atomic.DaemonService/GetCapabilities" => {
+                let request = decode::<GetCapabilitiesRequest>(request)?;
+                let response = DaemonImpl {
+                    state: self.state.clone(),
+                }
+                .get_capabilities(Request::new(request))
+                .await?;
+                Ok(response.into_inner().encode_to_vec())
+            }
             "/atomic.DaemonService/ResolveRepository" => {
                 let mut request = decode::<ResolveRepositoryRequest>(request)?;
                 // Filesystem discovery belongs to libatomic, not a foreign

@@ -5,6 +5,10 @@ const ATOM_CHANGE_FILE_HEADER_LEN: usize = 64;
 const ATOM_CHANGE_FILE_VERSION_V1: u32 = 1;
 const ATOM_CHANGE_FILE_VERSION_V2: u32 = 2;
 const ATOM_CHANGE_FILE_VERSION_SPAN: u32 = atomic_core::change::format_v3::SPAN_FORMAT_VERSION;
+const ATOM_CHANGE_FILE_VERSION_COMPACT: u32 =
+    atomic_core::change::format_v3::COMPACT_SEMANTIC_FORMAT_VERSION;
+const ATOM_CHANGE_FILE_VERSION_FIELDS: u32 =
+    atomic_core::change::format_v3::FIELD_CODEC_FORMAT_VERSION;
 
 fn atom_change_file_version(bytes: &[u8]) -> Result<u32, RepositoryError> {
     if bytes.len() < ATOM_CHANGE_FILE_HEADER_LEN {
@@ -307,7 +311,12 @@ impl Repository {
             self.fence_legacy_span_storage(change)?;
         }
         self.require_projected_semantic_storage_capability(change)?;
-        if version == ATOM_CHANGE_FILE_VERSION_SPAN {
+        if matches!(
+            version,
+            ATOM_CHANGE_FILE_VERSION_SPAN
+                | ATOM_CHANGE_FILE_VERSION_COMPACT
+                | ATOM_CHANGE_FILE_VERSION_FIELDS
+        ) {
             let (decoded, actual_hash) =
                 Change::deserialize(&mut std::io::Cursor::new(change_bytes))
                     .map_err(|error| RepositoryError::Serialization(error.to_string()))?;
@@ -319,9 +328,15 @@ impl Repository {
                     "span change bytes do not match the supplied change identity".into(),
                 ));
             }
-            self.require_span_storage_capability()?;
+            if decoded.hashed.span.is_some() {
+                self.require_span_storage_capability()?;
+            }
         }
-        if version == ATOM_CHANGE_FILE_VERSION_V2 || version == ATOM_CHANGE_FILE_VERSION_SPAN {
+        if version == ATOM_CHANGE_FILE_VERSION_V2
+            || version == ATOM_CHANGE_FILE_VERSION_SPAN
+            || version == ATOM_CHANGE_FILE_VERSION_COMPACT
+            || version == ATOM_CHANGE_FILE_VERSION_FIELDS
+        {
             self.pristine
                 .require_repository_capability(CHANGE_FORMAT_VNEXT_CAPABILITY)
                 .map_err(RepositoryError::from)?;
@@ -339,10 +354,10 @@ impl Repository {
     ) -> Result<Hash, RepositoryError> {
         self.require_projected_semantic_storage_capability(change)?;
         match atom_change_file_version(change_bytes)? {
-            ATOM_CHANGE_FILE_VERSION_V1 | ATOM_CHANGE_FILE_VERSION_V2 | ATOM_CHANGE_FILE_VERSION_SPAN => {}
+            ATOM_CHANGE_FILE_VERSION_V1 | ATOM_CHANGE_FILE_VERSION_V2 | ATOM_CHANGE_FILE_VERSION_SPAN | ATOM_CHANGE_FILE_VERSION_COMPACT | ATOM_CHANGE_FILE_VERSION_FIELDS => {}
             version => {
                 return Err(RepositoryError::Serialization(format!(
-                    "unsupported ATOM change file-header version {version}; supported versions are 1, 2 and 3"
+                    "unsupported ATOM change file-header version {version}; supported versions are 1 through 5"
                 )))
             }
         }
