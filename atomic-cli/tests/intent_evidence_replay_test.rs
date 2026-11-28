@@ -33,6 +33,36 @@ fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn response_body(response: &Value) -> String {
+    // This is a protocol control, not a subprocess-startup benchmark. A shell
+    // builtin returns the fixed response without launching another executable
+    // inside the production checker's bounded execution window.
+    format!(
+        "printf '%s\\n' {}",
+        quote(&serde_json::to_string(response).unwrap())
+    )
+}
+
+#[test]
+fn synthetic_response_does_not_require_external_path_tools() {
+    let response = json!({"reason": "author's literal %s \\n", "decision": "supported"});
+    let program = checker(&response_body(&response));
+    let empty_path = tempfile::tempdir().unwrap();
+    let output = Command::new(&program)
+        .env("PATH", empty_path.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        response
+    );
+}
+
 fn signed_fixture(root: &Path) -> (String, String) {
     let repo = Repository::init(root).unwrap();
     repo.init_vault().unwrap();
@@ -138,10 +168,7 @@ fn replay_is_opt_in_bound_to_native_state_and_does_not_mark_a_criterion_met() {
     let response = json!({"schema_version":"atomic-evidence-replay-response/v1", "request_digest":digest,
         "criterion_id":criterion_id, "claim_type":"source_text_coverage/v1", "decision":"supported",
         "reason":"synthetic_protocol_control", "details":{"scope":"synthetic checker; not a semantic result"}});
-    let body = format!(
-        "cat <<'RESPONSE'\n{}\nRESPONSE",
-        serde_json::to_string(&response).unwrap()
-    );
+    let body = response_body(&response);
     let program = checker(&body);
     let args = [
         "intent",
@@ -156,7 +183,8 @@ fn replay_is_opt_in_bound_to_native_state_and_does_not_mark_a_criterion_met() {
     let output = cli(temp.path(), &args);
     assert!(
         output.status.success(),
-        "{}",
+        "replay validation failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -208,9 +236,18 @@ fn replay_is_opt_in_bound_to_native_state_and_does_not_mark_a_criterion_met() {
     );
     let report: Value = serde_json::from_slice(&changed.stdout).unwrap();
     assert_eq!(report["conforms"], false);
-    assert!(report["results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|r| r["shape"] == "EvidenceReplayFreshness"));
+    assert_eq!(
+        report["evidence_replay"]["decisions"][0]["decision"], "supported",
+        "{report:#}"
+    );
+    assert!(
+        report["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["shape"] == "EvidenceReplayFreshness"),
+        "missing freshness violation:\n{}\nstderr: {}",
+        serde_json::to_string_pretty(&report).unwrap(),
+        String::from_utf8_lossy(&changed.stderr)
+    );
 }

@@ -10,3 +10,11 @@ fail-fast = false
 # Name long-running tests in the log so they can be tracked down.
 slow-timeout = { period = "60s" }
 failure-output = "immediate-final"
+
+# This protocol/freshness control runs a nested CLI inside the production
+# checker's fixed 10-second budget. Reserve capacity rather than extending the
+# security deadline or letting unrelated subprocess/IO-heavy tests exhaust it.
+# The default override is inherited by ci; every other test stays parallel.
+[[profile.default.overrides]]
+filter = 'binary(=intent_evidence_replay_test) & test(=replay_is_opt_in_bound_to_native_state_and_does_not_mark_a_criterion_met)'
+threads-required = "num-test-threads"
